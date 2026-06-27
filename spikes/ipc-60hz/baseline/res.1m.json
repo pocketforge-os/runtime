@@ -1,0 +1,8 @@
+{
+ "spike":"ipc-60hz","frame_budget_ns":16666667,"iters":1000000,
+ "measurements":[
+  {"name":"rpc_roundtrip","n":1000000,"mean_ns":12844.9,"p50_ns":13676,"p99_ns":16401,"p999_ns":20509,"max_ns":1371175},
+  {"name":"sharedfd_read","n":1000000,"mean_ns":552.4,"p50_ns":491,"p99_ns":1714,"p999_ns":2766,"max_ns":44184},
+  {"_":"end"}
+ ]
+}
