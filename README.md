@@ -41,6 +41,8 @@ crates/
                    the single physical_model (port of the sim's), and the per-capability managers/
   libpocketforge/  the C ABI (cdylib + staticlib) over `pocketforge` -> libpocketforge.{so,a}
   pf-broker-ref/   the reference PFW1 broker daemon (cooperative loopback; the enforcing one is .3)
+  pf-input-broker/ the v0 INPUT broker (.6): EVIOCGRAB + uinput re-emit + SCM_RIGHTS fd handoff —
+                   the ONE capability with REAL v0 enforcement
 wire/WIRE-PROTOCOL.md   the byte-level, reimplementable wire spec (folds in SPIKE-1's verdict)
 include/pocketforge.h   the hand-maintained C header (matches libpocketforge)
 ctest/                  a gcc C smoke test that links the staticlib and checks the contract
@@ -84,6 +86,42 @@ SAME `Backend` trait (so the backend swap holds for the manager layer too). High
 
 Contract proven in `crates/pocketforge/tests/managers.rs`. Honesty (R-A): these are the
 cooperative v0 contract — real default-deny-vs-hostile + server-side quotas are the `.3` broker.
+
+## The v0 INPUT broker (`tsp-e1b.6`) — the ONE real v0 enforcement
+
+`pf-input-broker` is the exception to "cooperative v0": it is genuinely enforcing on the vendor
+4.9 A133 kernel TODAY, with **no namespaces**. The daemon:
+
+1. **`EVIOCGRAB`s** the real evdev source — the kernel then delivers that device's events ONLY to
+   the broker, so a hostile app that opens the raw node reads **nothing** (the kernel-enforced
+   boundary, not a cooperative promise);
+2. **re-emits** a `uinput` virtual device, applying the **descriptor action-map** (canonical
+   positional codes) + a **rate-limit** token bucket. The X360 driver emits `BTN_X` (0x133) for
+   the physical WEST button and `BTN_Y` (0x134) for NORTH; the broker normalizes these onto
+   canonical `BTN_WEST`/`BTN_NORTH`, so the app never sees the driver quirk and the Pro→Pro-S delta
+   is invisible;
+3. **hands the app the re-emit read fd** via `Acquire("input")` + `SCM_RIGHTS` (the out-of-band
+   path `wire/WIRE-PROTOCOL.md` §4.1 reserves). The fd, not per-event RPC, is the input hot path
+   (SPIKE-1 / `.1`).
+
+```sh
+pf-input-broker --source /dev/input/eventN --descriptor <caps.toml> --acquire-sock <sock>
+```
+
+**Proof** (`crates/pf-input-broker/itest/run.sh`, run as root): against the E5 sim's
+descriptor-synthesized source it shows grab + remap (`BTN_X`→`BTN_WEST`) + the `SCM_RIGHTS`
+handoff + a **silent grabbed source** (the app cannot bypass), on **both** x86 (native, via the
+fd handoff) and **arm64 under `qemu-tsp`** (the device target). The authoritative on-silicon
+shared-fd latency (~0.15 ms/event on the A133) is a HARDWARE GATE (owner OK).
+
+### R-C: the Steam Link blessed-binary FD-pass exemption (the validator's canonical exemption)
+
+Steam Link is BOTH an input consumer AND a `uinput` producer (it makes its own virtual controller
+for the host). `EVIOCGRAB` on its input would break it (EBUSY / double-input / enumeration loop).
+So Steam Link is a **blessed binary**: the broker re-emits + hands the fd **without grabbing**
+(coarse FD-passing, `--no-grab` / `AcquireMode::BlessedNoGrab`), and Steam Link keeps its own
+`/dev/uinput`. The grab path is for genuine broker consumers (e.g. `pf-hwprobe`); the no-grab
+exemption is keyed on the consumer's identity (E3's blessed-binary tier).
 
 ## Honesty contract — contract now, enforce later (R-A)
 

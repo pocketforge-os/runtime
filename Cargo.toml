@@ -5,6 +5,7 @@ members = [
     "crates/pocketforge",
     "crates/libpocketforge",
     "crates/pf-broker-ref",
+    "crates/pf-input-broker",
 ]
 
 # Shared metadata for every crate in the runtime workspace (tsp-e1b.2 / E2).
@@ -21,6 +22,10 @@ pf-wire = { path = "crates/pf-wire", version = "0.0.1" }
 pocketforge = { path = "crates/pocketforge", version = "0.0.1" }
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
+# libc: ONLY the pf-input-broker daemon links it — it is privileged OS code (evdev/uinput
+# ioctls, SCM_RIGHTS). The wire/facade crates stay dependency-light; this is the one place
+# raw syscalls are unavoidable, and libc gives the correct struct layouts + ioctl FFI.
+libc = "0.2"
 
 # A release profile that prefers determinism + small daemons (E2 ships privileged
 # broker code; the ABI/wire are the contract, not the binary size, but keep it lean).
