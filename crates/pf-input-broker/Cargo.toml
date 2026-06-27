@@ -1,0 +1,26 @@
+[package]
+name = "pf-input-broker"
+description = "The v0 INPUT broker daemon (tsp-e1b.6): EVIOCGRABs the real evdev device, applies the descriptor action-map remap + rate limit, and re-emits via a uinput VIRTUAL device the app reads. The ONE capability with REAL v0 enforcement on the vendor 4.9 kernel (no namespaces). Hands the app the shared read fd via SCM_RIGHTS (the wire's Acquire(input) path)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lib]
+name = "pf_input_broker"
+path = "src/lib.rs"
+
+[[bin]]
+name = "pf-input-broker"
+path = "src/bin/pf-input-broker.rs"
+
+[[bin]]
+name = "pf-input-read"
+path = "src/bin/pf-input-read.rs"
+
+[dependencies]
+pocketforge = { workspace = true }
+pf-wire = { workspace = true }
+libc = { workspace = true }
