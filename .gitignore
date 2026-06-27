@@ -1,0 +1,12 @@
+# Rust build outputs (.2+ Cargo workspace)
+/target/
+**/target/
+Cargo.lock
+# C spike build outputs
+spikes/**/build/
+*.o
+# editor / OS noise
+*.swp
+.DS_Store
+__pycache__/
+*.pyc
