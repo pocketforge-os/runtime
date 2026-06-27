@@ -45,6 +45,8 @@ pub mod capability;
 pub mod descriptor;
 pub mod error;
 pub mod input;
+pub mod managers;
+pub mod physical_model;
 pub mod server;
 
 use std::sync::Arc;
@@ -58,35 +60,61 @@ pub use capability::{
 pub use descriptor::Descriptor;
 pub use error::{CapError, ConnectError, PermissionState};
 pub use input::{InputAction, InputMap};
+pub use managers::{
+    AudioManager, AudioSink, DescriptorTrustProbe, EgressManager, EgressReceipt, EntropyManager,
+    Fix, HardwareProbe, InputManager, LiveProbe, LocationManager, QuotaLedger, SensorManager,
+    SettingsManager, VibrationManager,
+};
 
 // Re-export the wire crate so reimplementors + the C ABI crate share one definition.
 pub use pf_wire;
 
-/// A live capability session — the object `acquire`/`query`/`has_capability` hang off. Cheap to
-/// hold; it owns a shared descriptor + a shared backend (the swap seam).
+/// A live capability session — the object `acquire`/`query`/`has_capability`/the per-capability
+/// managers hang off. Cheap to hold; it owns a shared descriptor + a shared backend (the swap
+/// seam) + the session's cooperative quota ledger + the live-probe seam.
 pub struct Pf {
     descriptor: Arc<Descriptor>,
     backend: Arc<dyn Backend>,
+    quotas: Arc<managers::QuotaLedger>,
+    probe: Arc<dyn managers::HardwareProbe>,
 }
 
 impl Pf {
+    /// The shared assembly point: every constructor lands here so the quota ledger + probe seam
+    /// are initialized exactly once. Off-hardware the probe is [`DescriptorTrustProbe`] (trust the
+    /// descriptor); [`Pf::with_probe`] swaps in a [`LiveProbe`] on silicon.
+    fn from_parts(descriptor: Arc<Descriptor>, backend: Arc<dyn Backend>) -> Pf {
+        Pf {
+            descriptor,
+            backend,
+            quotas: Arc::new(managers::QuotaLedger::new()),
+            probe: Arc::new(managers::DescriptorTrustProbe),
+        }
+    }
+
     /// Build a session over an explicit descriptor + backend (the general constructor).
     pub fn with_backend(descriptor: Arc<Descriptor>, backend: Arc<dyn Backend>) -> Pf {
-        Pf { descriptor, backend }
+        Pf::from_parts(descriptor, backend)
+    }
+
+    /// Replace the hardware-probe seam (e.g. a [`LiveProbe`] on real silicon). Builder-style.
+    pub fn with_probe(mut self, probe: Arc<dyn managers::HardwareProbe>) -> Pf {
+        self.probe = probe;
+        self
     }
 
     /// Build a session over the **v0 in-process backend** for a descriptor.
     pub fn in_process(descriptor: Descriptor) -> Pf {
         let d = Arc::new(descriptor);
         let backend = backends::InProcessBackend::shared(d.clone());
-        Pf { descriptor: d, backend }
+        Pf::from_parts(d, backend)
     }
 
     /// Build a session over an already-shared in-process backend (so a test/control plane can
     /// drive `set_consent`/`set_pose` on the same backend the session observes).
     pub fn over_in_process(backend: Arc<backends::InProcessBackend>) -> Pf {
         let d = backend.descriptor().clone();
-        Pf { descriptor: d, backend }
+        Pf::from_parts(d, backend)
     }
 
     /// Build a session over the **out-of-process broker** at `sock_path`. The descriptor is the
@@ -96,7 +124,7 @@ impl Pf {
         sock_path: impl AsRef<std::path::Path>,
     ) -> Result<Pf, ConnectError> {
         let backend = backends::BrokerClientBackend::connect(sock_path).map_err(ConnectError::Broker)?;
-        Ok(Pf { descriptor, backend: Arc::new(backend) })
+        Ok(Pf::from_parts(descriptor, Arc::new(backend)))
     }
 
     /// The descriptor this session reads structure from.
@@ -104,14 +132,29 @@ impl Pf {
         &self.descriptor
     }
 
+    /// A shared clone of the descriptor (managers hold this for structural reads).
+    pub fn descriptor_arc(&self) -> Arc<Descriptor> {
+        self.descriptor.clone()
+    }
+
     /// The backend (arbitration) as a trait object.
     pub fn backend(&self) -> &dyn Backend {
         &*self.backend
     }
 
-    /// A shared clone of the backend (handles hold this to call back).
+    /// A shared clone of the backend (handles + managers hold this to call back).
     pub fn backend_arc(&self) -> Arc<dyn Backend> {
         self.backend.clone()
+    }
+
+    /// A shared clone of the hardware-probe seam (managers hold this to reconcile presence).
+    pub fn probe_arc(&self) -> Arc<dyn managers::HardwareProbe> {
+        self.probe.clone()
+    }
+
+    /// The session's cooperative quota ledger (`location` read vs `egress` send buckets).
+    pub fn quotas(&self) -> Arc<managers::QuotaLedger> {
+        self.quotas.clone()
     }
 
     /// Acquire a capability handle, or the four-way typed error. (Cosmetic caps never error.)
@@ -145,6 +188,50 @@ impl Pf {
         }
         self.backend.acquire(&n)
     }
+
+    // ----- per-capability managers (tsp-e1b.4) -------------------------------------------------
+    // Each returns a device-agnostic object over the SAME backend + descriptor, so the backend
+    // swap holds for the manager layer too.
+
+    /// The input action-map manager (named-action resolution over the descriptor's controls).
+    pub fn input_manager(&self) -> managers::InputManager {
+        managers::InputManager::new(&self.descriptor, self.backend_arc(), self.probe_arc())
+    }
+
+    /// The haptics manager (unified no-op shape; E4 `hapticsEnabled` at the primitive).
+    pub fn vibration(&self) -> managers::VibrationManager {
+        managers::VibrationManager::new(self.backend_arc(), self.probe_arc())
+    }
+
+    /// The inertial-sensor manager (pose → device/chip-frame accel + gyro via the physical model).
+    pub fn sensors(&self) -> managers::SensorManager {
+        managers::SensorManager::new(self.descriptor_arc(), self.backend_arc(), self.probe_arc())
+    }
+
+    /// The ungated entropy manager.
+    pub fn entropy(&self) -> managers::EntropyManager {
+        managers::EntropyManager::new(self.backend_arc())
+    }
+
+    /// The location manager (GNSS, default-deny, consent-gated, `location`-read quota).
+    pub fn location(&self) -> managers::LocationManager {
+        managers::LocationManager::new(self.backend_arc(), self.probe_arc(), self.quotas())
+    }
+
+    /// The egress manager (network *send* — the separate logged + `egress`-quota'd capability).
+    pub fn egress(&self) -> managers::EgressManager {
+        managers::EgressManager::new(self.quotas())
+    }
+
+    /// The audio-routing manager.
+    pub fn audio(&self) -> managers::AudioManager {
+        managers::AudioManager::new(self.backend_arc())
+    }
+
+    /// The settings / accessibility-preference manager (the E4 toggle surface).
+    pub fn settings(&self) -> managers::SettingsManager {
+        managers::SettingsManager::new(self.backend_arc())
+    }
 }
 
 /// Open a capability session, choosing the descriptor + backend from the environment:
@@ -160,7 +247,7 @@ pub fn connect() -> Result<Pf, ConnectError> {
         Pf::via_broker(d, sock)
     } else {
         let backend = backends::InProcessBackend::shared(d.clone());
-        Ok(Pf { descriptor: d, backend })
+        Ok(Pf::from_parts(d, backend))
     }
 }
 

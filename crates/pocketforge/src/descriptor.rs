@@ -83,6 +83,14 @@ pub struct Sensor {
     pub iio_device: String,
     #[serde(default)]
     pub units: Option<String>,
+    /// The chip→device axis-alignment matrix (`device = M · chip`), 3×3 row-major of ±1/0.
+    /// Absent ⇒ identity (no remap). The [`crate::managers::sensors::SensorManager`] applies it
+    /// so the app reads the DEVICE frame regardless of how the chip is physically mounted.
+    #[serde(default)]
+    pub mount_matrix: Option<Vec<Vec<i32>>>,
+    /// The simulator skin widget hint (e.g. `"tilt_bubble"`), if any.
+    #[serde(default)]
+    pub ui: Option<String>,
 }
 
 /// One `[[actuators]]` row (rumble / led_array).
@@ -175,5 +183,34 @@ impl Descriptor {
             .find(|a| a.kind.to_ascii_lowercase().contains("led"))
             .and_then(|a| a.count)
             .unwrap_or(0)
+    }
+
+    /// The first inertial sensor row (accel/gyro/imu) on this device, if any.
+    fn inertial_sensor(&self) -> Option<&Sensor> {
+        self.sensors.iter().find(|s| {
+            let k = s.kind.to_ascii_lowercase();
+            k.contains("accel") || k.contains("gyro") || k.contains("imu")
+        })
+    }
+
+    /// The IMU's chip→device `mount_matrix` as floats (`device = M · chip`), defaulting to
+    /// [`crate::physical_model::IDENTITY_MOUNT`] when the descriptor omits it or the device has
+    /// no inertial sensor. A non-3×3 / non-square matrix is treated as identity (the descriptor
+    /// validator owns rejecting a malformed matrix; the manager degrades gracefully, never panics).
+    pub fn imu_mount_matrix(&self) -> crate::physical_model::Mat3 {
+        let rows = match self.inertial_sensor().and_then(|s| s.mount_matrix.as_ref()) {
+            Some(m) => m,
+            None => return crate::physical_model::IDENTITY_MOUNT,
+        };
+        if rows.len() != 3 || rows.iter().any(|r| r.len() != 3) {
+            return crate::physical_model::IDENTITY_MOUNT;
+        }
+        let mut m = crate::physical_model::IDENTITY_MOUNT;
+        for (r, row) in rows.iter().enumerate() {
+            for (c, v) in row.iter().enumerate() {
+                m[r][c] = *v as f64;
+            }
+        }
+        m
     }
 }

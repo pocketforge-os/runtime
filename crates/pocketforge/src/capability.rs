@@ -98,16 +98,38 @@ impl VibrationHandle {
     }
 }
 
-/// Handle for IMU / individual inertial sensors. v0 exposes the injected/observed pose; the
-/// full integrating physical model + per-channel IIO reads land in child `.4`.
+/// Handle for IMU / individual inertial sensors. Wraps the `.4`
+/// [`SensorManager`](crate::managers::SensorManager): the pose plus the derived device/chip-frame
+/// accelerometer + gyroscope channels (via the single physical model + the descriptor
+/// `mount_matrix`). `HardwareAbsent` on the base Pro, never a crash.
 pub struct SensorHandle {
-    backend: Arc<dyn Backend>,
+    mgr: crate::managers::SensorManager,
 }
 
 impl SensorHandle {
     /// Read the current pose (orientation in degrees, angular velocity in deg/s).
     pub fn read_pose(&self) -> Result<Pose, CapError> {
-        self.backend.get_pose()
+        self.mgr.read_pose()
+    }
+
+    /// The accelerometer reading in the **device frame** (m/s²) — gravity reaction from the pose.
+    pub fn read_accel(&self) -> Result<[f64; 3], CapError> {
+        self.mgr.read_accel()
+    }
+
+    /// The gyroscope reading in the **device frame** (rad/s).
+    pub fn read_gyro(&self) -> Result<[f64; 3], CapError> {
+        self.mgr.read_gyro()
+    }
+
+    /// The accelerometer in the **chip frame** (what the raw IIO node holds, pre-mount-matrix).
+    pub fn read_chip_accel(&self) -> Result<[f64; 3], CapError> {
+        self.mgr.read_chip_accel()
+    }
+
+    /// The chip→device mount matrix this device applies (identity unless the descriptor remaps).
+    pub fn mount_matrix(&self) -> &crate::physical_model::Mat3 {
+        self.mgr.mount_matrix()
     }
 }
 
@@ -179,7 +201,7 @@ impl Capability for Imu {
     type Handle = SensorHandle;
     fn acquire(pf: &Pf) -> Result<SensorHandle, CapError> {
         pf.backend().acquire(Self::NAME)?;
-        Ok(SensorHandle { backend: pf.backend_arc() })
+        Ok(SensorHandle { mgr: pf.sensors() })
     }
 }
 
@@ -188,7 +210,7 @@ impl Capability for Accelerometer {
     type Handle = SensorHandle;
     fn acquire(pf: &Pf) -> Result<SensorHandle, CapError> {
         pf.backend().acquire(Self::NAME)?;
-        Ok(SensorHandle { backend: pf.backend_arc() })
+        Ok(SensorHandle { mgr: pf.sensors() })
     }
 }
 
@@ -197,7 +219,7 @@ impl Capability for Gyroscope {
     type Handle = SensorHandle;
     fn acquire(pf: &Pf) -> Result<SensorHandle, CapError> {
         pf.backend().acquire(Self::NAME)?;
-        Ok(SensorHandle { backend: pf.backend_arc() })
+        Ok(SensorHandle { mgr: pf.sensors() })
     }
 }
 
@@ -206,7 +228,7 @@ impl Capability for Magnetometer {
     type Handle = SensorHandle;
     fn acquire(pf: &Pf) -> Result<SensorHandle, CapError> {
         pf.backend().acquire(Self::NAME)?;
-        Ok(SensorHandle { backend: pf.backend_arc() })
+        Ok(SensorHandle { mgr: pf.sensors() })
     }
 }
 

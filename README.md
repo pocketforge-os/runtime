@@ -37,7 +37,8 @@ crates/
   pf-wire/         PFW1 wire protocol — framing + messages + codec (ZERO deps, reimplementable)
   pocketforge/     the facade: connect()/acquire()/query()/has_capability(), the four-way
                    taxonomy, the v0 in-process backend (port of the sim's broker_stub.py), the
-                   out-of-process broker-client backend, the reference server, the action map
+                   out-of-process broker-client backend, the reference server, the action map,
+                   the single physical_model (port of the sim's), and the per-capability managers/
   libpocketforge/  the C ABI (cdylib + staticlib) over `pocketforge` -> libpocketforge.{so,a}
   pf-broker-ref/   the reference PFW1 broker daemon (cooperative loopback; the enforcing one is .3)
 wire/WIRE-PROTOCOL.md   the byte-level, reimplementable wire spec (folds in SPIKE-1's verdict)
@@ -60,6 +61,29 @@ in-process backend and the out-of-process broker (PFW1 over a real Unix socket) 
 byte-identical capability snapshots for both the a133 and a523 descriptors — the same app code,
 "surviving the runtime fork." The wire spec's reimplementability is demonstrated by a tiny
 from-spec client (no project code) driving `pf-broker-ref`.
+
+## Per-capability managers (`tsp-e1b.4`)
+
+`pf.sensors()` / `pf.vibration()` / `pf.input_manager()` / `pf.entropy()` / `pf.location()` /
+`pf.egress()` / `pf.audio()` / `pf.settings()` each return a **device-agnostic object** over the
+SAME `Backend` trait (so the backend swap holds for the manager layer too). Highlights:
+
+- **sensors** — pose → device/chip-frame accelerometer (gravity reaction) + gyroscope via the
+  single `physical_model` (a faithful port of the sim's), applying the descriptor `mount_matrix`.
+  ABSENT on the base Pro ⇒ typed `HardwareAbsent`, never a crash.
+- **vibration** — the unified no-op shape; the **E4 accessibility enforcement point lands here, at
+  the primitive**: `settings().set_bool("hapticsEnabled", false)` makes a pulse `NoopSuppressed`
+  via the SAME path as an absent motor.
+- **location vs egress** — `location` (read) and `egress` (send) account into **separate** quota
+  buckets: reading a fix never spends send budget and vice-versa (anti-exfiltration; the `.3`
+  broker turns this cooperative accounting + audit log into enforcement).
+- **probe seam** — each manager reconciles `descriptor` (expectation) against a `HardwareProbe`
+  (ground truth): an off-hardware `DescriptorTrustProbe` trusts the descriptor; an on-silicon
+  `LiveProbe` can DEMOTE a DT-but-unbound cap to `HardwareAbsent` (the authoritative reconciliation
+  is the owner-gated hardware leg).
+
+Contract proven in `crates/pocketforge/tests/managers.rs`. Honesty (R-A): these are the
+cooperative v0 contract — real default-deny-vs-hostile + server-side quotas are the `.3` broker.
 
 ## Honesty contract — contract now, enforce later (R-A)
 
