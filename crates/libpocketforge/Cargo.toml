@@ -1,0 +1,19 @@
+[package]
+name = "libpocketforge"
+description = "The C ABI for the PocketForge capability facade — so any-language OCI apps link libpocketforge.{so,a} and call the broker. Thin extern \"C\" wrapper over the `pocketforge` crate; the wire protocol stays language-agnostic (wire/WIRE-PROTOCOL.md)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lib]
+# Output artifacts are libpocketforge.{so,a}. (No `rlib`: it would collide with the core
+# `pocketforge` crate's rlib name, and the C ABI is exercised via gcc in ctest/, not Rust.)
+name = "pocketforge"
+crate-type = ["staticlib", "cdylib"]
+
+[dependencies]
+# Renamed so the dep is `pf::` even though this crate's own lib name is also `pocketforge`.
+pf = { package = "pocketforge", path = "../pocketforge" }

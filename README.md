@@ -27,6 +27,40 @@ E5 [`sim`](https://github.com/pocketforge-os/sim) → **E2 this repo** → E6 `p
   settings) + the **v0 INPUT broker** (`uinput`+`EVIOCGRAB`).
 - `spikes/` — de-risking spikes (e.g. `ipc-60hz/`, SPIKE-1).
 
+## Repo layout (as of `tsp-e1b.2`)
+
+A Cargo workspace (`Cargo.lock` IS committed — pinned deps are part of the reproducibility
+ethos):
+
+```
+crates/
+  pf-wire/         PFW1 wire protocol — framing + messages + codec (ZERO deps, reimplementable)
+  pocketforge/     the facade: connect()/acquire()/query()/has_capability(), the four-way
+                   taxonomy, the v0 in-process backend (port of the sim's broker_stub.py), the
+                   out-of-process broker-client backend, the reference server, the action map
+  libpocketforge/  the C ABI (cdylib + staticlib) over `pocketforge` -> libpocketforge.{so,a}
+  pf-broker-ref/   the reference PFW1 broker daemon (cooperative loopback; the enforcing one is .3)
+wire/WIRE-PROTOCOL.md   the byte-level, reimplementable wire spec (folds in SPIKE-1's verdict)
+include/pocketforge.h   the hand-maintained C header (matches libpocketforge)
+ctest/                  a gcc C smoke test that links the staticlib and checks the contract
+crates/pocketforge/tests/fixtures/  vendored a133 + a523 capability descriptors (from E1)
+```
+
+## Build & test (on the build host, `mm@10.0.40.90`)
+
+```sh
+cargo build --workspace                       # build everything
+cargo test  --workspace                       # taxonomy + backend-swap + change-event + wire
+cargo clippy --workspace --all-targets -- -D warnings
+bash ctest/run.sh                             # C ABI link + behavior smoke (gcc + staticlib)
+```
+
+The **backend-swap proof** lives in `crates/pocketforge/tests/backend_swap.rs`: the v0
+in-process backend and the out-of-process broker (PFW1 over a real Unix socket) produce
+byte-identical capability snapshots for both the a133 and a523 descriptors — the same app code,
+"surviving the runtime fork." The wire spec's reimplementability is demonstrated by a tiny
+from-spec client (no project code) driving `pf-broker-ref`.
+
 ## Honesty contract — contract now, enforce later (R-A)
 
 > The v0 facade is an **in-process library** linked into the app: an app running as `gamer` with

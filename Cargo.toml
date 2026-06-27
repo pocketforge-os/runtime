@@ -1,0 +1,31 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/pf-wire",
+    "crates/pocketforge",
+    "crates/libpocketforge",
+    "crates/pf-broker-ref",
+]
+
+# Shared metadata for every crate in the runtime workspace (tsp-e1b.2 / E2).
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.77"
+license = "MIT"
+repository = "https://github.com/pocketforge-os/runtime"
+authors = ["PocketForge <noreply@pocketforge.os>"]
+
+[workspace.dependencies]
+pf-wire = { path = "crates/pf-wire", version = "0.0.1" }
+pocketforge = { path = "crates/pocketforge", version = "0.0.1" }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+
+# A release profile that prefers determinism + small daemons (E2 ships privileged
+# broker code; the ABI/wire are the contract, not the binary size, but keep it lean).
+[profile.release]
+opt-level = 2
+lto = "thin"
+codegen-units = 1
+panic = "abort"

@@ -1,0 +1,16 @@
+[package]
+name = "pf-wire"
+description = "PocketForge capability-broker wire protocol (PFW1): length-prefixed, protobuf-wire-compatible framing + messages. Zero deps; reimplementable from wire/WIRE-PROTOCOL.md."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lib]
+name = "pf_wire"
+
+# Deliberately ZERO dependencies: the wire format must be reimplementable from the
+# committed spec in any language. No protoc, no codegen, no external crates.
+[dependencies]

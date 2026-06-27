@@ -1,10 +1,14 @@
 # Rust build outputs (.2+ Cargo workspace)
 /target/
 **/target/
-Cargo.lock
+# NOTE: Cargo.lock IS committed (this workspace ships daemons/binaries + the C ABI;
+# pinned deps are part of the "own the substrate, reproducible from pinned sources"
+# ethos). It is intentionally NOT ignored.
 # C spike build outputs
 spikes/**/build/
 *.o
+# C ABI smoke-test build output
+ctest/build/
 # editor / OS noise
 *.swp
 .DS_Store

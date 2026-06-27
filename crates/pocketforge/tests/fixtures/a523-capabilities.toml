@@ -1,0 +1,208 @@
+# platform/devices/a523/capabilities.toml — TrimUI Smart Pro S (Allwinner A523 / TG5050).
+#
+# Capability descriptor SIBLING to profile.toml (joined by device.id). Validate:
+# `pf caps validate a523`. Authored from hardware-firmware-probes.md §17 + the companion
+# trimui-smartpro-s-a523-platform-report.md + the shared chassis (FCC 2BD9O-TG5050).
+#
+# THE MULTI-DEVICE PROOF: this descriptor is the a133 one PLUS data rows — same schema,
+# zero per-device CODE. The added rows are: home, l3, r3 (inputs); imu (sensor); rumble
+# (actuator). The LED actuator DIFFERS (different controller IC: ledc vs the A133's
+# sunxi_led) — a genuine hardware difference expressed as DATA, still no code branch.
+#
+# INVARIANTS (as a133): descriptor = EXPECTATION; probe = GROUND TRUTH (SPIKE-0 / tsp-9sx.1).
+# Both units share ONE Xbox-360 HID (045e:028e); the SPIKE-0 fidelity check is asymmetric.
+# SPIKE-0 HAZARDS on this unit (R3): several A523 sensors are DT-but-UNBOUND — only the
+# IMU (qmi8658) is claimed here; the magnetometer (mmc5603) and GNSS are OMITTED until
+# SPIKE-0 proves they actually BIND. The Home key code/device is a SPIKE-0 confirm (see below).
+
+# Default "confirm" face button (Xbox/PS = south). HINT only; full action mapping is E2's.
+accept_default = "south"
+
+[identity]
+id           = "a523"
+manufacturer = "TrimUI"
+model        = "Smart Pro S"
+codename     = "5050"                                # Android-picker leaf: TrimUI > 5050 (Pro S)
+sdl_guid     = "030000005e0400008e02000010010000"   # same Xbox-360 gamepad identity as the base (§17)
+match        = { evdev_name = "TRIMUI Player1", vid = "045e", pid = "028e" }
+
+# Same chassis + panel as the base. Render INTENT is identical (app draws landscape 1280x720,
+# present portrait). The rotation MECHANISM differs per-SoC (A523 = sunxi DRM/KMS, not the
+# A133's legacy disp2) but that is CODE, not descriptor data — the logical enum is the same.
+[[screens]]
+role          = "primary"
+present       = "portrait"
+rotation      = "cw90"
+render_canvas = { w = 1280, h = 720 }
+display_rect  = { x = 304, y = 75, w = 872, h = 490 }
+
+# ---- INPUTS: the a133 set, verbatim (POSITIONAL face ids + label; see the a133 note) ----
+[[inputs]]
+id = "south"
+kind = "button"
+ev_type = "EV_KEY"
+code = "BTN_A"
+label = "A"
+skin_part = "btn_south"
+[[inputs]]
+id = "east"
+kind = "button"
+ev_type = "EV_KEY"
+code = "BTN_B"
+label = "B"
+skin_part = "btn_east"
+[[inputs]]
+id = "west"
+kind = "button"
+ev_type = "EV_KEY"
+code = "BTN_X"
+label = "X"
+skin_part = "btn_west"
+[[inputs]]
+id = "north"
+kind = "button"
+ev_type = "EV_KEY"
+code = "BTN_Y"
+label = "Y"
+skin_part = "btn_north"
+[[inputs]]
+id = "select"
+kind = "button"
+ev_type = "EV_KEY"
+code = "BTN_SELECT"
+skin_part = "btn_select"
+[[inputs]]
+id = "guide"
+kind = "button"
+ev_type = "EV_KEY"
+code = "BTN_MODE"
+skin_part = "btn_guide"
+[[inputs]]
+id = "start"
+kind = "button"
+ev_type = "EV_KEY"
+code = "BTN_START"
+skin_part = "btn_start"
+[[inputs]]
+id = "l1"
+kind = "button"
+ev_type = "EV_KEY"
+code = "BTN_TL"
+skin_part = "btn_l1"
+[[inputs]]
+id = "r1"
+kind = "button"
+ev_type = "EV_KEY"
+code = "BTN_TR"
+skin_part = "btn_r1"
+[[inputs]]
+id = "dpad"
+kind = "hat"
+ev_type = "EV_ABS"
+code = "ABS_HAT0X,ABS_HAT0Y"
+skin_part = "dpad"
+[[inputs]]
+id = "lstick"
+kind = "stick"
+ev_type = "EV_ABS"
+code = "ABS_X,ABS_Y"
+skin_part = "stick_l"
+x = { min = -32768, max = 32767, fuzz = 16, flat = 128 }
+y = { min = -32768, max = 32767, fuzz = 16, flat = 128 }
+[[inputs]]
+id = "rstick"
+kind = "stick"
+ev_type = "EV_ABS"
+code = "ABS_RX,ABS_RY"
+skin_part = "stick_r"
+x = { min = -32768, max = 32767, fuzz = 16, flat = 128 }
+y = { min = -32768, max = 32767, fuzz = 16, flat = 128 }
+[[inputs]]
+id = "ltrig"
+kind = "trigger"
+ev_type = "EV_ABS"
+code = "ABS_Z"
+ui = "slider_above"
+skin_part = "trig_l"
+range = { min = 0, max = 255, fuzz = 0, flat = 0 }
+[[inputs]]
+id = "rtrig"
+kind = "trigger"
+ev_type = "EV_ABS"
+code = "ABS_RZ"
+ui = "slider_above"
+skin_part = "trig_r"
+range = { min = 0, max = 255, fuzz = 0, flat = 0 }
+
+# ---- ... PLUS the Pro S-only PURE ADDED ROWS ----
+# Home: a dedicated system button physically NEXT TO POWER (Steam Deck HQ / FCC photos) —
+# i.e. a system key, NOT the gamepad's guide (BTN_MODE, already mapped above). Authored as
+# KEY_HOMEPAGE; the exact code + which evdev node it lands on is a SPIKE-0 ground-truth item.
+[[inputs]]
+id = "home"
+kind = "button"
+ev_type = "EV_KEY"
+code = "KEY_HOMEPAGE"
+skin_part = "btn_home"
+# Clickable thumbsticks (L3/R3) — the press of the existing sticks (lights the stick part).
+[[inputs]]
+id = "l3"
+kind = "stick-click"
+ev_type = "EV_KEY"
+code = "BTN_THUMBL"
+skin_part = "stick_l"
+[[inputs]]
+id = "r3"
+kind = "stick-click"
+ev_type = "EV_KEY"
+code = "BTN_THUMBR"
+skin_part = "stick_r"
+
+# ---- SENSORS (Pro S-only) ----
+# 6-axis IMU. SPIKE-0 must confirm the qmi8658 actually BINDS (DT-but-unbound is the R3
+# hazard); mag (mmc5603) + GNSS are intentionally OMITTED until proven bound.
+[[sensors]]
+id = "imu"
+kind = "accel+gyro"
+iio_device = "qmi8658"
+units = "m/s^2,rad/s"
+ui = "tilt_bubble"
+mount_matrix = [[1, 0, 0], [0, 1, 0], [0, 0, 1]]   # identity until SPIKE-0 measures the real mount
+
+# ---- ACTUATORS ----
+# Rumble (Pro S-only) — single pwm-vibrator motor (§17).
+[[actuators]]
+id = "rumble"
+kind = "rumble"
+ev_type = "EV_FF"
+code = "FF_RUMBLE"
+sysfs = "pwm-vibrator"
+# LEDs — DIFFERENT controller IC than the base (ledc/led_anim vs sunxi_led); ~17 LEDs.
+# A real hardware difference carried as DATA (count + controller), not a code branch.
+[[actuators]]
+id = "leds"
+kind = "led_array"
+controller = "ledc"
+count = 17
+
+# ---- SKIN (a133 layout + the Home key; L3/R3 reuse the stick parts) ----
+[skin]
+body     = "skins/a523/body.png"
+lit_body = "skins/a523/body_lit.png"
+
+[skin.parts]
+dpad       = { x = 92,   y = 140, w = 116, h = 116 }
+stick_l    = { x = 95,   y = 382, w = 116, h = 116 }
+stick_r    = { x = 1272, y = 382, w = 116, h = 116 }
+btn_north  = { x = 1306, y = 128, w = 48,  h = 48 }
+btn_east   = { x = 1356, y = 176, w = 48,  h = 48 }
+btn_south  = { x = 1306, y = 224, w = 48,  h = 48 }
+btn_west   = { x = 1256, y = 176, w = 48,  h = 48 }
+btn_select = { x = 600,  y = 586, w = 56,  h = 30 }
+btn_guide  = { x = 712,  y = 586, w = 56,  h = 30 }
+btn_start  = { x = 824,  y = 586, w = 56,  h = 30 }
+btn_home   = { x = 1200, y = 10,  w = 44,  h = 28 }
+btn_l1     = { x = 80,   y = 34,  w = 150, h = 22 }
+btn_r1     = { x = 1250, y = 34,  w = 150, h = 22 }
+trig_l     = { x = 80,   y = 8,   w = 150, h = 22 }
+trig_r     = { x = 1250, y = 8,   w = 150, h = 22 }
