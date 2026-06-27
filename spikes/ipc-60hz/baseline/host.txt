@@ -1,0 +1,8 @@
+host: modelmaker
+CPU(s): 32
+Model name: AMD Ryzen Threadripper PRO 3955WX 16-Cores
+Thread(s) per core: 2
+Core(s) per socket: 16
+CPU(s) scaling MHz: 55%
+gcc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0
+6.8.0-124-generic

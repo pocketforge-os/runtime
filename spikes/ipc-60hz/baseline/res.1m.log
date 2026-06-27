@@ -1,0 +1,3 @@
+SPIKE-1 ipc-60hz: iters=1000000 warmup=51000 (req=24B resp=8B event=24B)
+[rpc_roundtrip] n=1000000 mean=12845 p50=13676 p99=16401 p999=20509 max=1371175 (ns)
+[sharedfd_read] n=1000000 mean=552 p50=491 p99=1714 p999=2766 max=44184 (ns)
