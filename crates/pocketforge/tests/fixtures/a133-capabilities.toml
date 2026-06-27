@@ -1,0 +1,180 @@
+# platform/devices/a133/capabilities.toml — TrimUI Smart Pro (Allwinner A133 / TG5040).
+#
+# The NET-NEW capability descriptor — a SIBLING to profile.toml, joined ONLY by
+# device.id. profile.toml owns kernel/gpu/bootchain; THIS file owns what the device can
+# SENSE, ACTUATE, and LOOK LIKE. One descriptor, three consumers (broker / simulator / CI).
+# Validate: `pf caps validate a133`. Schema: schemas/capabilities.schema.json. Authored
+# from hardware-firmware-probes.md §§5,13,14 + the FCC external-photo layout (2BD9O-TG5040).
+#
+# INVARIANTS: descriptor = EXPECTATION; the live EVIOCGBIT/EVIOCGABS probe = GROUND TRUTH
+# (SPIKE-0 / tsp-9sx.1 reconciles on silicon). Missing hardware = ROW OMISSION, never a
+# fabricated row. The gamepad is one Xbox-360 HID (045e:028e) that advertises a SUPERSET of
+# codes (incl. BTN_THUMBL/R) the base chassis does not physically wire — so this file lists
+# only the PHYSICAL, drawable controls; the SPIKE-0 fidelity check is asymmetric (these
+# codes ⊆ the probe's advertised codes; extra advertised codes are expected, not mismatches).
+
+# Default "confirm" face button (Xbox/PS = south, Switch-region = east). A HINT only;
+# full confirm/cancel/action mapping is the broker/SDK layer's job (E2), not this file.
+accept_default = "south"
+
+[identity]
+id           = "a133"
+manufacturer = "TrimUI"
+model        = "Smart Pro"
+codename     = "5040"                                # Android-picker leaf: TrimUI > 5040 (Pro)
+sdl_guid     = "030000005e0400008e02000010010000"   # Xbox-360 wired; ship gamecontrollerdb verbatim (probe §13)
+match        = { evdev_name = "TRIMUI Player1", vid = "045e", pid = "028e" }
+
+# Screen = render INTENT, not panel pixel truth. The app draws a LANDSCAPE 1280x720 canvas;
+# the disp engine rotates it onto the physically-portrait panel (present=portrait). The
+# rotation MECHANISM (A133 legacy disp2, derived rotate-768) is per-SoC CODE, not data here
+# — only the logical enum is carried. Panel dims live in the kernel DTS (lcd0), not here.
+[[screens]]
+role          = "primary"
+present       = "portrait"
+rotation      = "cw90"
+render_canvas = { w = 1280, h = 720 }
+display_rect  = { x = 304, y = 75, w = 872, h = 490 }   # where the live fb composites on the bezel
+
+# ---- INPUTS: each row = one drawable, bindable PHYSICAL control ----
+# Face buttons — POSITIONAL ids (south/east/west/north, SDL3-aligned); the printed glyph
+# is in `label`. Binding is by POSITION so a Switch-format device differs by DATA only
+# (swap the labels + accept_default), never code or skin. `code` is the xpad driver's
+# EMITTED symbol (BTN_A/B/X/Y = 0x130/0x131/0x133/0x134) = ground truth; note id="west"
+# carries BTN_X (0x133, whose spatial alias is "NORTH") because physical X/left emits
+# 0x133 — trust the id for position, the code for the wire. SPIKE-0 confirms the numeric
+# code per physical button. Emits the canonical X360 gamecontrollerdb (a:b0,b:b1,x:b2,y:b3).
+[[inputs]]
+id = "south"
+kind = "button"
+ev_type = "EV_KEY"
+code = "BTN_A"
+label = "A"
+skin_part = "btn_south"
+[[inputs]]
+id = "east"
+kind = "button"
+ev_type = "EV_KEY"
+code = "BTN_B"
+label = "B"
+skin_part = "btn_east"
+[[inputs]]
+id = "west"
+kind = "button"
+ev_type = "EV_KEY"
+code = "BTN_X"
+label = "X"
+skin_part = "btn_west"
+[[inputs]]
+id = "north"
+kind = "button"
+ev_type = "EV_KEY"
+code = "BTN_Y"
+label = "Y"
+skin_part = "btn_north"
+# System buttons. guide = BTN_MODE (advertised + listed for the base unit; SPIKE-0 confirms
+# the physical press). The Pro S adds a SEPARATE Home key — see devices/a523.
+[[inputs]]
+id = "select"
+kind = "button"
+ev_type = "EV_KEY"
+code = "BTN_SELECT"
+skin_part = "btn_select"
+[[inputs]]
+id = "guide"
+kind = "button"
+ev_type = "EV_KEY"
+code = "BTN_MODE"
+skin_part = "btn_guide"
+[[inputs]]
+id = "start"
+kind = "button"
+ev_type = "EV_KEY"
+code = "BTN_START"
+skin_part = "btn_start"
+# Shoulders (digital).
+[[inputs]]
+id = "l1"
+kind = "button"
+ev_type = "EV_KEY"
+code = "BTN_TL"
+skin_part = "btn_l1"
+[[inputs]]
+id = "r1"
+kind = "button"
+ev_type = "EV_KEY"
+code = "BTN_TR"
+skin_part = "btn_r1"
+# D-pad as an ABS hat (classic Xbox layout).
+[[inputs]]
+id = "dpad"
+kind = "hat"
+ev_type = "EV_ABS"
+code = "ABS_HAT0X,ABS_HAT0Y"
+skin_part = "dpad"
+# Analog sticks — NOT clickable on the base unit (no L3/R3 rows; the Pro S adds them).
+[[inputs]]
+id = "lstick"
+kind = "stick"
+ev_type = "EV_ABS"
+code = "ABS_X,ABS_Y"
+skin_part = "stick_l"
+x = { min = -32768, max = 32767, fuzz = 16, flat = 128 }
+y = { min = -32768, max = 32767, fuzz = 16, flat = 128 }
+[[inputs]]
+id = "rstick"
+kind = "stick"
+ev_type = "EV_ABS"
+code = "ABS_RX,ABS_RY"
+skin_part = "stick_r"
+x = { min = -32768, max = 32767, fuzz = 16, flat = 128 }
+y = { min = -32768, max = 32767, fuzz = 16, flat = 128 }
+# Analog triggers (0..255; slider drawn above the trigger part — owner's UI).
+[[inputs]]
+id = "ltrig"
+kind = "trigger"
+ev_type = "EV_ABS"
+code = "ABS_Z"
+ui = "slider_above"
+skin_part = "trig_l"
+range = { min = 0, max = 255, fuzz = 0, flat = 0 }
+[[inputs]]
+id = "rtrig"
+kind = "trigger"
+ev_type = "EV_ABS"
+code = "ABS_RZ"
+ui = "slider_above"
+skin_part = "trig_r"
+range = { min = 0, max = 255, fuzz = 0, flat = 0 }
+
+# ---- ACTUATORS ----
+# 23 addressable RGB LEDs (sunxi_led0..22 ×rgb) = the analog-stick rings + edge (probe §14).
+# NO rumble on the base unit (omitted — the Pro S adds pwm-vibrator).
+[[actuators]]
+id = "leds"
+kind = "led_array"
+controller = "sunxi_led"
+count = 23
+
+# NO [[sensors]] — the base unit has no accel/gyro/mag (probe §§11-16). Omission, not a stub.
+
+# ---- SKIN (AVD clickable-skin model; original art traced from the FCC photos) ----
+[skin]
+body     = "skins/a133/body.png"
+lit_body = "skins/a133/body_lit.png"
+
+[skin.parts]
+dpad       = { x = 92,   y = 140, w = 116, h = 116 }
+stick_l    = { x = 95,   y = 382, w = 116, h = 116 }
+stick_r    = { x = 1272, y = 382, w = 116, h = 116 }
+btn_north  = { x = 1306, y = 128, w = 48,  h = 48 }
+btn_east   = { x = 1356, y = 176, w = 48,  h = 48 }
+btn_south  = { x = 1306, y = 224, w = 48,  h = 48 }
+btn_west   = { x = 1256, y = 176, w = 48,  h = 48 }
+btn_select = { x = 600,  y = 586, w = 56,  h = 30 }
+btn_guide  = { x = 712,  y = 586, w = 56,  h = 30 }
+btn_start  = { x = 824,  y = 586, w = 56,  h = 30 }
+btn_l1     = { x = 80,   y = 34,  w = 150, h = 22 }
+btn_r1     = { x = 1250, y = 34,  w = 150, h = 22 }
+trig_l     = { x = 80,   y = 8,   w = 150, h = 22 }
+trig_r     = { x = 1250, y = 8,   w = 150, h = 22 }

@@ -1,0 +1,17 @@
+[package]
+name = "pocketforge"
+description = "The PocketForge capability facade: getSystemService-style acquire/query over a backend-swappable capability broker. v0 in-process backend + out-of-process broker client behind ONE facade (epic tsp-e1b / child .2)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lib]
+name = "pocketforge"
+
+[dependencies]
+pf-wire = { workspace = true }
+serde = { workspace = true }
+toml = { workspace = true }

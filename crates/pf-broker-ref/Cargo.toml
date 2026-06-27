@@ -1,0 +1,16 @@
+[package]
+name = "pf-broker-ref"
+description = "Reference PFW1 broker daemon — wraps the v0 in-process backend behind a Unix socket so libpocketforge's out-of-process client can be exercised off-hardware (the backend-swap proof). NOT the enforcing broker (that is tsp-e1b.3)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "pf-broker-ref"
+path = "src/main.rs"
+
+[dependencies]
+pocketforge = { workspace = true }
