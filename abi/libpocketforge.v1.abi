@@ -1,0 +1,20 @@
+# libpocketforge — FROZEN public C ABI surface, contract version v1 (tsp-e1b.5).
+#
+# Every symbol below is part of the never-silently-broken contract: it MUST remain exported with
+# this exact name and C signature (see include/pocketforge.h). Removing or renaming any of these
+# is a BREAKING change that requires a major version bump + a new golden file (see STABILITY.md).
+# Adding a NEW pf_* symbol is an additive (minor) change — allowed; append it here in the same PR.
+#
+# `abi/check-abi.sh` asserts every symbol here is still exported by the built libpocketforge.so.
+pf_acquire
+pf_connect
+pf_connect_descriptor
+pf_entropy_fill
+pf_free
+pf_has_capability
+pf_is_granted
+pf_is_present
+pf_query
+pf_rumble_pulse
+pf_strerror
+pf_wire_version

@@ -159,8 +159,10 @@ the wire layer.
   peers skip them, §3) or **new `Op`/`Status` values** (peers reject unknown enums rather
   than guessing — see `BadEnum`). A breaking change bumps `WIRE_VERSION` and the socket-path
   basename (`broker.sock` → `broker.v2.sock`), never silently.
-* The frozen, never-silently-broken public surface (this file + the C ABI header) is what
-  `tsp-e1b.5` formally version-freezes and hands to E8.
+* The frozen, never-silently-broken public surface (this file + the C ABI header) is formally
+  version-frozen at **v1** by `STABILITY.md` (the compat/deprecation policy + the CI guards
+  `crates/pf-wire/tests/frozen_contract.rs` and `abi/check-abi.sh`); the Platform/SDK split that
+  hands it to E8 is `docs/RUNTIME-SDK-SPLIT.md` (`tsp-e1b.5`).
 
 ## 7. Security notes (honesty: contract now, enforce later — R-A)
 
