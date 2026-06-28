@@ -1,0 +1,23 @@
+[package]
+name = "pf-broker"
+description = "The ENFORCING capability-broker daemon core (tsp-e1b.3): default-deny, owns the device fds, validates the app.toml use=[] CapDL-style authority graph at launch, checks SO_PEERCRED, and routes brokered handles over the PFW1 wire (tsp-e1b.2). v0 is the NON-NAMESPACED reference impl — full fd-routing into real app namespaces is substrate-gated (owned kernel M2.B-E + paused M1.D). NEW privileged trust-path code — small + audited."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lib]
+name = "pf_broker"
+path = "src/lib.rs"
+
+[[bin]]
+name = "pf-broker"
+path = "src/bin/pf-broker.rs"
+
+[dependencies]
+pocketforge = { workspace = true }
+libc = { workspace = true }
+serde = { workspace = true }
+toml = { workspace = true }
