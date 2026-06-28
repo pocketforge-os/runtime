@@ -43,7 +43,10 @@ crates/
   pf-broker-ref/   the reference PFW1 broker daemon (cooperative loopback; the enforcing one is .3)
   pf-input-broker/ the v0 INPUT broker (.6): EVIOCGRAB + uinput re-emit + SCM_RIGHTS fd handoff —
                    the ONE capability with REAL v0 enforcement
+  pf-broker/       the ENFORCING broker daemon core (.3): app.toml use=[] launch validation +
+                   default-deny + manifest ceiling + SO_PEERCRED + per-cap quota (docs/BROKER-DESIGN.md)
 wire/WIRE-PROTOCOL.md   the byte-level, reimplementable wire spec (folds in SPIKE-1's verdict)
+docs/BROKER-DESIGN.md   the broker architecture + threat model + what v0 enforces vs. substrate-gated
 include/pocketforge.h   the hand-maintained C header (matches libpocketforge)
 ctest/                  a gcc C smoke test that links the staticlib and checks the contract
 crates/pocketforge/tests/fixtures/  vendored a133 + a523 capability descriptors (from E1)
@@ -122,6 +125,34 @@ So Steam Link is a **blessed binary**: the broker re-emits + hands the fd **with
 (coarse FD-passing, `--no-grab` / `AcquireMode::BlessedNoGrab`), and Steam Link keeps its own
 `/dev/uinput`. The grab path is for genuine broker consumers (e.g. `pf-hwprobe`); the no-grab
 exemption is keyed on the consumer's identity (E3's blessed-binary tier).
+
+## The enforcing broker daemon core (`tsp-e1b.3`)
+
+`pf-broker` is the **default-deny daemon** that owns the device fds and vends brokered handles
+over the `.2` wire. It is what turns the cooperative facade into a real broker, via three pieces
+(full design + threat model: [`docs/BROKER-DESIGN.md`](docs/BROKER-DESIGN.md)):
+
+1. **Launch-time `app.toml` validation** — the `use = [...]` CapDL-style authority graph is checked
+   against the device descriptor; **unknown / duplicate / bad-modifier / undescriptored-required**
+   routes are REJECTED before the app runs. `cap?` marks a capability *optional* (graceful absence
+   allowed → runtime `HardwareAbsent`); `location:approximate` / `egress:<host>` are scopes.
+2. **Runtime enforcement** (`EnforcingBackend`, itself a `Backend` so the `.2` server serves it
+   unchanged) — the validated manifest is the **ceiling** (undeclared ⇒ `PolicyBlocked`/`Denied`),
+   default-deny is preserved, dangerous caps are quota-capped, and **`entropy` is the deliberate
+   ungated exception** (non-exhaustible CSPRNG).
+3. **`SO_PEERCRED`** uid check at accept time.
+
+```sh
+pf-broker --validate-only --descriptor <caps.toml> --manifest <app.toml>   # launch gate
+pf-broker --socket <path> --descriptor <caps.toml> --manifest <app.toml> [--peer-uid <uid>]
+```
+
+The **backend-swap, now enforcing**: `crates/pf-broker/tests/broker.rs` runs the SAME client
+(`Pf::via_broker`) an app uses against this daemon and observes the ceiling + default-deny +
+quotas over the socket. **Honesty (R-A):** v0 enforces the authority graph cooperatively over the
+socket; it does NOT yet confine a process that ignores the socket and reaches `/dev/*` directly
+(no namespaces/seccomp — except INPUT's `EVIOCGRAB`). Real fd-isolation into an app namespace is
+the substrate-gated leg (owned kernel M2.B–E + paused M1.D) — named, not papered over.
 
 ## Honesty contract — contract now, enforce later (R-A)
 
