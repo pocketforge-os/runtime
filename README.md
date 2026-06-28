@@ -154,6 +154,27 @@ socket; it does NOT yet confine a process that ignores the socket and reaches `/
 (no namespaces/seccomp — except INPUT's `EVIOCGRAB`). Real fd-isolation into an app namespace is
 the substrate-gated leg (owned kernel M2.B–E + paused M1.D) — named, not papered over.
 
+## Frozen public contract + the runtime/SDK split (`tsp-e1b.5`)
+
+The `libpocketforge` C ABI and the PFW1 wire are **version-frozen at v1** — versioned, never
+silently broken (the libretro bar). Policy + the enumerated frozen surface:
+[`STABILITY.md`](STABILITY.md). Two CI guards make it a build gate, not a promise:
+
+```sh
+cargo test -p pf-wire --test frozen_contract   # wire: enum discriminants + golden message bytes
+bash abi/check-abi.sh                            # C ABI: every frozen pf_* symbol still exported
+```
+
+A break (renamed symbol, renumbered enum, changed framing/pose layout) FAILS these and requires an
+explicit major bump (`WIRE_VERSION`++, `broker.v2.sock`, `libpocketforge.so.2`, a new
+`abi/libpocketforge.v2.abi`). Additive symbols/fields are minor.
+
+The **Platform vs SDK** seam (Flatpak-style) — what ships on device vs. what an app pins, and how an
+app pins a **per-SoC family** (`sun50i-a133` 4.9/PowerVR/sunxifb vs `sun55i-a523` 5.15/Mali/kmsdrm)
+— is [`docs/RUNTIME-SDK-SPLIT.md`](docs/RUNTIME-SDK-SPLIT.md), which also fixes the E2/E8 boundary
+(E2 defines the contract; E8 packages it) and **names the reproducible-from-clean provenance gap**
+(`tsp-cv7.4.13`/`.6`/`tsp-iby`) rather than papering over it.
+
 ## Honesty contract — contract now, enforce later (R-A)
 
 > The v0 facade is an **in-process library** linked into the app: an app running as `gamer` with
