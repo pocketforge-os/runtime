@@ -1,0 +1,16 @@
+[package]
+name = "pf-settings"
+description = "The v1 user-preference WRITER surface (owner ruling Q1): a small `pf-settings get|set|list` CLI over the pf-prefs store, modeled on the pf-permissions command shape. This is authority-side — apps are read-only on preferences by contract; the on-panel settings UI (.3) writes through the same pf-prefs path."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "pf-settings"
+path = "src/main.rs"
+
+[dependencies]
+pf-prefs = { workspace = true }
