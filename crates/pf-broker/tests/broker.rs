@@ -61,12 +61,14 @@ fn manifest_for(app_id: &str, uses: &[&str]) -> AppManifest {
 }
 
 /// A synthetic descriptor that backs `location` (gnss) AND `vibration` (a rumble motor) — the
-/// shipped a133/a523 fixtures omit GNSS, so the bead's STEP-1 well-formed list needs this.
+/// shipped a133/a523 fixtures omit GNSS, so the bead's STEP-1 well-formed list needs this. (No
+/// `iio_device` — GNSS is DT-unbound on both SoCs and `iio_device` is optional as of runtime#13;
+/// `location` presence derives from the sensor `kind`, not the node.)
 fn desc_gnss_and_rumble() -> Descriptor {
     Descriptor::from_toml(
         "[identity]\nid=\"step1\"\nmanufacturer=\"x\"\nmodel=\"y\"\nsdl_guid=\"00000000000000000000000000000000\"\n\
          [[inputs]]\nid=\"south\"\nkind=\"button\"\nev_type=\"EV_KEY\"\ncode=\"BTN_A\"\n\
-         [[sensors]]\nid=\"gnss\"\nkind=\"gnss\"\niio_device=\"gnss0\"\n\
+         [[sensors]]\nid=\"gnss\"\nkind=\"gnss\"\n\
          [[actuators]]\nid=\"rumble\"\nkind=\"rumble\"\nev_type=\"EV_FF\"\ncode=\"FF_RUMBLE\"\nsysfs=\"pwm-vibrator\"\n",
     )
     .expect("synthetic descriptor parses")
