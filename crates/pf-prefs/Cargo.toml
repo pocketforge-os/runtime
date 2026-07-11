@@ -1,0 +1,19 @@
+[package]
+name = "pf-prefs"
+description = "E4 preference data layer: a typed accessibility/user-preference SCHEMA + persistent JSON store + validator + read-API and persist-and-signal write seam. Preferences are READ-ONLY TO APPS by contract (cooperatively honored, R-A); presence stays the E1 descriptor's job — this is user-mutable STATE, never a fork of the capabilities descriptor."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lib]
+name = "pf_prefs"
+
+[dependencies]
+# The store is a single current-state JSON document (owner ruling Q2). serde_json is the
+# canonical JSON codec; pf-prefs is a NEW leaf crate, so this does not touch the
+# dependency-light wire/facade crates.
+serde = { workspace = true }
+serde_json = { workspace = true }
