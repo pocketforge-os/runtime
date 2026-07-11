@@ -1,0 +1,151 @@
+===== s01-initial =====
+review_status=ok
+model=vllm/google/gemma-4-31B-it-qat-w4a16-ct
+images=/tmp/claude-1000/-home-matt-mission-control/071d3b8e-db54-4785-bd99-f6c7d06f888a/scratchpad/pngs/s01-initial.png
+
+[0m
+[0m
+TITLE: Weather wants to use LOCATION
+Focus: Deny (thick bright-blue outline)
+DECISION: None
+Hint: A: confirm B: cancel Dpad L/R: move focus
+
+===== s02-focus-once =====
+review_status=ok
+model=vllm/google/gemma-4-31B-it-qat-w4a16-ct
+images=/tmp/claude-1000/-home-matt-mission-control/071d3b8e-db54-4785-bd99-f6c7d06f888a/scratchpad/pngs/s02-focus-once.png
+
+[0m
+[0m
+TITLE: Weather wants to use LOCATION
+FOCUS: Allow once
+DECISION: No
+HINT: A: confirm  B: cancel  Dpad L/R: move focus
+Image reviewed: /tmp/claude-1000/-home-matt-mission-control/071d3b8e-db54-4785-bd99-f6c7d06f888a/scratchpad/pngs/s02-focus-once.png
+
+===== s03-focus-always =====
+review_status=ok
+model=vllm/google/gemma-4-31B-it-qat-w4a16-ct
+images=/tmp/claude-1000/-home-matt-mission-control/071d3b8e-db54-4785-bd99-f6c7d06f888a/scratchpad/pngs/s03-focus-always.png
+
+[0m
+[0m
+TITLE: Weather wants to use LOCATION
+Focus: Allow always
+DECISION: No
+Hint: A: confirm  B: cancel  Dpad L/R: move focus
+
+===== s04-focus-right-wrap-guard =====
+review_status=ok
+model=vllm/google/gemma-4-31B-it-qat-w4a16-ct
+images=/tmp/claude-1000/-home-matt-mission-control/071d3b8e-db54-4785-bd99-f6c7d06f888a/scratchpad/pngs/s04-focus-right-wrap-guard.png
+
+[0m
+[0m
+TITLE: Weather wants to use LOCATION
+Focus: Allow always
+DECISION: None
+Hint: show nearby weather
+Image reviewed: /tmp/claude-1000/-home-matt-mission-control/071d3b8e-db54-4785-bd99-f6c7d06f888a/scratchpad/pngs/s04-focus-right-wrap-guard.png
+
+===== s05-focus-left-wrap-guard =====
+review_status=ok
+model=vllm/google/gemma-4-31B-it-qat-w4a16-ct
+images=/tmp/claude-1000/-home-matt-mission-control/071d3b8e-db54-4785-bd99-f6c7d06f888a/scratchpad/pngs/s05-focus-left-wrap-guard.png
+
+[0m
+[0m
+TITLE: Weather wants to use LOCATION
+FOCUS: Deny
+DECISION: None
+HINT: A: confirm  B: cancel  Dpad L/R: move focus
+Image reviewed: /tmp/claude-1000/-home-matt-mission-control/071d3b8e-db54-4785-bd99-f6c7d06f888a/scratchpad/pngs/s05-focus-left-wrap-guard.png
+
+===== s06-commit-deny =====
+review_status=ok
+model=vllm/google/gemma-4-31B-it-qat-w4a16-ct
+images=/tmp/claude-1000/-home-matt-mission-control/071d3b8e-db54-4785-bd99-f6c7d06f888a/scratchpad/pngs/s06-commit-deny.png
+
+[0m
+[0m
+TITLE: Weather wants to use LOCATION
+Button: Deny is COMMITTED
+DECISION: Deny
+Hint: A: confirm B: cancel Dpad L/R: move focus
+Image reviewed: /tmp/claude-1000/-home-matt-mission-control/071d3b8e-db54-4785-bd99-f6c7d06f888a/scratchpad/pngs/s06-commit-deny.png
+
+===== s07-commit-allow-once =====
+review_status=ok
+model=vllm/google/gemma-4-31B-it-qat-w4a16-ct
+images=/tmp/claude-1000/-home-matt-mission-control/071d3b8e-db54-4785-bd99-f6c7d06f888a/scratchpad/pngs/s07-commit-allow-once.png
+
+[0m
+[0m
+TITLE: Weather wants to use LOCATION
+Allow once is COMMITTED
+DECISION: Allow once
+A: confirm B: cancel Dpad L/R: move focus
+
+===== s08-commit-allow-always =====
+review_status=ok
+model=vllm/google/gemma-4-31B-it-qat-w4a16-ct
+images=/tmp/claude-1000/-home-matt-mission-control/071d3b8e-db54-4785-bd99-f6c7d06f888a/scratchpad/pngs/s08-commit-allow-always.png
+
+[0m
+[0m
+TITLE: Weather wants to use LOCATION
+Allow always is COMMITTED
+DECISION: Allow always
+A: confirm B: cancel Dpad L/R: move focus
+
+===== s09-cancel-from-initial =====
+review_status=ok
+model=vllm/google/gemma-4-31B-it-qat-w4a16-ct
+images=/tmp/claude-1000/-home-matt-mission-control/071d3b8e-db54-4785-bd99-f6c7d06f888a/scratchpad/pngs/s09-cancel-from-initial.png
+
+[0m
+[0m
+TITLE: Weather wants to use LOCATION
+Button: Deny is CANCELLED-COLLAPSED-TO-DENY
+DECISION: Deny (via B/cancel)
+Hint: A: confirm B: cancel Dpad L/R: move focus
+
+===== s10-cancel-from-allow-always =====
+review_status=ok
+model=vllm/google/gemma-4-31B-it-qat-w4a16-ct
+images=/tmp/claude-1000/-home-matt-mission-control/071d3b8e-db54-4785-bd99-f6c7d06f888a/scratchpad/pngs/s10-cancel-from-allow-always.png
+
+[0m
+[0m
+TITLE: Weather wants to use LOCATION
+Button: Deny is CANCELLED-COLLAPSED-TO-DENY
+DECISION: Deny (via B/cancel)
+Hint: A: confirm B: cancel Dpad L/R: move focus
+Image path: /tmp/claude-1000/-home-matt-mission-control/071d3b8e-db54-4785-bd99-f6c7d06f888a/scratchpad/pngs/s10-cancel-from-allow-always.png
+
+===== s11-ignored-inputs =====
+review_status=ok
+model=vllm/google/gemma-4-31B-it-qat-w4a16-ct
+images=/tmp/claude-1000/-home-matt-mission-control/071d3b8e-db54-4785-bd99-f6c7d06f888a/scratchpad/pngs/s11-ignored-inputs.png
+
+[0m
+[0m
+TITLE: Weather wants to use LOCATION
+Deny: COMMITTED
+DECISION: Deny
+A: confirm B: cancel Dpad L/R: move focus
+
+===== s12-post-commit-events-no-op =====
+review_status=ok
+model=vllm/google/gemma-4-31B-it-qat-w4a16-ct
+images=/tmp/claude-1000/-home-matt-mission-control/071d3b8e-db54-4785-bd99-f6c7d06f888a/scratchpad/pngs/s12-post-commit-events-no-op.png
+
+[0m
+[0m
+TITLE: Weather wants to use LOCATION
+Button: Deny is COMMITTED
+DECISION: Deny
+Hint: A: confirm B: cancel Dpad L/R: move focus
+Image path: /tmp/claude-1000/-home-matt-mission-control/071d3b8e-db54-4785-bd99-f6c7d06f888a/scratchpad/pngs/s12-post-commit-events-no-op.png
+
+DONE — /tmp/claude-1000/-home-matt-mission-control/071d3b8e-db54-4785-bd99-f6c7d06f888a/scratchpad/verdicts.txt

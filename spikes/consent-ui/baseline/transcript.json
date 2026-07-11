@@ -1,0 +1,211 @@
+{
+  "generated_at": 1783805261,
+  "scenarios": [
+    {
+      "id": "s01-initial",
+      "description": "Default focus: Deny (least-privilege); no input yet.",
+      "events": [],
+      "final_focus": "deny",
+      "final_state": "initial",
+      "decision": null,
+      "event_log": [],
+      "ppm": "build/frames/s01-initial.ppm",
+      "png": "build/frames/s01-initial.png"
+    },
+    {
+      "id": "s02-focus-once",
+      "description": "One dpad-right: focus moves to Allow once.",
+      "events": [
+        "dpad-right"
+      ],
+      "final_focus": "allow-once",
+      "final_state": "initial",
+      "decision": null,
+      "event_log": [
+        "dpad-right"
+      ],
+      "ppm": "build/frames/s02-focus-once.ppm",
+      "png": "build/frames/s02-focus-once.png"
+    },
+    {
+      "id": "s03-focus-always",
+      "description": "Two dpad-right: focus moves to Allow always.",
+      "events": [
+        "dpad-right",
+        "dpad-right"
+      ],
+      "final_focus": "allow-always",
+      "final_state": "initial",
+      "decision": null,
+      "event_log": [
+        "dpad-right",
+        "dpad-right"
+      ],
+      "ppm": "build/frames/s03-focus-always.ppm",
+      "png": "build/frames/s03-focus-always.png"
+    },
+    {
+      "id": "s04-focus-right-wrap-guard",
+      "description": "Three dpad-right: focus stays at Allow always (no wrap).",
+      "events": [
+        "dpad-right",
+        "dpad-right",
+        "dpad-right"
+      ],
+      "final_focus": "allow-always",
+      "final_state": "initial",
+      "decision": null,
+      "event_log": [
+        "dpad-right",
+        "dpad-right",
+        "dpad-right"
+      ],
+      "ppm": "build/frames/s04-focus-right-wrap-guard.ppm",
+      "png": "build/frames/s04-focus-right-wrap-guard.png"
+    },
+    {
+      "id": "s05-focus-left-wrap-guard",
+      "description": "From initial, one dpad-left: focus stays at Deny (no wrap).",
+      "events": [
+        "dpad-left"
+      ],
+      "final_focus": "deny",
+      "final_state": "initial",
+      "decision": null,
+      "event_log": [
+        "dpad-left"
+      ],
+      "ppm": "build/frames/s05-focus-left-wrap-guard.ppm",
+      "png": "build/frames/s05-focus-left-wrap-guard.png"
+    },
+    {
+      "id": "s06-commit-deny",
+      "description": "A pressed on default focus (Deny) \u2014 commit deny.",
+      "events": [
+        "A"
+      ],
+      "final_focus": "deny",
+      "final_state": "selected",
+      "decision": "deny",
+      "event_log": [
+        "A"
+      ],
+      "ppm": "build/frames/s06-commit-deny.ppm",
+      "png": "build/frames/s06-commit-deny.png"
+    },
+    {
+      "id": "s07-commit-allow-once",
+      "description": "dpad-right x1, A \u2014 commit allow-once.",
+      "events": [
+        "dpad-right",
+        "A"
+      ],
+      "final_focus": "allow-once",
+      "final_state": "selected",
+      "decision": "allow-once",
+      "event_log": [
+        "dpad-right",
+        "A"
+      ],
+      "ppm": "build/frames/s07-commit-allow-once.ppm",
+      "png": "build/frames/s07-commit-allow-once.png"
+    },
+    {
+      "id": "s08-commit-allow-always",
+      "description": "dpad-right x2, A \u2014 commit allow-always.",
+      "events": [
+        "dpad-right",
+        "dpad-right",
+        "A"
+      ],
+      "final_focus": "allow-always",
+      "final_state": "selected",
+      "decision": "allow-always",
+      "event_log": [
+        "dpad-right",
+        "dpad-right",
+        "A"
+      ],
+      "ppm": "build/frames/s08-commit-allow-always.ppm",
+      "png": "build/frames/s08-commit-allow-always.png"
+    },
+    {
+      "id": "s09-cancel-from-initial",
+      "description": "B from initial focus \u2014 cancelled, collapses to Deny.",
+      "events": [
+        "B"
+      ],
+      "final_focus": "deny",
+      "final_state": "cancelled",
+      "decision": "deny",
+      "event_log": [
+        "B"
+      ],
+      "ppm": "build/frames/s09-cancel-from-initial.ppm",
+      "png": "build/frames/s09-cancel-from-initial.png"
+    },
+    {
+      "id": "s10-cancel-from-allow-always",
+      "description": "dpad-right x2 (focus Allow always), B \u2014 cancelled, collapses to Deny.",
+      "events": [
+        "dpad-right",
+        "dpad-right",
+        "B"
+      ],
+      "final_focus": "deny",
+      "final_state": "cancelled",
+      "decision": "deny",
+      "event_log": [
+        "dpad-right",
+        "dpad-right",
+        "B"
+      ],
+      "ppm": "build/frames/s10-cancel-from-allow-always.ppm",
+      "png": "build/frames/s10-cancel-from-allow-always.png"
+    },
+    {
+      "id": "s11-ignored-inputs",
+      "description": "dpad-up, X, Y, L1, L2 all no-op; then A \u2014 commit Deny (focus never moved).",
+      "events": [
+        "dpad-up",
+        "X",
+        "Y",
+        "L1",
+        "L2",
+        "A"
+      ],
+      "final_focus": "deny",
+      "final_state": "selected",
+      "decision": "deny",
+      "event_log": [
+        "dpad-up (no-op)",
+        "X (no-op)",
+        "Y (no-op)",
+        "L1 (no-op)",
+        "L2 (no-op)",
+        "A"
+      ],
+      "ppm": "build/frames/s11-ignored-inputs.ppm",
+      "png": "build/frames/s11-ignored-inputs.png"
+    },
+    {
+      "id": "s12-post-commit-events-no-op",
+      "description": "Commit Deny then dpad-right \u2014 later dpad no-ops (dialog dismissed).",
+      "events": [
+        "A",
+        "dpad-right",
+        "dpad-right"
+      ],
+      "final_focus": "deny",
+      "final_state": "selected",
+      "decision": "deny",
+      "event_log": [
+        "A",
+        "dpad-right (no-op)",
+        "dpad-right (no-op)"
+      ],
+      "ppm": "build/frames/s12-post-commit-events-no-op.ppm",
+      "png": "build/frames/s12-post-commit-events-no-op.png"
+    }
+  ]
+}
