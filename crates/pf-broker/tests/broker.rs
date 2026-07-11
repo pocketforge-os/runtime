@@ -183,7 +183,7 @@ fn default_deny_is_preserved_under_the_ceiling() {
     // synthetic GNSS rig → ConsentDenied (the inner default-deny survives the ceiling).
     let desc = Arc::new(
         Descriptor::from_toml(
-            "[identity]\nid=\"g\"\nmanufacturer=\"x\"\nmodel=\"y\"\nsdl_guid=\"00000000000000000000000000000000\"\n[[inputs]]\nid=\"south\"\nkind=\"button\"\nev_type=\"EV_KEY\"\ncode=\"BTN_A\"\n[[sensors]]\nid=\"gnss\"\nkind=\"gnss\"\niio_device=\"gnss0\"\n",
+            "[identity]\nid=\"g\"\nmanufacturer=\"x\"\nmodel=\"y\"\nsdl_guid=\"00000000000000000000000000000000\"\n[[inputs]]\nid=\"south\"\nkind=\"button\"\nev_type=\"EV_KEY\"\ncode=\"BTN_A\"\n[[sensors]]\nid=\"gnss\"\nkind=\"gnss\"\n",
         )
         .unwrap(),
     );
@@ -200,7 +200,7 @@ fn default_deny_is_preserved_under_the_ceiling() {
 fn dangerous_capability_quota_is_enforced() {
     let desc = Arc::new(
         Descriptor::from_toml(
-            "[identity]\nid=\"g\"\nmanufacturer=\"x\"\nmodel=\"y\"\nsdl_guid=\"00000000000000000000000000000000\"\n[[inputs]]\nid=\"south\"\nkind=\"button\"\nev_type=\"EV_KEY\"\ncode=\"BTN_A\"\n[[sensors]]\nid=\"gnss\"\nkind=\"gnss\"\niio_device=\"gnss0\"\n",
+            "[identity]\nid=\"g\"\nmanufacturer=\"x\"\nmodel=\"y\"\nsdl_guid=\"00000000000000000000000000000000\"\n[[inputs]]\nid=\"south\"\nkind=\"button\"\nev_type=\"EV_KEY\"\ncode=\"BTN_A\"\n[[sensors]]\nid=\"gnss\"\nkind=\"gnss\"\n",
         )
         .unwrap(),
     );
