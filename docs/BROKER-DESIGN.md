@@ -83,10 +83,18 @@ backend-swap, now enforcing. Per request:
    does not deplete it for another, and it carries no privacy payload — so gating it buys no
    security and only adds friction. This is the single deliberate hole in default-deny, documented
    so it is a decision, not an oversight.
-4. **Per-capability quota** — a dangerous cap (`location`) is rate-capped via the session
-   `QuotaLedger`; exhaustion is `PolicyBlocked`. (The finer per-op-rate token bucket over wall
-   time, and the egress byte ledger, are the `.4` cooperative model made authoritative here; v0
-   ships the count-based ceiling.)
+4. **Per-capability quota** — a dangerous cap (`location`, `gnss`, `egress`) is rate-capped via
+   the session `QuotaLedger`; exhaustion is `PolicyBlocked`. As of `tsp-ht0p.4` (merged), the
+   ledger is a wall-clock **token bucket**: tier-default `(capacity, refill_per_sec)` per cap
+   (`location`/`gnss` = 60 burst @ 1/sec; `egress` op count = 16 burst @ 0.25/sec; every other
+   cap is UNGATED — so `entropy` above is *structurally* never rate-limited, not just
+   short-circuited). A `Clock` trait + `ManualClock` make refill testable without sleeps. The
+   **egress byte ledger + per-host log** — `pocketforge::managers::egress_log::EgressLog` — is
+   persistent (JSONL, same dialect as `.3`'s AppOps ledger; separate directory), inspectable via
+   `pf-permissions egress`. `EgressManager::with_accounting` refuses a send to an UNDECLARED
+   host (typed `PolicyBlocked` + `refused` row) without spending an op token. All three are
+   **cooperative accounting** (Q1 ruling: v1 = contract, kernel/netns enforcement is the
+   follow-on tracked in [EGRESS-ENFORCEMENT-SEAM.md](EGRESS-ENFORCEMENT-SEAM.md)).
 
 ## 4. Peer-credential check (`SO_PEERCRED`)
 

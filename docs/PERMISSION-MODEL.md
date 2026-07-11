@@ -116,6 +116,29 @@ gives it consent via the generic tier path; `.4` adds the byte-level accounting.
 egress *enforcement* (nftables/socket-filter keyed by the `use=` host allowlist) is substrate-gated
 (Q1 ruled v1 = accounting/declaration, cooperative; enforcement is a Phase-2 follow-on bead).
 
+**Status update (`.4` landed, 2026-07-11).** All four `.4` accounting teeth are on `main`:
+
+- **Wall-clock token buckets** — `pocketforge::managers::QuotaLedger` now runs on a fake-clockable
+  token-bucket (`Clock` trait + `SystemClock`/`ManualClock`; `TokenBucket` refills at the
+  tier-default rate over wall time). Defaults: `location`/`gnss` = 60 burst @ 1 tok/sec; `egress`
+  (op count) = 16 burst @ 0.25 tok/sec ≈ 15 ops/min; every Normal-tier capability is UNGATED so
+  `entropy` is *structurally* never rate-limited (§5). Throttling surfaces as
+  `CapError::PolicyBlocked` — a typed error, no exit-code guessing.
+- **Egress byte ledger + per-host log** — `pocketforge::managers::EgressLog` is a persistent
+  JSONL-shaped store at `$PF_EGRESS_LOG_DIR` (else `$XDG_STATE_HOME/pocketforge/egress/`), same
+  tab-separated / backslash-escaped dialect as `.3`'s AppOps ledger. Every declared-host `send`
+  writes a `send` row; every undeclared-host attempt writes a `refused` row *without* spending an
+  op token.
+- **Undeclared-host refusal** — `EgressManager::with_accounting(quotas, EgressManager::accounting(
+  app_id, manifest_hosts, log))` binds the declared-host set to the manager. Any `send` to a host
+  outside that set returns `PolicyBlocked` (accounting-level, R-A honest) and logs the refusal.
+- **`pf-permissions egress`** — new subcommand: per-`(app × host)` byte rollup + refusal counts
+  read from the persistent log. Same CLI shape as `pf-permissions inspect` for the AppOps ledger.
+
+None of the four is kernel-level enforcement (an app that ignores the accountant and calls into
+the kernel directly still sends). The kernel/netns enforcement seam that closes that gap is the
+follow-on bead — see [EGRESS-ENFORCEMENT-SEAM.md](EGRESS-ENFORCEMENT-SEAM.md) (per the Q1 ruling).
+
 ## 5. Entropy — Normal-tier, UNGATED (with an honest scope note)
 
 `entropy` is **Normal-tier and deliberately ungated**: auto-granted even when *undeclared*, with no
