@@ -21,6 +21,8 @@ use pocketforge::backend::is_known;
 use pocketforge::Descriptor;
 use serde::Deserialize;
 
+use crate::tier::{tier_of, Tier};
+
 /// One parsed `use = [...]` entry: a base capability, an optional scope modifier, and whether it
 /// is OPTIONAL (`cap?` ⇒ graceful-degradation allowed if the device can't back it).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -60,6 +62,11 @@ pub enum Violation {
     BadModifier { cap: String, modifier: String },
     /// A REQUIRED hardware capability this device's descriptor cannot back (over-broad route).
     UndescriptoredRequired(String),
+    /// A **signature-tier** capability (raw/arbitrary egress, or a future first-party-only cap) was
+    /// declared by an app that is neither first-party-signed nor covered by a blessed-binary
+    /// exemption. The launch is REJECTED (R-C / LOCKED #3 signature tier). Carries the offending
+    /// `use=[]` token (e.g. `"egress:0.0.0.0/0"`).
+    SignatureTierRequiresTrust { token: String },
     /// A structurally malformed entry (empty cap, etc.).
     Malformed(String),
 }
@@ -75,6 +82,9 @@ impl std::fmt::Display for Violation {
             Violation::UndescriptoredRequired(c) => {
                 write!(f, "required capability '{c}' is not backed by this device's descriptor (mark it '{c}?' to allow graceful absence)")
             }
+            Violation::SignatureTierRequiresTrust { token } => {
+                write!(f, "signature-tier capability '{token}' requires a first-party or blessed-binary signature")
+            }
             Violation::Malformed(t) => write!(f, "malformed use entry '{t}'"),
         }
     }
@@ -84,6 +94,82 @@ impl std::fmt::Display for Violation {
 /// `egress:<host>`. It is NOT in `KNOWN_CAPS` (which is hardware/platform device caps), so the
 /// validator knows about it explicitly.
 pub const EGRESS_CAP: &str = "egress";
+
+/// An enumerated, first-party-signed **blessed-binary** broad-grant (R-C).
+///
+/// A blessed binary is a closed app that cannot be transparently brokered (e.g. Steam Link — it is
+/// both a uinput *consumer* and *producer*, so the `EVIOCGRAB` interposition would break it). Rather
+/// than force it through the broker, the platform grants it an *enumerated, signed* broad authority
+/// and confines it by cgroup/namespace/seccomp only (NOT capability-brokering). This registration is
+/// the validator's **canonical exemption case**: it clears [`Tier::Signature`] entries that the app
+/// could not otherwise declare, but ONLY for the enumerated `app_id` and only the enumerated
+/// `grants`. The registration ITSELF is first-party-signed and keyed to the signed-fetch `sha256`
+/// the supervisor verified — trust = first-party enrollment + signed-fetch SHA. See
+/// `docs/PERMISSION-MODEL.md` "Blessed-binary exemption" for the threat-model caveat.
+#[derive(Debug, Clone)]
+pub struct BlessedRegistration {
+    /// The app id this exemption is enrolled for (must match the manifest's `[app] id`).
+    pub app_id: String,
+    /// The signed-fetch SHA-256 the supervisor verified the bundle against (provenance anchor).
+    pub sha256: String,
+    /// The broad grants this blessed binary is enumerated to hold, as `use=[]` tokens
+    /// (e.g. `"egress:0.0.0.0/0"`) or bare cap names (a whole-capability grant).
+    pub grants: Vec<String>,
+}
+
+impl BlessedRegistration {
+    /// Does this registration enumerate `entry` (matching the full token or the bare capability)?
+    pub fn covers(&self, entry: &UseEntry) -> bool {
+        let token = entry.raw.trim().trim_end_matches('?').trim().to_ascii_lowercase();
+        self.grants.iter().any(|g| {
+            let g = g.trim().to_ascii_lowercase();
+            g == token || g == entry.cap
+        })
+    }
+}
+
+/// The **trust class of an app bundle at launch** — the INPUT that decides whether a
+/// [`Tier::Signature`] request is permitted.
+///
+/// It is established by the supervisor *before* manifest validation and passed in: an `app.toml.sig`
+/// minisign verification against the first-party `release.d` key directory sets [`first_party`], and
+/// a blessed-binary registry lookup sets [`blessed`]; an app that clears neither is untrusted. **`.2`
+/// does NOT implement that signature verification** — this type is only the seam the existing
+/// two-signature machinery + `.5`'s trust-chain design feed. The default ([`LaunchTrust::UNTRUSTED`],
+/// used by [`AppManifest::validate`]) is the safe floor: no signature-tier authority.
+///
+/// [`first_party`]: LaunchTrust::first_party
+/// [`blessed`]: LaunchTrust::blessed
+#[derive(Debug, Clone, Copy)]
+pub struct LaunchTrust<'a> {
+    /// The bundle is signed by the first-party release key (`app.toml.sig` verified) — clears ALL
+    /// signature-tier entries.
+    pub first_party: bool,
+    /// A blessed-binary registration covering this app, if any — clears the enumerated signature-tier
+    /// entries for the matching `app_id` only.
+    pub blessed: Option<&'a BlessedRegistration>,
+}
+
+impl LaunchTrust<'_> {
+    /// The safe floor: no signing authority (used by the back-compat [`AppManifest::validate`]).
+    pub const UNTRUSTED: LaunchTrust<'static> = LaunchTrust { first_party: false, blessed: None };
+    /// A first-party-signed bundle (clears every signature-tier entry).
+    pub const FIRST_PARTY: LaunchTrust<'static> = LaunchTrust { first_party: true, blessed: None };
+
+    /// A blessed-binary trust context over `reg` (not first-party, but exempt for what `reg` enumerates).
+    pub fn blessed(reg: &BlessedRegistration) -> LaunchTrust<'_> {
+        LaunchTrust { first_party: false, blessed: Some(reg) }
+    }
+
+    /// Does this trust context authorize declaring the signature-tier `entry` for `app_id`?
+    fn authorizes_signature(&self, app_id: &str, entry: &UseEntry) -> bool {
+        if self.first_party {
+            return true;
+        }
+        self.blessed
+            .is_some_and(|reg| reg.app_id.eq_ignore_ascii_case(app_id) && reg.covers(entry))
+    }
+}
 
 fn modifier_ok(cap: &str, modifier: &str) -> bool {
     match cap {
@@ -149,9 +235,29 @@ impl AppManifest {
         AppManifest::from_toml(&text).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))
     }
 
-    /// Validate the `use = [...]` graph against the device descriptor (the CEILING check). Returns
+    /// Validate the `use = [...]` graph against the device descriptor (the CEILING check), treating
+    /// the app as **untrusted** ([`LaunchTrust::UNTRUSTED`]) — the safe back-compat default. Returns
     /// the [`ValidatedManifest`] or the full list of [`Violation`]s (all of them, not just the first).
+    ///
+    /// An untrusted app may declare Normal + Dangerous capabilities but NOT [`Tier::Signature`] ones
+    /// (raw/arbitrary egress): use [`validate_with_trust`](Self::validate_with_trust) to supply the
+    /// first-party / blessed-binary trust that clears the signature tier.
     pub fn validate(&self, descriptor: &Descriptor) -> Result<ValidatedManifest, Vec<Violation>> {
+        self.validate_with_trust(descriptor, &LaunchTrust::UNTRUSTED)
+    }
+
+    /// Validate the `use = [...]` graph against the device descriptor AND the app's launch
+    /// [`LaunchTrust`]. Identical to [`validate`](Self::validate) plus the **signature-tier gate**: a
+    /// [`Tier::Signature`] capability (raw/arbitrary egress, or a future first-party-only cap) is a
+    /// [`Violation::SignatureTierRequiresTrust`] unless `trust` is first-party or a blessed-binary
+    /// registration enumerates it. `trust` is an INPUT the supervisor computes ahead of validation
+    /// (`app.toml.sig` verify → first-party; blessed registry lookup → blessed); `.2` does not verify
+    /// signatures itself.
+    pub fn validate_with_trust(
+        &self,
+        descriptor: &Descriptor,
+        trust: &LaunchTrust,
+    ) -> Result<ValidatedManifest, Vec<Violation>> {
         let mut violations = Vec::new();
         let mut allowed = BTreeSet::new();
         let mut egress_hosts = BTreeSet::new();
@@ -174,6 +280,16 @@ impl AppManifest {
                     violations.push(Violation::BadModifier { cap: e.cap.clone(), modifier: m.clone() });
                     continue;
                 }
+            }
+            // Signature-tier gate (R-C): a first-party-only capability (raw/arbitrary egress, …) may
+            // only be declared by a first-party-signed or blessed-binary-enumerated app. This runs
+            // before the egress/known/descriptor checks so an unauthorized signature request is
+            // rejected for the RIGHT reason (not as an over-broad-route or unknown-cap).
+            if tier_of(&e.cap, e.modifier.as_deref()) == Tier::Signature
+                && !trust.authorizes_signature(&self.app.id, &e)
+            {
+                violations.push(Violation::SignatureTierRequiresTrust { token: e.raw.clone() });
+                continue;
             }
             if e.cap == EGRESS_CAP {
                 if let Some(host) = &e.modifier {
