@@ -7,6 +7,7 @@ members = [
     "crates/pf-broker-ref",
     "crates/pf-input-broker",
     "crates/pf-broker",
+    "crates/pf-hw-exerciser",
 ]
 
 # Shared metadata for every crate in the runtime workspace (tsp-e1b.2 / E2).
