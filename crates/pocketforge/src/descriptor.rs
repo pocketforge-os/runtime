@@ -76,11 +76,17 @@ pub struct Axis {
 }
 
 /// One `[[sensors]]` row (accel/gyro/mag/imu/gnss). Presence of a row ⇒ the cap exists.
+///
+/// `iio_device` is `Option<String>` because GNSS/GPS sources aren't IIO devices (gpsd/NMEA/
+/// CUSE stream, not iio sysfs). IIO-backed kinds (accel/gyro/mag/accel+gyro/imu) must still
+/// declare it — the E1 [platform validator](../../../platform/core/caps.py) enforces that
+/// invariant semantically. See tsp-9sx.6.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Sensor {
     pub id: String,
     pub kind: String,
-    pub iio_device: String,
+    #[serde(default)]
+    pub iio_device: Option<String>,
     #[serde(default)]
     pub units: Option<String>,
     /// The chip→device axis-alignment matrix (`device = M · chip`), 3×3 row-major of ±1/0.
