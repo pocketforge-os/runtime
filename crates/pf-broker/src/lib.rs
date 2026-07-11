@@ -23,11 +23,18 @@
 //! fd-routing into a real app namespace is the substrate-gated follow-on leg, named not papered
 //! over. See `docs/BROKER-DESIGN.md`.
 
+pub mod appops;
+pub mod consent;
 pub mod enforce;
 pub mod manifest;
 pub mod serve;
 pub mod tier;
 
+pub use appops::{AppOpsLedger, GrantCheck, GrantEntry, GrantKey, LedgerError, Scope};
+pub use consent::{
+    AskContext, AskDecision, AskFocus, AskInput, AskRequest, AskResponse, AskScope, NullSupervisor,
+    PreparedAnswer, SimulatedSupervisor, SupervisorAsk,
+};
 pub use enforce::EnforcingBackend;
 pub use manifest::{
     AppManifest, AppSection, BlessedRegistration, LaunchTrust, UseEntry, ValidatedManifest, Violation,
