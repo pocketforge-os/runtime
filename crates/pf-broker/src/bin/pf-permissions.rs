@@ -11,14 +11,26 @@
 //! carry a live signal from the ledger to any running app. Until then, an app re-queries on next
 //! interaction and sees the standing-Denied.
 //!
+//! ## `.4` addition — egress accounting inspection
+//!
+//! The `egress` subcommand reads the [`pocketforge::managers::EgressLog`] (same JSONL dialect
+//! as the AppOps ledger; separate directory + file so a consumer never conflates a consent
+//! grant with a byte-accounting event) and prints a per-`(app × host)` rollup of accounted
+//! bytes + refusal counts. This is the surface an operator uses to sanity-check the
+//! declaration + accounting side of the E3 policy model (`tsp-ht0p.4`); real ENFORCEMENT is
+//! substrate-gated (see `docs/EGRESS-ENFORCEMENT-SEAM.md`).
+//!
 //! Usage:
 //!   pf-permissions inspect [--app <id>]
 //!   pf-permissions revoke  --app <id> --cap <name> [--modifier <mod>]
+//!   pf-permissions egress  [--app <id>] [--refusals]
 //!
 //! The ledger root is discovered from `$PF_APPOPS_DIR` (else `$XDG_STATE_HOME`, else
-//! `$HOME/.local/state/pocketforge/appops`) — see [`pf_broker::appops::AppOpsLedger`].
+//! `$HOME/.local/state/pocketforge/appops`) — see [`pf_broker::appops::AppOpsLedger`]. The
+//! egress log root uses `$PF_EGRESS_LOG_DIR` (else `$XDG_STATE_HOME`/pocketforge/egress).
 
 use pf_broker::appops::{AppOpsLedger, GrantKey};
+use pocketforge::managers::egress_log::{refusals_per_host, total_bytes_per_host, EgressLog};
 
 fn arg<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
     args.iter()
@@ -39,6 +51,7 @@ fn main() {
     let result = match sub.as_str() {
         "inspect" => run_inspect(rest),
         "revoke" => run_revoke(rest),
+        "egress" => run_egress(rest),
         "-h" | "--help" => {
             println!("{USAGE}");
             Ok(())
@@ -100,6 +113,68 @@ fn run_revoke(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+fn run_egress(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    // `pf-permissions egress [--app <id>] [--refusals]` — accounting-only surface (`tsp-ht0p.4`,
+    // Q1 = ACCOUNTING ONLY in v1). The default view is a per-`(app × host)` byte rollup; the
+    // `--refusals` flag surfaces attempted undeclared sends instead. R-A: neither view claims
+    // enforcement — the seam that closes the gap is `docs/EGRESS-ENFORCEMENT-SEAM.md`.
+    let app_filter = arg(args, "--app");
+    let show_refusals = args.iter().any(|a| a == "--refusals");
+    let log = EgressLog::open_default()?;
+    let events = match app_filter {
+        Some(app) => log.snapshot_for(app)?,
+        None => log.snapshot()?,
+    };
+    if show_refusals {
+        println!("app.id                          host                          refusals");
+        // Refusals are per-app × per-host; walk grouped by app id.
+        let mut apps: std::collections::BTreeMap<String, Vec<&pocketforge::managers::EgressEvent>> =
+            std::collections::BTreeMap::new();
+        for e in &events {
+            apps.entry(e.app_id.clone()).or_default().push(e);
+        }
+        for (app, es) in apps {
+            let refs = refusals_per_host(&es.iter().map(|&e| e.clone()).collect::<Vec<_>>());
+            let mut sorted: Vec<(&String, &u64)> = refs.iter().collect();
+            sorted.sort();
+            for (host, count) in sorted {
+                println!(
+                    "{app:31} {host:29} {count:>8}",
+                    app = truncate(&app, 31),
+                    host = host,
+                    count = count,
+                );
+            }
+        }
+    } else {
+        println!(
+            "app.id                          host                          bytes_total    events"
+        );
+        // Grouped by app then per-host bytes.
+        let mut apps: std::collections::BTreeMap<String, Vec<&pocketforge::managers::EgressEvent>> =
+            std::collections::BTreeMap::new();
+        for e in &events {
+            apps.entry(e.app_id.clone()).or_default().push(e);
+        }
+        for (app, es) in apps {
+            let bytes = total_bytes_per_host(&es.iter().map(|&e| e.clone()).collect::<Vec<_>>());
+            let mut sorted: Vec<(&String, &u64)> = bytes.iter().collect();
+            sorted.sort();
+            for (host, total) in sorted {
+                let event_count = es.iter().filter(|e| &e.host == host).count();
+                println!(
+                    "{app:31} {host:29} {total:>13}    {events:>6}",
+                    app = truncate(&app, 31),
+                    host = host,
+                    total = total,
+                    events = event_count,
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 fn truncate(s: &str, n: usize) -> String {
     if s.len() <= n {
         s.to_string()
@@ -109,9 +184,10 @@ fn truncate(s: &str, n: usize) -> String {
 }
 
 const USAGE: &str = "\
-pf-permissions — inspect + revoke AppOps ledger grants (tsp-ht0p.3)
+pf-permissions — inspect + revoke AppOps ledger grants; inspect egress accounting (tsp-ht0p.3/.4)
 
 Usage:
   pf-permissions inspect [--app <id>]
   pf-permissions revoke  --app <id> --cap <name> [--modifier <mod>]
+  pf-permissions egress  [--app <id>] [--refusals]     # v1 accounting-only view (tsp-ht0p.4)
 ";
