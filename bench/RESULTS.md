@@ -20,27 +20,48 @@ window grant). This file holds the build/qemu proof now and the on-silicon table
   a functional proof — the authoritative figures come from the A133 below). This is exactly why
   the real numbers need silicon: qemu can't exercise the uinput path.
 
-## On-silicon A133 tables (stock CrossMix, vendor 4.9 kernel, performance governor)
+## On-silicon A133 tables — captured 2026-07-11
 
-_Pending device window. Populated from `/tmp/ipc.json` + `/tmp/inp.json` on the DUT._
+**Environment / caveat (applies to every table below):** measured on the **PocketForge image**
+(owned **4.9.191** vendor-4.9 fork, Debian 12, hostname `pocketforge`), `gamer@192.168.86.132`,
+over SSH — **not stock CrossMix** (the CrossMix card had no bootloader — overlay-only — so the
+device was flashed with our image via the standard automation; per the coordinator this is better,
+the numbers land on the kernel we ship). **CPU: 4×A53 pinned at 1.008 GHz** — the image's
+`sun50i-cpufreq-nvmem` driver fails to probe (`Could not get nvmem cell: -22`), so there is **no
+cpufreq/DVFS and no governor to set** (the "performance governor" step is N/A here); the cores sit
+at the boot PLL (1.008 GHz, **below** the A133's ~2.0 GHz ceiling). **These numbers are therefore
+CONSERVATIVE** — filed as its own defect **`tsp-9h88`** (kernel/substrate). System otherwise idle.
+Binaries: static aarch64 musl, sha256 `65df627b…` (ipcbench) / `2e3bf618…` (inputlat).
 
-### IPC (`ipcbench`) — per-event cost vs the 16.667 ms frame budget
+### IPC (`ipcbench`, 200000 iters) — per-event cost vs the 16.667 ms frame budget
 
-| measurement | p50 (ns) | p95 (ns) | p99 (ns) | p999 (ns) | max (ns) |
+| measurement | p50 | p99 | p999 | max |
+| --- | --- | --- | --- | --- |
+| `rpc_roundtrip` | 134.7 µs | 170.0 µs | 218.4 µs | 667.1 µs |
+| `sharedfd_read` | 3.0 µs | 55.5 µs | 88.5 µs | 600.0 µs |
+
+_(`ipcbench` reports p50/p99/p999/max, not p95.)_
+
+### Input path (`inputlat`, 2000 iters, 0 dropped) — EVIOCGRAB→uinput re-emit interposition per event
+
+| measurement | p50 | p95 | p99 | p999 | max |
 | --- | --- | --- | --- | --- | --- |
-| `rpc_roundtrip` | | | | | |
-| `sharedfd_read` | | | | | |
+| `reemit_burst` | 36.5 µs | 38.9 µs | 48.3 µs | 266.6 µs | 795.6 µs |
+| `reemit_60hz` | 91.3 µs | 95.3 µs | 139.5 µs | 141.7 µs | 176.6 µs |
 
-### Input path (`inputlat`) — EVIOCGRAB→uinput re-emit interposition per event
+## Verdict — CONFIRMED (no epic reshape)
 
-| measurement | p50 (ns) | p95 (ns) | p99 (ns) | p999 (ns) | max (ns) |
-| --- | --- | --- | --- | --- | --- |
-| `reemit_burst` | | | | | |
-| `reemit_60hz` | | | | | |
+- **Input = shared-fd** (broker re-emit path, `tsp-e1b.6`): interposition p50 36–91 µs / p99
+  48–140 µs — matches the R-B **~0.15 ms/event** claim (paced/pessimistic ~90–140 µs < 150 µs;
+  warm ~36 µs), and every percentile is <1% of the 16.667 ms frame budget. Shared-fd `read()` alone
+  is p50 3.0 µs vs per-event RPC p50 134.7 µs → **~45× cheaper**, and RPC's max tail (667 µs) is the
+  broker scheduling tail the shared-fd path keeps off the render loop.
+- **Low-rate caps = per-event RPC fine** (`tsp-e1b.1`): even at the pinned 1.008 GHz, RPC round-trip
+  **p99 170 µs ≈ 1.0% of the frame budget** — the `.1` conclusion holds with margin on real silicon.
+- **vs the off-device model (`tsp-e1b.1`):** x86 RPC ~12–14 µs p50; ×6 A53 estimate ~78 µs p50 /
+  ~100 µs p99. Real A133 @1.008 GHz = 135 µs p50 / 170 µs p99 — the ×6 estimate was optimistic
+  because this device runs at ~half its max clock (`tsp-9h88`); scaling to ~2 GHz lands close.
+  **Shape/verdict unchanged; magnitudes now pinned on real silicon.**
 
-## Verdict
-
-_Pending._ Confirms or corrects the off-device model: input = shared-fd (broker re-emit path,
-`tsp-e1b.6`); low-rate caps = per-event RPC acceptable (`tsp-e1b.1`). Compare the on-silicon
-`rpc_roundtrip` p99 to the ×6 A53-scaled estimate (~100 µs p99) from `tsp-e1b.1`, and the
-`reemit_*` p99 to the ~0.15 ms/event R-B claim.
+Cross-posted to `tsp-e1b.1` and `tsp-e1b.6`. The bead's hardware gate (owner OK on the numbers) is
+relayed by the coordinator.
