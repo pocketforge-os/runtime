@@ -20,7 +20,11 @@ fn has_ff_rumble(fd: i32) -> bool {
 /// Upload a rumble effect; returns the kernel-assigned effect id.
 fn upload(fd: i32, strong: u16, weak: u16, ms: u16) -> Result<i16, String> {
     let mut eff: ff_effect = unsafe { std::mem::zeroed() };
-    eff.type_ = EV_FF;
+    // `ff_effect.type` is the EFFECT type (FF_RUMBLE), NOT the EV_FF event type — the kernel's
+    // input_ff_upload() rejects anything else with EINVAL (verified on real A523 pwm-vibrator
+    // silicon: setting EV_FF here returned `EVIOCSFF: Invalid argument`). EV_FF is only the
+    // `type` of the PLAY input_event written in set_play().
+    eff.type_ = FF_RUMBLE;
     eff.id = -1; // -1 ⇒ kernel assigns a fresh id
     eff.direction = 0;
     eff.replay.length = ms;
