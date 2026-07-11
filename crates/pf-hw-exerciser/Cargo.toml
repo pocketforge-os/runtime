@@ -1,0 +1,21 @@
+[package]
+name = "pf-hw-exerciser"
+description = "Static arm64 (musl) hardware ground-truth exercisers for the A523 (TrimUI Smart Pro S) — FF_RUMBLE player, IIO accel/gyro dumper (raw + mount-matrix-transformed via the SHARED physical_model math), /sys/class/leds walker, and a node-inventory probe. Runs over SSH on the STOCK-booted device to close the HARDWARE GATE of tsp-e1b.4 (the .4 managers were verified only against the E5 sim). Device-facing itest tooling — NOT part of the shipped runtime (tsp-e1b.8)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "pf-hw-exerciser"
+path = "src/main.rs"
+
+[dependencies]
+# pocketforge: reuse OUR mount-matrix math (physical_model) so the IMU exerciser exercises the
+# SAME transform the .4 SensorManager does, not an ad-hoc reimplementation.
+pocketforge = { workspace = true }
+# libc: raw evdev/IIO ioctls + input_event/ff_effect struct layouts — the same "one place raw
+# syscalls are unavoidable" rationale as pf-input-broker.
+libc = { workspace = true }
