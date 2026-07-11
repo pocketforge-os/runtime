@@ -16,6 +16,10 @@ path = "src/lib.rs"
 name = "pf-broker"
 path = "src/bin/pf-broker.rs"
 
+[[bin]]
+name = "pf-permissions"
+path = "src/bin/pf-permissions.rs"
+
 [dependencies]
 pocketforge = { workspace = true }
 libc = { workspace = true }
