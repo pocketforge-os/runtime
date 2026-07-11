@@ -31,6 +31,11 @@ its surface is intentionally tiny: parse a manifest, validate it, gate a fixed s
 
 ## 2. The `app.toml` launch contract (the CapDL-style authority graph)
 
+> **Protection tiers + the trust model** (normal/dangerous/signature capability tiers, the
+> blessed-binary app exemption, the signature-tier launch reject, and the entropy-ungated rationale)
+> are specified normatively in [`PERMISSION-MODEL.md`](PERMISSION-MODEL.md) (E3 / `infra-102`). This
+> section covers the validator mechanics; that doc covers the *policy* it enforces.
+
 ```toml
 [app]
 id  = "com.example.hwprobe"

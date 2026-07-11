@@ -8,7 +8,10 @@ use std::sync::Arc;
 use pocketforge::backends::InProcessBackend;
 use pocketforge::{Backend, CapError, Descriptor, PermissionState, Pf, QuotaLedger};
 
-use pf_broker::{peer_cred, serve_enforcing_until, AppManifest, EnforcingBackend};
+use pf_broker::{
+    peer_cred, serve_enforcing_until, AppManifest, BlessedRegistration, EnforcingBackend, LaunchTrust,
+    Violation,
+};
 
 fn descriptor(id: &str) -> Descriptor {
     let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -45,6 +48,100 @@ fn launch_validator_rejects_over_broad_and_accepts_well_formed() {
     assert!(manifest(&["imu?"]).validate(&descriptor("a133")).is_ok());
     // an unknown capability is rejected.
     assert!(manifest(&["telepathy"]).validate(&descriptor("a523")).is_err());
+}
+
+// --- E3 protection tiers: signature-tier launch gate + blessed-binary exemption (tsp-ht0p.2) --
+
+fn manifest_for(app_id: &str, uses: &[&str]) -> AppManifest {
+    let toml = format!(
+        "[app]\nid = \"{app_id}\"\nuse = [{}]\n",
+        uses.iter().map(|u| format!("\"{u}\"")).collect::<Vec<_>>().join(", ")
+    );
+    AppManifest::from_toml(&toml).expect("parse app.toml")
+}
+
+/// A synthetic descriptor that backs `location` (gnss) AND `vibration` (a rumble motor) — the
+/// shipped a133/a523 fixtures omit GNSS, so the bead's STEP-1 well-formed list needs this. (No
+/// `iio_device` — GNSS is DT-unbound on both SoCs and `iio_device` is optional as of runtime#13;
+/// `location` presence derives from the sensor `kind`, not the node.)
+fn desc_gnss_and_rumble() -> Descriptor {
+    Descriptor::from_toml(
+        "[identity]\nid=\"step1\"\nmanufacturer=\"x\"\nmodel=\"y\"\nsdl_guid=\"00000000000000000000000000000000\"\n\
+         [[inputs]]\nid=\"south\"\nkind=\"button\"\nev_type=\"EV_KEY\"\ncode=\"BTN_A\"\n\
+         [[sensors]]\nid=\"gnss\"\nkind=\"gnss\"\n\
+         [[actuators]]\nid=\"rumble\"\nkind=\"rumble\"\nev_type=\"EV_FF\"\ncode=\"FF_RUMBLE\"\nsysfs=\"pwm-vibrator\"\n",
+    )
+    .expect("synthetic descriptor parses")
+}
+
+#[test]
+fn step1_well_formed_manifest_passes_launch_validation() {
+    // Bead STEP-1 (well-formed): entropy(normal/ungated) + vibration(normal, backed by a motor) +
+    // location:approximate(dangerous, backed by gnss) + egress:<specific-host>(dangerous, declared)
+    // — ALL pass launch validation for an untrusted app (dangerous ≠ signature; no trust needed).
+    let desc = desc_gnss_and_rumble();
+    let v = manifest(&["entropy", "vibration", "location:approximate", "egress:tile.example"])
+        .validate(&desc)
+        .expect("well-formed manifest validates");
+    assert!(v.allows("entropy") && v.allows("vibration") && v.allows("location") && v.allows("egress"));
+    assert_eq!(v.egress_hosts().collect::<Vec<_>>(), ["tile.example"]);
+}
+
+#[test]
+fn step1_broad_egress_from_untrusted_app_is_signature_tier_reject() {
+    // Bead STEP-1 (reject): raw/arbitrary egress (0.0.0.0/0) from a NON-first-party app is a TYPED
+    // signature-tier launch REJECT — not an unknown-cap / over-broad-route reason.
+    let err = manifest(&["egress:0.0.0.0/0"]).validate(&descriptor("a133")).unwrap_err();
+    assert_eq!(err, vec![Violation::SignatureTierRequiresTrust { token: "egress:0.0.0.0/0".into() }]);
+}
+
+#[test]
+fn first_party_signed_app_clears_the_signature_tier() {
+    // The SAME broad-egress manifest passes when the app carries first-party (release-key) trust.
+    let v = manifest(&["egress:0.0.0.0/0"])
+        .validate_with_trust(&descriptor("a133"), &LaunchTrust::FIRST_PARTY)
+        .expect("first-party app may declare raw egress");
+    assert!(v.allows("egress"));
+    assert_eq!(v.egress_hosts().collect::<Vec<_>>(), ["0.0.0.0/0"]);
+}
+
+#[test]
+fn blessed_binary_exemption_clears_signature_tier_only_when_enumerated() {
+    // R-C blessed-binary (Steam Link): an enumerated, first-party-SIGNED broad-grant clears the
+    // signature tier for the matching app_id ONLY — via the enumeration, and only for that app.
+    let reg = BlessedRegistration {
+        app_id: "com.valve.steamlink".into(),
+        sha256: "deadbeefcafe".into(),
+        grants: vec!["egress:0.0.0.0/0".into()],
+    };
+    let steamlink = manifest_for("com.valve.steamlink", &["egress:0.0.0.0/0"]);
+
+    // Positive: blessed + enumerated + matching app_id ⇒ passes ONLY via the exemption path.
+    assert!(steamlink.validate_with_trust(&descriptor("a133"), &LaunchTrust::blessed(&reg)).is_ok());
+
+    // Negative 1 — the SAME grant WITHOUT the blessed registration (untrusted) ⇒ reject.
+    assert_eq!(
+        steamlink.validate(&descriptor("a133")).unwrap_err(),
+        vec![Violation::SignatureTierRequiresTrust { token: "egress:0.0.0.0/0".into() }]
+    );
+    // Negative 2 — a blessed registration for a DIFFERENT app does not carry over.
+    let copycat = manifest_for("com.evil.copycat", &["egress:0.0.0.0/0"]);
+    assert!(copycat.validate_with_trust(&descriptor("a133"), &LaunchTrust::blessed(&reg)).is_err());
+    // Negative 3 — blessed for the right app but the grant is NOT enumerated ⇒ reject.
+    let narrow = BlessedRegistration {
+        app_id: "com.valve.steamlink".into(),
+        sha256: "deadbeefcafe".into(),
+        grants: vec!["egress:tile.example".into()],
+    };
+    assert!(steamlink.validate_with_trust(&descriptor("a133"), &LaunchTrust::blessed(&narrow)).is_err());
+}
+
+#[test]
+fn specific_host_egress_is_dangerous_not_signature() {
+    // egress:<specific-host> is Dangerous (declared; runtime consent/default-deny lands via .3's
+    // generic dangerous-tier flow), NOT signature — an untrusted app may DECLARE it at launch.
+    let v = manifest(&["egress:steampowered.com"]).validate(&descriptor("a133")).expect("declared host ok");
+    assert!(v.allows("egress"));
 }
 
 // --- runtime enforcement: the manifest is the ceiling ---------------------------------------

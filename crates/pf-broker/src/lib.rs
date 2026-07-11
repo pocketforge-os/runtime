@@ -26,7 +26,11 @@
 pub mod enforce;
 pub mod manifest;
 pub mod serve;
+pub mod tier;
 
 pub use enforce::EnforcingBackend;
-pub use manifest::{AppManifest, AppSection, UseEntry, ValidatedManifest, Violation};
+pub use manifest::{
+    AppManifest, AppSection, BlessedRegistration, LaunchTrust, UseEntry, ValidatedManifest, Violation,
+};
 pub use serve::{peer_cred, serve_enforcing, serve_enforcing_until, PeerCred};
+pub use tier::{tier_of, Tier};
