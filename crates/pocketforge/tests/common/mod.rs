@@ -25,13 +25,14 @@ pub fn descriptor(id: &str) -> Descriptor {
 }
 
 /// A SYNTHETIC descriptor that advertises GNSS, used to exercise the default-deny / consent
-/// POLICY (real code) — neither shipping device (a133/a523) advertises GNSS today (it is
-/// DT-but-unbound, so the E1 descriptors omit it: descriptor = only-what's-proven). This stands
-/// in for a future GNSS-bearing device so the privacy-tier state machine is still tested.
+/// POLICY (real code) — neither shipping device (a133/a523) advertises GNSS today (DT-unbound
+/// on both SoCs per SPIKE-0 `tsp-9sx.1`, so the E1 descriptors omit it: descriptor = only-
+/// what's-proven). This stands in for a future GNSS-bearing device so the privacy-tier state
+/// machine is still tested.
 ///
-/// (NOTE: the E1 `capabilities.schema.json` sensor-kind enum does not yet include `gnss`; the
-/// sim's `broker_stub.py` keys `location` on a `gnss` sensor regardless. This synthetic mirrors
-/// `broker_stub.py`'s contract; the schema gap is filed as a cross-repo follow-up.)
+/// `[[sensors]] kind = "gnss"` is now schema-representable (E1 `capabilities.schema.json` post-
+/// `tsp-9sx.6`) and the row honestly OMITS `iio_device` (GNSS is not an IIO sink — gpsd/NMEA/
+/// CUSE stream, not iio sysfs).
 pub fn gnss_descriptor() -> Descriptor {
     Descriptor::from_toml(
         r#"
@@ -55,7 +56,6 @@ iio_device = "qmi8658"
 [[sensors]]
 id = "gnss"
 kind = "gnss"
-iio_device = "gnss0"
 "#,
     )
     .expect("parse synthetic gnss descriptor")
