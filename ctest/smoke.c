@@ -12,7 +12,9 @@
  * Usage: smoke <a133-capabilities.toml>
  */
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 #include "pocketforge.h"
 
 static int fails = 0;
@@ -54,6 +56,36 @@ int main(int argc, char **argv) {
     CHECK(pf_acquire(pf, "entropy") == PF_OK, "acquire(entropy) == OK (ungated)");
     unsigned char buf[16] = {0};
     CHECK(pf_entropy_fill(pf, buf, sizeof buf) == 0, "entropy fill succeeds");
+
+    /* input event fd (tsp-e1b.10). With no platform-provided node the gate passes (input is
+     * present) but there is nothing to open -> a negative -PF_HARDWARE_ABSENT, never a crash. */
+    unsetenv("PF_INPUT_NODE");
+    int no_node = pf_acquire_input_fd(pf);
+    printf("     pf_acquire_input_fd(no node) = %d\n", no_node);
+    CHECK(no_node == -PF_HARDWARE_ABSENT, "acquire_input_fd == -HARDWARE_ABSENT with no node");
+
+    /* Success leg: point PF_INPUT_NODE at a temp file holding a known 24-byte record; the export
+     * returns a REAL readable fd the C caller owns + reads off (the app's input read path). */
+    char tmpl[] = "/tmp/pf_smoke_inputXXXXXX";
+    int wfd = mkstemp(tmpl);
+    CHECK(wfd >= 0, "temp input node created");
+    unsigned char rec[24];
+    for (int i = 0; i < 24; i++) rec[i] = (unsigned char)(i + 1);
+    CHECK(write(wfd, rec, sizeof rec) == (ssize_t)sizeof rec, "wrote a 24-byte event record");
+    close(wfd);
+    setenv("PF_INPUT_NODE", tmpl, 1);
+    int ifd = pf_acquire_input_fd(pf);
+    printf("     pf_acquire_input_fd(node=%s) = %d\n", tmpl, ifd);
+    CHECK(ifd >= 0, "acquire_input_fd returns a non-negative fd when a node is provided");
+    if (ifd >= 0) {
+        unsigned char got[24] = {0};
+        ssize_t rn = read(ifd, got, sizeof got);
+        CHECK(rn == (ssize_t)sizeof got && memcmp(got, rec, sizeof rec) == 0,
+              "reading the fd yields the injected 24-byte record verbatim");
+        close(ifd); /* the caller owns the fd */
+    }
+    unsetenv("PF_INPUT_NODE");
+    unlink(tmpl);
 
     pf_free(pf);
     printf(fails ? "\nSMOKE FAILED (%d)\n" : "\nSMOKE OK\n", fails);

@@ -12,6 +12,7 @@
 //! except the session.
 
 use std::ffi::{c_char, CStr};
+use std::os::fd::IntoRawFd;
 use std::ptr;
 
 use pf::{Descriptor, Pf};
@@ -176,6 +177,27 @@ pub unsafe extern "C" fn pf_acquire(s: *const PfSession, name: *const c_char) ->
     match sess.pf.acquire_by_name(name) {
         Ok(()) => PF_OK,
         Err(e) => cap_err_code(e),
+    }
+}
+
+/// Acquire the **input event fd** for the session's input capability — the SPIKE-1 shared-fd hot
+/// path (`tsp-e1b.10`, additive to the frozen v1 ABI: NEW symbol, soname + wire version UNCHANGED).
+///
+/// On success returns a **non-negative fd the CALLER now OWNS and must `close()` exactly once**;
+/// the app `read()`s `struct input_event` records (`EV_KEY`/`EV_ABS`/`EV_SYN`) straight off it
+/// (never per-event RPC). On failure returns a **negative** value whose magnitude is a `PF_*`
+/// acquire code — `-PF_HARDWARE_ABSENT` (no input hardware / no platform-provided node),
+/// `-PF_CONSENT_DENIED`, `-PF_POLICY_BLOCKED`, or `-PF_UNSUPPORTED` (also for a NULL session).
+/// Never opens `/dev` ambiently: the fd is the facade-owned, platform-provided input node.
+///
+/// # Safety
+/// `s` must be a pointer from `pf_connect*` not already freed.
+#[no_mangle]
+pub unsafe extern "C" fn pf_acquire_input_fd(s: *const PfSession) -> i32 {
+    let Some(sess) = s.as_ref() else { return -PF_UNSUPPORTED };
+    match sess.pf.acquire_input_fd() {
+        Ok(fd) => fd.into_raw_fd(),        // ownership transfers to C; C closes it
+        Err(e) => -cap_err_code(e),        // negative PF_* taxonomy code
     }
 }
 

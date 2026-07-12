@@ -74,12 +74,24 @@ pub struct Settings;
 /// (the shared `uinput` fd) is delivered by child `.6`; this handle is the RPC-free map.
 pub struct InputHandle {
     map: InputMap,
+    /// The session backend, held so the handle can vend the input event fd on demand
+    /// (`tsp-e1b.10`) — the map is RPC-free; the fd is the hot path.
+    backend: Arc<dyn Backend>,
 }
 
 impl InputHandle {
     /// The descriptor-derived action map (named-action resolution + all bindable controls).
     pub fn map(&self) -> &InputMap {
         &self.map
+    }
+
+    /// Acquire the raw **input event fd** for this session (`tsp-e1b.10`). The app `read()`s
+    /// `input_event` records (`EV_KEY`/`EV_ABS`/`EV_SYN`) straight off the returned [`OwnedFd`] —
+    /// the SPIKE-1 shared-fd hot path, never per-event RPC. Same gate as acquiring the handle;
+    /// returns the four-way [`CapError`] on a hardware-absent / policy-blocked input. Equivalent
+    /// to [`crate::Pf::acquire_input_fd`]; the C ABI exposes it as `pf_acquire_input_fd`.
+    pub fn acquire_fd(&self) -> Result<std::os::fd::OwnedFd, CapError> {
+        self.backend.acquire_input_fd()
     }
 }
 
@@ -180,7 +192,10 @@ impl Capability for Input {
     type Handle = InputHandle;
     fn acquire(pf: &Pf) -> Result<InputHandle, CapError> {
         pf.backend().acquire(Self::NAME)?;
-        Ok(InputHandle { map: InputMap::from_descriptor(pf.descriptor()) })
+        Ok(InputHandle {
+            map: InputMap::from_descriptor(pf.descriptor()),
+            backend: pf.backend_arc(),
+        })
     }
 }
 

@@ -98,6 +98,11 @@ position in metres). `GetPose`/`SetPose` on a device with no IMU return `status=
 > **Acquiring INPUT** (added by `.6`): `Acquire` with `name="input"` returns the shared
 > `uinput` device fd out-of-band via `SCM_RIGHTS` on the same socket. The fd, not RPC, is the
 > hot path. `.6` specifies the ancillary-data layout; PFW1 itself does not frame the fd.
+>
+> The C ABI surfaces this as `pf_acquire_input_fd` (`tsp-e1b.10`, additive) — **no new `Op`**:
+> the broker-client backend sends this exact `Acquire("input")` and reads the framed `Response`
+> payload + the `SCM_RIGHTS` fd in one `recvmsg`; the in-process backend opens the
+> platform-provided node directly. Same facade, backend-swappable, wire unchanged.
 
 ### 4.2 Response (broker → client)
 

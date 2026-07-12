@@ -11,12 +11,15 @@
 
 use std::collections::HashMap;
 use std::io::Write as _;
+use std::os::fd::OwnedFd;
+use std::path::PathBuf;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 
 use pf_prefs::{PrefValue, Prefs, PrefsStore, SCHEMA};
 
 use crate::backend::{acquire_decision, query_decision, Backend, Pose, PoseDelta, RumbleStatus};
+use crate::backends::scm;
 use crate::descriptor::Descriptor;
 use crate::error::{CapError, PermissionState};
 
@@ -48,13 +51,34 @@ pub struct InProcessBackend {
     /// so those tests stay hermetic — they never touch the ambient filesystem). Production wiring
     /// ([`crate::connect`]) attaches [`PrefsStore::open_default`] so a flip persists.
     prefs_store: Option<Arc<PrefsStore>>,
+    /// The platform-provided, descriptor-matched input event node (`tsp-e1b.10`). When set, the
+    /// input fd handoff opens THIS node; when `None` it falls back to `$PF_INPUT_NODE` (the sim/
+    /// broker writes the synth `uinput` node path there). Either way the node is PLATFORM-supplied
+    /// — the facade never scans `/dev` (the capability-honesty invariant). A supervisor that
+    /// injected the node, and tests, set it explicitly via [`InProcessBackend::with_input_node`]
+    /// (no process-global env, so parallel sessions/tests never collide).
+    input_node: Option<PathBuf>,
     state: Mutex<State>,
 }
 
 impl InProcessBackend {
     /// Build a store-less backend over a descriptor (preferences are in-memory for the session).
     pub fn new(descriptor: Arc<Descriptor>) -> InProcessBackend {
-        InProcessBackend { descriptor, prefs_store: None, state: Mutex::new(State::default()) }
+        InProcessBackend {
+            descriptor,
+            prefs_store: None,
+            input_node: None,
+            state: Mutex::new(State::default()),
+        }
+    }
+
+    /// Pin the platform-provided input event node for the fd handoff (`tsp-e1b.10`), overriding
+    /// the `$PF_INPUT_NODE` fallback. Builder-style; consumed before the backend is `Arc`-shared,
+    /// so a test/supervisor sets it once at construction. The node is still PLATFORM-supplied —
+    /// this is the injection seam, NOT an app-side `/dev` scan.
+    pub fn with_input_node(mut self, node: impl Into<PathBuf>) -> InProcessBackend {
+        self.input_node = Some(node.into());
+        self
     }
 
     /// Build a shared (`Arc`) store-less backend — the form the reference [`crate::server`] wraps.
@@ -76,6 +100,7 @@ impl InProcessBackend {
         InProcessBackend {
             descriptor,
             prefs_store: Some(store),
+            input_node: None,
             state: Mutex::new(State { prefs, ..State::default() }),
         }
     }
@@ -243,6 +268,30 @@ impl Backend for InProcessBackend {
             return Ok(());
         }
         default
+    }
+
+    fn acquire_input_fd(&self) -> Result<OwnedFd, CapError> {
+        // Gate FIRST, identically to `acquire("input")`: a hardware-absent (no input rows) or
+        // consent-denied input never reaches an fd open. This is what keeps the fd handoff on the
+        // capability contract instead of an ambient `/dev` grab.
+        self.acquire("input")?;
+        // Resolve the PLATFORM-provided node: an explicit injected override (supervisor/test),
+        // else `$PF_INPUT_NODE` (the sim/broker writes the descriptor-matched synth `uinput` node
+        // path there). The app NEVER scans `/dev` — the platform names the node. A missing node =
+        // no input source wired on this platform config ⇒ HardwareAbsent (honest, not a panic).
+        let node = self
+            .input_node
+            .clone()
+            .or_else(|| std::env::var_os("PF_INPUT_NODE").map(PathBuf::from))
+            .ok_or(CapError::HardwareAbsent)?;
+        scm::open_read_fd(&node).map_err(|e| {
+            let _ = writeln!(
+                std::io::stderr(),
+                "pocketforge: input fd open of {} failed: {e}",
+                node.display()
+            );
+            CapError::HardwareAbsent
+        })
     }
 
     fn rumble_pulse(&self, _ms: u32) -> RumbleStatus {

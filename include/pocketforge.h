@@ -57,6 +57,14 @@ int        pf_query(const PfSession *s, const char *name);   /* -> PF_GRANTED/DE
 
 /* Acquire + act. */
 int  pf_acquire(const PfSession *s, const char *name);       /* -> PF_OK or taxonomy code */
+/*
+ * Acquire the input event fd — the shared-fd hot path (additive v1 export, tsp-e1b.10).
+ * On success returns a NON-NEGATIVE fd the CALLER OWNS and must close() once; read
+ * `struct input_event` records (EV_KEY/EV_ABS/EV_SYN) off it (never per-event RPC).
+ * On failure returns a NEGATIVE value whose magnitude is a PF_* code (e.g. -PF_HARDWARE_ABSENT,
+ * -PF_CONSENT_DENIED). Never scans /dev — the fd is the facade-owned, platform-provided node.
+ */
+int  pf_acquire_input_fd(PfSession *s);
 int  pf_rumble_pulse(const PfSession *s, uint32_t ms);       /* -> PF_RUMBLE_* (never fails) */
 int  pf_entropy_fill(const PfSession *s, uint8_t *buf, size_t len); /* 0 ok, -1 error */
 
