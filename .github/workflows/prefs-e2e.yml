@@ -1,0 +1,82 @@
+# tsp-xubv.4 — the E4 accessibility/user-preference sim end-to-end + unification CI matrix.
+#
+# Two matrix rows, ZERO test-code diff (`crates/pf-settings/tests/prefs_e2e.rs::run_unified_scenario`
+# is one function body; both rows pass an argument, no branch on the descriptor). Each row runs the
+# same `cargo test -p pf-settings --test prefs_e2e` filter, restricted to that row's descriptor by
+# the standard `#[test]`-name substring match — and every row also runs the `unified_zero_code_diff_
+# a133_absent` + `..._a523_suppressed` tests, since the a133/a523 substring hits both descriptors'
+# tests, honestly proving THE unification claim in each row.
+#
+# The two green rows ARE the unification proof: the same test code (byte-for-byte) exits 0 on both.
+# The honest diagnostic (`NoopAbsent` vs `NoopSuppressed`) is asserted inside each test — it is the
+# frozen-wire honesty layer, not a behavioral fork (see `docs/PREFERENCES.md` §6).
+
+name: E4 prefs sim E2E
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: prefs-e2e-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # One CI job per matrix row (descriptor). Both rows pass GREEN = the unification is real.
+  matrix-row:
+    name: prefs E2E (${{ matrix.descriptor }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        descriptor: [a133, a523]
+
+    steps:
+      - name: Checkout
+        # SHA-pinned per the org action-pinning norm (matches sim-gate.yml).
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+
+      - name: Install stable Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+          rustc --version
+          cargo --version
+
+      - name: Cache cargo registry + target
+        uses: actions/cache@1bd1e32a3bdc45362d1e726936510720a7c30a57  # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: prefs-e2e-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            prefs-e2e-${{ runner.os }}-
+
+      # The FILTER: cargo test does substring match on test names. `a133` runs every test whose
+      # name contains "a133" — including the unification test `unified_zero_code_diff_a133_absent`
+      # AND the a133 flip tests; symmetrically for a523. Each row's assertion set exercises its
+      # descriptor's silent-no-op flavor + the shared observer contract. Since the two unification
+      # tests share bodies via `run_unified_scenario`, GREEN on BOTH matrix rows is precisely the
+      # "zero test-code diff between rows" proof the epic acceptance names.
+      - name: Run E2E matrix row (${{ matrix.descriptor }})
+        run: |
+          cargo test -p pf-settings --test prefs_e2e -- --nocapture ${{ matrix.descriptor }}
+
+      # Additional cross-cutting seams (monoAudio + reduceMotion + brightness) do NOT carry a
+      # descriptor tag in their names; run them ONCE on the a523 row to avoid double-counting.
+      - name: Cross-cutting preferences (monoAudio + reduceMotion + brightness) [a523 row only]
+        if: ${{ matrix.descriptor == 'a523' }}
+        run: |
+          cargo test -p pf-settings --test prefs_e2e -- --nocapture \
+            mono_audio_flip_via_external_cli_flips_routing_layer \
+            reduce_motion_flip_via_control_plane_fires_observer_and_read_flips \
+            brightness_is_contract_only_readable_and_observable_via_external_cli
