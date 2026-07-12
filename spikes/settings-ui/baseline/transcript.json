@@ -1,0 +1,492 @@
+{
+  "generated_at": 1783816027,
+  "scenarios": [
+    {
+      "id": "s01-a523-initial",
+      "profile": "a523",
+      "description": "Default focus = top row (Reduce motion); schema defaults.",
+      "events": [],
+      "focus": "reduceMotion",
+      "exited": false,
+      "values": {
+        "reduceMotion": false,
+        "hapticsEnabled": true,
+        "monoAudio": false,
+        "brightness": 100
+      },
+      "writes": [],
+      "event_log": [],
+      "ppm": "/home/mm/runtime-xubv3/spikes/settings-ui/build/frames/s01-a523-initial.ppm",
+      "png": "/home/mm/runtime-xubv3/spikes/settings-ui/build/frames/s01-a523-initial.png"
+    },
+    {
+      "id": "s02-a523-focus-haptics",
+      "profile": "a523",
+      "description": "One dpad-down: focus Haptics (row index 1).",
+      "events": [
+        "dpad-down"
+      ],
+      "focus": "hapticsEnabled",
+      "exited": false,
+      "values": {
+        "reduceMotion": false,
+        "hapticsEnabled": true,
+        "monoAudio": false,
+        "brightness": 100
+      },
+      "writes": [],
+      "event_log": [
+        "dpad-down"
+      ],
+      "ppm": "/home/mm/runtime-xubv3/spikes/settings-ui/build/frames/s02-a523-focus-haptics.ppm",
+      "png": "/home/mm/runtime-xubv3/spikes/settings-ui/build/frames/s02-a523-focus-haptics.png"
+    },
+    {
+      "id": "s03-a523-toggle-haptics-off",
+      "profile": "a523",
+      "description": "Focus Haptics, A -> haptics OFF (authority write).",
+      "events": [
+        "dpad-down",
+        "A"
+      ],
+      "focus": "hapticsEnabled",
+      "exited": false,
+      "values": {
+        "reduceMotion": false,
+        "hapticsEnabled": false,
+        "monoAudio": false,
+        "brightness": 100
+      },
+      "writes": [
+        {
+          "key": "hapticsEnabled",
+          "value": false,
+          "via": "A-toggle"
+        }
+      ],
+      "event_log": [
+        "dpad-down",
+        "A -> toggle hapticsEnabled=False"
+      ],
+      "ppm": "/home/mm/runtime-xubv3/spikes/settings-ui/build/frames/s03-a523-toggle-haptics-off.ppm",
+      "png": "/home/mm/runtime-xubv3/spikes/settings-ui/build/frames/s03-a523-toggle-haptics-off.png"
+    },
+    {
+      "id": "s04-a523-toggle-reduce-motion-on",
+      "profile": "a523",
+      "description": "A on top row -> reduceMotion ON.",
+      "events": [
+        "A"
+      ],
+      "focus": "reduceMotion",
+      "exited": false,
+      "values": {
+        "reduceMotion": true,
+        "hapticsEnabled": true,
+        "monoAudio": false,
+        "brightness": 100
+      },
+      "writes": [
+        {
+          "key": "reduceMotion",
+          "value": true,
+          "via": "A-toggle"
+        }
+      ],
+      "event_log": [
+        "A -> toggle reduceMotion=True"
+      ],
+      "ppm": "/home/mm/runtime-xubv3/spikes/settings-ui/build/frames/s04-a523-toggle-reduce-motion-on.ppm",
+      "png": "/home/mm/runtime-xubv3/spikes/settings-ui/build/frames/s04-a523-toggle-reduce-motion-on.png"
+    },
+    {
+      "id": "s05-a523-toggle-mono-on",
+      "profile": "a523",
+      "description": "Two dpad-down: focus Mono audio (index 2), A -> monoAudio ON.",
+      "events": [
+        "dpad-down",
+        "dpad-down",
+        "A"
+      ],
+      "focus": "monoAudio",
+      "exited": false,
+      "values": {
+        "reduceMotion": false,
+        "hapticsEnabled": true,
+        "monoAudio": true,
+        "brightness": 100
+      },
+      "writes": [
+        {
+          "key": "monoAudio",
+          "value": true,
+          "via": "A-toggle"
+        }
+      ],
+      "event_log": [
+        "dpad-down",
+        "dpad-down",
+        "A -> toggle monoAudio=True"
+      ],
+      "ppm": "/home/mm/runtime-xubv3/spikes/settings-ui/build/frames/s05-a523-toggle-mono-on.ppm",
+      "png": "/home/mm/runtime-xubv3/spikes/settings-ui/build/frames/s05-a523-toggle-mono-on.png"
+    },
+    {
+      "id": "s06-a523-focus-brightness",
+      "profile": "a523",
+      "description": "Focus the brightness scalar row.",
+      "events": [
+        "dpad-down",
+        "dpad-down",
+        "dpad-down"
+      ],
+      "focus": "brightness",
+      "exited": false,
+      "values": {
+        "reduceMotion": false,
+        "hapticsEnabled": true,
+        "monoAudio": false,
+        "brightness": 100
+      },
+      "writes": [],
+      "event_log": [
+        "dpad-down",
+        "dpad-down",
+        "dpad-down"
+      ],
+      "ppm": "/home/mm/runtime-xubv3/spikes/settings-ui/build/frames/s06-a523-focus-brightness.ppm",
+      "png": "/home/mm/runtime-xubv3/spikes/settings-ui/build/frames/s06-a523-focus-brightness.png"
+    },
+    {
+      "id": "s07-a523-brightness-down",
+      "profile": "a523",
+      "description": "Focus brightness, six L presses -> 40.",
+      "events": [
+        "dpad-down",
+        "dpad-down",
+        "dpad-down",
+        "dpad-left",
+        "dpad-left",
+        "dpad-left",
+        "dpad-left",
+        "dpad-left",
+        "dpad-left"
+      ],
+      "focus": "brightness",
+      "exited": false,
+      "values": {
+        "reduceMotion": false,
+        "hapticsEnabled": true,
+        "monoAudio": false,
+        "brightness": 40
+      },
+      "writes": [
+        {
+          "key": "brightness",
+          "value": 90,
+          "via": "LR-adjust"
+        },
+        {
+          "key": "brightness",
+          "value": 80,
+          "via": "LR-adjust"
+        },
+        {
+          "key": "brightness",
+          "value": 70,
+          "via": "LR-adjust"
+        },
+        {
+          "key": "brightness",
+          "value": 60,
+          "via": "LR-adjust"
+        },
+        {
+          "key": "brightness",
+          "value": 50,
+          "via": "LR-adjust"
+        },
+        {
+          "key": "brightness",
+          "value": 40,
+          "via": "LR-adjust"
+        }
+      ],
+      "event_log": [
+        "dpad-down",
+        "dpad-down",
+        "dpad-down",
+        "dpad-left -> brightness=90",
+        "dpad-left -> brightness=80",
+        "dpad-left -> brightness=70",
+        "dpad-left -> brightness=60",
+        "dpad-left -> brightness=50",
+        "dpad-left -> brightness=40"
+      ],
+      "ppm": "/home/mm/runtime-xubv3/spikes/settings-ui/build/frames/s07-a523-brightness-down.ppm",
+      "png": "/home/mm/runtime-xubv3/spikes/settings-ui/build/frames/s07-a523-brightness-down.png"
+    },
+    {
+      "id": "s08-a523-brightness-up-clamp",
+      "profile": "a523",
+      "description": "Focus brightness, R at max -> clamped at 100 (non-wrap).",
+      "events": [
+        "dpad-down",
+        "dpad-down",
+        "dpad-down",
+        "dpad-right"
+      ],
+      "focus": "brightness",
+      "exited": false,
+      "values": {
+        "reduceMotion": false,
+        "hapticsEnabled": true,
+        "monoAudio": false,
+        "brightness": 100
+      },
+      "writes": [],
+      "event_log": [
+        "dpad-down",
+        "dpad-down",
+        "dpad-down",
+        "dpad-right (brightness clamped at 100)"
+      ],
+      "ppm": "/home/mm/runtime-xubv3/spikes/settings-ui/build/frames/s08-a523-brightness-up-clamp.ppm",
+      "png": "/home/mm/runtime-xubv3/spikes/settings-ui/build/frames/s08-a523-brightness-up-clamp.png"
+    },
+    {
+      "id": "s09-a523-focus-up-wrap-guard",
+      "profile": "a523",
+      "description": "From top row, dpad-up -> stays on Reduce motion (no wrap).",
+      "events": [
+        "dpad-up"
+      ],
+      "focus": "reduceMotion",
+      "exited": false,
+      "values": {
+        "reduceMotion": false,
+        "hapticsEnabled": true,
+        "monoAudio": false,
+        "brightness": 100
+      },
+      "writes": [],
+      "event_log": [
+        "dpad-up"
+      ],
+      "ppm": "/home/mm/runtime-xubv3/spikes/settings-ui/build/frames/s09-a523-focus-up-wrap-guard.ppm",
+      "png": "/home/mm/runtime-xubv3/spikes/settings-ui/build/frames/s09-a523-focus-up-wrap-guard.png"
+    },
+    {
+      "id": "s10-a523-focus-down-wrap-guard",
+      "profile": "a523",
+      "description": "Five dpad-down -> focus clamps at Brightness (no wrap).",
+      "events": [
+        "dpad-down",
+        "dpad-down",
+        "dpad-down",
+        "dpad-down",
+        "dpad-down"
+      ],
+      "focus": "brightness",
+      "exited": false,
+      "values": {
+        "reduceMotion": false,
+        "hapticsEnabled": true,
+        "monoAudio": false,
+        "brightness": 100
+      },
+      "writes": [],
+      "event_log": [
+        "dpad-down",
+        "dpad-down",
+        "dpad-down",
+        "dpad-down",
+        "dpad-down"
+      ],
+      "ppm": "/home/mm/runtime-xubv3/spikes/settings-ui/build/frames/s10-a523-focus-down-wrap-guard.ppm",
+      "png": "/home/mm/runtime-xubv3/spikes/settings-ui/build/frames/s10-a523-focus-down-wrap-guard.png"
+    },
+    {
+      "id": "s11-a523-ignored-inputs",
+      "profile": "a523",
+      "description": "X, Y, L1, home all no-op; focus unmoved.",
+      "events": [
+        "X",
+        "Y",
+        "L1",
+        "home"
+      ],
+      "focus": "reduceMotion",
+      "exited": false,
+      "values": {
+        "reduceMotion": false,
+        "hapticsEnabled": true,
+        "monoAudio": false,
+        "brightness": 100
+      },
+      "writes": [],
+      "event_log": [
+        "X (no-op)",
+        "Y (no-op)",
+        "L1 (no-op)",
+        "home (no-op)"
+      ],
+      "ppm": "/home/mm/runtime-xubv3/spikes/settings-ui/build/frames/s11-a523-ignored-inputs.ppm",
+      "png": "/home/mm/runtime-xubv3/spikes/settings-ui/build/frames/s11-a523-ignored-inputs.png"
+    },
+    {
+      "id": "s12-a523-back-then-noop",
+      "profile": "a523",
+      "description": "Focus Mono (2 down), A -> mono ON, B -> back; later dpad no-ops (dismissed).",
+      "events": [
+        "dpad-down",
+        "dpad-down",
+        "A",
+        "B",
+        "dpad-down",
+        "dpad-down"
+      ],
+      "focus": "monoAudio",
+      "exited": true,
+      "values": {
+        "reduceMotion": false,
+        "hapticsEnabled": true,
+        "monoAudio": true,
+        "brightness": 100
+      },
+      "writes": [
+        {
+          "key": "monoAudio",
+          "value": true,
+          "via": "A-toggle"
+        }
+      ],
+      "event_log": [
+        "dpad-down",
+        "dpad-down",
+        "A -> toggle monoAudio=True",
+        "B -> back (screen dismissed)",
+        "dpad-down (no-op: screen dismissed)",
+        "dpad-down (no-op: screen dismissed)"
+      ],
+      "ppm": "/home/mm/runtime-xubv3/spikes/settings-ui/build/frames/s12-a523-back-then-noop.ppm",
+      "png": "/home/mm/runtime-xubv3/spikes/settings-ui/build/frames/s12-a523-back-then-noop.png"
+    },
+    {
+      "id": "s13-a133-initial-haptics-absent",
+      "profile": "a133",
+      "description": "a133: Haptics row greyed 'unavailable'; focus = Reduce motion.",
+      "events": [],
+      "focus": "reduceMotion",
+      "exited": false,
+      "values": {
+        "reduceMotion": false,
+        "hapticsEnabled": true,
+        "monoAudio": false,
+        "brightness": 100
+      },
+      "writes": [],
+      "event_log": [],
+      "ppm": "/home/mm/runtime-xubv3/spikes/settings-ui/build/frames/s13-a133-initial-haptics-absent.ppm",
+      "png": "/home/mm/runtime-xubv3/spikes/settings-ui/build/frames/s13-a133-initial-haptics-absent.png"
+    },
+    {
+      "id": "s14-a133-focus-skips-haptics",
+      "profile": "a133",
+      "description": "One dpad-down -> focus jumps PAST absent Haptics to Mono audio.",
+      "events": [
+        "dpad-down"
+      ],
+      "focus": "monoAudio",
+      "exited": false,
+      "values": {
+        "reduceMotion": false,
+        "hapticsEnabled": true,
+        "monoAudio": false,
+        "brightness": 100
+      },
+      "writes": [],
+      "event_log": [
+        "dpad-down"
+      ],
+      "ppm": "/home/mm/runtime-xubv3/spikes/settings-ui/build/frames/s14-a133-focus-skips-haptics.ppm",
+      "png": "/home/mm/runtime-xubv3/spikes/settings-ui/build/frames/s14-a133-focus-skips-haptics.png"
+    },
+    {
+      "id": "s15-a133-toggle-mono-on",
+      "profile": "a133",
+      "description": "a133: focus Mono audio, A -> monoAudio ON (Haptics still absent).",
+      "events": [
+        "dpad-down",
+        "A"
+      ],
+      "focus": "monoAudio",
+      "exited": false,
+      "values": {
+        "reduceMotion": false,
+        "hapticsEnabled": true,
+        "monoAudio": true,
+        "brightness": 100
+      },
+      "writes": [
+        {
+          "key": "monoAudio",
+          "value": true,
+          "via": "A-toggle"
+        }
+      ],
+      "event_log": [
+        "dpad-down",
+        "A -> toggle monoAudio=True"
+      ],
+      "ppm": "/home/mm/runtime-xubv3/spikes/settings-ui/build/frames/s15-a133-toggle-mono-on.ppm",
+      "png": "/home/mm/runtime-xubv3/spikes/settings-ui/build/frames/s15-a133-toggle-mono-on.png"
+    },
+    {
+      "id": "s16-a133-brightness-down",
+      "profile": "a133",
+      "description": "a133: focus Brightness (2 downs past absent Haptics), three L -> 70.",
+      "events": [
+        "dpad-down",
+        "dpad-down",
+        "dpad-left",
+        "dpad-left",
+        "dpad-left"
+      ],
+      "focus": "brightness",
+      "exited": false,
+      "values": {
+        "reduceMotion": false,
+        "hapticsEnabled": true,
+        "monoAudio": false,
+        "brightness": 70
+      },
+      "writes": [
+        {
+          "key": "brightness",
+          "value": 90,
+          "via": "LR-adjust"
+        },
+        {
+          "key": "brightness",
+          "value": 80,
+          "via": "LR-adjust"
+        },
+        {
+          "key": "brightness",
+          "value": 70,
+          "via": "LR-adjust"
+        }
+      ],
+      "event_log": [
+        "dpad-down",
+        "dpad-down",
+        "dpad-left -> brightness=90",
+        "dpad-left -> brightness=80",
+        "dpad-left -> brightness=70"
+      ],
+      "ppm": "/home/mm/runtime-xubv3/spikes/settings-ui/build/frames/s16-a133-brightness-down.ppm",
+      "png": "/home/mm/runtime-xubv3/spikes/settings-ui/build/frames/s16-a133-brightness-down.png"
+    }
+  ]
+}
