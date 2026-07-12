@@ -69,6 +69,16 @@ pub enum Violation {
     SignatureTierRequiresTrust { token: String },
     /// A structurally malformed entry (empty cap, etc.).
     Malformed(String),
+    /// The app pins an `[runtime] abi` this Platform does not offer (the frozen-contract version
+    /// the running Platform advertises does not include the app's pinned `abi`).
+    UnsupportedAbi { abi: String },
+    /// The app pins an `[runtime] family` that is neither THIS Platform's canonical family id nor
+    /// one of its accepted aliases — a build for a different SoC family (different kernel/GPU/SDL).
+    FamilyMismatch { app_family: String, platform_family: String },
+    /// [`AppManifest::check_runtime`] was asked to verify a launch that requires a Platform pin, but
+    /// the `app.toml` carries no `[runtime]` table (parsing stays back-compatible; requiring the pin
+    /// is the supervisor's launch-policy choice).
+    MissingRuntime,
 }
 
 impl std::fmt::Display for Violation {
@@ -86,6 +96,16 @@ impl std::fmt::Display for Violation {
                 write!(f, "signature-tier capability '{token}' requires a first-party or blessed-binary signature")
             }
             Violation::Malformed(t) => write!(f, "malformed use entry '{t}'"),
+            Violation::UnsupportedAbi { abi } => {
+                write!(f, "this Platform does not offer ABI '{abi}'")
+            }
+            Violation::FamilyMismatch { app_family, platform_family } => write!(
+                f,
+                "app targets family '{app_family}' but this Platform is '{platform_family}' (nor an accepted alias)"
+            ),
+            Violation::MissingRuntime => {
+                write!(f, "app.toml has no [runtime] family/abi pin (required for this launch)")
+            }
         }
     }
 }
@@ -209,10 +229,15 @@ impl ValidatedManifest {
     }
 }
 
-/// A raw `app.toml`: `[app] id, use`.
+/// A raw `app.toml`: `[app] id, use` plus the optional `[runtime]` Platform pin.
 #[derive(Debug, Deserialize)]
 pub struct AppManifest {
     pub app: AppSection,
+    /// The `[runtime]` Platform pin (family + frozen-ABI version). **Optional** so an `app.toml`
+    /// written before the pin existed still parses (back-compat); a launch that *requires* the pin
+    /// gets [`Violation::MissingRuntime`] from [`check_runtime`](Self::check_runtime).
+    #[serde(default)]
+    pub runtime: Option<RuntimeSection>,
 }
 
 /// The `[app]` table.
@@ -221,6 +246,92 @@ pub struct AppSection {
     pub id: String,
     #[serde(default, rename = "use")]
     pub uses: Vec<String>,
+}
+
+/// The `[runtime]` table — an app's **Platform pin**: the per-SoC *family* it was built for and the
+/// frozen `libpocketforge`/PFW1 `abi` version it links. Reconciled from
+/// `runtime/docs/RUNTIME-SDK-SPLIT.md` §2 + the canonical registry `platform/abi/families.toml`.
+///
+/// The **static** package-time validator (`platform/core/appmanifest.py`, `tsp-ziac.1`) already
+/// rejects unknown-family / out-of-lock-version at packaging; this on-device table is the
+/// **cooperative** launch-time consumer — [`check_runtime`](AppManifest::check_runtime) rejects an
+/// app whose `family`/`abi` this running Platform does not offer (the "one descriptor, three
+/// consumers" third consumer). `platform-version` (the frozen substrate SHA-set pin) is parsed but
+/// NOT matched here — out-of-lock-version is the static validator's job, and the on-device broker
+/// holds no lock (`platform.lock` lives in the `platform` repo).
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct RuntimeSection {
+    /// The canonical per-SoC family id this build targets (e.g. `pocketforge/a133-powervr`), or an
+    /// accepted alias (`pocketforge/sun50i-a133`).
+    pub family: String,
+    /// The frozen `libpocketforge`/PFW1 contract version this build links (e.g. `"1"`).
+    pub abi: String,
+    /// The frozen substrate SHA-set this build pins (E8). Parsed for completeness; version-in-lock
+    /// checking is the static package-time validator's job, not the broker's.
+    #[serde(default, rename = "platform-version")]
+    pub platform_version: Option<String>,
+}
+
+/// **What family am I?** — the running Platform's own family advertisement, the INPUT
+/// [`check_runtime`](AppManifest::check_runtime) matches an app's `[runtime]` pin against.
+///
+/// The supervisor supplies this; it is **sourced from the device/platform config, NOT hardcoded in
+/// Rust** (hardcoding a family registry here would diverge from the canonical
+/// `platform/abi/families.toml`). At image-build time the platform tooling derives THIS device's
+/// family row (canonical id + accepted aliases + the ABI versions this Platform offers) into a
+/// small on-device config the supervisor reads via [`load`](Self::load); the broker carries no
+/// family names of its own. See `platform/abi/families.toml` / `docs/PLATFORM-ABI-CONTRACT.md`.
+///
+/// On-device config shape (`[platform]` table):
+/// ```toml
+/// [platform]
+/// family        = "pocketforge/a133-powervr"
+/// aliases       = ["pocketforge/sun50i-a133"]
+/// supported-abi = ["1"]
+/// ```
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct PlatformContext {
+    /// This Platform's canonical family id (matches `families.toml` `[[family]] id`).
+    pub family: String,
+    /// The accepted alias ids for this family (matches `families.toml` `[[family]] alias`); an app
+    /// that pinned a superseded id still resolves.
+    #[serde(default)]
+    pub aliases: Vec<String>,
+    /// The frozen-ABI versions this Platform offers (e.g. `["1"]`).
+    #[serde(default, rename = "supported-abi")]
+    pub supported_abi: Vec<String>,
+}
+
+/// The on-device platform-advertisement file: a single `[platform]` table wrapping a
+/// [`PlatformContext`], so the supervisor can `PlatformContext::load("…/platform.toml")`.
+#[derive(Debug, Deserialize)]
+struct PlatformFile {
+    platform: PlatformContext,
+}
+
+impl PlatformContext {
+    /// Parse a platform advertisement from a `[platform]`-table TOML string.
+    pub fn from_toml(s: &str) -> Result<PlatformContext, toml::de::Error> {
+        toml::from_str::<PlatformFile>(s).map(|f| f.platform)
+    }
+
+    /// Load the platform advertisement from an on-device `platform.toml` path (the supervisor's
+    /// family-advertisement source; derived from `platform/abi/families.toml` at image-build time).
+    pub fn load(path: impl AsRef<std::path::Path>) -> std::io::Result<PlatformContext> {
+        let text = std::fs::read_to_string(path)?;
+        PlatformContext::from_toml(&text)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))
+    }
+
+    /// Does this Platform accept `app_family` — its canonical id OR an accepted alias?
+    pub fn family_matches(&self, app_family: &str) -> bool {
+        self.family == app_family || self.aliases.iter().any(|a| a == app_family)
+    }
+
+    /// Does this Platform offer `abi`?
+    pub fn offers_abi(&self, abi: &str) -> bool {
+        self.supported_abi.iter().any(|a| a == abi)
+    }
 }
 
 impl AppManifest {
@@ -321,6 +432,49 @@ impl AppManifest {
         }
     }
 
+    /// Validate the app's `[runtime]` Platform pin against the running Platform's own family
+    /// advertisement (`platform`) — the **cooperative on-device launch-time family/abi match** (the
+    /// third consumer of the one canonical descriptor, next to the `use=[]` graph check above and
+    /// the static package-time validator in the `platform` repo).
+    ///
+    /// Rejects (collecting ALL applicable violations, not just the first):
+    ///   * [`Violation::MissingRuntime`] — no `[runtime]` table (this launch requires a pin);
+    ///   * [`Violation::FamilyMismatch`] — the pinned `family` is neither this Platform's canonical
+    ///     family nor an accepted alias (a build for a different SoC family);
+    ///   * [`Violation::UnsupportedAbi`] — this Platform does not offer the pinned `abi`.
+    ///
+    /// Accepts (returning the pin) a `family` that matches canonical OR alias AND an offered `abi`.
+    /// `platform-version` is deliberately NOT checked here (out-of-lock-version is the static
+    /// package-time validator's job; the on-device broker holds no `platform.lock`).
+    ///
+    /// Parsing an `app.toml` with no `[runtime]` still succeeds ([`from_toml`](Self::from_toml)) —
+    /// back-compat lives at the parse layer; a supervisor that wants to allow un-pinned legacy apps
+    /// simply skips this check (or gates on [`self.runtime`](Self::runtime)`.is_some()`).
+    pub fn check_runtime(
+        &self,
+        platform: &PlatformContext,
+    ) -> Result<&RuntimeSection, Vec<Violation>> {
+        let rt = match &self.runtime {
+            Some(rt) => rt,
+            None => return Err(vec![Violation::MissingRuntime]),
+        };
+        let mut violations = Vec::new();
+        if !platform.family_matches(&rt.family) {
+            violations.push(Violation::FamilyMismatch {
+                app_family: rt.family.clone(),
+                platform_family: platform.family.clone(),
+            });
+        }
+        if !platform.offers_abi(&rt.abi) {
+            violations.push(Violation::UnsupportedAbi { abi: rt.abi.clone() });
+        }
+        if violations.is_empty() {
+            Ok(rt)
+        } else {
+            Err(violations)
+        }
+    }
+
     fn uses_iter(&self) -> Vec<String> {
         self.app.uses.clone()
     }
@@ -340,6 +494,7 @@ mod tests {
     fn manifest(uses: &[&str]) -> AppManifest {
         AppManifest {
             app: AppSection { id: "com.test.app".into(), uses: uses.iter().map(|s| s.to_string()).collect() },
+            runtime: None,
         }
     }
 
@@ -386,5 +541,115 @@ mod tests {
         for c in ["input", "entropy", "audio", "settings"] {
             assert!(v.allows(c));
         }
+    }
+
+    // --- [runtime] family/abi cooperative launch-time match (tsp-ziac.5) -------------------------
+
+    /// This Platform is the a133-powervr family, advertised (as the supervisor would derive it from
+    /// `platform/abi/families.toml`) with its accepted alias + the ABI versions it offers.
+    fn a133_platform() -> PlatformContext {
+        PlatformContext::from_toml(
+            "[platform]\n\
+             family = \"pocketforge/a133-powervr\"\n\
+             aliases = [\"pocketforge/sun50i-a133\"]\n\
+             supported-abi = [\"1\"]\n",
+        )
+        .expect("platform advertisement parses")
+    }
+
+    /// An `app.toml` carrying an `[app]` + `[runtime]` pin, parsed the same way the supervisor does.
+    fn app_with_runtime(family: &str, abi: &str) -> AppManifest {
+        AppManifest::from_toml(&format!(
+            "[app]\n\
+             id = \"com.test.app\"\n\
+             use = [\"input\"]\n\
+             [runtime]\n\
+             family = \"{family}\"\n\
+             abi = \"{abi}\"\n\
+             platform-version = \"1\"\n",
+        ))
+        .expect("app.toml with [runtime] parses")
+    }
+
+    #[test]
+    fn runtime_section_parses_all_fields() {
+        let m = app_with_runtime("pocketforge/a133-powervr", "1");
+        let rt = m.runtime.as_ref().expect("[runtime] present");
+        assert_eq!(rt.family, "pocketforge/a133-powervr");
+        assert_eq!(rt.abi, "1");
+        assert_eq!(rt.platform_version.as_deref(), Some("1"));
+    }
+
+    #[test]
+    fn back_compat_no_runtime_table_still_parses() {
+        // An app.toml written before the pin existed carries no [runtime]: parse succeeds, runtime None.
+        let m = AppManifest::from_toml("[app]\nid = \"com.legacy.app\"\nuse = [\"input\"]\n")
+            .expect("legacy app.toml parses");
+        assert!(m.runtime.is_none(), "missing [runtime] stays None (back-compat)");
+        // …but a launch that requires the pin gets MissingRuntime from check_runtime.
+        assert_eq!(
+            m.check_runtime(&a133_platform()).unwrap_err(),
+            vec![Violation::MissingRuntime]
+        );
+    }
+
+    #[test]
+    fn check_runtime_accepts_canonical_family_match() {
+        let m = app_with_runtime("pocketforge/a133-powervr", "1");
+        let rt = m.check_runtime(&a133_platform()).expect("canonical family + offered abi accepted");
+        assert_eq!(rt.family, "pocketforge/a133-powervr");
+    }
+
+    #[test]
+    fn check_runtime_accepts_alias_family_match() {
+        // An app that pinned the E2 draft SoC-only id resolves against the Platform's accepted alias.
+        let m = app_with_runtime("pocketforge/sun50i-a133", "1");
+        m.check_runtime(&a133_platform()).expect("alias family accepted");
+    }
+
+    #[test]
+    fn check_runtime_rejects_family_mismatch() {
+        // A build for the OTHER SoC family (different kernel/GPU/SDL) is rejected on this Platform.
+        let m = app_with_runtime("pocketforge/a523-mali", "1");
+        assert_eq!(
+            m.check_runtime(&a133_platform()).unwrap_err(),
+            vec![Violation::FamilyMismatch {
+                app_family: "pocketforge/a523-mali".into(),
+                platform_family: "pocketforge/a133-powervr".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn check_runtime_rejects_unsupported_abi() {
+        // Right family, but an ABI version this Platform does not offer.
+        let m = app_with_runtime("pocketforge/a133-powervr", "2");
+        assert_eq!(
+            m.check_runtime(&a133_platform()).unwrap_err(),
+            vec![Violation::UnsupportedAbi { abi: "2".into() }]
+        );
+    }
+
+    #[test]
+    fn check_runtime_reports_both_family_and_abi_violations() {
+        // Wrong family AND unoffered abi → BOTH violations collected (not just the first).
+        let m = app_with_runtime("pocketforge/a523-mali", "9");
+        let errs = m.check_runtime(&a133_platform()).unwrap_err();
+        assert!(errs.contains(&Violation::FamilyMismatch {
+            app_family: "pocketforge/a523-mali".into(),
+            platform_family: "pocketforge/a133-powervr".into(),
+        }));
+        assert!(errs.contains(&Violation::UnsupportedAbi { abi: "9".into() }));
+    }
+
+    #[test]
+    fn platform_context_loads_from_config_not_a_hardcoded_registry() {
+        // The family-advertisement source is device/platform config (parsed here), NOT Rust constants.
+        let p = a133_platform();
+        assert!(p.family_matches("pocketforge/a133-powervr"));
+        assert!(p.family_matches("pocketforge/sun50i-a133"), "alias resolves");
+        assert!(!p.family_matches("pocketforge/a523-mali"));
+        assert!(p.offers_abi("1"));
+        assert!(!p.offers_abi("2"));
     }
 }

@@ -37,7 +37,8 @@ pub use consent::{
 };
 pub use enforce::EnforcingBackend;
 pub use manifest::{
-    AppManifest, AppSection, BlessedRegistration, LaunchTrust, UseEntry, ValidatedManifest, Violation,
+    AppManifest, AppSection, BlessedRegistration, LaunchTrust, PlatformContext, RuntimeSection,
+    UseEntry, ValidatedManifest, Violation,
 };
 pub use serve::{peer_cred, serve_enforcing, serve_enforcing_until, PeerCred};
 pub use tier::{tier_of, Tier};
