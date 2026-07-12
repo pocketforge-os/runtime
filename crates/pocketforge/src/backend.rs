@@ -13,6 +13,7 @@
 //! ([`acquire_decision`], [`query_decision`], …) so both the in-process backend AND the
 //! reference server compute identically — the swap cannot drift in behavior.
 
+use std::os::fd::OwnedFd;
 use std::sync::mpsc::Receiver;
 
 use crate::error::{CapError, PermissionState};
@@ -109,6 +110,28 @@ pub trait Backend: Send + Sync {
     /// Acquire arbitration: `Ok` if granted, else the four-way taxonomy. (Cosmetic no-op caps
     /// — rumble/leds — are resolved at the capability layer and do not call this.)
     fn acquire(&self, name: &str) -> Result<(), CapError>;
+
+    /// Acquire the **input event fd** the facade owns — the hot-path handoff (`tsp-e1b.10`).
+    ///
+    /// This is the fd-returning shape SPIKE-1 mandated for input (never per-event RPC, see
+    /// `wire/WIRE-PROTOCOL.md` §5): the caller `read()`s `EV_KEY`/`EV_ABS`/`EV_SYN`
+    /// `input_event` records straight off the returned descriptor. The fd is gated exactly like
+    /// [`Backend::acquire`]`("input")` — presence + policy first — so a hardware-absent or
+    /// policy-blocked input surfaces as the four-way [`CapError`], never an ambient `/dev` open.
+    ///
+    /// * [`crate::backends::InProcessBackend`] returns the platform-provided, descriptor-matched
+    ///   evdev node (never app-scanned — the sim/broker hands the node path in via
+    ///   `PF_INPUT_NODE`; the app reads the SAME synth `uinput` node the E5 sim exposes).
+    /// * [`crate::backends::BrokerClientBackend`] returns the `EVIOCGRAB`-grabbed re-emit fd the
+    ///   broker hands over via `SCM_RIGHTS` on the acquire socket (`Acquire("input")`, wire §4.1
+    ///   — no new `Op`; the fd rides as ancillary data).
+    ///
+    /// The default is `Unsupported` so a backend without a real input fd path (e.g. the
+    /// enforcing-broker wrapper, whose on-device fd-routing is device-gated `.3`/C8) stays honest
+    /// rather than fabricating one — R-A: name the gap, do not fake it.
+    fn acquire_input_fd(&self) -> Result<OwnedFd, CapError> {
+        Err(CapError::Unsupported)
+    }
     /// Pulse the rumble actuator for `ms` ms — the unified no-op shape (never fails).
     fn rumble_pulse(&self, ms: u32) -> RumbleStatus;
     /// Read the current IMU pose, or `HardwareAbsent` if the descriptor has no IMU.

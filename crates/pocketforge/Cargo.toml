@@ -16,3 +16,13 @@ pf-wire = { workspace = true }
 pf-prefs = { workspace = true }
 serde = { workspace = true }
 toml = { workspace = true }
+# libc: the input fd-handoff path (tsp-e1b.10) needs raw syscalls — open() the platform-provided
+# evdev node (in-process backend) and recvmsg() the SCM_RIGHTS fd off the acquire socket (broker
+# client). This is the one place in the facade where the fd, not a value, crosses the boundary;
+# libc gives the correct msghdr/cmsg layouts + O_* flags. The rest of the facade stays value-only.
+libc = { workspace = true }
+
+[dev-dependencies]
+# The input-fd integration tests build FIFO/socketpair fixtures + input_event records with the
+# same raw syscalls (an integration test is a separate crate and needs its own libc).
+libc = { workspace = true }

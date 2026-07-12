@@ -27,9 +27,12 @@ surfaces). Frozen values:
   (varint + len-delimited), unknown fields skipped.
 - **Pose payload:** exactly 9× IEEE-754 `binary64` little-endian = 72 bytes, order
   `yaw,pitch,roll,x,y,z,wx,wy,wz`.
-- **C symbols (12):** `pf_connect`, `pf_connect_descriptor`, `pf_free`, `pf_has_capability`,
-  `pf_is_present`, `pf_is_granted`, `pf_query`, `pf_acquire`, `pf_rumble_pulse`,
-  `pf_entropy_fill`, `pf_wire_version`, `pf_strerror` (full list: `abi/libpocketforge.v1.abi`).
+- **C symbols (13):** `pf_connect`, `pf_connect_descriptor`, `pf_free`, `pf_has_capability`,
+  `pf_is_present`, `pf_is_granted`, `pf_query`, `pf_acquire`, `pf_acquire_input_fd`,
+  `pf_rumble_pulse`, `pf_entropy_fill`, `pf_wire_version`, `pf_strerror` (full list:
+  `abi/libpocketforge.v1.abi`). `pf_acquire_input_fd` was ADDED additively (`tsp-e1b.10`, the
+  input event fd handoff) — a new symbol, so soname + `WIRE_VERSION` are UNCHANGED and no `Op`
+  was added (the broker path reuses `Acquire("input")` + `SCM_RIGHTS`, wire §4.1).
 
 ## 2. Compatibility rules (semver of the contract)
 

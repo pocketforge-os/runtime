@@ -168,6 +168,19 @@ impl Pf {
         self.backend.query(C::NAME)
     }
 
+    /// Acquire the **input event fd** — the SPIKE-1 shared-fd hot path (`tsp-e1b.10`). The app
+    /// `read()`s `input_event` records (`EV_KEY`/`EV_ABS`/`EV_SYN`) straight off the returned
+    /// [`OwnedFd`], never per-event RPC (`wire/WIRE-PROTOCOL.md` §5). It is gated exactly like
+    /// [`Pf::acquire::<Input>`](Pf::acquire) — presence + policy first — so a hardware-absent or
+    /// policy-blocked input returns the four-way [`CapError`], never an ambient `/dev` open. The
+    /// backend decides WHERE the fd comes from (the in-process node open vs the broker's
+    /// `SCM_RIGHTS` handoff), so the backend swap holds for the fd path too. This is the fd the C
+    /// ABI's `pf_acquire_input_fd` returns; [`crate::InputHandle::acquire_fd`] is the same fd off
+    /// an already-acquired handle.
+    pub fn acquire_input_fd(&self) -> Result<std::os::fd::OwnedFd, CapError> {
+        self.backend.acquire_input_fd()
+    }
+
     /// Two-stage detection: API-present (the type is compiled in) vs hardware-present.
     pub fn has_capability<C: Capability>(&self) -> CapabilityPresence {
         CapabilityPresence { api: true, hardware: self.backend.is_present(C::NAME) }

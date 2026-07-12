@@ -7,6 +7,7 @@
 #
 # `abi/check-abi.sh` asserts every symbol here is still exported by the built libpocketforge.so.
 pf_acquire
+pf_acquire_input_fd
 pf_connect
 pf_connect_descriptor
 pf_entropy_fill
