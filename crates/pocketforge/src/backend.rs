@@ -13,8 +13,15 @@
 //! ([`acquire_decision`], [`query_decision`], …) so both the in-process backend AND the
 //! reference server compute identically — the swap cannot drift in behavior.
 
+use std::sync::mpsc::Receiver;
+
 use crate::error::{CapError, PermissionState};
 pub use pf_wire::RumbleStatus;
+
+// Re-export the preference value type so the observer payload has one definition (the E4 data
+// layer's), and callers of `subscribe_preference` / `preference_scalar` do not reach into
+// `pf_prefs` directly through the facade.
+pub use pf_prefs::PrefValue;
 
 /// A rigid-body pose in human/UI units (degrees, deg/s) — the shape `set_pose`/`get_pose`
 /// exchange. (The full integrating physical model from the sim's `physical_model.py` lands in
@@ -118,6 +125,27 @@ pub trait Backend: Send + Sync {
     fn preference_bool(&self, name: &str, default: bool) -> bool;
     /// Set an accessibility/user preference bool (fires the query() change-event where relevant).
     fn set_preference_bool(&self, name: &str, value: bool);
+
+    /// Read an accessibility/user preference SCALAR (E4; `brightness` today), or `default` if the
+    /// backend has no store-backed value. Defaulted so a backend without scalar preferences (the
+    /// v0 broker client, which has no preference wire op yet) stays honest — it returns the
+    /// caller's default rather than fabricating one. The in-process backend overrides this to read
+    /// the persistent store; `EnforcingBackend` delegates to its inner backend.
+    fn preference_scalar(&self, name: &str, default: i64) -> i64 {
+        let _ = name;
+        default
+    }
+
+    /// Subscribe to `PrefsDidChange` for a preference `name`, mirroring the query() change-event
+    /// shape ([`crate::backends::InProcessBackend::subscribe`]). Returns `Some(Receiver)` on a
+    /// backend that can observe preferences in-process (the v0 in-process backend) and `None` on
+    /// one that cannot yet (the broker client — preferences are not a wire op in v0; R-A honesty:
+    /// name the gap, do not fake an observer that never fires). The receiver yields the new
+    /// effective [`PrefValue`] on every write path (CLI reload, control plane, future UI).
+    fn subscribe_preference(&self, name: &str) -> Option<Receiver<PrefValue>> {
+        let _ = name;
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------

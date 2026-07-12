@@ -29,9 +29,10 @@
 
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::Receiver;
 use std::sync::Arc;
 
-use pocketforge::backend::{Backend, Pose, RumbleStatus};
+use pocketforge::backend::{Backend, Pose, PrefValue, RumbleStatus};
 use pocketforge::backends::InProcessBackend;
 use pocketforge::error::{CapError, PermissionState};
 use pocketforge::QuotaLedger;
@@ -388,10 +389,23 @@ impl Backend for EnforcingBackend {
 
     fn preference_bool(&self, name: &str, default: bool) -> bool {
         // Accessibility/user preferences (E4) are user-owned, not app authority — pass through.
+        // The store is loaded ONCE, by the inner in-process backend; the enforcing wrapper adds no
+        // second source of truth (owner-ratified single-load-point, 2026-07-11).
         self.inner.preference_bool(name, default)
     }
 
     fn set_preference_bool(&self, name: &str, value: bool) {
         self.inner.set_preference_bool(name, value);
+    }
+
+    fn preference_scalar(&self, name: &str, default: i64) -> i64 {
+        // E4 scalar preference (`brightness`) — user-owned; delegate to the store-backed inner.
+        self.inner.preference_scalar(name, default)
+    }
+
+    fn subscribe_preference(&self, name: &str) -> Option<Receiver<PrefValue>> {
+        // Delegate the PrefsDidChange observer to the inner backend (the in-process store owner);
+        // an inner that cannot observe (broker client) returns None, and so do we — honestly.
+        self.inner.subscribe_preference(name)
     }
 }

@@ -13,5 +13,6 @@ name = "pocketforge"
 
 [dependencies]
 pf-wire = { workspace = true }
+pf-prefs = { workspace = true }
 serde = { workspace = true }
 toml = { workspace = true }
