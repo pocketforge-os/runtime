@@ -1,0 +1,103 @@
+{
+  "generated_at": 1783816028,
+  "writes": [
+    {
+      "scenario": "s03-a523-toggle-haptics-off",
+      "profile": "a523",
+      "key": "hapticsEnabled",
+      "value": false,
+      "via": "A-toggle"
+    },
+    {
+      "scenario": "s04-a523-toggle-reduce-motion-on",
+      "profile": "a523",
+      "key": "reduceMotion",
+      "value": true,
+      "via": "A-toggle"
+    },
+    {
+      "scenario": "s05-a523-toggle-mono-on",
+      "profile": "a523",
+      "key": "monoAudio",
+      "value": true,
+      "via": "A-toggle"
+    },
+    {
+      "scenario": "s07-a523-brightness-down",
+      "profile": "a523",
+      "key": "brightness",
+      "value": 90,
+      "via": "LR-adjust"
+    },
+    {
+      "scenario": "s07-a523-brightness-down",
+      "profile": "a523",
+      "key": "brightness",
+      "value": 80,
+      "via": "LR-adjust"
+    },
+    {
+      "scenario": "s07-a523-brightness-down",
+      "profile": "a523",
+      "key": "brightness",
+      "value": 70,
+      "via": "LR-adjust"
+    },
+    {
+      "scenario": "s07-a523-brightness-down",
+      "profile": "a523",
+      "key": "brightness",
+      "value": 60,
+      "via": "LR-adjust"
+    },
+    {
+      "scenario": "s07-a523-brightness-down",
+      "profile": "a523",
+      "key": "brightness",
+      "value": 50,
+      "via": "LR-adjust"
+    },
+    {
+      "scenario": "s07-a523-brightness-down",
+      "profile": "a523",
+      "key": "brightness",
+      "value": 40,
+      "via": "LR-adjust"
+    },
+    {
+      "scenario": "s12-a523-back-then-noop",
+      "profile": "a523",
+      "key": "monoAudio",
+      "value": true,
+      "via": "A-toggle"
+    },
+    {
+      "scenario": "s15-a133-toggle-mono-on",
+      "profile": "a133",
+      "key": "monoAudio",
+      "value": true,
+      "via": "A-toggle"
+    },
+    {
+      "scenario": "s16-a133-brightness-down",
+      "profile": "a133",
+      "key": "brightness",
+      "value": 90,
+      "via": "LR-adjust"
+    },
+    {
+      "scenario": "s16-a133-brightness-down",
+      "profile": "a133",
+      "key": "brightness",
+      "value": 80,
+      "via": "LR-adjust"
+    },
+    {
+      "scenario": "s16-a133-brightness-down",
+      "profile": "a133",
+      "key": "brightness",
+      "value": 70,
+      "via": "LR-adjust"
+    }
+  ]
+}

@@ -1,0 +1,26 @@
+# tsp-xubv.3 settings-UI liveness harness — a DETACHED spike crate.
+#
+# This is deliberately NOT a member of the runtime workspace: the empty
+# `[workspace]` table below makes it its own workspace root, so building it
+# touches ZERO existing files (no root Cargo.toml / Cargo.lock churn) — honoring
+# this bead's "new files under spikes/settings-ui/ only" surface. It path-depends
+# on the already-merged .1 store + .2 observer crates and drives them through
+# their PUBLIC API only (no wire/ABI touch; STABILITY.md frozen-v1 respected).
+[workspace]
+
+[package]
+name = "settings-ui-liveness"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "settings-ui-liveness"
+path = "src/main.rs"
+
+[dependencies]
+# The merged E4 store (.1) + facade/observer (.2). Paths reach up out of the spike
+# into the workspace crates; cargo resolves their own workspace inheritance against
+# the runtime root, which is fine for a path dep from a detached crate.
+pf-prefs = { path = "../../../crates/pf-prefs" }
+pocketforge = { path = "../../../crates/pocketforge" }
