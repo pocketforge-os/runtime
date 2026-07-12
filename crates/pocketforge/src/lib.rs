@@ -51,7 +51,7 @@ pub mod server;
 
 use std::sync::Arc;
 
-pub use backend::{Backend, Pose, PoseDelta, RumbleStatus};
+pub use backend::{Backend, Pose, PoseDelta, PrefValue, RumbleStatus};
 pub use capability::{
     Accelerometer, Audio, AudioHandle, Capability, CapabilityPresence, Entropy, EntropyHandle,
     Gyroscope, Imu, Input, InputHandle, Leds, LedsHandle, Location, LocationHandle, Magnetometer,
@@ -62,6 +62,7 @@ pub use error::{CapError, ConnectError, PermissionState};
 pub use input::{InputAction, InputMap};
 pub use managers::{
     AudioManager, AudioSink, DescriptorTrustProbe, EgressManager, EgressReceipt, EntropyManager,
+    OutputMix,
     Fix, HardwareProbe, InputManager, LiveProbe, LocationManager, QuotaLedger, SensorManager,
     SettingsManager, VibrationManager,
 };
@@ -246,7 +247,12 @@ pub fn connect() -> Result<Pf, ConnectError> {
     if let Some(sock) = std::env::var_os("PF_BROKER_SOCK") {
         Pf::via_broker(d, sock)
     } else {
-        let backend = backends::InProcessBackend::shared(d.clone());
+        // Production in-process wiring attaches the PERSISTENT preference store (honoring
+        // `$PF_PREFS_DIR`), so a `pf-settings` flip persists across sessions and is honored at the
+        // primitive. Tests/examples that need a store-less or scratch-dir backend construct
+        // `InProcessBackend::{shared, shared_with_store}` directly.
+        let store = Arc::new(pf_prefs::PrefsStore::open_default());
+        let backend = backends::InProcessBackend::shared_with_store(d.clone(), store);
         Ok(Pf::from_parts(d, backend))
     }
 }

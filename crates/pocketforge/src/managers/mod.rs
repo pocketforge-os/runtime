@@ -33,7 +33,7 @@ pub mod sensors;
 pub mod settings;
 pub mod vibration;
 
-pub use audio::{AudioManager, AudioSink};
+pub use audio::{AudioManager, AudioSink, OutputMix};
 pub use egress::{EgressAccounting, EgressManager, EgressReceipt};
 pub use egress_log::{EgressEvent, EgressEventKind, EgressLog, EgressLogError};
 pub use entropy::EntropyManager;

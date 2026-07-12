@@ -3,6 +3,15 @@
 //! routing is the flash→serial HARDWARE GATE's authority. Routing state is stored through the
 //! backend's cooperative capability store under `"audio"`, so it observes the SAME value over the
 //! in-process and broker backends (the swap holds).
+//!
+//! ## `monoAudio` (E4) — honored on the routing layer
+//!
+//! The `monoAudio` accessibility preference is honored HERE, at the routing layer: when the user
+//! enables it, [`output_mix`](AudioManager::output_mix) reports [`OutputMix::Mono`], the
+//! **sim-visible semantic** an app (or the sim's control surface / a future mixer) reads to render
+//! single-channel output. The real on-device DSP/ALSA channel down-mix is post-v0 and
+//! hardware-gated — v0 proves the preference is read at the primitive and flips the routing-layer
+//! contract, not that silicon mixes channels (R-A honesty). See `docs/PREFERENCES.md`.
 
 use std::sync::Arc;
 
@@ -16,6 +25,17 @@ pub enum AudioSink {
     Speaker,
     /// 3.5 mm / USB-C headphone out.
     Headphone,
+}
+
+/// The channel mix the routing layer presents, driven by the `monoAudio` accessibility preference.
+/// v0 semantic only (what a cooperative renderer/mixer honors); the real DSP down-mix is
+/// hardware-gated (see the module docs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputMix {
+    /// Normal stereo output (`monoAudio` off).
+    Stereo,
+    /// Down-mixed to a single channel for single-ear / hearing accessibility (`monoAudio` on).
+    Mono,
 }
 
 impl AudioSink {
@@ -63,5 +83,22 @@ impl AudioManager {
     /// Route output to `sink` (cooperative; the real mixer change is hardware-gated).
     pub fn route(&self, sink: AudioSink) -> Result<(), CapError> {
         self.backend.set_capability("audio", sink.as_str().as_bytes())
+    }
+
+    /// Whether the `monoAudio` accessibility preference (E4) is enabled — read at the primitive
+    /// from the backend's preference store.
+    pub fn mono_enabled(&self) -> bool {
+        self.backend.preference_bool("monoAudio", false)
+    }
+
+    /// The effective channel mix the routing layer presents, honoring `monoAudio` (E4). This is
+    /// the sim-visible semantic a cooperative renderer/mixer reads; the real DSP down-mix is
+    /// post-v0 + hardware-gated (see the module docs).
+    pub fn output_mix(&self) -> OutputMix {
+        if self.mono_enabled() {
+            OutputMix::Mono
+        } else {
+            OutputMix::Stereo
+        }
     }
 }
