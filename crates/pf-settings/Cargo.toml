@@ -14,3 +14,10 @@ path = "src/main.rs"
 
 [dependencies]
 pf-prefs = { workspace = true }
+
+# Dev-only: the sim end-to-end matrix (tsp-xubv.4) drives the built pf-settings binary as a REAL
+# external subprocess against a live `pocketforge` facade, so the tests need the facade crate. It
+# is NOT added to the shipped binary's dependency graph. No cycle: pocketforge does not depend on
+# pf-settings — only pf-settings depends on it, and only for tests.
+[dev-dependencies]
+pocketforge = { workspace = true }
