@@ -72,12 +72,20 @@ symbols. `frozen_contract.rs` FAILS on any enum renumber, `WIRE_VERSION`/`MAX_FR
 changed canonical message encoding. Together they make "never silently broken" a build gate, not a
 promise.
 
-## 5. Provenance gap (named, not papered over — R8)
+## 5. Provenance gap (named, not papered over — R8; PER-FAMILY as of E8 `tsp-ziac.1`)
 
-The contract above is frozen, but the **build provenance of the runtime/SDK is NOT yet
-reproducible-from-clean**. Today's interim flow (`sync-build-sources.sh` rsync of dirty working
-trees + `make build-image LOCAL_BLOBS=…`) is not a clean-room build, so a third party cannot yet
-rebuild a bit-identical Platform/SDK from committed sources alone. This is tracked in
-**`tsp-cv7.4.13`** (provenance gap), **`tsp-cv7.6`** / **`tsp-iby`** (one-command reproducible
-container-multistage build from pinned refs). Freezing the *contract* does not close that gap; an
-ABI-freeze claim must cite it. See `docs/RUNTIME-SDK-SPLIT.md` §4.
+The contract above is frozen; build provenance is **per-family**, not one blanket claim. The old
+"interim `sync-build-sources.sh` rsync of dirty working trees" flow this section once described is
+**RETIRED** — replaced by the hermetic `pf build` from committed `platform.lock` refs. The honest,
+current position:
+
+- **`pocketforge/a133-powervr`** — SHA-pinned **AND reproducible-from-clean** (`tsp-1dl.4.5`,
+  `tsp-cv7.6.1` closed): a third party CAN rebuild a bit-identical a133 Platform from committed
+  refs.
+- **`pocketforge/a523-mali`** — SHA-pinned, **NOT yet reproducible** (`tsp-jet` open; blob→IPFS
+  `tsp-iby` open; no owned a523 SDL fork yet). An ABI-freeze claim for a523 must cite this.
+
+Freezing the *contract* does not, by itself, make a given family's *build* reproducible. The
+authoritative per-family posture is machine-checked in the `platform` repo
+(`abi/platform-abi.json` `reproducible`/`lock_state`; `docs/PLATFORM-ABI-CONTRACT.md` §5). See
+`docs/RUNTIME-SDK-SPLIT.md` §4 and the `mission-control` repo's `.claude/rules/provenance.md`.
