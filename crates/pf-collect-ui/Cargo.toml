@@ -1,0 +1,38 @@
+[package]
+name = "pf-collect-ui"
+description = "Guided-collection on-panel UI (tsp-bwrg.3): the on-device front end that drives the headless pf-input-collect engine (tsp-bwrg.2). It renders a canonical gamepad FACE on the device's own screen, highlights the control the engine is prompting for, shows the prompt text + progress, and drives the engine (record/commit/advance/back/emit) from on-panel input. Renders through a backend-agnostic Canvas: the SAME draw code blits to /dev/fb0 on-device (libc-only, static aarch64-musl, single OTA binary — no SDL/PowerVR, so it runs during bring-up before the GPU stack and sidesteps tsp-osr) and dumps a PPM off-device for headless /screen-check render validation. SDL3 + the tsp-osr recipe-B is the documented fb-down fallback (see docs/RENDER_HOST_DECISION.md)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "pf-collect-ui"
+path = "src/bin/pf-collect-ui.rs"
+
+[lib]
+name = "pf_collect_ui"
+path = "src/lib.rs"
+
+[dependencies]
+# The headless collection engine (tsp-bwrg.2), linked IN-PROCESS. The UI owns the render loop and
+# the event pump and drives the engine's Collector state machine programmatically — exactly the
+# path pf_input_collect::collect documents for the on-panel UI.
+pf-input-collect = { path = "../pf-input-collect", version = "0.0.1" }
+# libc: the fbdev ioctls (FBIOGET_VSCREENINFO / FBIOGET_FSCREENINFO), mmap(2) for the framebuffer,
+# and the evdev read path shared with pf-input-collect's source. The ONE place raw syscalls are
+# unavoidable — same rationale as pf-input-broker / pf-hw-exerciser / pf-input-collect. No SDL,
+# no dynamic GPU deps: the on-panel binary is a single static aarch64-unknown-linux-musl artifact.
+libc = { workspace = true }
+# The FACE is the real device 3D model, CONSUMED from the platform .scad->skin chain (owner-directed
+# 2026-07-26; tsp-65jc.7-gated assets) — NOT hand-drawn and NOT re-generated here (one source of
+# truth). png/toml/serde are the standard tools to CONSUME those committed, drift-gated assets:
+#   png  — decode the gated skin PNGs (skins/<dev>/body.png, body_lit.png, body_*_top.png).
+#   toml/serde — parse the gated descriptor (devices/<dev>/capabilities.toml) for the [skin.parts]
+#   rects + [[inputs]] id->skin_part map, so rects are read, never hardcoded. All pure-Rust, so the
+#   binary stays a single static aarch64-musl artifact (no C, no GPU) — the tsp-osr sidestep holds.
+png = "0.17"
+toml = { workspace = true }
+serde = { workspace = true }
