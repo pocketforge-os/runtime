@@ -108,7 +108,10 @@ fn present<K: Sink>(sink: &mut K, canvas: &mut Canvas, skin: &SkinSet, collector
 fn relevant(kind: plan::Kind, e: &RawEvent) -> bool {
     match kind {
         plan::Kind::Button | plan::Kind::StickClick => e.ev_type == EV_KEY,
-        plan::Kind::Hat | plan::Kind::Stick | plan::Kind::Trigger => e.ev_type == EV_ABS,
+        plan::Kind::Hat | plan::Kind::Stick => e.ev_type == EV_ABS,
+        // A trigger may be analog (ABS_Z/RZ) OR a binary button (the a133 L2/R2 → BTN_TL2/BTN_TR2),
+        // so either an axis or a key press counts as activity — mirrors pf_input_collect::is_relevant.
+        plan::Kind::Trigger => e.ev_type == EV_ABS || e.ev_type == EV_KEY,
     }
 }
 
@@ -154,7 +157,10 @@ pub fn drive_live<S: EventSource, K: Sink>(
                 present(sink, &mut canvas, skin, &collector, StepView { active_id: Some(&spec.id), prompt: &spec.prompt, status: "CAPTURING...", done: false });
                 showed_capturing = true;
             }
-            if matches!(spec.kind, plan::Kind::Button | plan::Kind::StickClick)
+            // A button/click — and a trigger realized as a binary button (a133 L2/R2) — completes
+            // the instant a key-down is seen. A genuinely analog trigger emits no key, so its sweep
+            // is never short-circuited.
+            if matches!(spec.kind, plan::Kind::Button | plan::Kind::StickClick | plan::Kind::Trigger)
                 && buf.iter().any(|e| e.ev_type == EV_KEY && e.value == 1)
             {
                 break;
@@ -258,8 +264,9 @@ fn synth_events_for(id: &str) -> Vec<RawEvent> {
         ],
         "lstick" => stick(0x0, 0x1),
         "rstick" => stick(0x3, 0x4),
-        // Left trigger BINARY (endpoint-only jump) — the a133 L2/R2 quirk.
-        "ltrig" => vec![RawEvent::new(EV_ABS, 0x2, 0), RawEvent::new(EV_ABS, 0x2, 255)],
+        // Left trigger realized as a binary BUTTON — the real a133 L2/R2 shape (the MCU reports it
+        // as a bit; the decoder emits BTN_TL2). Exercises the button-trigger path on the panel.
+        "ltrig" => btn(0x138), // BTN_TL2
         // Right trigger ANALOG (intermediate travel) — shows the other classification.
         "rtrig" => vec![
             RawEvent::new(EV_ABS, 0x5, 0),

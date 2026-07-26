@@ -43,6 +43,13 @@ pub enum Recorded {
     Hat { x_code: u16, y_code: u16 },
     Stick { x_code: u16, x: AbsInfo, y_code: u16, y: AbsInfo },
     Trigger { code: u16, abs: AbsInfo, semantics: Semantics },
+    /// A trigger that manifests as a single EV_KEY button — a binary switch on the wire, never an
+    /// analog axis (the a133 L2/R2: the MCU reports them as a bit in the button bitmask, and the
+    /// decoder emits `BTN_TL2`/`BTN_TR2`, per `tsp-ozbp.2` + the owner-verified decoder output).
+    /// It is a `trigger` by intent but a button on the wire, so it emits an `EV_KEY` row carrying
+    /// `semantics="binary"` (the exact `kind=trigger` + button-code shape caps.py already maps to
+    /// SDL `lefttrigger`/`righttrigger`).
+    TriggerButton { code: u16 },
 }
 
 /// The result of committing the current control.
@@ -298,6 +305,20 @@ fn input_row(spec: &ControlSpec, rec: &Recorded) -> Result<emit::Input, CollectE
             x: None,
             y: None,
         },
+        Recorded::TriggerButton { code } => emit::Input {
+            id: spec.id.clone(),
+            // `kind` stays the control's INTENT (`trigger`); the EV_KEY code + `semantics=binary`
+            // record that this trigger is realized as a button on the wire. caps.py accepts a
+            // `kind=trigger` EV_KEY BTN_* row (SDL `lefttrigger:bN`) and keeps `semantics` valid
+            // (semantics is only meaningful on kind=trigger) — no analog `range` to emit.
+            kind: spec.kind.as_str().to_string(),
+            ev_type: "EV_KEY".to_string(),
+            code: codes::key_name(*code).ok_or_else(|| unknown_key(*code))?.to_string(),
+            semantics: Some(Semantics::Binary.as_str().to_string()),
+            range: None,
+            x: None,
+            y: None,
+        },
     })
 }
 
@@ -389,26 +410,47 @@ fn finalize(
             Ok(Recorded::Stick { x_code, x, y_code, y })
         }
         Kind::Trigger => {
+            // A trigger manifests one of two ways, and the a133 is the second:
+            //  (1) an ANALOG axis (`ABS_Z`/`ABS_RZ`) that travels to a full press — a genuine
+            //      proportional trigger (or an analog-wire switch that only hits its endpoints); or
+            //  (2) a single EV_KEY BUTTON (`BTN_TL2`/`BTN_TR2`) — the a133 L2/R2, which the MCU
+            //      reports as a binary bit and the decoder emits as a button (tsp-ozbp.2 + the
+            //      owner-verified decoder output). There is NO analog value on the wire for it.
+            // Prefer an axis ONLY if one actually reached a full press; otherwise a resting
+            // neighbour axis (e.g. the same-side stick still streaming its centre value while the
+            // owner squeezes the trigger) must NOT be mistaken for the trigger — fall back to the
+            // key. This ordering is what makes case (2) robust against live stick crosstalk.
+            let key_down = events
+                .iter()
+                .find(|e| e.ev_type == EV_KEY && e.value == 1)
+                .map(|e| e.code);
             let axes = distinct_abs_codes(events);
+            if !axes.is_empty() {
+                let code = rank_axes_by_span(events, &axes)[0];
+                let abs = src.absinfo(code).map_err(|e| CollectError::AbsInfo { code, source: e })?;
+                let vals: Vec<i32> =
+                    events.iter().filter(|e| e.ev_type == EV_ABS && e.code == code).map(|e| e.value).collect();
+                let obs = observe_axis(&vals, &abs);
+                let span = (abs.max - abs.min).max(1);
+                let reached_press = obs.max >= abs.max - (span / 16).max(1);
+                if reached_press {
+                    let semantics =
+                        if obs.visited_intermediate { Semantics::Analog } else { Semantics::Binary };
+                    return Ok(Recorded::Trigger { code, abs, semantics });
+                }
+                // Axis activity but no real press → not the trigger axis (crosstalk). Fall through.
+            }
+            // Case (2): a binary trigger realized as a button.
+            if let Some(code) = key_down {
+                return Ok(Recorded::TriggerButton { code });
+            }
             if axes.is_empty() {
                 return Err(CollectError::NoActivity { id: spec.id.clone() });
             }
-            // The most-active axis is the trigger.
-            let code = rank_axes_by_span(events, &axes)[0];
-            let abs = src.absinfo(code).map_err(|e| CollectError::AbsInfo { code, source: e })?;
-            let vals: Vec<i32> = events.iter().filter(|e| e.ev_type == EV_ABS && e.code == code).map(|e| e.value).collect();
-            let obs = observe_axis(&vals, &abs);
-            // Require a real actuation: at least one value near the top of the declared range.
-            let span = (abs.max - abs.min).max(1);
-            let reached_press = obs.max >= abs.max - (span / 16).max(1);
-            if !reached_press {
-                return Err(CollectError::Incomplete {
-                    id: spec.id.clone(),
-                    reason: "trigger never reached a full press — squeeze it fully".to_string(),
-                });
-            }
-            let semantics = if obs.visited_intermediate { Semantics::Analog } else { Semantics::Binary };
-            Ok(Recorded::Trigger { code, abs, semantics })
+            Err(CollectError::Incomplete {
+                id: spec.id.clone(),
+                reason: "trigger never reached a full press — squeeze it fully".to_string(),
+            })
         }
     }
 }
@@ -477,7 +519,10 @@ impl Default for RunConfig {
 fn is_relevant(kind: Kind, e: &RawEvent) -> bool {
     match kind {
         Kind::Button | Kind::StickClick => e.ev_type == EV_KEY,
-        Kind::Hat | Kind::Stick | Kind::Trigger => e.ev_type == EV_ABS,
+        Kind::Hat | Kind::Stick => e.ev_type == EV_ABS,
+        // A trigger may be an analog axis OR a binary button (a133 L2/R2 → BTN_TL2/BTN_TR2), so
+        // EITHER an axis OR a key press counts as activity for it.
+        Kind::Trigger => e.ev_type == EV_ABS || e.ev_type == EV_KEY,
     }
 }
 
@@ -508,8 +553,10 @@ fn pump<S: EventSource>(src: &mut S, spec: &ControlSpec, cfg: &RunConfig) -> io:
             }
             buf.push(e);
         }
-        // A button/click completes the instant a key-down is seen.
-        if matches!(spec.kind, Kind::Button | Kind::StickClick)
+        // A button/click completes the instant a key-down is seen — and so does a trigger that
+        // turns out to be a binary button (the a133 L2/R2 → BTN_TL2/BTN_TR2). A genuinely analog
+        // trigger emits no key, so this never short-circuits its sweep.
+        if matches!(spec.kind, Kind::Button | Kind::StickClick | Kind::Trigger)
             && buf.iter().any(|e| e.ev_type == EV_KEY && e.value == 1)
         {
             break;
@@ -558,6 +605,10 @@ fn describe(rec: &Recorded) -> String {
         Recorded::Trigger { code, abs, semantics } => format!(
             "trigger {} [{}..{}] semantics={}",
             codes::abs_name(*code).unwrap_or("?"), abs.min, abs.max, semantics.as_str()
+        ),
+        Recorded::TriggerButton { code } => format!(
+            "trigger {} (button, semantics=binary)",
+            codes::key_name(*code).unwrap_or("?")
         ),
     }
 }

@@ -1,11 +1,15 @@
 //! Acceptance test for the guided-collection engine (`tsp-bwrg.2`).
 //!
-//! Feeds the engine a SYNTHETIC a133-shaped decoded-evdev stream (no kernel, no `/dev/uinput`,
-//! CI-safe), runs the full prompt sequence headlessly via `collect::run`, and asserts:
-//!   1. the emitted `[[inputs]]` rows match the a133 ground-truth code map
-//!      (`platform/devices/a133/capabilities.toml` / the `tsp-ozbp.2` map);
-//!   2. the L2/R2 triggers are classified `semantics="binary"` from OBSERVED endpoint-only
-//!      behaviour (the a133 quirk);
+//! Feeds the engine a SYNTHETIC a133-shaped decoded-evdev stream that mirrors the REAL decoder
+//! output (`pf-input-decode`, `tsp-ozbp.9`) — no kernel, no `/dev/uinput`, CI-safe — runs the full
+//! prompt sequence headlessly via `collect::run`, and asserts:
+//!   1. the emitted `[[inputs]]` rows match the a133 ground-truth code map — the `tsp-ozbp.2` UART
+//!      decode + the owner-verified frozen evdev baseline (17/17), i.e. the DECODER's real output.
+//!      (Note: `platform/devices/a133/capabilities.toml` still models L2/R2 as `ABS_Z`/`ABS_RZ`
+//!      analog axes — stale vs the decoder's button output; that descriptor correction is
+//!      tsp-e1b-coord's lane, see the tsp-bwrg.6 validation report.)
+//!   2. the L2/R2 triggers are BINARY triggers realized as BUTTONS (`BTN_TL2`/`BTN_TR2`,
+//!      `semantics="binary"`) — the a133 MCU reports them as bits in the button bitmask;
 //!   3. stick axis ranges + the derived SDL GUID + identity match;
 //!   4. (when a `platform` checkout is discoverable) the emitted candidate PASSES the real
 //!      `platform/core/caps.py validate` — in a self-contained temp tree, so it neither needs
@@ -30,6 +34,8 @@ const BTN_START: u16 = 0x13b;
 const BTN_MODE: u16 = 0x13c;
 const BTN_TL: u16 = 0x136;
 const BTN_TR: u16 = 0x137;
+const BTN_TL2: u16 = 0x138; // L2 — the a133 left trigger, emitted as a BUTTON by the decoder
+const BTN_TR2: u16 = 0x139; // R2 — the a133 right trigger, emitted as a BUTTON by the decoder
 const ABS_X: u16 = 0x00;
 const ABS_Y: u16 = 0x01;
 const ABS_Z: u16 = 0x02;
@@ -59,13 +65,14 @@ fn a133_source() -> ScriptedSource {
         pid: 0x028e, // Xbox 360 wired
         version: 0x0110,
     };
+    // The real a133 decoder (pf-input-decode, tsp-ozbp.9) advertises ONLY these axes — the two
+    // sticks + the dpad hat. It does NOT advertise ABS_Z/ABS_RZ: L2/R2 come over the UART as
+    // BINARY BITS in the button bitmask and are emitted as BTN_TL2/BTN_TR2 buttons, never axes.
     let mut s = ScriptedSource::new(ident)
         .with_abs(ABS_X, STICK)
         .with_abs(ABS_Y, STICK)
         .with_abs(ABS_RX, STICK)
-        .with_abs(ABS_RY, STICK)
-        .with_abs(ABS_Z, TRIG)
-        .with_abs(ABS_RZ, TRIG);
+        .with_abs(ABS_RY, STICK);
 
     // Buttons complete on key-down, so a single batch each; no separator needed.
     for code in [BTN_A, BTN_B, BTN_X, BTN_Y, BTN_SELECT, BTN_START, BTN_MODE, BTN_TL, BTN_TR] {
@@ -104,15 +111,12 @@ fn a133_source() -> ScriptedSource {
         s.push_batch(vec![]);
     }
 
-    // ltrig — ENDPOINT-ONLY (binary switch on an analog wire): only 0 and 255; settle.
-    s.push_batch(vec![abs(ABS_Z, 0), abs(ABS_Z, 255), abs(ABS_Z, 0), abs(ABS_Z, 255), abs(ABS_Z, 0)]);
-    s.push_batch(vec![]);
-    s.push_batch(vec![]);
+    // ltrig — a BINARY trigger realized as a BUTTON: the a133 L2 fires BTN_TL2 (no analog axis).
+    // Completes on key-down, like the face buttons.
+    s.push_batch(vec![key(BTN_TL2, 1), key(BTN_TL2, 0)]);
 
-    // rtrig — endpoint-only; settle.
-    s.push_batch(vec![abs(ABS_RZ, 0), abs(ABS_RZ, 255), abs(ABS_RZ, 0)]);
-    s.push_batch(vec![]);
-    s.push_batch(vec![]);
+    // rtrig — R2 fires BTN_TR2.
+    s.push_batch(vec![key(BTN_TR2, 1), key(BTN_TR2, 0)]);
 
     s
 }
@@ -157,8 +161,11 @@ fn emitted_inputs_match_the_a133_ground_truth_code_map() {
         ("dpad", ("hat", "EV_ABS", "ABS_HAT0X,ABS_HAT0Y", None)),
         ("lstick", ("stick", "EV_ABS", "ABS_X,ABS_Y", None)),
         ("rstick", ("stick", "EV_ABS", "ABS_RX,ABS_RY", None)),
-        ("ltrig", ("trigger", "EV_ABS", "ABS_Z", Some("binary"))),
-        ("rtrig", ("trigger", "EV_ABS", "ABS_RZ", Some("binary"))),
+        // L2/R2: binary triggers realized as buttons — kind=trigger (intent), EV_KEY BTN_TL2/TR2
+        // (the decoder's real output), semantics=binary. This is the owner-verified reality
+        // (tsp-ozbp.2 + frozen evdev baseline 17/17), NOT the stale ABS_Z/RZ analog model.
+        ("ltrig", ("trigger", "EV_KEY", "BTN_TL2", Some("binary"))),
+        ("rtrig", ("trigger", "EV_KEY", "BTN_TR2", Some("binary"))),
     ]);
 
     let got: BTreeMap<String, (String, String, String, Option<String>)> = caps
@@ -203,10 +210,12 @@ fn identity_sdl_guid_and_stick_ranges_are_correct() {
     assert_eq!((x.min, x.max, x.fuzz, x.flat), (-32768, 32767, 16, 128));
     assert!(lstick.y.is_some());
 
-    // Trigger range is the analog wire range even though semantics=binary.
+    // The a133 trigger is a BUTTON on the wire (BTN_TL2), so it carries NO analog range — but it
+    // is still marked semantics=binary (a binary trigger realized as a button).
     let ltrig = caps.inputs.iter().find(|i| i.id == "ltrig").unwrap();
-    let r = ltrig.range.expect("ltrig has range");
-    assert_eq!((r.min, r.max), (0, 255));
+    assert_eq!(ltrig.ev_type, "EV_KEY");
+    assert_eq!(ltrig.code, "BTN_TL2");
+    assert!(ltrig.range.is_none(), "a button-realized trigger has no analog range");
     assert_eq!(ltrig.semantics.as_deref(), Some("binary"));
 }
 
