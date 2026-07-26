@@ -15,7 +15,7 @@ use pocketforge::descriptor::Descriptor;
 use crate::evdev::Evdev;
 use crate::ioc;
 use crate::policy::TokenBucket;
-use crate::remap::Remap;
+use crate::remap::{AbsAction, Remap};
 use crate::scm;
 use crate::uinput::Uinput;
 
@@ -99,8 +99,19 @@ impl InputBroker {
                 self.sink.emit(t, self.remap.remap_key(ev.code), ev.value)?;
                 emitted += 1;
             } else if t == ioc::EV_ABS && self.bucket.allow(now) {
-                self.sink.emit(t, ev.code, ev.value)?; // axes are already canonical
-                emitted += 1;
+                // Analog axes pass through; a physically-binary trigger (semantics="binary") is
+                // reclassified to an EV_KEY press/release on its canonical button (descriptor-driven).
+                match self.remap.classify_abs(ev.code, ev.value) {
+                    AbsAction::Passthrough => {
+                        self.sink.emit(t, ev.code, ev.value)?;
+                        emitted += 1;
+                    }
+                    AbsAction::Button { code, value } => {
+                        self.sink.emit(ioc::EV_KEY, code, value)?;
+                        emitted += 1;
+                    }
+                    AbsAction::None => {} // inside the hysteresis band / no state change — drop
+                }
             }
             // EV_KEY/EV_ABS over the rate-limit budget, and other types (FF, MSC, …), are dropped.
         }

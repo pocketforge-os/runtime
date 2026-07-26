@@ -130,11 +130,14 @@ skin_part = "stick_r"
 x = { min = -32768, max = 32767, fuzz = 16, flat = 128 }
 y = { min = -32768, max = 32767, fuzz = 16, flat = 128 }
 # Analog triggers (0..255; slider drawn above the trigger part — owner's UI).
+# PHYSICALLY BINARY despite the analog wire range (tsp-ozbp.2: byte2 bit held constant when
+# squeezed, no analog travel) → semantics="binary" makes the broker re-emit them as BUTTONS.
 [[inputs]]
 id = "ltrig"
 kind = "trigger"
 ev_type = "EV_ABS"
 code = "ABS_Z"
+semantics = "binary"
 ui = "slider_above"
 skin_part = "trig_l"
 range = { min = 0, max = 255, fuzz = 0, flat = 0 }
@@ -143,6 +146,7 @@ id = "rtrig"
 kind = "trigger"
 ev_type = "EV_ABS"
 code = "ABS_RZ"
+semantics = "binary"
 ui = "slider_above"
 skin_part = "trig_r"
 range = { min = 0, max = 255, fuzz = 0, flat = 0 }
