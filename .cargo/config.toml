@@ -1,0 +1,14 @@
+# Cargo build config for the runtime workspace (tsp-bwrg.8).
+#
+# Pin the linker for `aarch64-unknown-linux-musl` (the a133 static-binary
+# target used by pf-input-collect + pf-collect-ui + the device bench tools).
+# Without this, `cargo build --target aarch64-unknown-linux-musl` on a host
+# whose default `cc` cannot emit aarch64 objects fails at link with:
+#   /usr/bin/ld: crt1.o: Relocations in generic ELF (EM: 183)
+#   /usr/bin/ld: crt1.o: error adding symbols: file in wrong format
+# rust-lld ships with every rustup toolchain, so this needs no additional
+# host packages (no bootlin cross-gcc install), works on modelmaker AND on
+# a stock GitHub runner. Pass-through `-C linker-flavor=ld.lld` keeps rustc
+# from re-invoking `cc` as the driver.
+[target.aarch64-unknown-linux-musl]
+linker = "rust-lld"

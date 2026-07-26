@@ -1,0 +1,115 @@
+# Runtime test suite for the input bring-up app crates (tsp-bwrg.8).
+#
+# Runs the cargo tests for pf-input-collect and pf-collect-ui with a `platform`
+# checkout co-located and PF_PLATFORM_DIR set — so the tests that gate on real
+# platform assets ACTUALLY RUN in CI rather than skip. Silently-skipping
+# acceptance tests are the "passes tests while semantically wrong" failure
+# mode that tsp-bwrg.8 targets: pf-input-collect's
+# `candidate_passes_real_caps_py_validate_when_platform_available`
+# (validates the emitter's output against the real platform/core/caps.py) and
+# pf-collect-ui's `a133_real_skin` tests (proves the SkinSet::load fs+PNG+toml
+# path over the committed platform/skins/a133 + capabilities.toml [skin]
+# tables) both use the same `PF_PLATFORM_DIR` discovery.
+#
+# Also builds pf-input-collect + pf-collect-ui for aarch64-unknown-linux-musl
+# (the a133 static device target) without a per-invocation RUSTFLAGS override
+# — proving the workspace `.cargo/config.toml`'s rust-lld linker pin works
+# on a stock GitHub runner (the same fix that makes musl cross-builds work on
+# modelmaker and the Dell without a bootlin cross-gcc install).
+
+name: Runtime tests (input bring-up)
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'crates/pf-input-collect/**'
+      - 'crates/pf-collect-ui/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.cargo/config.toml'
+      - '.github/workflows/runtime-tests.yml'
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: runtime-tests-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: cargo test + musl cross-build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      # Runtime is the current PR's tree.
+      - name: Checkout runtime (this PR)
+        # SHA-pinned per the org action-pinning norm (matches prefs-e2e.yml).
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        with:
+          path: runtime
+
+      # Platform provides `core/caps.py` + `schemas/capabilities.schema.json`
+      # for the pf-input-collect caps.py-validate test AND the committed
+      # a133 skin assets (`devices/a133/capabilities.toml`,
+      # `skins/a133/*.png`) for the pf-collect-ui real-asset render test.
+      # Pinned to `main` deliberately: platform is a sibling repo whose
+      # committed a133 assets are the ground truth this runtime PR must be
+      # green against right now. A stale pin would defeat the test's
+      # regression-catching purpose (a platform schema shift that renamed
+      # a skin part IS what this test wakes up for).
+      - name: Checkout platform (sibling, main)
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        with:
+          repository: pocketforge-os/platform
+          ref: main
+          path: platform
+
+      - name: Install stable Rust toolchain + aarch64-musl target
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+          rustup target add aarch64-unknown-linux-musl
+          rustc --version
+          cargo --version
+
+      - name: Cache cargo registry + target
+        uses: actions/cache@1bd1e32a3bdc45362d1e726936510720a7c30a57  # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            runtime/target
+          key: runtime-tests-${{ runner.os }}-${{ hashFiles('runtime/Cargo.lock') }}
+          restore-keys: |
+            runtime-tests-${{ runner.os }}-
+
+      # PF_PLATFORM_DIR points at the sibling checkout. The tests fall back
+      # to a `../platform` sibling discovery too (see
+      # `discover_platform()` in both crates' test files) — setting the env
+      # explicitly is the belt-and-braces path so the acceptance tests
+      # cannot silently skip on a layout tweak.
+      - name: cargo test — pf-input-collect + pf-collect-ui (with PF_PLATFORM_DIR)
+        env:
+          PF_PLATFORM_DIR: ${{ github.workspace }}/platform
+        working-directory: runtime
+        run: |
+          cargo test -p pf-input-collect -p pf-collect-ui --tests --no-fail-fast -- --nocapture
+
+      # The point of the cross-build step: prove a plain `cargo build
+      # --target aarch64-unknown-linux-musl` links with NO per-invocation
+      # RUSTFLAGS override on a runner whose default `cc` cannot emit
+      # aarch64 objects. This wires the workspace .cargo/config.toml's
+      # linker pin end-to-end, so a future change that dropped or broke
+      # the config would turn this job red.
+      - name: cargo build — aarch64-unknown-linux-musl (no RUSTFLAGS)
+        working-directory: runtime
+        run: |
+          cargo build --target aarch64-unknown-linux-musl \
+            -p pf-input-collect --bin pf-input-collect
+          cargo build --target aarch64-unknown-linux-musl \
+            -p pf-collect-ui --bin pf-collect-ui
