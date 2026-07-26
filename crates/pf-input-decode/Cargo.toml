@@ -1,0 +1,27 @@
+[package]
+name = "pf-input-decode"
+description = "The A133 gamepad MCU decoder daemon (tsp-ozbp.9): reads the two RX-only UARTs the pad MCU streams (ttyS3 = right stick + buttons, ttyS4 = left stick + buttons + dpad + menu) at 19200 8N1, decodes the 8-byte `FF 01 <btn> Xhi Xlo Yhi Ylo FE` frames, and emits ONE standard evdev gamepad via /dev/uinput. It is the RAW-SOURCE layer beneath pf-input-broker: nothing in our owned image previously exposed a gamepad device at all. The frame scanner + control mapper are pure logic, unit-tested against synthetic frames with no kernel."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lib]
+name = "pf_input_decode"
+path = "src/lib.rs"
+
+[[bin]]
+name = "pf-input-decode"
+path = "src/bin/pf-input-decode.rs"
+
+[dependencies]
+# libc: the ONE place raw syscalls are unavoidable — the uinput ioctls (UI_SET_*/UI_DEV_CREATE),
+# input_event / uinput_user_dev struct layouts, and the termios setup for 19200 8N1 raw serial.
+# The ioctl table is carried self-contained (typed as libc::Ioctl, the pf-input-collect /
+# pf-hw-exerciser precedent) so this device binary cross-compiles cleanly to
+# aarch64-unknown-linux-musl (static) AND stays decoupled from in-flight pf-input-broker edits —
+# this crate sits BELOW pf-input-broker (it produces the evdev node the broker grabs), so it
+# deliberately takes no dependency on it.
+libc = { workspace = true }
