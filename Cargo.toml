@@ -11,6 +11,7 @@ members = [
     "crates/pf-prefs",
     "crates/pf-settings",
     "crates/pf-input-collect",
+    "crates/pf-input-decode",
 ]
 
 # Shared metadata for every crate in the runtime workspace (tsp-e1b.2 / E2).

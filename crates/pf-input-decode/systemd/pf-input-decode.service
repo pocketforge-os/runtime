@@ -1,0 +1,31 @@
+# pf-input-decode — the A133 gamepad MCU decoder daemon (tsp-ozbp.9).
+#
+# Presents the pad's two RX-only UARTs (ttyS3 right, ttyS4 left) as ONE standard evdev gamepad
+# via /dev/uinput, so the pad works from a cold boot with no manual setup and no vendor daemon.
+#
+# The image installs this unit and enables it (`systemctl enable pf-input-decode.service`), which
+# is what satisfies the bead's "survives a cold boot with no manual setup" gate. The pad MCU is
+# powered at boot by the committed DT gpio-hog (tsp-ozbp.8); the UARTs only stream once that has
+# landed, so a cold-boot device is present but silent until then — the decoder simply waits.
+
+[Unit]
+Description=PocketForge A133 gamepad MCU decoder (uinput)
+Documentation=https://github.com/pocketforge-os/runtime
+# The character devices must exist before we open them. On this kernel they are static nodes
+# available early; ordering after local-fs is sufficient. We do NOT touch event0/LRADC (VOL±).
+After=local-fs.target
+ConditionPathExists=/dev/uinput
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/pf-input-decode --right /dev/ttyS3 --left /dev/ttyS4
+# Reads two ttys + writes /dev/uinput; runs as root (the default on the image). If a dedicated
+# service user is ever introduced it needs read on the ttys and rw on /dev/uinput.
+Restart=on-failure
+RestartSec=2
+# The virtual device is destroyed on process exit (fd close), so a restart is clean.
+KillSignal=SIGTERM
+TimeoutStopSec=5
+
+[Install]
+WantedBy=multi-user.target
