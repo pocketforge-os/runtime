@@ -84,6 +84,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "pf-input-collect"
+version = "0.0.1"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "pf-prefs"
 version = "0.0.1"
 dependencies = [
@@ -96,6 +103,7 @@ name = "pf-settings"
 version = "0.0.1"
 dependencies = [
  "pf-prefs",
+ "pocketforge",
 ]
 
 [[package]]
@@ -106,6 +114,8 @@ version = "0.0.1"
 name = "pocketforge"
 version = "0.0.1"
 dependencies = [
+ "libc",
+ "pf-prefs",
  "pf-wire",
  "serde",
  "toml",
