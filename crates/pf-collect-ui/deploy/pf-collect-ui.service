@@ -1,0 +1,21 @@
+# PocketForge guided-collection on-panel UI (pf-collect-ui, tsp-bwrg.3).
+#
+# Installed by pf-app-deploy.sh --unit at /etc/systemd/system/pf-collect-ui.service.
+# /dev/fb0 is single-owner: starting this unit STOPS the sibling fb owner (the menu /
+# boot-animator) via Conflicts=, so the wizard can take the panel; systemctl start/stop is the
+# fb-ownership handoff. Default command runs the on-panel DEMO (a synthetic press per control,
+# needs no live pad — the tsp-bwrg.3 on-panel proof). For real collection, run pf-collect-ui
+# --mode live --source <node> ad-hoc, or drop in a unit override with the live args.
+[Unit]
+Description=PocketForge guided-collection on-panel UI (pf-collect-ui)
+Conflicts=pocketforge-menu.service
+After=pocketforge-menu.service
+
+[Service]
+Type=simple
+ExecStart=/opt/pocketforge/bin/pf-collect-ui --mode demo --fb /dev/fb0
+# The wizard owns the panel for its run; do not auto-restart into a loop.
+Restart=no
+
+[Install]
+WantedBy=multi-user.target
