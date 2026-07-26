@@ -26,3 +26,13 @@ pf-input-collect = { path = "../pf-input-collect", version = "0.0.1" }
 # unavoidable — same rationale as pf-input-broker / pf-hw-exerciser / pf-input-collect. No SDL,
 # no dynamic GPU deps: the on-panel binary is a single static aarch64-unknown-linux-musl artifact.
 libc = { workspace = true }
+# The FACE is the real device 3D model, CONSUMED from the platform .scad->skin chain (owner-directed
+# 2026-07-26; tsp-65jc.7-gated assets) — NOT hand-drawn and NOT re-generated here (one source of
+# truth). png/toml/serde are the standard tools to CONSUME those committed, drift-gated assets:
+#   png  — decode the gated skin PNGs (skins/<dev>/body.png, body_lit.png, body_*_top.png).
+#   toml/serde — parse the gated descriptor (devices/<dev>/capabilities.toml) for the [skin.parts]
+#   rects + [[inputs]] id->skin_part map, so rects are read, never hardcoded. All pure-Rust, so the
+#   binary stays a single static aarch64-musl artifact (no C, no GPU) — the tsp-osr sidestep holds.
+png = "0.17"
+toml = { workspace = true }
+serde = { workspace = true }

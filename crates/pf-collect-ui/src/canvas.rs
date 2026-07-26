@@ -120,6 +120,34 @@ impl Canvas {
         self.text(center_x - w / 2, y, s, scale, c);
     }
 
+    /// Blit an [`crate::image::Rgb`] scaled (nearest-neighbor) into the dest rect. If `key` is set,
+    /// source pixels within `tol` of the key color are skipped (transparent) — used to knock out the
+    /// device render's solid background so the device floats on the dark UI.
+    pub fn blit_scaled_keyed(&mut self, img: &crate::image::Rgb, dx: i32, dy: i32, dw: i32, dh: i32, key: Option<(Color, u8)>) {
+        if img.w == 0 || img.h == 0 || dw <= 0 || dh <= 0 {
+            return;
+        }
+        for yy in 0..dh {
+            let sy = ((yy as i64 * img.h as i64 / dh as i64) as usize).min(img.h - 1);
+            for xx in 0..dw {
+                let sx = ((xx as i64 * img.w as i64 / dw as i64) as usize).min(img.w - 1);
+                let c = img.get(sx, sy);
+                if let Some((k, tol)) = key {
+                    let (r, g, b) = channels(c);
+                    let (kr, kg, kb) = channels(k);
+                    let t = tol as i32;
+                    if (r as i32 - kr as i32).abs() <= t
+                        && (g as i32 - kg as i32).abs() <= t
+                        && (b as i32 - kb as i32).abs() <= t
+                    {
+                        continue;
+                    }
+                }
+                self.put(dx + xx, dy + yy, c);
+            }
+        }
+    }
+
     pub const GLYPH_H: usize = GLYPH_H;
 
     /// Serialize as a binary PPM (P6) — the off-device validation sink (`--dump`). Also the

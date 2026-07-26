@@ -1,120 +1,40 @@
-//! Frame composition: given the current wizard state, draw one 1280x720 frame — the title, the
-//! progress readout, the generic gamepad face (with the currently-prompted control HIGHLIGHTED and
-//! already-captured controls marked), the prompt text, and a status line. The fbdev/dump layer is
-//! responsible only for getting these pixels onto the panel or into a PPM; all layout lives here.
+//! Frame composition: draw the REAL DEVICE (composited from the gated `.scad`->skin assets with the
+//! prompted control highlighted) with the title, progress readout, prompt, and status overlaid. The
+//! device image comes from [`crate::skin::SkinSet::compose`]; this module owns only the on-canvas
+//! layout + the text overlay. The fbdev/dump layer just gets these pixels onto the panel or a PPM.
 
 use crate::canvas::{rgb, Canvas, Color};
-use crate::face::{self, Control, Shape, CANVAS_H, CANVAS_W};
 use crate::font;
+use crate::skin::SkinSet;
+
+/// The logical canvas the layout is authored against (letterboxed to the real fb resolution).
+pub const CANVAS_W: i32 = 1280;
+pub const CANVAS_H: i32 = 720;
+
+// Layout: the device fills the middle band; title above, prompt/status below.
+const DEVICE_Y: i32 = 78;
+const DEVICE_H: i32 = 468;
+const DEVICE_MARGIN_X: i32 = 24;
 
 // Palette.
 const BG: Color = rgb(18, 20, 28);
-const BODY: Color = rgb(40, 44, 56);
-const IDLE_FILL: Color = rgb(58, 63, 76);
-const IDLE_LINE: Color = rgb(120, 128, 142);
-const RECORDED: Color = rgb(58, 196, 120);
-const SKIPPED: Color = rgb(78, 82, 96);
-const ACTIVE: Color = rgb(255, 196, 64);
-const GLOW: Color = rgb(255, 224, 130);
 const TEXT: Color = rgb(234, 238, 245);
+const ACTIVE: Color = rgb(255, 196, 64);
+const DONE_C: Color = rgb(58, 196, 120);
 const TEXT_DIM: Color = rgb(150, 158, 172);
 const TITLE_C: Color = rgb(120, 200, 255);
 
-/// Everything the renderer needs for one frame. Ids are borrowed slices so no allocation per frame.
+/// Everything the renderer needs for one frame.
 pub struct FrameState<'a> {
     pub title: &'a str,
+    /// The engine control id currently prompted (highlighted on the device), or `None`.
     pub active_id: Option<&'a str>,
-    pub recorded_ids: &'a [String],
-    pub skipped_ids: &'a [String],
     pub prompt: &'a str,
-    /// 1-based current control number (0 when done).
+    /// 1-based current control number.
     pub index: usize,
     pub total: usize,
     pub status: &'a str,
     pub done: bool,
-}
-
-#[derive(Clone, Copy, PartialEq)]
-enum Style {
-    Idle,
-    Recorded,
-    Skipped,
-    Active,
-}
-
-fn style_for(ctrl: &Control, st: &FrameState) -> Style {
-    if st.active_id == Some(ctrl.id) {
-        Style::Active
-    } else if st.recorded_ids.iter().any(|r| r == ctrl.id) {
-        Style::Recorded
-    } else if st.skipped_ids.iter().any(|s| s == ctrl.id) {
-        Style::Skipped
-    } else {
-        Style::Idle
-    }
-}
-
-fn colors(style: Style) -> (Color, Color) {
-    // (fill, outline)
-    match style {
-        Style::Idle => (IDLE_FILL, IDLE_LINE),
-        Style::Recorded => (RECORDED, rgb(220, 255, 232)),
-        Style::Skipped => (SKIPPED, rgb(110, 116, 130)),
-        Style::Active => (ACTIVE, GLOW),
-    }
-}
-
-fn draw_control(c: &mut Canvas, ctrl: &Control, style: Style) {
-    let (fill, line) = colors(style);
-    match ctrl.shape {
-        Shape::Circle { r } => {
-            if style == Style::Active {
-                c.ring(ctrl.cx, ctrl.cy, r + 12, 5, GLOW);
-            }
-            c.fill_circle(ctrl.cx, ctrl.cy, r, fill);
-            c.ring(ctrl.cx, ctrl.cy, r, 3, line);
-        }
-        Shape::Rect { w, h } => {
-            let (x, y) = (ctrl.cx - w / 2, ctrl.cy - h / 2);
-            if style == Style::Active {
-                c.rect_outline(x - 8, y - 8, w + 16, h + 16, 4, GLOW);
-            }
-            c.fill_rect(x, y, w, h, fill);
-            c.rect_outline(x, y, w, h, 3, line);
-        }
-        Shape::Cross { arm, thick } => {
-            if style == Style::Active {
-                c.rect_outline(ctrl.cx - arm - 8, ctrl.cy - thick / 2 - 8, 2 * arm + 16, thick + 16, 4, GLOW);
-                c.rect_outline(ctrl.cx - thick / 2 - 8, ctrl.cy - arm - 8, thick + 16, 2 * arm + 16, 4, GLOW);
-            }
-            // horizontal arm
-            c.fill_rect(ctrl.cx - arm, ctrl.cy - thick / 2, 2 * arm, thick, fill);
-            // vertical arm
-            c.fill_rect(ctrl.cx - thick / 2, ctrl.cy - arm, thick, 2 * arm, fill);
-            c.rect_outline(ctrl.cx - arm, ctrl.cy - thick / 2, 2 * arm, thick, 2, line);
-            c.rect_outline(ctrl.cx - thick / 2, ctrl.cy - arm, thick, 2 * arm, 2, line);
-        }
-    }
-    // Label: inside the control (wide bars / face buttons) or below it. Pick a label color that
-    // contrasts with the fill it sits on — dark on the bright active/recorded fills, light on the
-    // dark idle fill.
-    let half_glyph = (Canvas::GLYPH_H as i32 * 2) / 2; // scale-2 glyph half-height
-    if ctrl.label_inside {
-        let inside_c = if matches!(style, Style::Active | Style::Recorded) {
-            rgb(20, 22, 28)
-        } else {
-            TEXT
-        };
-        c.text_centered(ctrl.cx, ctrl.cy - half_glyph, ctrl.label, 2, inside_c);
-    } else {
-        let label_c = if style == Style::Active { TEXT } else { TEXT_DIM };
-        let below = match ctrl.shape {
-            Shape::Circle { r } => r + 6,
-            Shape::Rect { h, .. } => h / 2 + 6,
-            Shape::Cross { arm, .. } => arm + 6,
-        };
-        c.text_centered(ctrl.cx, ctrl.cy + below, ctrl.label, 2, label_c);
-    }
 }
 
 /// Break `s` into lines that each fit within `max_px` at `scale`.
@@ -138,102 +58,115 @@ fn wrap(s: &str, max_px: i32, scale: usize) -> Vec<String> {
     lines
 }
 
-/// Draw one full frame. `c` MUST be `CANVAS_W`x`CANVAS_H` (the face coordinates are absolute).
-pub fn render_frame(c: &mut Canvas, st: &FrameState) {
+/// Fit `(iw,ih)` into `(area_w,area_h)` preserving aspect. Returns (draw_w, draw_h).
+fn fit(iw: i32, ih: i32, area_w: i32, area_h: i32) -> (i32, i32) {
+    if iw <= 0 || ih <= 0 {
+        return (0, 0);
+    }
+    let by_h_w = (area_h as i64 * iw as i64 / ih as i64) as i32;
+    if by_h_w <= area_w {
+        (by_h_w, area_h)
+    } else {
+        (area_w, (area_w as i64 * ih as i64 / iw as i64) as i32)
+    }
+}
+
+/// Draw one full frame. `c` MUST be `CANVAS_W`x`CANVAS_H`.
+pub fn render_frame(c: &mut Canvas, skin: &SkinSet, st: &FrameState) {
     debug_assert_eq!((c.w as i32, c.h as i32), (CANVAS_W, CANVAS_H));
     c.clear(BG);
 
-    // Title + progress bar.
-    c.text_centered(CANVAS_W / 2, 24, st.title, 3, TITLE_C);
-    let progress = if st.done {
-        "DONE".to_string()
-    } else {
-        format!("{} / {}", st.index, st.total)
-    };
-    c.text(CANVAS_W - font::text_width(&progress, 3) as i32 - 24, 24, &progress, 3, TEXT);
+    // Title + progress.
+    c.text_centered(CANVAS_W / 2, 22, st.title, 3, TITLE_C);
+    let progress = if st.done { "DONE".to_string() } else { format!("{} / {}", st.index, st.total) };
+    c.text(CANVAS_W - font::text_width(&progress, 3) as i32 - 22, 22, &progress, 3, TEXT);
 
-    // Controller body.
-    c.fill_rect(330, 150, 620, 340, BODY);
-    c.rect_outline(330, 150, 620, 340, 3, rgb(70, 76, 92));
+    // The real device, with the prompted control highlighted (neutral when done).
+    let img = skin.compose(if st.done { None } else { st.active_id });
+    let (dw, dh) = fit(img.w as i32, img.h as i32, CANVAS_W - 2 * DEVICE_MARGIN_X, DEVICE_H);
+    let dx = (CANVAS_W - dw) / 2;
+    let dy = DEVICE_Y + (DEVICE_H - dh) / 2;
+    c.blit_scaled_keyed(&img, dx, dy, dw, dh, Some((skin.bg, 12)));
 
-    // Controls: draw non-active first so the active glow lands on top; l3/r3 after their stick.
-    let face = face::generic_face();
-    let mut active: Option<&Control> = None;
-    for ctrl in &face {
-        let style = style_for(ctrl, st);
-        if style == Style::Active {
-            active = Some(ctrl);
-        } else {
-            draw_control(c, ctrl, style);
-        }
-    }
-    if let Some(ctrl) = active {
-        draw_control(c, ctrl, Style::Active);
-    }
-
-    // Prompt block (wrapped), amber when a control is active, dim when done.
+    // Prompt (wrapped) + status.
     let prompt_scale = 4usize;
-    let prompt_c = if st.done { RECORDED } else { ACTIVE };
+    let prompt_c = if st.done { DONE_C } else { ACTIVE };
     let lines = wrap(st.prompt, CANVAS_W - 120, prompt_scale);
     let line_h = (Canvas::GLYPH_H + 3) as i32 * prompt_scale as i32;
-    let mut y = 545;
+    let mut y = 560;
     for line in &lines {
         c.text_centered(CANVAS_W / 2, y, line, prompt_scale, prompt_c);
         y += line_h;
     }
-
-    // Status hint line at the very bottom.
-    c.text_centered(CANVAS_W / 2, CANVAS_H - 30, st.status, 2, TEXT_DIM);
+    c.text_centered(CANVAS_W / 2, CANVAS_H - 28, st.status, 2, TEXT_DIM);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::image::Rgb;
+    use crate::skin::{Rect, SkinSet, View};
+    use std::collections::HashMap;
 
-    fn is_bg(c: &Canvas) -> bool {
-        c.pixels().iter().all(|&p| p == BG)
+    fn tiny_skin() -> SkinSet {
+        let body = Rgb::new(40, 20, rgb(248, 248, 248)); // light bg (color-keyed out)
+        let mut lit = Rgb::new(40, 20, rgb(248, 248, 248));
+        for y in 8..12 {
+            for x in 18..24 {
+                lit.set(x, y, rgb(210, 0, 0));
+            }
+        }
+        let mut parts = HashMap::new();
+        parts.insert("btn_south".to_string(), Rect { x: 18, y: 8, w: 6, h: 4 });
+        let mut map = HashMap::new();
+        map.insert("south".to_string(), "btn_south".to_string());
+        SkinSet::from_parts(map, View { body, lit, parts }, None, rgb(248, 248, 248))
     }
 
     #[test]
-    fn renders_something_and_active_highlight_changes_pixels() {
+    fn renders_device_and_overlay_without_panicking() {
         let mut c = Canvas::new(CANVAS_W as usize, CANVAS_H as usize);
-        let recorded: Vec<String> = vec!["south".into()];
+        let skin = tiny_skin();
         let st = FrameState {
             title: "POCKETFORGE INPUT COLLECTION",
-            active_id: Some("east"),
-            recorded_ids: &recorded,
-            skipped_ids: &[],
-            prompt: "Press the RIGHT face button (east)",
-            index: 2,
-            total: 16,
-            status: "auto-advancing demo",
+            active_id: Some("south"),
+            prompt: "Press the BOTTOM face button (south)",
+            index: 1,
+            total: 14,
+            status: "demo",
             done: false,
         };
-        render_frame(&mut c, &st);
-        assert!(!is_bg(&c), "frame should not be all background");
-
-        // The amber glow should appear somewhere near the 'east' hotspot (895, 265).
-        let near = |cx: usize, cy: usize| -> bool {
-            let mut found = false;
-            for dy in 0..40usize {
-                for dx in 0..40usize {
-                    let x = cx + dx - 20;
-                    let y = cy + dy - 20;
-                    if x < c.w && y < c.h && c.pixels()[y * c.w + x] == ACTIVE {
-                        found = true;
-                    }
+        render_frame(&mut c, &skin, &st);
+        // Not all background — something was drawn.
+        assert!(c.pixels().iter().any(|&p| p != BG));
+        // The red highlight (color-keyed device) should appear somewhere in the device band.
+        let mut saw_red = false;
+        for y in DEVICE_Y..DEVICE_Y + DEVICE_H {
+            for x in 0..CANVAS_W {
+                let (r, g, b) = crate::canvas::channels(c.pixels()[y as usize * c.w + x as usize]);
+                if r > 150 && g < 80 && b < 80 {
+                    saw_red = true;
                 }
             }
-            found
-        };
-        assert!(near(895, 265), "active control 'east' should paint ACTIVE pixels near its hotspot");
+        }
+        assert!(saw_red, "the highlighted control's red should be visible on the device");
+    }
+
+    #[test]
+    fn fit_preserves_aspect() {
+        // 1480x640 into 1232x468 -> fit by height: 468*1480/640 = 1082 <= 1232
+        assert_eq!(fit(1480, 640, 1232, 468), (1082, 468));
+        // a very wide image fits by width instead
+        let (w, h) = fit(4000, 400, 1232, 468);
+        assert_eq!(w, 1232);
+        assert!(h < 468);
     }
 
     #[test]
     fn wrap_breaks_long_prompts() {
         let long = "Sweep the LEFT STICK fully in a circle all the way in every direction";
         let lines = wrap(long, CANVAS_W - 120, 4);
-        assert!(lines.len() >= 2, "a long prompt should wrap to multiple lines");
+        assert!(lines.len() >= 2);
         for l in &lines {
             assert!(font::text_width(l, 4) as i32 <= CANVAS_W - 120);
         }

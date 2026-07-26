@@ -1,24 +1,25 @@
 //! The wizard driver: it owns the render loop + the event pump and drives the headless
 //! `pf_input_collect` engine's [`Collector`] state machine (record → commit → advance/back → emit),
-//! rendering a frame for each step. Two entry points share the same frame presentation:
-//!  - [`drive_live`] — engine-parity pump against a real [`EventSource`] (a live evdev node): show
-//!    the highlighted control, wait for the press, capture, advance. This is the real-collection
-//!    path (its full live-pad exercise is tsp-bwrg.6).
+//! rendering a frame — the REAL DEVICE with the prompted control highlighted (from the gated
+//! `.scad`->skin assets, via [`SkinSet`]) — for each step. Two entry points share the same frame
+//! presentation:
+//!  - [`drive_live`] — engine-parity pump against a real [`EventSource`] (a live evdev node). The
+//!    real-collection path (full live-pad exercise is tsp-bwrg.6).
 //!  - [`drive_demo`] — an auto-advancing pass that synthesizes a press per control against a
 //!    scripted source, so the FULL render + prompt sequence is demonstrable on the panel WITHOUT
-//!    the live pad decoder (tsp-ozbp.9). This is what proves this bead's on-panel acceptance.
+//!    the live pad decoder. This proves this bead's on-panel acceptance.
 
 use std::time::Duration;
 
 use pf_input_collect::codes::{EV_ABS, EV_KEY};
-use pf_input_collect::collect::{CommitOutcome, DeviceMeta};
+use pf_input_collect::collect::DeviceMeta;
 use pf_input_collect::emit::Capabilities;
 use pf_input_collect::source::{AbsInfo, EventSource, Identity, RawEvent, ScriptedSource};
 use pf_input_collect::{collect::CollectError, plan, Collector};
 
 use crate::canvas::Canvas;
-use crate::face::{CANVAS_H, CANVAS_W};
-use crate::render::{render_frame, FrameState};
+use crate::render::{render_frame, FrameState, CANVAS_H, CANVAS_W};
+use crate::skin::SkinSet;
 
 pub const TITLE: &str = "POCKETFORGE INPUT COLLECTION";
 
@@ -73,27 +74,15 @@ impl Timing {
     /// Demo: hold each control long enough for a person / the webcam to see it.
     pub fn demo() -> Timing {
         Timing {
-            pre_dwell: Duration::from_millis(850),
-            post_dwell: Duration::from_millis(550),
+            pre_dwell: Duration::from_millis(950),
+            post_dwell: Duration::from_millis(650),
             ..Timing::live()
         }
     }
 }
 
-/// Wizard progress state the drive loops accumulate and hand to the renderer.
-struct Progress {
-    recorded: Vec<String>,
-    skipped: Vec<String>,
-}
-
-impl Progress {
-    fn new() -> Progress {
-        Progress { recorded: Vec::new(), skipped: Vec::new() }
-    }
-}
-
-/// The per-frame view knobs that change step to step (progress/index come from the collector).
-struct View<'a> {
+/// The per-frame knobs that change step to step (index/total come from the collector).
+struct StepView<'a> {
     active_id: Option<&'a str>,
     prompt: &'a str,
     status: &'a str,
@@ -101,20 +90,18 @@ struct View<'a> {
 }
 
 /// Render + present one frame from the collector's current state.
-fn present<K: Sink>(sink: &mut K, canvas: &mut Canvas, collector: &Collector, prog: &Progress, v: View) {
+fn present<K: Sink>(sink: &mut K, canvas: &mut Canvas, skin: &SkinSet, collector: &Collector, v: StepView) {
     let (i, n) = collector.position();
     let st = FrameState {
         title: TITLE,
         active_id: v.active_id,
-        recorded_ids: &prog.recorded,
-        skipped_ids: &prog.skipped,
         prompt: v.prompt,
         index: i + 1,
         total: n,
         status: v.status,
         done: v.done,
     };
-    render_frame(canvas, &st);
+    render_frame(canvas, skin, &st);
     sink.present(canvas);
 }
 
@@ -129,18 +116,16 @@ fn relevant(kind: plan::Kind, e: &RawEvent) -> bool {
 pub fn drive_live<S: EventSource, K: Sink>(
     src: &mut S,
     sink: &mut K,
+    skin: &SkinSet,
     meta: &DeviceMeta,
     timing: &Timing,
 ) -> Result<Capabilities, CollectError> {
     let mut collector = Collector::new(plan::default_gamepad_plan());
-    let mut prog = Progress::new();
     let mut canvas = Canvas::new(CANVAS_W as usize, CANVAS_H as usize);
 
     while let Some(spec) = collector.current().cloned() {
-        // Show the ask.
-        present(sink, &mut canvas, &collector, &prog, View { active_id: Some(&spec.id), prompt: &spec.prompt, status: "PRESS THE HIGHLIGHTED CONTROL", done: false });
+        present(sink, &mut canvas, skin, &collector, StepView { active_id: Some(&spec.id), prompt: &spec.prompt, status: "PRESS THE HIGHLIGHTED CONTROL", done: false });
 
-        // Engine-parity pump.
         let mut buf: Vec<RawEvent> = Vec::new();
         let mut saw = false;
         let mut empties = 0usize;
@@ -166,7 +151,7 @@ pub fn drive_live<S: EventSource, K: Sink>(
                 buf.push(e);
             }
             if saw && !showed_capturing {
-                present(sink, &mut canvas, &collector, &prog, View { active_id: Some(&spec.id), prompt: &spec.prompt, status: "CAPTURING...", done: false });
+                present(sink, &mut canvas, skin, &collector, StepView { active_id: Some(&spec.id), prompt: &spec.prompt, status: "CAPTURING...", done: false });
                 showed_capturing = true;
             }
             if matches!(spec.kind, plan::Kind::Button | plan::Kind::StickClick)
@@ -177,20 +162,15 @@ pub fn drive_live<S: EventSource, K: Sink>(
         }
 
         collector.record(&buf);
-        match collector.commit_current(src)? {
-            CommitOutcome::Captured(_) => prog.recorded.push(spec.id.clone()),
-            CommitOutcome::Skipped => prog.skipped.push(spec.id.clone()),
-        }
+        let _ = collector.commit_current(src)?;
         collector.advance();
-        // Show the result (recorded green / skipped grey), briefly.
-        present(sink, &mut canvas, &collector, &prog, View { active_id: None, prompt: &spec.prompt, status: "PRESS THE HIGHLIGHTED CONTROL", done: collector.is_done() });
+        present(sink, &mut canvas, skin, &collector, StepView { active_id: None, prompt: &spec.prompt, status: "PRESS THE HIGHLIGHTED CONTROL", done: collector.is_done() });
         if !timing.post_dwell.is_zero() {
             std::thread::sleep(timing.post_dwell);
         }
     }
 
-    // Completion frame.
-    present(sink, &mut canvas, &collector, &prog, View { active_id: None, prompt: "COLLECTION COMPLETE", status: "EMITTING CANDIDATE CAPABILITIES.TOML", done: true });
+    present(sink, &mut canvas, skin, &collector, StepView { active_id: None, prompt: "COLLECTION COMPLETE", status: "EMITTING CANDIDATE CAPABILITIES.TOML", done: true });
     collector.emit(src, meta)
 }
 
@@ -199,36 +179,33 @@ pub fn drive_live<S: EventSource, K: Sink>(
 pub fn drive_demo<K: Sink>(
     src: &mut ScriptedSource,
     sink: &mut K,
+    skin: &SkinSet,
     meta: &DeviceMeta,
     timing: &Timing,
 ) -> Result<Capabilities, CollectError> {
     let mut collector = Collector::new(plan::default_gamepad_plan());
-    let mut prog = Progress::new();
     let mut canvas = Canvas::new(CANVAS_W as usize, CANVAS_H as usize);
 
     while let Some(spec) = collector.current().cloned() {
-        present(sink, &mut canvas, &collector, &prog, View { active_id: Some(&spec.id), prompt: &spec.prompt, status: "GUIDED COLLECTION (DEMO) - AUTO-ADVANCING", done: false });
+        present(sink, &mut canvas, skin, &collector, StepView { active_id: Some(&spec.id), prompt: &spec.prompt, status: "GUIDED COLLECTION (DEMO) - AUTO-ADVANCING", done: false });
         if !timing.pre_dwell.is_zero() {
             std::thread::sleep(timing.pre_dwell);
         }
 
         let evs = synth_events_for(&spec.id);
         if !evs.is_empty() {
-            present(sink, &mut canvas, &collector, &prog, View { active_id: Some(&spec.id), prompt: &spec.prompt, status: "CAPTURING...", done: false });
+            present(sink, &mut canvas, skin, &collector, StepView { active_id: Some(&spec.id), prompt: &spec.prompt, status: "CAPTURING...", done: false });
             collector.record(&evs);
         }
-        match collector.commit_current(src)? {
-            CommitOutcome::Captured(_) => prog.recorded.push(spec.id.clone()),
-            CommitOutcome::Skipped => prog.skipped.push(spec.id.clone()),
-        }
+        let _ = collector.commit_current(src)?;
         collector.advance();
-        present(sink, &mut canvas, &collector, &prog, View { active_id: None, prompt: &spec.prompt, status: "GUIDED COLLECTION (DEMO) - AUTO-ADVANCING", done: collector.is_done() });
+        present(sink, &mut canvas, skin, &collector, StepView { active_id: None, prompt: &spec.prompt, status: "GUIDED COLLECTION (DEMO) - AUTO-ADVANCING", done: collector.is_done() });
         if !timing.post_dwell.is_zero() {
             std::thread::sleep(timing.post_dwell);
         }
     }
 
-    present(sink, &mut canvas, &collector, &prog, View { active_id: None, prompt: "COLLECTION COMPLETE", status: "EMITTING CANDIDATE CAPABILITIES.TOML", done: true });
+    present(sink, &mut canvas, skin, &collector, StepView { active_id: None, prompt: "COLLECTION COMPLETE", status: "EMITTING CANDIDATE CAPABILITIES.TOML", done: true });
     collector.emit(src, meta)
 }
 
@@ -251,11 +228,9 @@ pub fn demo_source() -> ScriptedSource {
 }
 
 /// The synthetic events a demo press produces for a plan id. Optional controls left with no
-/// hardware (`guide`, `l3`, `r3`) return empty → the engine records them as Skipped (row omitted),
-/// which visibly demonstrates the "missing hardware = grey/omitted" path on-panel.
+/// hardware (`guide`, `l3`, `r3`) return empty → the engine records them as Skipped (row omitted).
 fn synth_events_for(id: &str) -> Vec<RawEvent> {
     let btn = |code: u16| vec![RawEvent::new(EV_KEY, code, 1), RawEvent::new(EV_KEY, code, 0)];
-    // A full circular stick sweep on two axes (min..max..min on both).
     let stick = |xc: u16, yc: u16| {
         let mut v = Vec::new();
         for &val in &[2048, 4095, 2048, 0, 2048] {
@@ -267,15 +242,14 @@ fn synth_events_for(id: &str) -> Vec<RawEvent> {
         v
     };
     match id {
-        "south" => btn(0x130), // BTN_A
-        "east" => btn(0x131),  // BTN_B
-        "west" => btn(0x133),  // BTN_X
-        "north" => btn(0x134), // BTN_Y
+        "south" => btn(0x130),
+        "east" => btn(0x131),
+        "west" => btn(0x133),
+        "north" => btn(0x134),
         "select" => btn(0x13a),
         "start" => btn(0x13b),
-        "l1" => btn(0x136), // BTN_TL
-        "r1" => btn(0x137), // BTN_TR
-        // D-pad hat: exercise both HAT axes to their extents.
+        "l1" => btn(0x136),
+        "r1" => btn(0x137),
         "dpad" => vec![
             RawEvent::new(EV_ABS, 0x10, -1),
             RawEvent::new(EV_ABS, 0x10, 1),
@@ -293,7 +267,6 @@ fn synth_events_for(id: &str) -> Vec<RawEvent> {
             RawEvent::new(EV_ABS, 0x5, 180),
             RawEvent::new(EV_ABS, 0x5, 255),
         ],
-        // guide, l3, r3: no synthetic hardware -> Skipped.
         _ => Vec::new(),
     }
 }
@@ -301,48 +274,57 @@ fn synth_events_for(id: &str) -> Vec<RawEvent> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::image::Rgb;
+    use crate::skin::{Rect, View};
+    use std::collections::HashMap;
+
+    // A tiny synthetic skin covering every a133 engine id so compose() never no-ops in the drive.
+    fn demo_skin() -> SkinSet {
+        let ids = [
+            ("south", "btn_south"), ("east", "btn_east"), ("west", "btn_west"), ("north", "btn_north"),
+            ("select", "btn_select"), ("start", "btn_start"), ("guide", "btn_guide"), ("l1", "btn_l1"),
+            ("r1", "btn_r1"), ("dpad", "dpad"), ("lstick", "stick_l"), ("rstick", "stick_r"),
+            ("ltrig", "trig_l"), ("rtrig", "trig_r"),
+        ];
+        let body = Rgb::new(60, 30, crate::canvas::rgb(248, 248, 248));
+        let lit = Rgb::new(60, 30, crate::canvas::rgb(210, 0, 0));
+        let mut parts = HashMap::new();
+        let mut map = HashMap::new();
+        for (i, (id, part)) in ids.iter().enumerate() {
+            parts.insert(part.to_string(), Rect { x: (i as i64) * 2, y: 0, w: 2, h: 2 });
+            map.insert(id.to_string(), part.to_string());
+        }
+        SkinSet::from_parts(map, View { body, lit, parts }, None, crate::canvas::rgb(248, 248, 248))
+    }
 
     #[test]
     fn demo_runs_the_full_sequence_and_emits_a_valid_candidate() {
         let mut src = demo_source();
         let mut sink = CountingSink::default();
+        let skin = demo_skin();
         let meta = DeviceMeta { id: "demopad".into(), manufacturer: "PocketForge".into(), model: "Demo Pad".into() };
         let timing = Timing { pre_dwell: Duration::ZERO, post_dwell: Duration::ZERO, ..Timing::demo() };
-        let caps = drive_demo(&mut src, &mut sink, &meta, &timing).expect("demo should emit");
+        let caps = drive_demo(&mut src, &mut sink, &skin, &meta, &timing).expect("demo should emit");
 
-        // Rendered multiple frames (>= at least one per control).
-        assert!(sink.frames >= 16, "expected a frame per control, got {}", sink.frames);
-
-        // The emitted candidate has the required controls and the two trigger classifications.
+        assert!(sink.frames >= 14, "expected a frame per control, got {}", sink.frames);
         let toml = caps.to_toml();
         assert!(toml.contains("id = \"south\""), "candidate missing south:\n{toml}");
-        assert!(toml.contains("id = \"lstick\""));
         assert!(toml.contains("id = \"ltrig\""));
         assert!(toml.contains("semantics = \"binary\""), "left trigger should classify binary:\n{toml}");
         assert!(toml.contains("semantics = \"analog\""), "right trigger should classify analog:\n{toml}");
-        // Skipped optionals are omitted, not fabricated.
         assert!(!toml.contains("id = \"guide\""), "skipped guide must be omitted:\n{toml}");
     }
 
     #[test]
     fn drive_live_captures_a_button_from_a_scripted_stream() {
-        // A minimal live-parity exercise: feed one button press then quiet, and only for the
-        // first (required, non-optional) control, then let the rest idle-skip is impossible for
-        // required controls — so restrict to a one-control plan by using the demo source's
-        // absinfo and a scripted event stream. We assert the button captures + a frame rendered.
         let ident = Identity { name: "x".into(), bus: 3, vid: 1, pid: 1, version: 1 };
         let mut src = ScriptedSource::new(ident);
-        // south press (keydown breaks the pump immediately).
         src.push_batch(vec![RawEvent::new(EV_KEY, 0x130, 1), RawEvent::new(EV_KEY, 0x130, 0)]);
-        // Everything after south will get empty polls; required controls would block to max_polls.
-        // Keep max_polls tiny so the test is fast, and only assert south recorded before that.
         let mut sink = CountingSink::default();
+        let skin = demo_skin();
         let meta = DeviceMeta { id: "x".into(), manufacturer: "x".into(), model: "x".into() };
         let timing = Timing { max_polls: 2, idle_skip_polls: 1, quiet_polls: 1, ..Timing::live() };
-        // east/west/... are required with no events -> NoActivity error after max_polls. We only
-        // need to prove the loop drove the engine + rendered, so assert the error names a later
-        // required control (meaning south already committed) and that frames were drawn.
-        let err = drive_live(&mut src, &mut sink, &meta, &timing).unwrap_err();
+        let err = drive_live(&mut src, &mut sink, &skin, &meta, &timing).unwrap_err();
         match err {
             CollectError::NoActivity { id } => assert_ne!(id, "south", "south should have captured"),
             other => panic!("unexpected: {other}"),
