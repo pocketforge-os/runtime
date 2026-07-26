@@ -1,0 +1,26 @@
+[package]
+name = "pf-input-collect"
+description = "Guided-collection ENGINE (tsp-bwrg.2): the headless data heart of the input bring-up app. With NO pre-filled descriptor it prompts for each control in turn, reads the RAW /dev/input/eventN node directly (post-decoder, exactly as platform/regression/caps/evdev-probe.py --watch does — it CANNOT go through pf-input-broker, whose InputBroker::start_with() requires a Descriptor this mode has none of), records the raw evdev event(s) per prompt, classifies binary-vs-analog triggers from observed behavior, and emits a candidate capabilities.toml the on-panel UI (tsp-bwrg.3) drives. Validated headless against a synthetic a133-shaped event stream."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lib]
+name = "pf_input_collect"
+path = "src/lib.rs"
+
+[[bin]]
+name = "pf-input-collect"
+path = "src/bin/pf-input-collect.rs"
+
+[dependencies]
+# libc: the raw evdev ioctls (EVIOCGNAME/EVIOCGID/EVIOCGABS), input_event / input_id /
+# input_absinfo struct layouts, and poll(2)/read(2) for the blocking read path. The ioctl table
+# is carried self-contained (typed as libc::Ioctl, the pf-hw-exerciser precedent) rather than
+# reused from pf-input-broker, so this device binary cross-compiles cleanly to
+# aarch64-unknown-linux-musl (static) AND stays decoupled from in-flight pf-input-broker edits.
+# Same "one place raw syscalls are unavoidable" rationale as pf-input-broker / pf-hw-exerciser.
+libc = { workspace = true }
