@@ -48,6 +48,13 @@ pub struct Input {
     pub ev_type: String,
     /// One or two canonical Linux input-event codes, comma-joined (e.g. `"ABS_X,ABS_Y"`).
     pub code: String,
+    /// How the control behaves at the API surface, when the wire encoding lies about it.
+    /// `"analog"` (or absent) = report the axis/key as-is; `"binary"` = a control that reports
+    /// over an analog `range` on the wire but is PHYSICALLY on/off (e.g. the a133 `ltrig`/`rtrig`,
+    /// tsp-ozbp.2 — byte held constant when squeezed, no analog travel), so the broker re-emits it
+    /// as an `EV_KEY` button thresholded on `range`. Absent ⇒ analog (backward-compatible).
+    #[serde(default)]
+    pub semantics: Option<String>,
     #[serde(default)]
     pub label: Option<String>,
     #[serde(default)]
