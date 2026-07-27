@@ -128,7 +128,6 @@ version = "0.0.1"
 dependencies = [
  "libc",
  "pf-input-collect",
- "pf-input-decode",
  "png",
  "serde",
  "toml",
@@ -156,7 +155,6 @@ name = "pf-input-collect"
 version = "0.0.1"
 dependencies = [
  "libc",
- "pf-input-decode",
 ]
 
 [[package]]
