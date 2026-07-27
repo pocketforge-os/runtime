@@ -228,6 +228,7 @@ pub fn drive_live<S: EventSource, K: Sink>(
             // presses the dpad directions / stick axes SEQUENTIALLY, so a settle after one axis must
             // not close the window (tsp-bwrg.6: the dpad never advanced). Mirrors the engine pump.
             let mut seen_axes: std::collections::HashSet<u16> = std::collections::HashSet::new();
+            let mut axis_span: HashMap<u16, (i32, i32)> = HashMap::new();
             let need_axes = spec.kind.expected_axes();
             while Instant::now() < deadline && iters < timing.max_polls {
                 iters += 1;
@@ -243,6 +244,11 @@ pub fn drive_live<S: EventSource, K: Sink>(
                         if e.ev_type == EV_ABS {
                             seen_axes.insert(e.code);
                         }
+                    }
+                    if e.ev_type == EV_ABS {
+                        let ent = axis_span.entry(e.code).or_insert((e.value, e.value));
+                        if e.value < ent.0 { ent.0 = e.value; }
+                        if e.value > ent.1 { ent.1 = e.value; }
                     }
                     buf.push(*e);
                 }
@@ -274,12 +280,15 @@ pub fn drive_live<S: EventSource, K: Sink>(
                             break; // optional & never actuated → skip
                         }
                     } else {
-                        // A 2-axis control settles only once BOTH axes have actuated (else a
-                        // sequential press closes the window on one axis → Incomplete → re-prompt
-                        // forever, the dpad bug). A 1-axis control settles on quiet, as before.
-                        let enough = need_axes < 2 || seen_axes.len() >= need_axes;
-                        if enough && quiet >= timing.quiet_polls {
-                            break; // actuated (both axes if 2-axis) then settled
+                        // A 2-axis control (stick) completes only after BOTH axes are swept near
+                        // their extremes (a full circle, not a quarter-roll) AND it settles at rest.
+                        // A 1-axis control settles on quiet. The full-sweep gate stops the window
+                        // closing on a brief mid-roll centre-transit — the tsp-bwrg.6 defect where
+                        // the stick advanced after ~0.25s and cascaded the rest of the roll into
+                        // later controls — and guarantees the full min/max calibration envelope.
+                        let swept = pf_input_collect::collect::axes_fully_swept(&seen_axes, &axis_span, &absc, need_axes);
+                        if swept && quiet >= timing.quiet_polls {
+                            break; // fully actuated (both axes swept, if 2-axis) then settled
                         }
                     }
                 }

@@ -137,10 +137,15 @@ pub fn default_gamepad_plan() -> Vec<ControlSpec> {
 /// two agreeing is then checkable, not coincidental.
 pub fn a133_gamepad_plan() -> Vec<ControlSpec> {
     vec![
-        ControlSpec::new("south", Kind::Button, "Press the BOTTOM face button (A)", false),
-        ControlSpec::new("east", Kind::Button, "Press the RIGHT face button (B)", false),
-        ControlSpec::new("west", Kind::Button, "Press the LEFT face button (X)", false),
-        ControlSpec::new("north", Kind::Button, "Press the TOP face button (Y)", false),
+        // Prompt by POSITION only — never by an A/B/X/Y letter. The map is by SDL position
+        // (south=bottom -> BTN_A, etc.) and the skin parts are positional (btn_south...); the
+        // physical LETTER printed on a button differs by vendor layout (a TrimUI is not laid out
+        // like an Xbox pad), so a letter hint is wrong as often as right. Position is unambiguous
+        // and is what the user actually presses (tsp-bwrg.6, owner: "we call them the wrong thing").
+        ControlSpec::new("south", Kind::Button, "Press the BOTTOM face button", false),
+        ControlSpec::new("east", Kind::Button, "Press the RIGHT face button", false),
+        ControlSpec::new("west", Kind::Button, "Press the LEFT face button", false),
+        ControlSpec::new("north", Kind::Button, "Press the TOP face button", false),
         ControlSpec::new("select", Kind::Button, "Press SELECT", false),
         ControlSpec::new("start", Kind::Button, "Press START", false),
         // Menu button — evdev BTN_MODE, which SDL names `guide` (caps.py 0x13c -> guide). The

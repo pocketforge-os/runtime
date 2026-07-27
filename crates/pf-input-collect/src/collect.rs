@@ -287,6 +287,36 @@ fn measured_axis(a: &AbsInfo, cal: (i32, i32, i32)) -> Axis {
     Axis { min, max, fuzz: a.fuzz, flat: a.flat, resolution: a.resolution, value: Some(centre) }
 }
 
+/// Whether a control has been actuated ENOUGH to complete. A 1-axis control needs only activity
+/// (the caller already gates on `saw_activity`). A 2-axis control (a stick) needs BOTH axes swept
+/// near their declared extremes in BOTH directions — a real full circular sweep, not a quarter-
+/// roll: each seen axis must have reached within 30% of its declared min AND its declared max.
+/// This both captures the full min/max calibration envelope AND stops the completion window closing
+/// on a brief mid-roll centre-transit — the tsp-bwrg.6 defect where a stick completed after ~0.25s
+/// and the remainder of the roll cascaded into (and falsely satisfied) later controls.
+pub fn axes_fully_swept(
+    seen: &std::collections::HashSet<u16>,
+    span: &HashMap<u16, (i32, i32)>,
+    declared: &HashMap<u16, AbsInfo>,
+    need_axes: usize,
+) -> bool {
+    if need_axes < 2 {
+        return true;
+    }
+    let full = seen
+        .iter()
+        .filter(|&&c| match (span.get(&c), declared.get(&c)) {
+            (Some(&(lo, hi)), Some(ai)) => {
+                let s = (ai.max - ai.min).max(1);
+                let tol = s * 3 / 10;
+                lo <= ai.min + tol && hi >= ai.max - tol
+            }
+            _ => false,
+        })
+        .count();
+    full >= need_axes
+}
+
 /// Observed per-axis calibration envelope from a control's captured events: the real travel
 /// extremes the user reached (min/max) and the rest/centre position (median — the continuous
 /// a133 stream sits at rest for most frames, punctuated by brief excursions, so the median of an
@@ -705,6 +735,8 @@ fn pump<S: EventSource>(src: &mut S, spec: &ControlSpec, cfg: &RunConfig) -> io:
     // a settle after one axis closes the window and finalize rejects the one-axis buffer as
     // Incomplete forever — the dpad never advanced on the real device (tsp-bwrg.6).
     let mut seen_axes: std::collections::HashSet<u16> = std::collections::HashSet::new();
+    // Per-axis observed extent (min,max) over the window — feeds the full-sweep completion gate.
+    let mut axis_span: HashMap<u16, (i32, i32)> = HashMap::new();
     let need_axes = spec.kind.expected_axes();
     let deadline = Instant::now() + cfg.control_timeout;
     let mut iters = 0usize;
@@ -724,6 +756,11 @@ fn pump<S: EventSource>(src: &mut S, spec: &ControlSpec, cfg: &RunConfig) -> io:
                     seen_axes.insert(e.code);
                 }
             }
+            if e.ev_type == EV_ABS {
+                let ent = axis_span.entry(e.code).or_insert((e.value, e.value));
+                if e.value < ent.0 { ent.0 = e.value; }
+                if e.value > ent.1 { ent.1 = e.value; }
+            }
             buf.push(*e);
         }
         // A button/click — and a trigger realized as a binary button (a133 L2/R2) — completes the
@@ -742,12 +779,15 @@ fn pump<S: EventSource>(src: &mut S, spec: &ControlSpec, cfg: &RunConfig) -> io:
                     break; // optional & never actuated → skip
                 }
             } else {
-                // A 2-axis control settles only once BOTH axes have actuated (else a sequential
-                // press closes the window on one axis → Incomplete forever); a 1-axis control
-                // settles as soon as it goes quiet after activity.
-                let enough = need_axes < 2 || seen_axes.len() >= need_axes;
-                if enough && quiet >= cfg.quiet_polls {
-                    break; // actuated (both axes if 2-axis) then settled
+                // A 2-axis control (stick) completes only once BOTH axes have been swept near their
+                // extremes — a full circle, not a quarter-roll — AND it has settled at rest. A
+                // 1-axis control settles as soon as it goes quiet after activity. Without the
+                // full-sweep gate the window closed on a brief mid-roll centre-transit (tsp-bwrg.6:
+                // the stick advanced after ~0.25s and cascaded the rest of the roll into later
+                // controls); the gate also guarantees the full min/max calibration envelope.
+                let swept = axes_fully_swept(&seen_axes, &axis_span, &absc, need_axes);
+                if swept && quiet >= cfg.quiet_polls {
+                    break; // fully actuated (both axes swept, if 2-axis) then settled
                 }
             }
         }

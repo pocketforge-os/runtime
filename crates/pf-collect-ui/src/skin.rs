@@ -131,7 +131,16 @@ impl SkinSet {
 
     /// The skin_part an engine control id maps to, if any.
     pub fn part_for(&self, input_id: &str) -> Option<&str> {
-        self.input_to_part.get(input_id).map(|s| s.as_str())
+        if let Some(p) = self.input_to_part.get(input_id) {
+            return Some(p.as_str());
+        }
+        // The four D-PAD direction prompts (dpad_up/down/left/right) all highlight the single
+        // `dpad` skin part — splitting the PROMPT must not lose the on-device highlight
+        // (tsp-bwrg.6: the dpad steps rendered with no control lit).
+        if input_id.starts_with("dpad_") {
+            return self.input_to_part.get("dpad").map(|s| s.as_str());
+        }
+        None
     }
 
     /// Choose the best view for an engine control: the TOP view when the control's part is drawn
@@ -207,6 +216,27 @@ mod tests {
         // btn_south rect became red; a pixel outside stays neutral.
         assert_eq!(img.get(6, 6), rgb(200, 0, 0));
         assert_eq!(img.get(0, 5), rgb(4, 4, 5));
+    }
+
+    #[test]
+    fn dpad_direction_prompts_resolve_to_the_single_dpad_part() {
+        // The four atomic dpad direction prompts (dpad_up/down/left/right) are NOT in the
+        // descriptor's id->skin_part map (which has only "dpad"), so part_for must fall back to the
+        // single "dpad" part — else the dpad renders with no highlight (tsp-bwrg.6 owner pass #5).
+        let mut map = HashMap::new();
+        map.insert("dpad".to_string(), "dpad".to_string());
+        map.insert("south".to_string(), "btn_south".to_string());
+        let s = SkinSet::from_parts(
+            map,
+            View { body: Rgb::new(4, 4, rgb(0, 0, 0)), lit: Rgb::new(4, 4, rgb(0, 0, 0)), parts: HashMap::new() },
+            None,
+            rgb(0, 0, 0),
+        );
+        for dir in ["dpad_up", "dpad_down", "dpad_left", "dpad_right"] {
+            assert_eq!(s.part_for(dir), Some("dpad"), "{dir} must highlight the dpad part");
+        }
+        assert_eq!(s.part_for("south"), Some("btn_south"), "a directly-mapped id still resolves");
+        assert_eq!(s.part_for("nonexistent"), None, "an unrelated unknown id resolves to nothing");
     }
 
     #[test]

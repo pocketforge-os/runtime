@@ -222,6 +222,38 @@ fn stick_records_observed_calibration_envelope() {
     assert!((y.value.expect("y centre recorded") - 2107).abs() <= 3, "y centre ~ rest, got {:?}", y.value);
 }
 
+/// tsp-bwrg.6 OWNER PASS #5: the stick advanced after ~0.25s (both axes merely TOUCHED) on a brief
+/// mid-roll centre-transit, truncating the roll and cascading its remainder into later controls.
+/// The full-sweep completion gate keeps the window open until BOTH axes reach their extremes, so a
+/// mid-roll pause does NOT complete it and the WHOLE min/max envelope is captured. Fail-old
+/// (completes at the first corner, x.min ~2097) / pass-new (full 0..4095 envelope).
+#[test]
+fn stick_full_roll_survives_a_mid_roll_pause_and_records_the_whole_envelope() {
+    let mut src = dut();
+    let lx = |x: i32| vec![abs(ABS_X, x), abs(ABS_Y, 2107), abs(ABS_RX, 2013), abs(ABS_RY, 2129)];
+    let ly = |y: i32| vec![abs(ABS_X, 2097), abs(ABS_Y, y), abs(ABS_RX, 2013), abs(ABS_RY, 2129)];
+    // First corner: X then Y to MAX (both axes seen active) ...
+    src.push_batch(lx(4095)); src.push_batch(ly(4095));
+    // ... then a real mid-roll PAUSE at rest (would complete under the old "both axes seen" gate) ...
+    for _ in 0..4 { src.push_batch(rest_frame()); }
+    // ... then the REST of the roll: both axes to MIN, then settle at rest.
+    src.push_batch(lx(0)); src.push_batch(ly(0));
+    for _ in 0..4 { src.push_batch(rest_frame()); }
+    src.push_batch(vec![]); src.push_batch(vec![]);
+
+    let spec = ControlSpec { id: "lstick".into(), kind: Kind::Stick, prompt: "lstick".into(), optional: false };
+    let mut c = Collector::new(vec![spec]);
+    let cfg = RunConfig { quiet_polls: 2, idle_skip_polls: 40, max_polls: 600, control_timeout: std::time::Duration::from_secs(5), ..RunConfig::default() };
+    let mut log = Vec::new();
+    let cap = collect::run(&mut c, &mut src, &meta(), &cfg, &mut log).expect("lstick completes after the full roll");
+    let ls = cap.inputs.iter().find(|i| i.id == "lstick").expect("lstick row");
+    let x = ls.x.expect("x axis");
+    let y = ls.y.expect("y axis");
+    // The WHOLE envelope was captured — the mid-roll pause did NOT truncate the roll at the corner.
+    assert!(x.min <= 100 && x.max >= 3995, "x must span the full roll (mid-roll pause must not truncate), got {}..{}", x.min, x.max);
+    assert!(y.min <= 100 && y.max >= 3995, "y must span the full roll, got {}..{}", y.min, y.max);
+}
+
 /// The FOUR atomic dpad direction steps (HatDir) each complete on their own single-axis press —
 /// removing the dpad from the 2-axis-single-window class entirely (owner-directed, tsp-bwrg.6) —
 /// and MERGE at emit into ONE hat row (`ABS_HAT0X,ABS_HAT0Y`), so the collected map is unchanged
