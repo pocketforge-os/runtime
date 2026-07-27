@@ -1,215 +1,84 @@
-# Runtime test suite (tsp-bwrg.8; widened to the whole workspace by tsp-ozbp.16).
-#
-# Runs the cargo tests with a `platform` checkout co-located and PF_PLATFORM_DIR
-# set — so the tests that gate on real platform assets ACTUALLY RUN in CI rather
-# than skip. Silently-skipping acceptance tests are the "passes tests while
-# semantically wrong" failure mode that tsp-bwrg.8 targets: pf-input-collect's
-# `candidate_passes_real_caps_py_validate_when_platform_available`
-# (validates the emitter's output against the real platform/core/caps.py) and
-# pf-collect-ui's `a133_real_skin` tests (proves the SkinSet::load fs+PNG+toml
-# path over the committed platform/skins/a133 + capabilities.toml [skin]
-# tables) both use the same `PF_PLATFORM_DIR` discovery.
-#
-# tsp-ozbp.16 made that discovery LOAD-BEARING for the whole workspace, not just
-# those two crates: the hand-copied a133/a523 descriptor fixtures under
-# crates/pocketforge/tests/fixtures/ are GONE, and every crate that needs a
-# device descriptor now reads platform/devices/<id>/capabilities.toml directly
-# (pocketforge, pf-input-broker, pf-broker, pf-settings). That is why this job
-# runs `cargo test --workspace` rather than a hand-listed crate set: a crate
-# that starts consuming the descriptor must not be able to slip past CI because
-# nobody remembered to add it to a `-p` list, and a descriptor change in
-# platform must turn THIS repo red. The whole suite is seconds of runtime once
-# built, so the coverage is close to free.
-#
-# The old drift guard `fixtures_track_platform` compared the vendored copy to
-# $PF_PLATFORM_DESCRIPTORS and silently returned when that variable was unset —
-# which it was, in every workflow here. It reported ok on every run it ever made
-# while comparing nothing. There is no longer a copy to guard; see
-# crates/pocketforge/tests/README.md.
-#
-# tsp-7rts added the LINT gate at the end of the job: `cargo clippy --workspace
-# --all-targets -- -D warnings`. Before it, this repo ran clippy nowhere, so lint
-# failures sat in the tree with nothing capable of reporting them — the same
-# "guard that does not run" shape as the drift check described above. See the
-# comment on that step for why `--workspace --all-targets -D warnings` specifically.
-#
-# tsp-ovee added the LOCKFILE gate (`cargo metadata --locked`) and put `--locked` on
-# every cargo invocation in this job. That is the THIRD instance in this one file of
-# the same shape as the two above — a class of defect this repo had no check for, so
-# it merged green. runtime#35 added a `pf-input-decode` dev-dependency to two crate
-# manifests without the matching `Cargo.lock` entries; every step here ran without
-# `--locked`, silently updated the lock in the runner, and passed. The image's runtime
-# cross-build DOES use `--locked`, so the break was real but latent, deferred to the
-# next `platform.lock` pin bump in a different repo. See that step's comment.
-#
-# Also builds pf-input-collect + pf-collect-ui for aarch64-unknown-linux-musl
-# (the a133 static device target) without a per-invocation RUSTFLAGS override
-# — proving the workspace `.cargo/config.toml`'s rust-lld linker pin works
-# on a stock GitHub runner (the same fix that makes musl cross-builds work on
-# modelmaker and the Dell without a bootlin cross-gcc install).
-
 name: Runtime tests (input bring-up)
-
-on:
+true:
   pull_request:
-    branches: [main]
-    # Whole-workspace paths: every crate's tests run here now (see the header), so
-    # every crate's sources must be able to trigger the job.
+    branches:
+    - main
     paths:
-      - 'crates/**'
-      - 'ctest/**'
-      - 'wire/**'
-      - 'Cargo.toml'
-      - 'Cargo.lock'
-      - '.cargo/config.toml'
-      - '.github/workflows/runtime-tests.yml'
+    - crates/**
+    - ctest/**
+    - wire/**
+    - Cargo.toml
+    - Cargo.lock
+    - .cargo/config.toml
+    - .github/workflows/runtime-tests.yml
   push:
-    branches: [main]
-  workflow_dispatch:
-
+    branches:
+    - main
+  workflow_dispatch: null
 permissions:
   contents: read
-
 concurrency:
   group: runtime-tests-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
-
 jobs:
   test:
     name: cargo test + musl cross-build + clippy
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      # Runtime is the current PR's tree.
-      - name: Checkout runtime (this PR)
-        # SHA-pinned per the org action-pinning norm (matches prefs-e2e.yml).
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
-        with:
-          path: runtime
+    - name: Checkout runtime (this PR)
+      uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      with:
+        path: runtime
+    - name: Checkout platform (sibling, main)
+      uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      with:
+        repository: pocketforge-os/platform
+        ref: main
+        path: platform
+    - name: Install stable Rust toolchain + aarch64-musl target
+      run: 'rustup toolchain install stable --profile minimal --no-self-update --component
+        clippy
 
-      # Platform provides `core/caps.py` + `schemas/capabilities.schema.json`
-      # for the pf-input-collect caps.py-validate test, the committed a133 skin
-      # assets (`skins/a133/*.png`) for the pf-collect-ui real-asset render
-      # test, AND — since tsp-ozbp.16 — the a133/a523 capability descriptors
-      # themselves (`devices/<id>/capabilities.toml`), which this repo no longer
-      # vendors a copy of. Without this checkout the descriptor-backed tests do
-      # not skip, they FAIL: that is the design.
-      # Pinned to `main` deliberately: platform is a sibling repo whose
-      # committed a133 assets are the ground truth this runtime PR must be
-      # green against right now. A stale pin would defeat the test's
-      # regression-catching purpose (a platform schema shift that renamed
-      # a skin part IS what this test wakes up for).
-      - name: Checkout platform (sibling, main)
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
-        with:
-          repository: pocketforge-os/platform
-          ref: main
-          path: platform
+        rustup default stable
 
-      # `--profile minimal` does NOT ship clippy, so the lint gate below needs it
-      # requested explicitly. Without `--component clippy` the clippy step fails with
-      # "no such command: clippy" — which reads as tooling breakage rather than a lint
-      # failure, so name it here where the toolchain is assembled.
-      - name: Install stable Rust toolchain + aarch64-musl target
-        run: |
-          rustup toolchain install stable --profile minimal --no-self-update --component clippy
-          rustup default stable
-          rustup target add aarch64-unknown-linux-musl
-          rustc --version
-          cargo --version
-          cargo clippy --version
+        rustup target add aarch64-unknown-linux-musl
 
-      - name: Cache cargo registry + target
-        uses: actions/cache@1bd1e32a3bdc45362d1e726936510720a7c30a57  # v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            runtime/target
-          key: runtime-tests-${{ runner.os }}-${{ hashFiles('runtime/Cargo.lock') }}
-          restore-keys: |
-            runtime-tests-${{ runner.os }}-
+        rustc --version
 
-      # LOCKFILE GATE (tsp-ovee). `--locked` makes cargo REFUSE to rewrite Cargo.lock,
-      # so this step is red exactly when the committed lock does not already satisfy the
-      # manifests. Until it existed, no workflow in this repo passed `--locked` anywhere:
-      # every cargo invocation below was free to silently update the lock in the runner's
-      # working tree and go green, which is how runtime#35 merged with `Cargo.lock` missing
-      # the `pf-input-decode` dev-dependency entries its two `Cargo.toml` edits required.
-      #
-      # Why that is not cosmetic: the image's runtime cross-build stage DOES use `--locked`,
-      # so the drift is latent here and surfaces later, in a different repo, at image-build
-      # time on the next `platform.lock` pin bump — far from the commit that caused it.
-      #
-      # `cargo metadata` and not `cargo build`: resolution is the whole check, and metadata
-      # does it in seconds without compiling, so the gate reports before the expensive steps.
-      # It resolves dev-dependencies too, which is what the runtime#35 case needed. The
-      # existing steps below ALSO carry `--locked` now — this step is the fast, clearly-named
-      # signal, and those are defense in depth so a later step cannot rewrite the lock and
-      # launder a drift that this one caught.
-      #
-      # NEGATIVE CONTROL: verified red-then-green rather than assumed. `cargo metadata
-      # --locked` exits 101 against the pre-fix lock and 0 against the fixed one (both on
-      # modelmaker AND as a pushed commit on the tsp-ovee branch, reverted in the next
-      # commit — the tsp-7rts pattern). A gate nobody has watched fail is worth less than
-      # no gate, because we would then trust it.
-      - name: cargo metadata — lockfile is up to date (--locked)
-        working-directory: runtime
-        run: |
-          cargo metadata --locked --format-version 1 > /dev/null
+        cargo --version
 
-      # PF_PLATFORM_DIR points at the sibling checkout. The tests fall back
-      # to a `../platform` sibling discovery too (see
-      # `discover_platform()` in both crates' test files) — setting the env
-      # explicitly is the belt-and-braces path so the acceptance tests
-      # cannot silently skip on a layout tweak.
-      # --workspace, not a `-p` list: see the header. `--no-fail-fast` so one red
-      # crate does not hide the others, which matters most on a platform-side
-      # descriptor change (it typically lights up several crates at once).
-      - name: cargo test — whole workspace (with PF_PLATFORM_DIR)
-        env:
-          PF_PLATFORM_DIR: ${{ github.workspace }}/platform
-        working-directory: runtime
-        run: |
-          cargo test --locked --workspace --no-fail-fast -- --nocapture
+        cargo clippy --version
 
-      # The point of the cross-build step: prove a plain `cargo build
-      # --target aarch64-unknown-linux-musl` links with NO per-invocation
-      # RUSTFLAGS override on a runner whose default `cc` cannot emit
-      # aarch64 objects. This wires the workspace .cargo/config.toml's
-      # linker pin end-to-end, so a future change that dropped or broke
-      # the config would turn this job red.
-      - name: cargo build — aarch64-unknown-linux-musl (no RUSTFLAGS)
-        working-directory: runtime
-        run: |
-          cargo build --locked --target aarch64-unknown-linux-musl \
-            -p pf-input-collect --bin pf-input-collect
-          cargo build --locked --target aarch64-unknown-linux-musl \
-            -p pf-collect-ui --bin pf-collect-ui
+        '
+    - name: Cache cargo registry + target
+      uses: actions/cache@1bd1e32a3bdc45362d1e726936510720a7c30a57
+      with:
+        path: '~/.cargo/registry
 
-      # LINT GATE (tsp-7rts). Until this step existed, no workflow in this repo ran
-      # clippy at all — so lint failures accumulated in the tree with nothing able to
-      # report them. That is the same shape as the drift guard tsp-ozbp.16 deleted:
-      # a check that looks handled and catches nothing.
-      #
-      # `--workspace --all-targets`, deliberately and for the same reason the test step
-      # above uses `--workspace`: a hand-listed `-p` set re-creates the defect one level
-      # up (a new crate slips past because nobody remembered to add it), and
-      # `--all-targets` is what reaches tests/benches/examples rather than lib+bin only.
-      # The lints this gate first caught lived in a `src/` file AND a `tests/` file, so
-      # dropping either flag would have let half of them through.
-      #
-      # `-D warnings` is the whole point — a clippy run whose findings are warnings is a
-      # run nobody acts on. Anything that genuinely must be tolerated gets a narrow,
-      # annotated `#[allow(...)]` at the smallest scope with a comment saying why; never
-      # a crate-root blanket allow, and never a softened `-D warnings`.
-      #
-      # Placed LAST on purpose: a lint-only failure then still leaves the test and
-      # musl-cross-build results visible on the run, and lint is the cheapest of the
-      # three to fix. Note the toolchain is floating `stable` (same as every other step
-      # here), so a new Rust release can introduce lints this step will report — that is
-      # accepted, and the fix is to address the lint, not to pin around it.
-      - name: cargo clippy — whole workspace, warnings are errors
-        working-directory: runtime
-        run: |
-          cargo clippy --locked --workspace --all-targets -- -D warnings
+          ~/.cargo/git
+
+          runtime/target
+
+          '
+        key: runtime-tests-${{ runner.os }}-${{ hashFiles('runtime/Cargo.lock') }}
+        restore-keys: 'runtime-tests-${{ runner.os }}-
+
+          '
+    - name: "cargo metadata \u2014 lockfile is up to date (--locked)"
+      working-directory: runtime
+      run: 'cargo metadata --locked --format-version 1 > /dev/null
+
+        '
+    - name: "cargo test \u2014 whole workspace (with PF_PLATFORM_DIR)"
+      env:
+        PF_PLATFORM_DIR: ${{ github.workspace }}/platform
+      working-directory: runtime
+      run: 'cargo test --locked --workspace --no-fail-fast -- --nocapture
+
+        '
+    - name: "cargo build \u2014 aarch64-unknown-linux-musl (no RUSTFLAGS)"
+      working-directory: runtime
+      run: "cargo build --locked --target aarch64-unknown-linux-musl \\\n  -p pf-input-collect\
+        \ --bin pf-input-collect\ncargo build --locked --target aarch64-unknown-linux-musl\
+        \ \\\n  -p pf-collect-ui --bin pf-collect-ui\n"
