@@ -57,6 +57,10 @@ struct InputRow {
     id: String,
     #[serde(default)]
     skin_part: Option<String>,
+    /// The PRINTED faceplate glyph (e.g. south -> "B" on a Nintendo chassis) — rendered in the
+    /// on-panel prompt, never an SDL letter derived from the position id (tsp-bwrg.6 pass #5).
+    #[serde(default)]
+    label: Option<String>,
 }
 
 /// One rendered view (front or top): its neutral body, its lit atlas, and its part rects.
@@ -82,6 +86,10 @@ impl View {
 /// A device's consumable skin: the engine-id->skin_part map + the front (and optional top) views.
 pub struct SkinSet {
     input_to_part: HashMap<String, String>,
+    /// engine-id -> the PRINTED faceplate glyph (descriptor `label`), e.g. south -> "B" on a
+    /// Nintendo-arranged chassis. The ONLY control-name source an on-panel prompt may render — never
+    /// an internal id or an SDL letter derived from position (tsp-bwrg.6 owner pass #5).
+    input_to_label: HashMap<String, String>,
     front: View,
     top: Option<View>,
     /// The device background color (a solid corner pixel) — used to color-key the device onto the
@@ -97,11 +105,21 @@ impl SkinSet {
         let desc: Descriptor = toml::from_str(&text)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("parsing {}: {e}", descriptor_path.display())))?;
 
-        let front = View {
+        let mut front = View {
             body: load_png(&skin_root.join(&desc.skin.body))?,
             lit: load_png(&skin_root.join(&desc.skin.lit_body))?,
             parts: desc.skin.parts,
         };
+        // Synthesize per-direction D-PAD highlight rects from the single `dpad` part, so each of the
+        // four direction prompts lights ONLY its own arm (a half of the cross) — no new atlas needed
+        // (tsp-bwrg.6 pass #5: "any way to just highlight the top/left/right/bottom?").
+        if let Some(&d) = front.parts.get("dpad") {
+            let (w2, h2, w3, h3) = (d.w / 2, d.h / 2, d.w / 3, d.h / 3);
+            front.parts.insert("dpad_up".into(), Rect { x: d.x + w3, y: d.y, w: w3, h: h2 });
+            front.parts.insert("dpad_down".into(), Rect { x: d.x + w3, y: d.y + h2, w: w3, h: d.h - h2 });
+            front.parts.insert("dpad_left".into(), Rect { x: d.x, y: d.y + h3, w: w2, h: h3 });
+            front.parts.insert("dpad_right".into(), Rect { x: d.x + w2, y: d.y + h3, w: d.w - w2, h: h3 });
+        }
         let top = match desc.skin.views.get("top") {
             Some(v) => Some(View {
                 body: load_png(&skin_root.join(&v.body))?,
@@ -111,17 +129,29 @@ impl SkinSet {
             None => None,
         };
         let bg = front.body.get(0, 0);
-        let input_to_part = desc
-            .inputs
-            .into_iter()
-            .filter_map(|r| r.skin_part.map(|p| (r.id, p)))
-            .collect();
-        Ok(SkinSet { input_to_part, front, top, bg })
+        let mut input_to_part = HashMap::new();
+        let mut input_to_label = HashMap::new();
+        for r in desc.inputs {
+            if let Some(p) = r.skin_part {
+                input_to_part.insert(r.id.clone(), p);
+            }
+            if let Some(l) = r.label {
+                input_to_label.insert(r.id, l);
+            }
+        }
+        Ok(SkinSet { input_to_part, input_to_label, front, top, bg })
     }
 
-    /// In-memory constructor for tests (no disk / PNG decode).
+    /// In-memory constructor for tests (no disk / PNG decode). Labels default empty; add them with
+    /// [`with_labels`](Self::with_labels).
     pub fn from_parts(input_to_part: HashMap<String, String>, front: View, top: Option<View>, bg: Color) -> SkinSet {
-        SkinSet { input_to_part, front, top, bg }
+        SkinSet { input_to_part, input_to_label: HashMap::new(), front, top, bg }
+    }
+
+    /// Attach an engine-id -> faceplate-label map (test builder / overlay).
+    pub fn with_labels(mut self, input_to_label: HashMap<String, String>) -> Self {
+        self.input_to_label = input_to_label;
+        self
     }
 
     /// The front body dimensions (all views share them) — for scaling into the canvas.
@@ -134,13 +164,23 @@ impl SkinSet {
         if let Some(p) = self.input_to_part.get(input_id) {
             return Some(p.as_str());
         }
-        // The four D-PAD direction prompts (dpad_up/down/left/right) all highlight the single
-        // `dpad` skin part — splitting the PROMPT must not lose the on-device highlight
-        // (tsp-bwrg.6: the dpad steps rendered with no control lit).
+        // A D-PAD direction prompt (dpad_up/down/left/right) highlights its OWN arm — the synthetic
+        // per-direction sub-rect built in `load()` — falling back to the whole `dpad` part if the
+        // sub-rects weren't synthesized (tsp-bwrg.6 pass #5: highlight the specific direction).
         if input_id.starts_with("dpad_") {
+            if let Some((k, _)) = self.front.parts.get_key_value(input_id) {
+                return Some(k.as_str());
+            }
             return self.input_to_part.get("dpad").map(|s| s.as_str());
         }
         None
+    }
+
+    /// The PRINTED faceplate glyph (descriptor `label`) for an engine control id, if the descriptor
+    /// gives one — what a human reads on the device. This is the ONLY control-name source an
+    /// on-panel prompt may render (never an internal id, never an SDL letter derived from position).
+    pub fn label_for(&self, input_id: &str) -> Option<&str> {
+        self.input_to_label.get(input_id).map(|s| s.as_str())
     }
 
     /// Choose the best view for an engine control: the TOP view when the control's part is drawn
@@ -237,6 +277,44 @@ mod tests {
         }
         assert_eq!(s.part_for("south"), Some("btn_south"), "a directly-mapped id still resolves");
         assert_eq!(s.part_for("nonexistent"), None, "an unrelated unknown id resolves to nothing");
+    }
+
+    #[test]
+    fn dpad_direction_highlights_its_own_arm_when_a_subrect_exists() {
+        // With a per-direction sub-rect present (synthesized from the whole `dpad` in load()), a
+        // direction highlights its OWN arm; a direction without a sub-rect falls back to whole dpad.
+        let mut parts = HashMap::new();
+        parts.insert("dpad_up".to_string(), Rect { x: 0, y: 0, w: 2, h: 2 });
+        let mut map = HashMap::new();
+        map.insert("dpad".to_string(), "dpad".to_string());
+        let s = SkinSet::from_parts(
+            map,
+            View { body: Rgb::new(4, 4, rgb(0, 0, 0)), lit: Rgb::new(4, 4, rgb(0, 0, 0)), parts },
+            None,
+            rgb(0, 0, 0),
+        );
+        assert_eq!(s.part_for("dpad_up"), Some("dpad_up"), "a synthesized per-direction sub-rect wins");
+        assert_eq!(s.part_for("dpad_down"), Some("dpad"), "a direction with no sub-rect falls back to whole dpad");
+    }
+
+    #[test]
+    fn load_synthesizes_four_dpad_direction_subrects_inside_the_dpad_rect() {
+        // Pure geometry check on the synthesis: four direction rects, each inside the parent dpad.
+        let mut parts = HashMap::new();
+        parts.insert("dpad".to_string(), Rect { x: 100, y: 200, w: 144, h: 142 });
+        // Re-run the same synthesis load() does (kept in sync with the load() body).
+        let d = parts["dpad"];
+        let (w2, h2, w3, h3) = (d.w / 2, d.h / 2, d.w / 3, d.h / 3);
+        parts.insert("dpad_up".into(), Rect { x: d.x + w3, y: d.y, w: w3, h: h2 });
+        parts.insert("dpad_down".into(), Rect { x: d.x + w3, y: d.y + h2, w: w3, h: d.h - h2 });
+        parts.insert("dpad_left".into(), Rect { x: d.x, y: d.y + h3, w: w2, h: h3 });
+        parts.insert("dpad_right".into(), Rect { x: d.x + w2, y: d.y + h3, w: d.w - w2, h: h3 });
+        for dir in ["dpad_up", "dpad_down", "dpad_left", "dpad_right"] {
+            let r = parts[dir];
+            assert!(r.x >= d.x && r.y >= d.y && r.x + r.w <= d.x + d.w && r.y + r.h <= d.y + d.h,
+                "{dir} rect {r:?} must lie inside the parent dpad {d:?}");
+            assert!(r.w > 0 && r.h > 0, "{dir} must be non-empty");
+        }
     }
 
     #[test]

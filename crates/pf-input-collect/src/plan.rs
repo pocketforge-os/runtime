@@ -137,11 +137,11 @@ pub fn default_gamepad_plan() -> Vec<ControlSpec> {
 /// two agreeing is then checkable, not coincidental.
 pub fn a133_gamepad_plan() -> Vec<ControlSpec> {
     vec![
-        // Prompt by POSITION only — never by an A/B/X/Y letter. The map is by SDL position
-        // (south=bottom -> BTN_A, etc.) and the skin parts are positional (btn_south...); the
-        // physical LETTER printed on a button differs by vendor layout (a TrimUI is not laid out
-        // like an Xbox pad), so a letter hint is wrong as often as right. Position is unambiguous
-        // and is what the user actually presses (tsp-bwrg.6, owner: "we call them the wrong thing").
+        // Prompt text here is POSITION only and never carries an A/B/X/Y letter. The map is by SDL
+        // position (south=bottom -> BTN_A, etc.); the PRINTED faceplate glyph differs by chassis (a
+        // TrimUI is Nintendo-arranged: bottom is "B", not "A"), so the wizard appends the device's
+        // real glyph from the descriptor `label` field at render time — never a letter derived here
+        // (tsp-bwrg.6 owner pass #5: "...BOTTOM FACE BUTTON (A)" pointed at a button printed "B").
         ControlSpec::new("south", Kind::Button, "Press the BOTTOM face button", false),
         ControlSpec::new("east", Kind::Button, "Press the RIGHT face button", false),
         ControlSpec::new("west", Kind::Button, "Press the LEFT face button", false),
@@ -164,17 +164,20 @@ pub fn a133_gamepad_plan() -> Vec<ControlSpec> {
         ControlSpec::new("dpad_down", Kind::HatDir, "Press DOWN on the D-PAD", false),
         ControlSpec::new("dpad_left", Kind::HatDir, "Press LEFT on the D-PAD", false),
         ControlSpec::new("dpad_right", Kind::HatDir, "Press RIGHT on the D-PAD", false),
-        // A stick needs BOTH axes actuated — a partial arc only moves one, so ask for a full circle.
+        // A stick completes on ONE full circle that touches all four edges (both axes reach both
+        // extremes). Prompt for exactly that ONE sweep — never "both directions"/back-and-forth,
+        // which reads as a second roll and confused the owner when the step advanced after one
+        // (tsp-bwrg.6 pass #5: "it stopped after 1 roll ... just want to be consistent").
         ControlSpec::new(
             "lstick",
             Kind::Stick,
-            "Roll the LEFT STICK all the way around in a FULL CIRCLE (both directions)",
+            "Roll the LEFT STICK once all the way around the circle (touch every edge)",
             false,
         ),
         ControlSpec::new(
             "rstick",
             Kind::Stick,
-            "Roll the RIGHT STICK all the way around in a FULL CIRCLE (both directions)",
+            "Roll the RIGHT STICK once all the way around the circle (touch every edge)",
             false,
         ),
         // L2/R2 are BINARY buttons on the a133 (BTN_TL2/BTN_TR2) — a press, not an analog squeeze.

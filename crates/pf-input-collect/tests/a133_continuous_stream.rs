@@ -254,6 +254,45 @@ fn stick_full_roll_survives_a_mid_roll_pause_and_records_the_whole_envelope() {
     assert!(y.min <= 100 && y.max >= 3995, "y must span the full roll, got {}..{}", y.min, y.max);
 }
 
+/// tsp-bwrg.6 OWNER PASS #5, the CASCADE half: the stick completed early and the REST of the roll
+/// leaked into the NEXT control and falsely satisfied it (the following stick captured the FIRST
+/// stick's axes — "wrongly associated the rest of the roll with other buttons"). The full-sweep gate
+/// keeps the roll inside its own control until the roll ENDS, so the next control gets ITS OWN
+/// input. Fail-old (rstick captures ABS_X,ABS_Y from the bleed) / pass-new (rstick=ABS_RX,ABS_RY).
+#[test]
+fn a_long_stick_roll_does_not_bleed_into_the_next_control() {
+    let mut src = dut();
+    let lx = |x: i32| vec![abs(ABS_X, x), abs(ABS_Y, 2107), abs(ABS_RX, 2013), abs(ABS_RY, 2129)];
+    let ly = |y: i32| vec![abs(ABS_X, 2097), abs(ABS_Y, y), abs(ABS_RX, 2013), abs(ABS_RY, 2129)];
+    let rx = |x: i32| vec![abs(ABS_X, 2098), abs(ABS_Y, 2107), abs(ABS_RX, x), abs(ABS_RY, 2129)];
+    let ry = |y: i32| vec![abs(ABS_X, 2098), abs(ABS_Y, 2107), abs(ABS_RX, 2013), abs(ABS_RY, y)];
+    // lstick: one corner, a mid-roll PAUSE (the old early-complete point), then finish to the
+    // opposite extremes, then MORE roll (the "excess" that used to bleed) — all before any settle.
+    src.push_batch(lx(4095)); src.push_batch(ly(4095));
+    for _ in 0..3 { src.push_batch(rest_frame()); }
+    src.push_batch(lx(0)); src.push_batch(ly(0));
+    src.push_batch(lx(4095)); src.push_batch(ly(0)); src.push_batch(lx(0)); src.push_batch(ly(4095));
+    for _ in 0..3 { src.push_batch(rest_frame()); }
+    // rstick: its OWN roll on RX/RY.
+    src.push_batch(rx(4095)); src.push_batch(rx(0)); src.push_batch(ry(4095)); src.push_batch(ry(0));
+    for _ in 0..3 { src.push_batch(rest_frame()); }
+    src.push_batch(vec![]); src.push_batch(vec![]);
+
+    let plan = vec![
+        ControlSpec { id: "lstick".into(), kind: Kind::Stick, prompt: "lstick".into(), optional: false },
+        ControlSpec { id: "rstick".into(), kind: Kind::Stick, prompt: "rstick".into(), optional: false },
+    ];
+    let mut c = Collector::new(plan);
+    let cfg = RunConfig { quiet_polls: 2, idle_skip_polls: 40, max_polls: 2000, control_timeout: std::time::Duration::from_secs(5), ..RunConfig::default() };
+    let mut log = Vec::new();
+    let cap = collect::run(&mut c, &mut src, &meta(), &cfg, &mut log).expect("both sticks complete");
+    let ls = cap.inputs.iter().find(|i| i.id == "lstick").expect("lstick row");
+    let rs = cap.inputs.iter().find(|i| i.id == "rstick").expect("rstick row");
+    assert_eq!(ls.code, "ABS_X,ABS_Y", "lstick must own the left-stick axes");
+    assert_eq!(rs.code, "ABS_RX,ABS_RY",
+        "rstick must capture ITS OWN axes — the lstick roll must not bleed in and falsely satisfy it");
+}
+
 /// The FOUR atomic dpad direction steps (HatDir) each complete on their own single-axis press —
 /// removing the dpad from the 2-axis-single-window class entirely (owner-directed, tsp-bwrg.6) —
 /// and MERGE at emit into ONE hat row (`ABS_HAT0X,ABS_HAT0Y`), so the collected map is unchanged
