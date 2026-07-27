@@ -152,8 +152,12 @@ pub struct FbDev {
     map: *mut u8,
     map_len: usize,
     fmt: FbFormat,
-    /// Kept for FBIOPAN_DISPLAY (pan-to-present): we set `yoffset=0` and pass it back each frame.
+    /// Kept for FBIOPAN_DISPLAY (pan-to-present): we set `yoffset` and pass it back each frame.
     var: FbVarScreeninfo,
+    /// Bytes per page (`line_length * yres`) + double-buffering state (see `open`/`present`).
+    page_bytes: usize,
+    n_pages: u32,
+    page: u32,
 }
 
 impl FbDev {
@@ -186,12 +190,20 @@ impl FbDev {
             b_off: var.blue.offset,
             b_len: var.blue.length,
         };
-        // Single-buffered page 0 (yoffset 0): this is the menu's proven-visible path on the A133
-        // g2d-rotated scan-out. (The panel only reliably reflects page 0; panning to page 1 shows
-        // black — verified live on tsp-bwrg.6, both fb0 pages held content yet a page-1 pan was
-        // dark.) We map just the visible page and always draw + pan it; at the wizard's slow
-        // redraw cadence single-buffering never tears.
-        let map_len = fix.line_length as usize * var.yres as usize;
+        // DOUBLE-BUFFER, mirroring apps/pocketforge-menu. This panel's scan-out is a g2d-rotated copy
+        // that refreshes ONLY on an FBIOPAN_DISPLAY whose yoffset actually CHANGES — panning to the
+        // SAME offset is a no-op. A single-page-0 present therefore cannot refresh when the panel is
+        // already at offset 0, which left a long-parked wizard showing a stale frame (tsp-bwrg.6: the
+        // wizard was alive but the panel kept the previous menu). So map BOTH pages and alternate
+        // page 0/1 each present, forcing the offset to change every frame. (Page 1 DOES display — the
+        // menu uses it; the earlier "page 1 is black" note was undrawn / pre-alpha-fix content.)
+        let page_bytes = fix.line_length as usize * var.yres as usize;
+        let n_pages: u32 = if var.yres_virtual >= 2 * var.yres { 2 } else { 1 };
+        let map_len = page_bytes * n_pages as usize;
+        // Start `page` at whatever the panel is CURRENTLY showing, so the first present's toggle moves
+        // to the OTHER page — guaranteeing even a single present (a long parked timeout) changes the
+        // offset and refreshes rather than no-op'ing onto a stale frame.
+        let cur_page = if n_pages > 1 { (var.yoffset / var.yres.max(1)).min(1) } else { 0 };
         let map = unsafe {
             libc::mmap(std::ptr::null_mut(), map_len, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_SHARED, fd, 0)
         };
@@ -200,7 +212,7 @@ impl FbDev {
             unsafe { libc::close(fd) };
             return Err(e);
         }
-        Ok(FbDev { fd, map: map as *mut u8, map_len, fmt, var })
+        Ok(FbDev { fd, map: map as *mut u8, map_len, fmt, var, page_bytes, n_pages, page: cur_page })
     }
 
     pub fn format(&self) -> FbFormat {
@@ -210,12 +222,16 @@ impl FbDev {
     /// Blit a logical `CANVAS_W`x`CANVAS_H` canvas onto the panel, letterboxed + nearest-neighbor
     /// scaled, black borders. Cheap enough at the wizard's low frame rate (one full sweep/frame).
     pub fn present(&mut self, canvas: &Canvas) {
+        // Alternate the draw/scan-out page each frame so the pan offset always CHANGES (see `open`) —
+        // panning to the same offset is a no-op that leaves a stale frame on this g2d-rotated panel.
+        self.page = if self.n_pages > 1 { self.page ^ 1 } else { 0 };
+        let page_off = self.page as usize * self.page_bytes;
         let (draw_w, draw_h, off_x, off_y) = letterbox(canvas.w as u32, canvas.h as u32, self.fmt.w, self.fmt.h);
         let bpp = self.fmt.bytes_per_pixel();
         let ll = self.fmt.line_length as usize;
         let src = canvas.pixels();
         for dy in 0..self.fmt.h {
-            let row = unsafe { self.map.add(dy as usize * ll) };
+            let row = unsafe { self.map.add(page_off + dy as usize * ll) };
             for dx in 0..self.fmt.w {
                 let word = if dx >= off_x && dx < off_x + draw_w && dy >= off_y && dy < off_y + draw_h {
                     let sx = ((dx - off_x) as u64 * canvas.w as u64 / draw_w as u64) as usize;
@@ -234,13 +250,13 @@ impl FbDev {
                 }
             }
         }
-        // Pan-to-present: flush the drawn page, then FBIOPAN_DISPLAY to page 0. On this panel the
-        // scan-out (a g2d-rotated copy) refreshes ONLY on the pan — a raw write is invisible
-        // without it. We always pan to yoffset 0 (page 0), the menu's proven-visible path.
+        // Pan-to-present: flush the drawn page, then FBIOPAN_DISPLAY to it. On this panel the scan-out
+        // (a g2d-rotated copy) refreshes ONLY on a pan whose offset changes — a raw write, or a pan to
+        // the same offset, is invisible. We just drew the back page, so panning to it is a real change.
         unsafe {
             libc::msync(self.map as *mut libc::c_void, self.map_len, libc::MS_SYNC);
             self.var.xoffset = 0;
-            self.var.yoffset = 0;
+            self.var.yoffset = self.page * self.fmt.h;
             libc::ioctl(self.fd, FBIOPAN_DISPLAY, &mut self.var as *mut _);
         }
     }

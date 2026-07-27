@@ -217,6 +217,13 @@ pub fn drive_live<S: EventSource, K: Sink>(
             // through in seconds (tsp-bwrg.6). `max_polls` is only a runaway guard now.
             let deadline = Instant::now() + timing.control_timeout;
             let mut iters = 0usize;
+            // Keep-alive: re-present the idle prompt periodically. On a long parked timeout a control
+            // is otherwise drawn only ONCE, and that single present can lose the panel to a stale
+            // frame left by the outgoing menu (tsp-bwrg.6: the parked wizard was alive but the panel
+            // kept showing the menu). Periodic re-presents make the panel converge to the current
+            // control within ~1.5s regardless, and keep a parked panel live.
+            let mut last_present = Instant::now();
+            let keepalive = std::time::Duration::from_millis(1500);
             while Instant::now() < deadline && iters < timing.max_polls {
                 iters += 1;
                 let evs = src.poll(timing.poll_step).map_err(|e| CollectError::AbsInfo { code: 0, source: e })?;
@@ -234,6 +241,12 @@ pub fn drive_live<S: EventSource, K: Sink>(
                 if active_now && !showed_capturing {
                     present(sink, &mut canvas, skin, &collector, StepView { active_id: Some(&spec.id), prompt: &prompt_text, status: "CAPTURING...", done: false });
                     showed_capturing = true;
+                    last_present = Instant::now();
+                }
+                // Keep-alive re-present of the idle prompt (see `last_present`/`keepalive` above).
+                if !showed_capturing && last_present.elapsed() >= keepalive {
+                    present(sink, &mut canvas, skin, &collector, StepView { active_id: Some(&spec.id), prompt: &prompt_text, status, done: false });
+                    last_present = Instant::now();
                 }
                 // A button/click — and a trigger realized as a binary button (a133 L2/R2) — completes
                 // the instant a key-down is seen. A genuinely analog trigger emits no key, so its sweep
