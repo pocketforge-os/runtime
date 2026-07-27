@@ -43,15 +43,13 @@ fn check(name: &str, cond: bool) {
     }
 }
 
-/// The committed E1 descriptor fixtures (a133 omits `rumble`; a523 has it). Resolved
-/// from the crate dir at compile time so cwd does not matter. Read-only consumption —
-/// this harness never edits `crates/*`.
+/// The REAL E1 device descriptors from the `platform` checkout (a133 omits `rumble`; a523 has
+/// it). This repo vendors no copy (`tsp-ozbp.16`) — resolution goes through
+/// `pocketforge::test_support`, which reads `$PF_PLATFORM_DIR` or a sibling `platform` checkout
+/// and panics (never skips) when neither is present. Read-only consumption — this harness never
+/// edits `crates/*`.
 fn descriptor(id: &str) -> Descriptor {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../../crates/pocketforge/tests/fixtures")
-        .join(format!("{id}-capabilities.toml"));
-    Descriptor::load(&path)
-        .unwrap_or_else(|e| panic!("load descriptor {id} from {}: {e}", path.display()))
+    pocketforge::test_support::descriptor(id)
 }
 
 /// A scratch prefs dir unique to this process + tag (mirrors the `.2` test convention;

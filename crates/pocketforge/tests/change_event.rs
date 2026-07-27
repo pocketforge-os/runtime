@@ -41,11 +41,15 @@ fn location_consent_grant_fires_change_event_and_flips_query() {
 
 #[test]
 fn no_event_without_a_change() {
-    let backend = InProcessBackend::shared(Arc::new(common::descriptor("a523")));
+    // Runs on the synthetic IMU rig: the sanity-check below needs a device whose imu is actually
+    // granted, and no shipping device has a bound IMU today (a523's qmi8658 is DT-present but
+    // driver-unbound, so platform omits the row). Naming the a523 here only worked against the
+    // stale vendored copy (tsp-ozbp.16).
+    let backend = InProcessBackend::shared(Arc::new(common::imu_descriptor()));
     let rx = backend.subscribe("imu");
     // Nothing changed → no spurious event.
     assert_eq!(rx.recv_timeout(Duration::from_millis(100)), Err(RecvTimeoutError::Timeout));
-    // (imu starts granted on a523; sanity-check that read path is unaffected.)
+    // (imu starts granted on the rig; sanity-check that read path is unaffected.)
     let pf = Pf::over_in_process(backend);
     assert!(pf.acquire::<Imu>().is_ok());
 }

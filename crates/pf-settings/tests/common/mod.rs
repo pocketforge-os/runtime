@@ -23,21 +23,13 @@ use std::time::Duration;
 use pf_prefs::PrefValue;
 use pocketforge::{Descriptor, Pf, RumbleStatus};
 
-/// Load a fixture descriptor from the `pocketforge` crate's shared test fixtures. Reusing the
-/// merged fixtures (rather than defining a parallel set here) keeps the a133 / a523 truth in ONE
-/// place — descriptor drift would immediately surface as a broken test on both sides.
+/// Load a device descriptor straight from the `platform` checkout — the ONE source of a133 /
+/// a523 truth for every crate in this workspace (`tsp-ozbp.16`). This used to read a vendored
+/// snapshot under `crates/pocketforge/tests/fixtures/`; that copy is gone, because nothing forced
+/// it to agree with the descriptor it claimed to mirror and it had silently drifted. Resolution
+/// PANICS rather than skips when no checkout is found — see `pocketforge::test_support`.
 pub fn descriptor(id: &str) -> Descriptor {
-    // pf-settings sits at `crates/pf-settings`; the pocketforge fixtures are at
-    // `crates/pocketforge/tests/fixtures/`. CARGO_MANIFEST_DIR is the pf-settings package root.
-    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("pocketforge")
-        .join("tests")
-        .join("fixtures")
-        .join(format!("{id}-capabilities.toml"));
-    Descriptor::load(&fixture).unwrap_or_else(|e| {
-        panic!("load fixture descriptor {}: {e}", fixture.display())
-    })
+    pocketforge::test_support::descriptor(id)
 }
 
 /// A scratch `$PF_PREFS_DIR` unique to this process + tag, wiped fresh so no prior run's state

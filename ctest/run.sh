@@ -9,9 +9,15 @@ root="$(cd "$here/.." && pwd)"
 build="$here/build"
 mkdir -p "$build"
 
-# Descriptor: arg 1, or the committed a133 test fixture.
-desc="${1:-$root/crates/pocketforge/tests/fixtures/a133-capabilities.toml}"
-[ -f "$desc" ] || { echo "ctest: no descriptor at $desc" >&2; exit 2; }
+# Descriptor: arg 1, or the REAL a133 descriptor from a `platform` checkout. This repo vendors no
+# copy of it (tsp-ozbp.16) — set PF_PLATFORM_DIR, or keep `platform` checked out beside `runtime`.
+platform="${PF_PLATFORM_DIR:-$root/../platform}"
+desc="${1:-$platform/devices/a133/capabilities.toml}"
+[ -f "$desc" ] || {
+  echo "ctest: no descriptor at $desc" >&2
+  echo "ctest: clone https://github.com/pocketforge-os/platform beside this repo, or set PF_PLATFORM_DIR" >&2
+  exit 2
+}
 
 echo "ctest: building libpocketforge staticlib (release)..."
 cargo build --release -p libpocketforge >/dev/null

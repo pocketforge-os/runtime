@@ -36,22 +36,42 @@ fn a133_sensors_hardware_absent_never_a_crash() {
 }
 
 #[test]
-fn a523_imu_pose_roundtrips_through_the_physical_model() {
-    let backend = InProcessBackend::shared(Arc::new(common::descriptor("a523")));
+fn a523_sensors_hardware_absent_qmi8658_is_dt_present_but_unbound() {
+    // The a523's qmi8658 is DT-present but driver-UNBOUND on the operative stock kernel, so
+    // platform OMITS the [[sensors]] row (SPIKE-0, 2026-07-11 — two independent on-silicon
+    // checks). Until an owned A523 kernel binds the IIO driver, the Pro S degrades exactly like
+    // the base unit. This assertion used to read `assert!(s.present(), "a523 has a qmi8658 IMU")`
+    // and stayed green only because the vendored copy still carried the removed row (tsp-ozbp.16).
+    let pf = Pf::in_process(common::descriptor("a523"));
+    let s = pf.sensors();
+    assert!(!s.present(), "a523 advertises no bound IMU (qmi8658 DT-present, driver unbound)");
+    assert_eq!(s.read_pose().err(), Some(CapError::HardwareAbsent));
+    assert_eq!(s.read_accel().err(), Some(CapError::HardwareAbsent));
+    // Rumble is a SEPARATE actuator row the Pro S really does carry — absence is per-capability,
+    // not a whole-device downgrade.
+    assert!(pf.vibration().has_motor(), "a523 keeps its pwm-vibrator");
+}
+
+#[test]
+fn imu_pose_roundtrips_through_the_physical_model() {
+    // Runs on the SYNTHETIC imu rig: no shipping device advertises a bound IMU today (see
+    // `pocketforge::test_support::imu_descriptor`), and asserting this in the a523's name is what
+    // the stale copy let us get away with. The physical-model code under test is unchanged.
+    let backend = InProcessBackend::shared(Arc::new(common::imu_descriptor()));
     let pf = Pf::over_in_process(backend.clone());
     let s = pf.sensors();
-    assert!(s.present(), "a523 has a qmi8658 IMU");
+    assert!(s.present(), "the synthetic rig advertises a bound qmi8658");
 
     // Tilt the top fully away (pitch 90°): gravity reaction rotates onto +Y; spin about Z.
     backend
         .set_pose(Pose { pitch: 90.0, wz: 30.0, ..Pose::default() })
-        .expect("a523 accepts a pose");
+        .expect("the rig accepts a pose");
 
     close(&s.read_accel().unwrap(), &[0.0, G, 0.0]);
     // gyro is reported in SI rad/s; the pose carried 30 deg/s about Z.
     close(&s.read_gyro().unwrap(), &[0.0, 0.0, 30.0_f64.to_radians()]);
 
-    // The mount-matrix pipeline round-trips (a523 mount is identity): chip → device recovers accel.
+    // The mount-matrix pipeline round-trips (the rig mount is identity): chip → device recovers accel.
     let chip = s.read_chip_accel().unwrap();
     close(&s.device_from_chip(&chip), &s.read_accel().unwrap());
     assert_eq!(s.mount_matrix(), &pocketforge::physical_model::IDENTITY_MOUNT);
@@ -191,10 +211,17 @@ impl HardwareProbe for ImuUnboundProbe {
 
 #[test]
 fn live_probe_demotes_an_unbound_imu_to_hardware_absent() {
-    let pf = Pf::in_process(common::descriptor("a523")).with_probe(Arc::new(ImuUnboundProbe));
+    // MUST run on a descriptor that actually ADVERTISES an IMU, or there is nothing to demote and
+    // the assertion passes for the wrong reason. It used to name the a523 — which platform no
+    // longer describes as having a bound IMU, so against the real descriptor this test would have
+    // gone vacuously green rather than red: a silent second instance of the very failure class
+    // tsp-ozbp.16 is about. The synthetic rig keeps the demotion observable.
+    let rig = common::imu_descriptor();
+    assert!(rig.cap_present("imu"), "precondition: the rig advertises an IMU to demote");
+    let pf = Pf::in_process(rig).with_probe(Arc::new(ImuUnboundProbe));
     let s = pf.sensors();
     assert!(!s.present(), "probe demotes the descriptor-advertised IMU");
     assert_eq!(s.read_pose().err(), Some(CapError::HardwareAbsent));
-    // Vibration on a523 is unaffected (the probe is inconclusive for rumble ⇒ trust descriptor).
+    // Vibration is unaffected (the probe is inconclusive for rumble ⇒ trust the descriptor).
     assert!(pf.vibration().has_motor());
 }

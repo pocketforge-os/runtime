@@ -44,13 +44,30 @@ fn a133_location_absent() {
     assert_eq!(pf.query::<Location>(), PermissionState::Denied);
 }
 
-// --- a523 (Pro S): IMU + rumble + GNSS -------------------------------------------------------
+// --- a523 (Pro S): rumble; IMU + GNSS silicon present but DT-unbound → row-omitted -----------
 
 #[test]
-fn a523_imu_present_and_readable() {
+fn a523_imu_is_hardware_absent_qmi8658_dt_present_but_unbound() {
+    // Was `a523_imu_present_and_readable`. platform REMOVED the a523 `[[sensors]]` IMU row after
+    // SPIKE-0 adjudicated the qmi8658 DT-present but driver-UNBOUND on the operative stock kernel
+    // (2026-07-11, two independent on-silicon checks) — R3: missing hardware is a row omission,
+    // never a fabricated row. This test kept asserting the opposite for months, green, because it
+    // read a vendored copy of the descriptor instead of the descriptor (tsp-ozbp.16).
     let pf = Pf::in_process(common::descriptor("a523"));
-    assert!(pf.has_capability::<Imu>().present(), "a523 has a qmi8658 IMU");
-    let imu = pf.acquire::<Imu>().expect("a523 IMU acquires");
+    let has = pf.has_capability::<Imu>();
+    assert!(has.api, "the Imu capability type still exists in the build");
+    assert!(!has.hardware, "a523 advertises no BOUND IMU (qmi8658 driver unbound)");
+    assert_eq!(pf.acquire::<Imu>().err(), Some(CapError::HardwareAbsent));
+    assert_eq!(pf.query::<Imu>(), PermissionState::Denied);
+}
+
+#[test]
+fn imu_present_and_readable_on_a_bound_imu() {
+    // The acquire/read/query path for a device that DOES have a bound IMU. No shipping device
+    // does today, so this runs on the honestly-synthetic rig rather than in a real device's name.
+    let pf = Pf::in_process(common::imu_descriptor());
+    assert!(pf.has_capability::<Imu>().present(), "the rig has a bound qmi8658");
+    let imu = pf.acquire::<Imu>().expect("bound IMU acquires");
     assert!(imu.read_pose().is_ok());
     assert_eq!(pf.query::<Imu>(), PermissionState::Granted);
 }
@@ -140,19 +157,57 @@ fn leds_present_on_both_with_descriptor_count() {
     assert!(a523.acquire::<Leds>().unwrap().count > 0, "a523 has an led array");
 }
 
-// --- drift guard: vendored fixtures vs the live platform descriptors (CI-gated) -------------
+// --- one truth: no vendored descriptor copy may come back (tsp-ozbp.16) ----------------------
 
+/// This REPLACES the old `fixtures_track_platform`, which compared a vendored copy against
+/// `$PF_PLATFORM_DESCRIPTORS` and **silently returned when that variable was unset** — as it was
+/// in every workflow in this repo. It reported `ok` on every run it ever made while comparing
+/// nothing, and the copy it was supposed to guard drifted anyway (stale a133 face-button labels,
+/// an a523 IMU row platform had deleted). The copy is gone; the suite reads
+/// `platform/devices/<id>/capabilities.toml` directly, so there is no longer a second copy TO
+/// drift. What remains is keeping one from being reintroduced.
 #[test]
-fn fixtures_track_platform() {
-    let Some(root) = std::env::var_os("PF_PLATFORM_DESCRIPTORS") else {
-        eprintln!("skip: set PF_PLATFORM_DESCRIPTORS=<platform/devices> to check fixture drift");
-        return;
-    };
+fn no_vendored_descriptor_copy_exists() {
+    let crates_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("crates/ dir");
+    let mut found = Vec::new();
+    let mut stack = vec![crates_dir.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        for e in entries.flatten() {
+            let p = e.path();
+            let name = e.file_name().to_string_lossy().into_owned();
+            if p.is_dir() {
+                // `target/` is build output, not a checked-in copy.
+                if name != "target" {
+                    stack.push(p);
+                }
+            } else if name.ends_with("capabilities.toml") || name.contains("-capabilities.toml") {
+                found.push(p);
+            }
+        }
+    }
+    assert!(
+        found.is_empty(),
+        "a device descriptor copy has reappeared under crates/: {found:?}\n\
+         The runtime suite reads platform/devices/<id>/capabilities.toml directly — a vendored \
+         snapshot has nothing forcing it to agree with the device truth it mirrors, which is how \
+         four tests came to assert an a523 IMU platform had removed (tsp-ozbp.16). If you need a \
+         device shape platform does not describe, add an explicitly SYNTHETIC rig in \
+         pocketforge::test_support instead."
+    );
+}
+
+/// The descriptors the suite runs on really are the platform ones — the property every assertion
+/// in this file leans on. It fails loudly (never skips) when no platform checkout is resolvable.
+#[test]
+fn descriptors_come_from_the_platform_checkout() {
+    let root = pocketforge::test_support::platform_root()
+        .expect("no platform checkout — see crates/pocketforge/tests/README.md (this must not skip)");
     for id in ["a133", "a523"] {
-        let live = std::path::Path::new(&root).join(id).join("capabilities.toml");
-        let live = std::fs::read_to_string(&live)
-            .unwrap_or_else(|e| panic!("read live {id} descriptor: {e}"));
-        let fixture = std::fs::read_to_string(common::fixture_path(id)).unwrap();
-        assert_eq!(fixture, live, "fixture {id} drifted from platform — refresh it");
+        let path = pocketforge::test_support::try_descriptor_path(id).expect("descriptor path");
+        assert!(path.starts_with(&root), "{id} descriptor resolved outside the platform checkout");
+        assert_eq!(common::descriptor(id).identity.id, id);
     }
 }

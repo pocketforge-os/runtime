@@ -39,9 +39,26 @@ jobs:
         descriptor: [a133, a523]
 
     steps:
-      - name: Checkout
+      - name: Checkout runtime (this PR)
         # SHA-pinned per the org action-pinning norm (matches sim-gate.yml).
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        with:
+          path: runtime
+
+      # pf-settings' E2E helpers load the a133/a523 capability descriptors, and since
+      # tsp-ozbp.16 those come from the `platform` repo DIRECTLY — this repo no longer
+      # vendors a copy under crates/pocketforge/tests/fixtures/, because nothing forced
+      # the copy to agree with the descriptor it mirrored and it had silently drifted.
+      # Without this checkout the descriptor load FAILS loudly rather than skipping,
+      # which is the point: a test that cannot see the device truth must not be green.
+      # Pinned to `main` deliberately, for the same reason runtime-tests.yml is: a
+      # platform descriptor correction SHOULD light this repo up.
+      - name: Checkout platform (sibling, main)
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        with:
+          repository: pocketforge-os/platform
+          ref: main
+          path: platform
 
       - name: Install stable Rust toolchain
         run: |
@@ -56,8 +73,8 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
-          key: prefs-e2e-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+            runtime/target
+          key: prefs-e2e-${{ runner.os }}-${{ hashFiles('runtime/Cargo.lock') }}
           restore-keys: |
             prefs-e2e-${{ runner.os }}-
 
@@ -68,6 +85,9 @@ jobs:
       # tests share bodies via `run_unified_scenario`, GREEN on BOTH matrix rows is precisely the
       # "zero test-code diff between rows" proof the epic acceptance names.
       - name: Run E2E matrix row (${{ matrix.descriptor }})
+        env:
+          PF_PLATFORM_DIR: ${{ github.workspace }}/platform
+        working-directory: runtime
         run: |
           cargo test -p pf-settings --test prefs_e2e -- --nocapture ${{ matrix.descriptor }}
 
@@ -75,6 +95,9 @@ jobs:
       # descriptor tag in their names; run them ONCE on the a523 row to avoid double-counting.
       - name: Cross-cutting preferences (monoAudio + reduceMotion + brightness) [a523 row only]
         if: ${{ matrix.descriptor == 'a523' }}
+        env:
+          PF_PLATFORM_DIR: ${{ github.workspace }}/platform
+        working-directory: runtime
         run: |
           cargo test -p pf-settings --test prefs_e2e -- --nocapture \
             mono_audio_flip_via_external_cli_flips_routing_layer \

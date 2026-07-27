@@ -18,11 +18,13 @@ PF_SIM="${PF_SIM:-$HOME/sim}"
 CRATE="$(cd "$(dirname "$0")/.." && pwd)"                 # crates/pf-input-broker
 ROOT="$(cd "$CRATE/../.." && pwd)"                        # workspace root
 DEVICE="${DEVICE:-a133}"
-FIXTURE="$ROOT/crates/pocketforge/tests/fixtures/${DEVICE}-capabilities.toml"
+# The REAL descriptor from a `platform` checkout — this repo vendors no copy (tsp-ozbp.16).
+PLATFORM_DIR="${PF_PLATFORM_DIR:-$ROOT/../platform}"
+FIXTURE="$PLATFORM_DIR/devices/${DEVICE}/capabilities.toml"
 
 [ -x "$QEMU_TSP" ] || { echo "FAIL: QEMU_TSP not executable at $QEMU_TSP"; exit 1; }
 [ -f "$PF_SIM/synth/uinput_synth.py" ] || { echo "FAIL: sim synth not at $PF_SIM/synth/uinput_synth.py"; exit 1; }
-[ -f "$FIXTURE" ] || { echo "FAIL: descriptor $FIXTURE missing"; exit 1; }
+[ -f "$FIXTURE" ] || { echo "FAIL: descriptor $FIXTURE missing — clone pocketforge-os/platform beside this repo or set PF_PLATFORM_DIR"; exit 1; }
 
 WORK="$(mktemp -d)"
 PLATFORM="$WORK/platform/devices/$DEVICE"
