@@ -91,18 +91,6 @@ fn canonical_message_encodings_are_frozen() {
     assert_eq!(rback.flag, 1);
 }
 
-// ===== TEMPORARY — tsp-7rts AC3 NEGATIVE CONTROL. Reverted in the very next commit. =====
-// A deliberate `clippy::len_zero` (style, warn-by-default) planted in a TEST target, so the CI
-// run on this commit proves two things at once: that the new clippy step runs at all, and that
-// `--all-targets` is what reaches `tests/` — a gate built with lib+bin targets only would stay
-// green on exactly this violation. A gate nobody has watched fail is not known to be a gate.
-#[test]
-fn deliberate_clippy_violation_negative_control() {
-    let b: Vec<u8> = vec![1, 2, 3];
-    assert!(b.len() > 0, "planted lint: use !b.is_empty()");
-}
-// ===== END TEMPORARY =====
-
 // Written as a fold + `write!` rather than `.map(|x| format!(..)).collect()` so it does not trip
 // `clippy::format_collect` (a per-element `String` allocation) if that lint is ever promoted out of
 // the allow-by-default set. It is not part of the frozen contract — just the assertion pretty-printer.
