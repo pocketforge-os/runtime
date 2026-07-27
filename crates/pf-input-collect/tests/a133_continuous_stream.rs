@@ -5,6 +5,7 @@
 //!   - `distinct_abs_codes` filters `value != 0`, so the resting sticks (~2098) always count as
 //!     "active" — which makes the DPAD (hat) collection pick the stick axes (ABS_X,ABS_Y) instead
 //!     of ABS_HAT0X,ABS_HAT0Y.
+//!
 //! It documents the CURRENT (broken) behaviour so the fix has a regression target.
 
 use pf_input_collect::collect::{self, DeviceMeta, Recorded, RunConfig};
