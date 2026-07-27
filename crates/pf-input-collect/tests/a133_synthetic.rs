@@ -41,7 +41,6 @@ const ABS_Y: u16 = 0x01;
 const ABS_Z: u16 = 0x02;
 const ABS_RX: u16 = 0x03;
 const ABS_RY: u16 = 0x04;
-const ABS_RZ: u16 = 0x05;
 const ABS_HAT0X: u16 = 0x10;
 const ABS_HAT0Y: u16 = 0x11;
 
@@ -54,6 +53,7 @@ fn abs(code: u16, val: i32) -> RawEvent {
 
 const STICK: AbsInfo = AbsInfo { min: -32768, max: 32767, fuzz: 16, flat: 128, resolution: 0 };
 const TRIG: AbsInfo = AbsInfo { min: 0, max: 255, fuzz: 0, flat: 0, resolution: 0 };
+const HAT: AbsInfo = AbsInfo { min: -1, max: 1, fuzz: 0, flat: 0, resolution: 0 };
 
 /// Build the synthetic a133 source. Batches are queued in PLAN ORDER; empty batches act as the
 /// inter-control "quiet" separators the sweep-settle / optional-skip heuristics key on.
@@ -72,7 +72,11 @@ fn a133_source() -> ScriptedSource {
         .with_abs(ABS_X, STICK)
         .with_abs(ABS_Y, STICK)
         .with_abs(ABS_RX, STICK)
-        .with_abs(ABS_RY, STICK);
+        .with_abs(ABS_RY, STICK)
+        // The decoder advertises the dpad hat axes (range -1..1); declare them so the engine's
+        // midpoint-deviation activity test can read their absinfo (tsp-bwrg.6 continuous-stream fix).
+        .with_abs(ABS_HAT0X, HAT)
+        .with_abs(ABS_HAT0Y, HAT);
 
     // Buttons complete on key-down, so a single batch each; no separator needed.
     for code in [BTN_A, BTN_B, BTN_X, BTN_Y, BTN_SELECT, BTN_START, BTN_MODE, BTN_TL, BTN_TR] {
@@ -122,7 +126,13 @@ fn a133_source() -> ScriptedSource {
 }
 
 fn test_cfg() -> RunConfig {
-    RunConfig { quiet_polls: 2, idle_skip_polls: 2, max_polls: 60, ..RunConfig::default() }
+    RunConfig {
+        quiet_polls: 2,
+        idle_skip_polls: 2,
+        max_polls: 2000,
+        control_timeout: std::time::Duration::from_secs(5),
+        ..RunConfig::default()
+    }
 }
 
 fn run_a133() -> (pf_input_collect::Capabilities, String) {

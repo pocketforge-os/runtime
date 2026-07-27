@@ -9,7 +9,8 @@
 //!    scripted source, so the FULL render + prompt sequence is demonstrable on the panel WITHOUT
 //!    the live pad decoder. This proves this bead's on-panel acceptance.
 
-use std::time::Duration;
+use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 use pf_input_collect::codes::{EV_ABS, EV_KEY};
 use pf_input_collect::collect::DeviceMeta;
@@ -53,7 +54,12 @@ pub struct Timing {
     pub poll_step: Duration,
     pub quiet_polls: usize,
     pub idle_skip_polls: usize,
+    /// Runaway guard (NOT the timing bound — that is `control_timeout`).
     pub max_polls: usize,
+    /// Wall-clock per-control window — the real bound. A poll count is unreliable on a device that
+    /// STREAMS continuously (the a133 pad ~48fps): `poll()` never blocks so a fixed count burns
+    /// through in seconds, far too short for a person to react (tsp-bwrg.6). Generous = err long.
+    pub control_timeout: Duration,
     pub pre_dwell: Duration,
     pub post_dwell: Duration,
 }
@@ -65,7 +71,8 @@ impl Timing {
             poll_step: Duration::from_millis(50),
             quiet_polls: 3,
             idle_skip_polls: 40,
-            max_polls: 600,
+            max_polls: 100_000,                       // runaway guard only
+            control_timeout: Duration::from_secs(45), // generous per-control window (err long)
             pre_dwell: Duration::ZERO,
             post_dwell: Duration::ZERO,
         }
@@ -105,13 +112,35 @@ fn present<K: Sink>(sink: &mut K, canvas: &mut Canvas, skin: &SkinSet, collector
     sink.present(canvas);
 }
 
-fn relevant(kind: plan::Kind, e: &RawEvent) -> bool {
+/// Whether one event is a real ACTUATION of a control of `kind` — the identical continuous-stream-
+/// safe test the engine's pump uses (`pf_input_collect::collect::poll_event_active`): a button/click
+/// actuates on a key-DOWN; a hat/stick/trigger on a SIGNIFICANT abs deviation (so the a133's ~48fps
+/// at-rest stick stream is NOT read as activity) or, for a trigger, a key-down.
+fn poll_active(
+    kind: plan::Kind,
+    e: &RawEvent,
+    src: &mut dyn EventSource,
+    cache: &mut HashMap<u16, AbsInfo>,
+) -> bool {
     match kind {
-        plan::Kind::Button | plan::Kind::StickClick => e.ev_type == EV_KEY,
-        plan::Kind::Hat | plan::Kind::Stick => e.ev_type == EV_ABS,
-        // A trigger may be analog (ABS_Z/RZ) OR a binary button (the a133 L2/R2 → BTN_TL2/BTN_TR2),
-        // so either an axis or a key press counts as activity — mirrors pf_input_collect::is_relevant.
-        plan::Kind::Trigger => e.ev_type == EV_ABS || e.ev_type == EV_KEY,
+        plan::Kind::Button | plan::Kind::StickClick => e.ev_type == EV_KEY && e.value == 1,
+        plan::Kind::Hat | plan::Kind::Stick | plan::Kind::Trigger => {
+            if e.ev_type == EV_KEY {
+                return e.value == 1;
+            }
+            if e.ev_type != EV_ABS {
+                return false;
+            }
+            let ai = match cache.get(&e.code) {
+                Some(a) => a.clone(),
+                None => {
+                    let a = src.absinfo(e.code).unwrap_or(AbsInfo { min: 0, max: 0, fuzz: 0, flat: 0, resolution: 0 });
+                    cache.insert(e.code, a.clone());
+                    a
+                }
+            };
+            pf_input_collect::collect::abs_value_is_active(e.value, &ai)
+        }
     }
 }
 
@@ -131,29 +160,28 @@ pub fn drive_live<S: EventSource, K: Sink>(
 
         let mut buf: Vec<RawEvent> = Vec::new();
         let mut saw = false;
-        let mut empties = 0usize;
+        let mut quiet = 0usize;
         let mut showed_capturing = false;
-        for _ in 0..timing.max_polls {
+        let mut absc: HashMap<u16, AbsInfo> = HashMap::new();
+        // WALL-CLOCK per-control window — the a133 streams continuously so a poll count would burn
+        // through in seconds (tsp-bwrg.6). `max_polls` is only a runaway guard now.
+        let deadline = Instant::now() + timing.control_timeout;
+        let mut iters = 0usize;
+        while Instant::now() < deadline && iters < timing.max_polls {
+            iters += 1;
             let evs = src.poll(timing.poll_step).map_err(|e| CollectError::AbsInfo { code: 0, source: e })?;
-            if evs.is_empty() {
-                empties += 1;
-                if !saw {
-                    if spec.optional && empties >= timing.idle_skip_polls {
-                        break;
-                    }
-                } else if empties >= timing.quiet_polls {
-                    break;
+            let mut active_now = false;
+            let mut key_down = false;
+            for e in &evs {
+                if e.ev_type == EV_KEY && e.value == 1 {
+                    key_down = true;
                 }
-                continue;
-            }
-            empties = 0;
-            for e in evs {
-                if relevant(spec.kind, &e) {
-                    saw = true;
+                if poll_active(spec.kind, e, src, &mut absc) {
+                    active_now = true;
                 }
-                buf.push(e);
+                buf.push(*e);
             }
-            if saw && !showed_capturing {
+            if active_now && !showed_capturing {
                 present(sink, &mut canvas, skin, &collector, StepView { active_id: Some(&spec.id), prompt: &spec.prompt, status: "CAPTURING...", done: false });
                 showed_capturing = true;
             }
@@ -161,9 +189,22 @@ pub fn drive_live<S: EventSource, K: Sink>(
             // the instant a key-down is seen. A genuinely analog trigger emits no key, so its sweep
             // is never short-circuited.
             if matches!(spec.kind, plan::Kind::Button | plan::Kind::StickClick | plan::Kind::Trigger)
-                && buf.iter().any(|e| e.ev_type == EV_KEY && e.value == 1)
+                && key_down
             {
                 break;
+            }
+            if active_now {
+                saw = true;
+                quiet = 0;
+            } else {
+                quiet += 1;
+                if !saw {
+                    if spec.optional && quiet >= timing.idle_skip_polls {
+                        break; // optional & never actuated → skip
+                    }
+                } else if quiet >= timing.quiet_polls {
+                    break; // actuated then settled
+                }
             }
         }
 

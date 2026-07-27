@@ -10,8 +10,9 @@
 //!  - **Headless CLI** ([`run`]): owns the pump itself against any [`EventSource`], for the
 //!    `pf-input-collect` binary AND for the synthetic-stream unit tests.
 
+use std::collections::HashMap;
 use std::io::{self, Write};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::codes::{self, EV_ABS, EV_KEY};
 use crate::emit::{self, Axis, Capabilities};
@@ -373,7 +374,7 @@ fn finalize(
             Ok(Recorded::Button { code })
         }
         Kind::Hat => {
-            let axes = distinct_abs_codes(events);
+            let axes = active_abs_codes(events, src);
             if axes.is_empty() {
                 return Err(CollectError::NoActivity { id: spec.id.clone() });
             }
@@ -390,7 +391,7 @@ fn finalize(
             Ok(Recorded::Hat { x_code: axes[0], y_code: axes[1] })
         }
         Kind::Stick => {
-            let axes = distinct_abs_codes(events);
+            let axes = active_abs_codes(events, src);
             if axes.is_empty() {
                 return Err(CollectError::NoActivity { id: spec.id.clone() });
             }
@@ -424,7 +425,7 @@ fn finalize(
                 .iter()
                 .find(|e| e.ev_type == EV_KEY && e.value == 1)
                 .map(|e| e.code);
-            let axes = distinct_abs_codes(events);
+            let axes = active_abs_codes(events, src);
             if !axes.is_empty() {
                 let code = rank_axes_by_span(events, &axes)[0];
                 let abs = src.absinfo(code).map_err(|e| CollectError::AbsInfo { code, source: e })?;
@@ -455,16 +456,44 @@ fn finalize(
     }
 }
 
-/// The distinct EV_ABS codes that showed a non-zero value, sorted ascending.
-fn distinct_abs_codes(events: &[RawEvent]) -> Vec<u16> {
-    let mut codes: Vec<u16> = events
+/// Fraction (of an axis's declared range) that a value must be off the axis MIDPOINT by to count
+/// as a real actuation rather than rest jitter. The a133 decoder streams the sticks CONTINUOUSLY
+/// at their (non-zero, near-midpoint) rest, so a plain `value != 0` filter treats a resting stick
+/// as active — which mis-attributes the dpad hat to the stick axes (tsp-bwrg.6). Judging activity
+/// by midpoint-relative deviation instead separates a resting stick (~1-2% off midpoint) from a
+/// pressed hat (±full = 100% of its range) or a swept stick (~50-100%), with NO need for a captured
+/// baseline. 15% is comfortably above stick rest jitter and well below any real actuation.
+const ACTIVE_DEV_NUM: i64 = 15;
+const ACTIVE_DEV_DEN: i64 = 100;
+
+/// True if a single ABS value sits more than `ACTIVE_DEV` of the axis range off its midpoint —
+/// i.e. a real actuation, not rest jitter. Public so the on-panel wizard's pump
+/// (`pf-collect-ui`) applies the identical continuous-stream-safe activity test as this engine.
+pub fn abs_value_is_active(value: i32, ai: &AbsInfo) -> bool {
+    let mid = (ai.min as i64 + ai.max as i64) / 2;
+    let range = ((ai.max as i64) - (ai.min as i64)).max(1);
+    ((value as i64) - mid).abs() * ACTIVE_DEV_DEN >= range * ACTIVE_DEV_NUM
+}
+
+/// True if any EV_ABS event for `code` was really actuated (not just streaming at rest).
+fn abs_is_active(code: u16, events: &[RawEvent], ai: &AbsInfo) -> bool {
+    events
         .iter()
-        .filter(|e| e.ev_type == EV_ABS && e.value != 0)
-        .map(|e| e.code)
-        .collect();
+        .filter(|e| e.ev_type == EV_ABS && e.code == code)
+        .any(|e| abs_value_is_active(e.value, ai))
+}
+
+/// The EV_ABS codes that were really ACTUATED (midpoint-deviation past the activity threshold),
+/// sorted ascending. Reads each candidate axis's `EVIOCGABS` range via `src`; a resting
+/// continuously-streaming stick is correctly excluded. Replaces the old `value != 0` filter.
+fn active_abs_codes(events: &[RawEvent], src: &mut dyn EventSource) -> Vec<u16> {
+    let mut codes: Vec<u16> = events.iter().filter(|e| e.ev_type == EV_ABS).map(|e| e.code).collect();
     codes.sort_unstable();
     codes.dedup();
     codes
+        .into_iter()
+        .filter(|&c| matches!(src.absinfo(c), Ok(ai) if abs_is_active(c, events, &ai)))
+        .collect()
 }
 
 /// The candidate abs codes ordered by observed value span (largest first) — used to pick the
@@ -496,12 +525,16 @@ fn rank_axes_by_span(events: &[RawEvent], candidates: &[u16]) -> Vec<u16> {
 pub struct RunConfig {
     /// How long one `poll()` blocks (real device); ignored by the scripted source.
     pub poll_step: Duration,
-    /// Consecutive empty polls AFTER activity that mean "the sweep/press has settled".
+    /// Consecutive polls with NO active event AFTER activity that mean "the sweep/press settled".
     pub quiet_polls: usize,
-    /// Consecutive empty polls from the start with NO activity before an OPTIONAL control is
-    /// auto-skipped.
+    /// Consecutive inactive polls from the start before an OPTIONAL control is auto-skipped.
     pub idle_skip_polls: usize,
-    /// Hard cap on polls per control.
+    /// Wall-clock cap per control — the real bound. Iteration counts are unreliable on a device
+    /// that STREAMS continuously (the a133 pad ~48fps), where `poll()` never blocks and a fixed
+    /// poll count burns through in a few seconds (tsp-bwrg.6). A generous wall-clock window gives a
+    /// human time to react on every control.
+    pub control_timeout: Duration,
+    /// Infinite-loop guard (NOT the timing bound — that is `control_timeout`).
     pub max_polls: usize,
 }
 
@@ -510,56 +543,90 @@ impl Default for RunConfig {
         RunConfig {
             poll_step: Duration::from_millis(50),
             quiet_polls: 3,
-            idle_skip_polls: 40, // ~2s of quiet on a real device
-            max_polls: 600,      // ~30s hard cap per control
+            idle_skip_polls: 40,
+            control_timeout: Duration::from_secs(45), // generous per-control window (err long)
+            max_polls: 100_000,                       // pure runaway guard
         }
     }
 }
 
-fn is_relevant(kind: Kind, e: &RawEvent) -> bool {
+/// Whether one event counts as a real actuation of a control of `kind` — used by the pump to drive
+/// activity/settle. A button/stick-click actuates on a key-DOWN. A hat/stick/trigger actuates on a
+/// SIGNIFICANT abs deviation (midpoint-relative, so the a133's continuous at-rest stick stream does
+/// NOT read as activity) OR, for a trigger, a key-down (the a133 L2/R2 button-triggers).
+fn poll_event_active(
+    kind: Kind,
+    e: &RawEvent,
+    src: &mut dyn EventSource,
+    cache: &mut HashMap<u16, AbsInfo>,
+) -> bool {
     match kind {
-        Kind::Button | Kind::StickClick => e.ev_type == EV_KEY,
-        Kind::Hat | Kind::Stick => e.ev_type == EV_ABS,
-        // A trigger may be an analog axis OR a binary button (a133 L2/R2 → BTN_TL2/BTN_TR2), so
-        // EITHER an axis OR a key press counts as activity for it.
-        Kind::Trigger => e.ev_type == EV_ABS || e.ev_type == EV_KEY,
+        Kind::Button | Kind::StickClick => e.ev_type == EV_KEY && e.value == 1,
+        Kind::Hat | Kind::Stick | Kind::Trigger => {
+            if e.ev_type == EV_KEY {
+                return e.value == 1;
+            }
+            if e.ev_type != EV_ABS {
+                return false;
+            }
+            let ai = match cache.get(&e.code) {
+                Some(a) => a.clone(),
+                None => {
+                    let a = src.absinfo(e.code).unwrap_or(AbsInfo {
+                        min: 0, max: 0, fuzz: 0, flat: 0, resolution: 0,
+                    });
+                    cache.insert(e.code, a.clone());
+                    a
+                }
+            };
+            abs_value_is_active(e.value, &ai)
+        }
     }
 }
 
-/// Pump one control's events off the source per the completion heuristic for its kind.
+/// Pump one control's events off the source per the completion heuristic for its kind. Bounded by a
+/// WALL-CLOCK window (`control_timeout`) — robust to a continuously-streaming device — and settled
+/// by a run of inactive polls after real activity.
 fn pump<S: EventSource>(src: &mut S, spec: &ControlSpec, cfg: &RunConfig) -> io::Result<Vec<RawEvent>> {
     let mut buf: Vec<RawEvent> = Vec::new();
     let mut saw_activity = false;
-    let mut empties = 0usize;
+    let mut quiet = 0usize;
+    let mut absc: HashMap<u16, AbsInfo> = HashMap::new();
+    let deadline = Instant::now() + cfg.control_timeout;
+    let mut iters = 0usize;
 
-    for _ in 0..cfg.max_polls {
+    while Instant::now() < deadline && iters < cfg.max_polls {
+        iters += 1;
         let evs = src.poll(cfg.poll_step)?;
-        if evs.is_empty() {
-            empties += 1;
-            if !saw_activity {
-                if spec.optional && empties >= cfg.idle_skip_polls {
-                    break; // optional & idle → skip
-                }
-                // required: keep waiting (bounded by max_polls)
-            } else if empties >= cfg.quiet_polls {
-                break; // activity then quiet → settled
+        let mut active_now = false;
+        let mut key_down = false;
+        for e in &evs {
+            if e.ev_type == EV_KEY && e.value == 1 {
+                key_down = true;
             }
-            continue;
-        }
-        empties = 0;
-        for e in evs {
-            if is_relevant(spec.kind, &e) {
-                saw_activity = true;
+            if poll_event_active(spec.kind, e, src, &mut absc) {
+                active_now = true;
             }
-            buf.push(e);
+            buf.push(*e);
         }
-        // A button/click completes the instant a key-down is seen — and so does a trigger that
-        // turns out to be a binary button (the a133 L2/R2 → BTN_TL2/BTN_TR2). A genuinely analog
-        // trigger emits no key, so this never short-circuits its sweep.
-        if matches!(spec.kind, Kind::Button | Kind::StickClick | Kind::Trigger)
-            && buf.iter().any(|e| e.ev_type == EV_KEY && e.value == 1)
-        {
+        // A button/click — and a trigger realized as a binary button (a133 L2/R2) — completes the
+        // instant a key-down is seen. A genuinely analog trigger emits no key, so its sweep is not
+        // short-circuited.
+        if matches!(spec.kind, Kind::Button | Kind::StickClick | Kind::Trigger) && key_down {
             break;
+        }
+        if active_now {
+            saw_activity = true;
+            quiet = 0;
+        } else {
+            quiet += 1;
+            if !saw_activity {
+                if spec.optional && quiet >= cfg.idle_skip_polls {
+                    break; // optional & never actuated → skip
+                }
+            } else if quiet >= cfg.quiet_polls {
+                break; // actuated then settled
+            }
         }
     }
     Ok(buf)
