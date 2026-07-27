@@ -17,7 +17,7 @@ use crate::wizard::TITLE;
 /// the consumed device skin. Returns the written paths in order.
 pub fn dump_frames(dir: &Path, skin: &SkinSet) -> io::Result<Vec<PathBuf>> {
     std::fs::create_dir_all(dir)?;
-    let controls = plan::default_gamepad_plan();
+    let controls = plan::a133_gamepad_plan();
     let total = controls.len();
     let mut written = Vec::new();
 

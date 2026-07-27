@@ -10,8 +10,9 @@
 //!  - **Headless CLI** ([`run`]): owns the pump itself against any [`EventSource`], for the
 //!    `pf-input-collect` binary AND for the synthetic-stream unit tests.
 
+use std::collections::HashMap;
 use std::io::{self, Write};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::codes::{self, EV_ABS, EV_KEY};
 use crate::emit::{self, Axis, Capabilities};
@@ -41,8 +42,22 @@ impl Semantics {
 pub enum Recorded {
     Button { code: u16 },
     Hat { x_code: u16, y_code: u16 },
-    Stick { x_code: u16, x: AbsInfo, y_code: u16, y: AbsInfo },
+    /// `x`/`y` carry the driver-declared `AbsInfo` (for fuzz/flat/resolution); `x_cal`/`y_cal`
+    /// carry the OBSERVED `(min, max, centre)` measured from the live sweep — the real per-axis
+    /// calibration envelope emitted into the axis row (`min`/`max` = observed travel, `value` = rest).
+    Stick { x_code: u16, x: AbsInfo, y_code: u16, y: AbsInfo, x_cal: (i32, i32, i32), y_cal: (i32, i32, i32) },
     Trigger { code: u16, abs: AbsInfo, semantics: Semantics },
+    /// A trigger that manifests as a single EV_KEY button — a binary switch on the wire, never an
+    /// analog axis (the a133 L2/R2: the MCU reports them as a bit in the button bitmask, and the
+    /// decoder emits `BTN_TL2`/`BTN_TR2`, per `tsp-ozbp.2` + the owner-verified decoder output).
+    /// It is a `trigger` by intent but a button on the wire, so it emits an `EV_KEY` row carrying
+    /// `semantics="binary"` (the exact `kind=trigger` + button-code shape caps.py already maps to
+    /// SDL `lefttrigger`/`righttrigger`).
+    TriggerButton { code: u16 },
+    /// One D-PAD direction's captured hat axis (`HAT0X`/`HAT0Y`). INTERNAL — the four direction
+    /// captures are MERGED at emit into the single `hat` row (`ABS_HAT0X,ABS_HAT0Y`); a `HatAxis`
+    /// is never emitted directly, so the collected map is unchanged by the four-step prompt UX.
+    HatAxis { code: u16 },
 }
 
 /// The result of committing the current control.
@@ -206,6 +221,18 @@ impl Collector {
         let mut inputs = Vec::new();
         let mut has_south = false;
 
+        // The four dpad-direction (`HatDir`) captures MERGE into ONE `hat` row (`ABS_HAT0X,ABS_HAT0Y`),
+        // emitted at the position of the first direction — so the four-step prompt UX leaves the
+        // collected map identical to a single hat control (tsp-bwrg.6).
+        let dpad_axes: std::collections::BTreeSet<u16> = self
+            .slots
+            .iter()
+            .filter_map(|s| match &s.recorded {
+                Some(Recorded::HatAxis { code }) => Some(*code),
+                _ => None,
+            })
+            .collect();
+        let mut dpad_emitted = false;
         for slot in &self.slots {
             let rec = match &slot.recorded {
                 Some(r) => r,
@@ -213,6 +240,13 @@ impl Collector {
             };
             if slot.spec.id == "south" {
                 has_south = true;
+            }
+            if let Recorded::HatAxis { .. } = rec {
+                if !dpad_emitted {
+                    inputs.push(merged_dpad_row(&dpad_axes)?);
+                    dpad_emitted = true;
+                }
+                continue; // subsequent dpad directions fold into the one row already emitted
             }
             inputs.push(input_row(&slot.spec, rec)?);
         }
@@ -242,7 +276,66 @@ impl Collector {
 
 /// Convert a source `AbsInfo` into an emit `Axis`.
 fn to_axis(a: &AbsInfo) -> Axis {
-    Axis { min: a.min, max: a.max, fuzz: a.fuzz, flat: a.flat, resolution: a.resolution }
+    Axis { min: a.min, max: a.max, fuzz: a.fuzz, flat: a.flat, resolution: a.resolution, value: None }
+}
+
+/// Build an axis row from the driver-declared `AbsInfo` (for fuzz/flat/resolution) overlaid with an
+/// observed `(min, max, centre)` calibration envelope: min/max become the measured travel and
+/// `value` records the measured rest/centre.
+fn measured_axis(a: &AbsInfo, cal: (i32, i32, i32)) -> Axis {
+    let (min, max, centre) = cal;
+    Axis { min, max, fuzz: a.fuzz, flat: a.flat, resolution: a.resolution, value: Some(centre) }
+}
+
+/// Whether a control has been actuated ENOUGH to complete. A 1-axis control needs only activity
+/// (the caller already gates on `saw_activity`). A 2-axis control (a stick) needs BOTH axes swept
+/// near their declared extremes in BOTH directions — a real full circular sweep, not a quarter-
+/// roll: each seen axis must have reached within 30% of its declared min AND its declared max.
+/// This both captures the full min/max calibration envelope AND stops the completion window closing
+/// on a brief mid-roll centre-transit — the tsp-bwrg.6 defect where a stick completed after ~0.25s
+/// and the remainder of the roll cascaded into (and falsely satisfied) later controls.
+pub fn axes_fully_swept(
+    seen: &std::collections::HashSet<u16>,
+    span: &HashMap<u16, (i32, i32)>,
+    declared: &HashMap<u16, AbsInfo>,
+    need_axes: usize,
+) -> bool {
+    if need_axes < 2 {
+        return true;
+    }
+    let full = seen
+        .iter()
+        .filter(|&&c| match (span.get(&c), declared.get(&c)) {
+            (Some(&(lo, hi)), Some(ai)) => {
+                let s = (ai.max - ai.min).max(1);
+                let tol = s * 3 / 10;
+                lo <= ai.min + tol && hi >= ai.max - tol
+            }
+            _ => false,
+        })
+        .count();
+    full >= need_axes
+}
+
+/// Observed per-axis calibration envelope from a control's captured events: the real travel
+/// extremes the user reached (min/max) and the rest/centre position (median — the continuous
+/// a133 stream sits at rest for most frames, punctuated by brief excursions, so the median of an
+/// axis's samples is its resting value). Falls back to the declared range if the axis never
+/// appeared (should not happen for an axis finalize already ruled active).
+fn axis_calibration(events: &[RawEvent], code: u16, declared: &AbsInfo) -> (i32, i32, i32) {
+    let mut vals: Vec<i32> = events
+        .iter()
+        .filter(|e| e.ev_type == EV_ABS && e.code == code)
+        .map(|e| e.value)
+        .collect();
+    if vals.is_empty() {
+        return (declared.min, declared.max, (declared.min + declared.max) / 2);
+    }
+    let min = *vals.iter().min().unwrap();
+    let max = *vals.iter().max().unwrap();
+    vals.sort_unstable();
+    let centre = vals[vals.len() / 2];
+    (min, max, centre)
 }
 
 /// Build one `[[inputs]]` row from a recorded capture.
@@ -274,7 +367,7 @@ fn input_row(spec: &ControlSpec, rec: &Recorded) -> Result<emit::Input, CollectE
             x: None,
             y: None,
         },
-        Recorded::Stick { x_code, x, y_code, y } => emit::Input {
+        Recorded::Stick { x_code, x, y_code, y, x_cal, y_cal } => emit::Input {
             id: spec.id.clone(),
             kind: spec.kind.as_str().to_string(),
             ev_type: "EV_ABS".to_string(),
@@ -285,8 +378,9 @@ fn input_row(spec: &ControlSpec, rec: &Recorded) -> Result<emit::Input, CollectE
             ),
             semantics: None,
             range: None,
-            x: Some(to_axis(x)),
-            y: Some(to_axis(y)),
+            // Observed calibration envelope: min/max = measured travel, value = measured rest/centre.
+            x: Some(measured_axis(x, *x_cal)),
+            y: Some(measured_axis(y, *y_cal)),
         },
         Recorded::Trigger { code, abs, semantics } => emit::Input {
             id: spec.id.clone(),
@@ -298,6 +392,53 @@ fn input_row(spec: &ControlSpec, rec: &Recorded) -> Result<emit::Input, CollectE
             x: None,
             y: None,
         },
+        Recorded::TriggerButton { code } => emit::Input {
+            id: spec.id.clone(),
+            // `kind` stays the control's INTENT (`trigger`); the EV_KEY code + `semantics=binary`
+            // record that this trigger is realized as a button on the wire. caps.py accepts a
+            // `kind=trigger` EV_KEY BTN_* row (SDL `lefttrigger:bN`) and keeps `semantics` valid
+            // (semantics is only meaningful on kind=trigger) — no analog `range` to emit.
+            kind: spec.kind.as_str().to_string(),
+            ev_type: "EV_KEY".to_string(),
+            code: codes::key_name(*code).ok_or_else(|| unknown_key(*code))?.to_string(),
+            semantics: Some(Semantics::Binary.as_str().to_string()),
+            range: None,
+            x: None,
+            y: None,
+        },
+        Recorded::HatAxis { .. } => unreachable!(
+            "HatDir captures are merged into the hat row in Collector::emit, never emitted via input_row"
+        ),
+    })
+}
+
+/// Merge the four D-PAD direction (`HatDir`) captures into the single `hat` input row. The four
+/// directions collectively actuate both hat axes (HAT0X from left/right, HAT0Y from up/down); this
+/// emits ONE `EV_ABS` row `ABS_HAT0X,ABS_HAT0Y` — exactly the shape a single hat control produced,
+/// so the collected map + gatediff vs the ground truth are unchanged by the four-step prompt UX.
+fn merged_dpad_row(axes: &std::collections::BTreeSet<u16>) -> Result<emit::Input, CollectError> {
+    let codes: Vec<u16> = axes.iter().copied().collect();
+    if codes.len() < 2 {
+        return Err(CollectError::Incomplete {
+            id: "dpad".to_string(),
+            reason: "the four D-PAD directions did not actuate both hat axes".to_string(),
+        });
+    }
+    // BTreeSet iterates ascending: HAT0X (0x10) < HAT0Y (0x11).
+    let (x_code, y_code) = (codes[0], codes[1]);
+    Ok(emit::Input {
+        id: "dpad".to_string(),
+        kind: "hat".to_string(),
+        ev_type: "EV_ABS".to_string(),
+        code: format!(
+            "{},{}",
+            codes::abs_name(x_code).ok_or(CollectError::UnknownCode { ev_type: EV_ABS, code: x_code })?,
+            codes::abs_name(y_code).ok_or(CollectError::UnknownCode { ev_type: EV_ABS, code: y_code })?
+        ),
+        semantics: None,
+        range: None,
+        x: None,
+        y: None,
     })
 }
 
@@ -352,7 +493,7 @@ fn finalize(
             Ok(Recorded::Button { code })
         }
         Kind::Hat => {
-            let axes = distinct_abs_codes(events);
+            let axes = active_abs_codes(events, src);
             if axes.is_empty() {
                 return Err(CollectError::NoActivity { id: spec.id.clone() });
             }
@@ -368,8 +509,23 @@ fn finalize(
             // Lowest code is the X axis (HAT0X=0x10 < HAT0Y=0x11), highest is Y.
             Ok(Recorded::Hat { x_code: axes[0], y_code: axes[1] })
         }
+        Kind::HatDir => {
+            // ONE dpad direction: a single hat axis actuated. Record WHICH hat axis (merged into the
+            // single hat row at emit). Prefer a real HAT axis over any stick crosstalk from a brushed
+            // thumbstick; the continuous at-rest stick stream is already filtered by significance.
+            let axes = active_abs_codes(events, src);
+            let code = axes
+                .iter()
+                .copied()
+                .find(|&c| c == 0x10 || c == 0x11) // ABS_HAT0X / ABS_HAT0Y
+                .or_else(|| axes.first().copied());
+            match code {
+                Some(code) => Ok(Recorded::HatAxis { code }),
+                None => Err(CollectError::NoActivity { id: spec.id.clone() }),
+            }
+        }
         Kind::Stick => {
-            let axes = distinct_abs_codes(events);
+            let axes = active_abs_codes(events, src);
             if axes.is_empty() {
                 return Err(CollectError::NoActivity { id: spec.id.clone() });
             }
@@ -386,43 +542,94 @@ fn finalize(
             let (x_code, y_code) = (ranked[0], ranked[1]);
             let x = src.absinfo(x_code).map_err(|e| CollectError::AbsInfo { code: x_code, source: e })?;
             let y = src.absinfo(y_code).map_err(|e| CollectError::AbsInfo { code: y_code, source: e })?;
-            Ok(Recorded::Stick { x_code, x, y_code, y })
+            let x_cal = axis_calibration(events, x_code, &x);
+            let y_cal = axis_calibration(events, y_code, &y);
+            Ok(Recorded::Stick { x_code, x, y_code, y, x_cal, y_cal })
         }
         Kind::Trigger => {
-            let axes = distinct_abs_codes(events);
+            // A trigger manifests one of two ways, and the a133 is the second:
+            //  (1) an ANALOG axis (`ABS_Z`/`ABS_RZ`) that travels to a full press — a genuine
+            //      proportional trigger (or an analog-wire switch that only hits its endpoints); or
+            //  (2) a single EV_KEY BUTTON (`BTN_TL2`/`BTN_TR2`) — the a133 L2/R2, which the MCU
+            //      reports as a binary bit and the decoder emits as a button (tsp-ozbp.2 + the
+            //      owner-verified decoder output). There is NO analog value on the wire for it.
+            // Prefer an axis ONLY if one actually reached a full press; otherwise a resting
+            // neighbour axis (e.g. the same-side stick still streaming its centre value while the
+            // owner squeezes the trigger) must NOT be mistaken for the trigger — fall back to the
+            // key. This ordering is what makes case (2) robust against live stick crosstalk.
+            let key_down = events
+                .iter()
+                .find(|e| e.ev_type == EV_KEY && e.value == 1)
+                .map(|e| e.code);
+            let axes = active_abs_codes(events, src);
+            if !axes.is_empty() {
+                let code = rank_axes_by_span(events, &axes)[0];
+                let abs = src.absinfo(code).map_err(|e| CollectError::AbsInfo { code, source: e })?;
+                let vals: Vec<i32> =
+                    events.iter().filter(|e| e.ev_type == EV_ABS && e.code == code).map(|e| e.value).collect();
+                let obs = observe_axis(&vals, &abs);
+                let span = (abs.max - abs.min).max(1);
+                let reached_press = obs.max >= abs.max - (span / 16).max(1);
+                if reached_press {
+                    let semantics =
+                        if obs.visited_intermediate { Semantics::Analog } else { Semantics::Binary };
+                    return Ok(Recorded::Trigger { code, abs, semantics });
+                }
+                // Axis activity but no real press → not the trigger axis (crosstalk). Fall through.
+            }
+            // Case (2): a binary trigger realized as a button.
+            if let Some(code) = key_down {
+                return Ok(Recorded::TriggerButton { code });
+            }
             if axes.is_empty() {
                 return Err(CollectError::NoActivity { id: spec.id.clone() });
             }
-            // The most-active axis is the trigger.
-            let code = rank_axes_by_span(events, &axes)[0];
-            let abs = src.absinfo(code).map_err(|e| CollectError::AbsInfo { code, source: e })?;
-            let vals: Vec<i32> = events.iter().filter(|e| e.ev_type == EV_ABS && e.code == code).map(|e| e.value).collect();
-            let obs = observe_axis(&vals, &abs);
-            // Require a real actuation: at least one value near the top of the declared range.
-            let span = (abs.max - abs.min).max(1);
-            let reached_press = obs.max >= abs.max - (span / 16).max(1);
-            if !reached_press {
-                return Err(CollectError::Incomplete {
-                    id: spec.id.clone(),
-                    reason: "trigger never reached a full press — squeeze it fully".to_string(),
-                });
-            }
-            let semantics = if obs.visited_intermediate { Semantics::Analog } else { Semantics::Binary };
-            Ok(Recorded::Trigger { code, abs, semantics })
+            Err(CollectError::Incomplete {
+                id: spec.id.clone(),
+                reason: "trigger never reached a full press — squeeze it fully".to_string(),
+            })
         }
     }
 }
 
-/// The distinct EV_ABS codes that showed a non-zero value, sorted ascending.
-fn distinct_abs_codes(events: &[RawEvent]) -> Vec<u16> {
-    let mut codes: Vec<u16> = events
+/// Fraction (of an axis's declared range) that a value must be off the axis MIDPOINT by to count
+/// as a real actuation rather than rest jitter. The a133 decoder streams the sticks CONTINUOUSLY
+/// at their (non-zero, near-midpoint) rest, so a plain `value != 0` filter treats a resting stick
+/// as active — which mis-attributes the dpad hat to the stick axes (tsp-bwrg.6). Judging activity
+/// by midpoint-relative deviation instead separates a resting stick (~1-2% off midpoint) from a
+/// pressed hat (±full = 100% of its range) or a swept stick (~50-100%), with NO need for a captured
+/// baseline. 15% is comfortably above stick rest jitter and well below any real actuation.
+const ACTIVE_DEV_NUM: i64 = 15;
+const ACTIVE_DEV_DEN: i64 = 100;
+
+/// True if a single ABS value sits more than `ACTIVE_DEV` of the axis range off its midpoint —
+/// i.e. a real actuation, not rest jitter. Public so the on-panel wizard's pump
+/// (`pf-collect-ui`) applies the identical continuous-stream-safe activity test as this engine.
+pub fn abs_value_is_active(value: i32, ai: &AbsInfo) -> bool {
+    let mid = (ai.min as i64 + ai.max as i64) / 2;
+    let range = ((ai.max as i64) - (ai.min as i64)).max(1);
+    ((value as i64) - mid).abs() * ACTIVE_DEV_DEN >= range * ACTIVE_DEV_NUM
+}
+
+/// True if any EV_ABS event for `code` was really actuated (not just streaming at rest).
+fn abs_is_active(code: u16, events: &[RawEvent], ai: &AbsInfo) -> bool {
+    events
         .iter()
-        .filter(|e| e.ev_type == EV_ABS && e.value != 0)
-        .map(|e| e.code)
-        .collect();
+        .filter(|e| e.ev_type == EV_ABS && e.code == code)
+        .any(|e| abs_value_is_active(e.value, ai))
+}
+
+/// The EV_ABS codes that were really ACTUATED (midpoint-deviation past the activity threshold),
+/// sorted ascending. Reads each candidate axis's `EVIOCGABS` range via `src`; a resting
+/// continuously-streaming stick is correctly excluded. Replaces the old `value != 0` filter.
+fn active_abs_codes(events: &[RawEvent], src: &mut dyn EventSource) -> Vec<u16> {
+    let mut codes: Vec<u16> = events.iter().filter(|e| e.ev_type == EV_ABS).map(|e| e.code).collect();
     codes.sort_unstable();
     codes.dedup();
     codes
+        .into_iter()
+        .filter(|&c| matches!(src.absinfo(c), Ok(ai) if abs_is_active(c, events, &ai)))
+        .collect()
 }
 
 /// The candidate abs codes ordered by observed value span (largest first) — used to pick the
@@ -454,12 +661,16 @@ fn rank_axes_by_span(events: &[RawEvent], candidates: &[u16]) -> Vec<u16> {
 pub struct RunConfig {
     /// How long one `poll()` blocks (real device); ignored by the scripted source.
     pub poll_step: Duration,
-    /// Consecutive empty polls AFTER activity that mean "the sweep/press has settled".
+    /// Consecutive polls with NO active event AFTER activity that mean "the sweep/press settled".
     pub quiet_polls: usize,
-    /// Consecutive empty polls from the start with NO activity before an OPTIONAL control is
-    /// auto-skipped.
+    /// Consecutive inactive polls from the start before an OPTIONAL control is auto-skipped.
     pub idle_skip_polls: usize,
-    /// Hard cap on polls per control.
+    /// Wall-clock cap per control — the real bound. Iteration counts are unreliable on a device
+    /// that STREAMS continuously (the a133 pad ~48fps), where `poll()` never blocks and a fixed
+    /// poll count burns through in a few seconds (tsp-bwrg.6). A generous wall-clock window gives a
+    /// human time to react on every control.
+    pub control_timeout: Duration,
+    /// Infinite-loop guard (NOT the timing bound — that is `control_timeout`).
     pub max_polls: usize,
 }
 
@@ -468,51 +679,117 @@ impl Default for RunConfig {
         RunConfig {
             poll_step: Duration::from_millis(50),
             quiet_polls: 3,
-            idle_skip_polls: 40, // ~2s of quiet on a real device
-            max_polls: 600,      // ~30s hard cap per control
+            idle_skip_polls: 40,
+            control_timeout: Duration::from_secs(45), // generous per-control window (err long)
+            max_polls: 100_000,                       // pure runaway guard
         }
     }
 }
 
-fn is_relevant(kind: Kind, e: &RawEvent) -> bool {
+/// Whether one event counts as a real actuation of a control of `kind` — used by the pump to drive
+/// activity/settle. A button/stick-click actuates on a key-DOWN. A hat/stick/trigger actuates on a
+/// SIGNIFICANT abs deviation (midpoint-relative, so the a133's continuous at-rest stick stream does
+/// NOT read as activity) OR, for a trigger, a key-down (the a133 L2/R2 button-triggers).
+fn poll_event_active(
+    kind: Kind,
+    e: &RawEvent,
+    src: &mut dyn EventSource,
+    cache: &mut HashMap<u16, AbsInfo>,
+) -> bool {
     match kind {
-        Kind::Button | Kind::StickClick => e.ev_type == EV_KEY,
-        Kind::Hat | Kind::Stick | Kind::Trigger => e.ev_type == EV_ABS,
+        Kind::Button | Kind::StickClick => e.ev_type == EV_KEY && e.value == 1,
+        Kind::Hat | Kind::Stick | Kind::Trigger | Kind::HatDir => {
+            if e.ev_type == EV_KEY {
+                return e.value == 1;
+            }
+            if e.ev_type != EV_ABS {
+                return false;
+            }
+            let ai = match cache.get(&e.code) {
+                Some(a) => a.clone(),
+                None => {
+                    let a = src.absinfo(e.code).unwrap_or(AbsInfo {
+                        min: 0, max: 0, fuzz: 0, flat: 0, resolution: 0,
+                    });
+                    cache.insert(e.code, a.clone());
+                    a
+                }
+            };
+            abs_value_is_active(e.value, &ai)
+        }
     }
 }
 
-/// Pump one control's events off the source per the completion heuristic for its kind.
+/// Pump one control's events off the source per the completion heuristic for its kind. Bounded by a
+/// WALL-CLOCK window (`control_timeout`) — robust to a continuously-streaming device — and settled
+/// by a run of inactive polls after real activity.
 fn pump<S: EventSource>(src: &mut S, spec: &ControlSpec, cfg: &RunConfig) -> io::Result<Vec<RawEvent>> {
     let mut buf: Vec<RawEvent> = Vec::new();
     let mut saw_activity = false;
-    let mut empties = 0usize;
+    let mut quiet = 0usize;
+    let mut absc: HashMap<u16, AbsInfo> = HashMap::new();
+    // A 2-axis control (hat/stick) is actuated SEQUENTIALLY by a human — the dpad's four directions
+    // are discrete (up/down move HAT0Y, left/right move HAT0X, one at a time), and a stick can be
+    // pushed one axis at a time — so the capture window must NOT close when the FIRST axis settles.
+    // Track which abs axes have actuated and hold the window open until BOTH are seen. Without this,
+    // a settle after one axis closes the window and finalize rejects the one-axis buffer as
+    // Incomplete forever — the dpad never advanced on the real device (tsp-bwrg.6).
+    let mut seen_axes: std::collections::HashSet<u16> = std::collections::HashSet::new();
+    // Per-axis observed extent (min,max) over the window — feeds the full-sweep completion gate.
+    let mut axis_span: HashMap<u16, (i32, i32)> = HashMap::new();
+    let need_axes = spec.kind.expected_axes();
+    let deadline = Instant::now() + cfg.control_timeout;
+    let mut iters = 0usize;
 
-    for _ in 0..cfg.max_polls {
+    while Instant::now() < deadline && iters < cfg.max_polls {
+        iters += 1;
         let evs = src.poll(cfg.poll_step)?;
-        if evs.is_empty() {
-            empties += 1;
-            if !saw_activity {
-                if spec.optional && empties >= cfg.idle_skip_polls {
-                    break; // optional & idle → skip
+        let mut active_now = false;
+        let mut key_down = false;
+        for e in &evs {
+            if e.ev_type == EV_KEY && e.value == 1 {
+                key_down = true;
+            }
+            if poll_event_active(spec.kind, e, src, &mut absc) {
+                active_now = true;
+                if e.ev_type == EV_ABS {
+                    seen_axes.insert(e.code);
                 }
-                // required: keep waiting (bounded by max_polls)
-            } else if empties >= cfg.quiet_polls {
-                break; // activity then quiet → settled
             }
-            continue;
-        }
-        empties = 0;
-        for e in evs {
-            if is_relevant(spec.kind, &e) {
-                saw_activity = true;
+            if e.ev_type == EV_ABS {
+                let ent = axis_span.entry(e.code).or_insert((e.value, e.value));
+                if e.value < ent.0 { ent.0 = e.value; }
+                if e.value > ent.1 { ent.1 = e.value; }
             }
-            buf.push(e);
+            buf.push(*e);
         }
-        // A button/click completes the instant a key-down is seen.
-        if matches!(spec.kind, Kind::Button | Kind::StickClick)
-            && buf.iter().any(|e| e.ev_type == EV_KEY && e.value == 1)
-        {
+        // A button/click — and a trigger realized as a binary button (a133 L2/R2) — completes the
+        // instant a key-down is seen. A genuinely analog trigger emits no key, so its sweep is not
+        // short-circuited.
+        if matches!(spec.kind, Kind::Button | Kind::StickClick | Kind::Trigger) && key_down {
             break;
+        }
+        if active_now {
+            saw_activity = true;
+            quiet = 0;
+        } else {
+            quiet += 1;
+            if !saw_activity {
+                if spec.optional && quiet >= cfg.idle_skip_polls {
+                    break; // optional & never actuated → skip
+                }
+            } else {
+                // A 2-axis control (stick) completes only once BOTH axes have been swept near their
+                // extremes — a full circle, not a quarter-roll — AND it has settled at rest. A
+                // 1-axis control settles as soon as it goes quiet after activity. Without the
+                // full-sweep gate the window closed on a brief mid-roll centre-transit (tsp-bwrg.6:
+                // the stick advanced after ~0.25s and cascaded the rest of the roll into later
+                // controls); the gate also guarantees the full min/max calibration envelope.
+                let swept = axes_fully_swept(&seen_axes, &axis_span, &absc, need_axes);
+                if swept && quiet >= cfg.quiet_polls {
+                    break; // fully actuated (both axes swept, if 2-axis) then settled
+                }
+            }
         }
     }
     Ok(buf)
@@ -550,14 +827,19 @@ fn describe(rec: &Recorded) -> String {
             codes::abs_name(*x_code).unwrap_or("?"),
             codes::abs_name(*y_code).unwrap_or("?")
         ),
-        Recorded::Stick { x_code, x, y_code, y } => format!(
-            "stick {}[{}..{}],{}[{}..{}]",
-            codes::abs_name(*x_code).unwrap_or("?"), x.min, x.max,
-            codes::abs_name(*y_code).unwrap_or("?"), y.min, y.max
+        Recorded::Stick { x_code, y_code, x_cal, y_cal, .. } => format!(
+            "stick {}[{}..{} @{}],{}[{}..{} @{}]",
+            codes::abs_name(*x_code).unwrap_or("?"), x_cal.0, x_cal.1, x_cal.2,
+            codes::abs_name(*y_code).unwrap_or("?"), y_cal.0, y_cal.1, y_cal.2
         ),
         Recorded::Trigger { code, abs, semantics } => format!(
             "trigger {} [{}..{}] semantics={}",
             codes::abs_name(*code).unwrap_or("?"), abs.min, abs.max, semantics.as_str()
         ),
+        Recorded::TriggerButton { code } => format!(
+            "trigger {} (button, semantics=binary)",
+            codes::key_name(*code).unwrap_or("?")
+        ),
+        Recorded::HatAxis { code } => format!("dpad direction {} (merges into the hat row)", codes::abs_name(*code).unwrap_or("?")),
     }
 }

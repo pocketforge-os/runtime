@@ -15,6 +15,9 @@ pub struct Axis {
     pub fuzz: i32,
     pub flat: i32,
     pub resolution: i32,
+    /// Observed rest/centre position (evdev `input_absinfo.value`), when this axis was measured
+    /// from a live sweep rather than the driver's declared range. `None` for declared-only axes.
+    pub value: Option<i32>,
 }
 
 /// One `[[inputs]]` row.
@@ -100,6 +103,9 @@ fn axis_inline(a: &Axis) -> String {
     if a.resolution != 0 {
         s.push_str(&format!(", resolution = {}", a.resolution));
     }
+    if let Some(v) = a.value {
+        s.push_str(&format!(", value = {v}"));
+    }
     s.push_str(" }");
     s
 }
@@ -183,12 +189,15 @@ mod tests {
 
     #[test]
     fn axis_inline_omits_zero_resolution() {
-        let a = Axis { min: 0, max: 255, fuzz: 0, flat: 0, resolution: 0 };
+        let a = Axis { min: 0, max: 255, fuzz: 0, flat: 0, resolution: 0, value: None };
         assert_eq!(axis_inline(&a), "{ min = 0, max = 255, fuzz = 0, flat = 0 }");
-        let b = Axis { min: -32768, max: 32767, fuzz: 16, flat: 128, resolution: 5 };
+        let b = Axis { min: -32768, max: 32767, fuzz: 16, flat: 128, resolution: 5, value: None };
         assert_eq!(
             axis_inline(&b),
             "{ min = -32768, max = 32767, fuzz = 16, flat = 128, resolution = 5 }"
         );
+        // A measured axis carries its observed rest/centre as `value`.
+        let c = Axis { min: 12, max: 4083, fuzz: 0, flat: 0, resolution: 0, value: Some(2097) };
+        assert_eq!(axis_inline(&c), "{ min = 12, max = 4083, fuzz = 0, flat = 0, value = 2097 }");
     }
 }

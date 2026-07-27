@@ -80,6 +80,9 @@ pub struct Axis {
     pub fuzz: i32,
     #[serde(default)]
     pub resolution: i32,
+    /// Observed rest/centre position (evdev `input_absinfo.value`), recorded by guided collection.
+    #[serde(default)]
+    pub value: Option<i32>,
 }
 
 /// One `[[sensors]]` row (accel/gyro/mag/imu/gnss). Presence of a row ⇒ the cap exists.
