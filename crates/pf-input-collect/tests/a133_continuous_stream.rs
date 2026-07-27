@@ -73,4 +73,44 @@ fn dpad_capture_under_continuous_stick_stream() {
     }
 }
 
+/// FAITHFUL race-bug regression (tsp-bwrg.6, coordinator hard-bar): a REQUIRED control fed ONLY the
+/// a133's continuous at-rest stick stream — NO real actuation — must NOT be collected. The engine
+/// must return `NoActivity` (the wizard SITS on the control / aborts, rather than fabricating a
+/// value), NOT an `Ok(..)` map synthesized from ambient noise.
+///
+/// This targets the EXACT defect that raced ~14 controls in ~7s and wrote a fabricated map TWICE
+/// (two owner trips): the OLD `value != 0` active-test counted the ~2098 rest as actuation, so
+/// `finalize` recorded the continuously-streaming axes for a control the owner never touched. The
+/// prior test in this file only exercises ATTRIBUTION (rest stream + a REAL hat press); it never
+/// covered the no-actuation FABRICATION, which is why the bug shipped under a green suite.
+///
+/// Fail/pass directions (demonstrated in PR #32): against the OLD (`value != 0`) logic this FAILS
+/// (`Ok` with a fabricated stick); against the significance-based fix it PASSES (`NoActivity`).
+#[test]
+fn required_control_is_not_fabricated_from_the_ambient_rest_stream() {
+    let mut src = dut();
+    // A long continuous at-rest stream, then quiet — the owner NEVER actuated the stick.
+    for _ in 0..500 { src.push_batch(rest_frame()); }
+    src.push_batch(vec![]); src.push_batch(vec![]);
+
+    let spec = ControlSpec { id: "lstick".into(), kind: Kind::Stick, prompt: "lstick".into(), optional: false };
+    let mut c = Collector::new(vec![spec]);
+    let cfg = RunConfig {
+        quiet_polls: 2,
+        idle_skip_polls: 2,
+        max_polls: 600, // runaway guard hit fast (ScriptedSource poll is instant); the point is finalize
+        control_timeout: std::time::Duration::from_secs(5),
+        ..RunConfig::default()
+    };
+    let mut log = Vec::new();
+    match collect::run(&mut c, &mut src, &meta(), &cfg, &mut log) {
+        Err(collect::CollectError::NoActivity { id }) => assert_eq!(id, "lstick"),
+        Ok(cap) => panic!(
+            "FABRICATED a control from the ambient rest stream (the race bug): {:?}",
+            cap.inputs.iter().map(|i| (i.id.clone(), i.code.clone())).collect::<Vec<_>>()
+        ),
+        Err(e) => panic!("unexpected error (expected NoActivity for an untouched required control): {e}"),
+    }
+}
+
 fn meta() -> DeviceMeta { DeviceMeta { id: "a133".into(), manufacturer: "TrimUI".into(), model: "Smart Pro".into() } }
