@@ -1043,6 +1043,10 @@ pub fn run<S: EventSource, W: Write>(
     while let Some(spec) = collector.current().cloned() {
         let (i, n) = collector.position();
         writeln!(out, "[{}/{}] {} — {}", i + 1, n, spec.id, spec.prompt).ok();
+        // Route to the node this control lives on (its descriptor `source`); `None` = the primary
+        // gamepad node (tsp-bwrg.16). A single-node source ignores this (default no-op), so
+        // single-source runs are unchanged; a MultiSource switches nodes here.
+        src.set_active_source(spec.source.as_deref());
         let evs = pump(src, &spec, cfg).map_err(|e| CollectError::AbsInfo { code: 0, source: e })?;
         collector.record(&evs);
         match collector.commit_current(src)? {

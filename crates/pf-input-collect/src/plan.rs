@@ -62,11 +62,25 @@ pub struct ControlSpec {
     /// controls a given chassis may not physically wire (e.g. `guide`, stick-clicks). A NEW
     /// device's guided run leaves these optional so "missing hardware = row omission".
     pub optional: bool,
+    /// The evdev NODE this control lives on, by name — the descriptor's `input.source` field
+    /// (tsp-bwrg.16). `None` = the PRIMARY gamepad node (the run's default source). A device with
+    /// more than one input node — the a133 has THREE (the `TRIMUI Player1` gamepad, the
+    /// `sunxi-keyboard` LRADC where VOL± live, the `audiocodec` Audio Jack) — names the non-default
+    /// node here so the engine reads that control from the right place. The engine routes to it via
+    /// [`crate::source::EventSource::set_active_source`] before pumping each control; a single-node
+    /// source ignores the hint (default no-op), so single-source runs are unchanged.
+    pub source: Option<String>,
 }
 
 impl ControlSpec {
-    fn new(id: &str, kind: Kind, prompt: &str, optional: bool) -> ControlSpec {
-        ControlSpec { id: id.to_string(), kind, prompt: prompt.to_string(), optional }
+    pub fn new(id: &str, kind: Kind, prompt: &str, optional: bool) -> ControlSpec {
+        ControlSpec { id: id.to_string(), kind, prompt: prompt.to_string(), optional, source: None }
+    }
+
+    /// Builder: pin this control to a NON-primary evdev node (its descriptor `source`).
+    pub fn on_source(mut self, node: &str) -> ControlSpec {
+        self.source = Some(node.to_string());
+        self
     }
 }
 
@@ -121,20 +135,35 @@ pub fn default_gamepad_plan() -> Vec<ControlSpec> {
     ]
 }
 
-/// The **A133 (TrimUI Smart Pro)** prompt plan — the controls THIS device actually has, sourced
-/// from the **tsp-ozbp.9 frozen parity baseline** (owner-verified, actuated on real silicon
-/// 2026-07-26). That measured ground truth OUTRANKS the known-wrong `a133/capabilities.toml`
-/// descriptor (tsp-ozbp.13: it lists analog `ABS_Z`/`ABS_RZ` triggers when L2/R2 are binary
-/// `BTN_TL2`/`BTN_TR2`, and signed16 stick ranges when the real axes are unsigned 0..4095).
+/// The **A133 (TrimUI Smart Pro) GAMEPAD-NODE** prompt plan — the controls on the `TRIMUI Player1`
+/// gamepad node (event2), sourced from the **tsp-ozbp.9 frozen parity baseline** (owner-verified,
+/// actuated on real silicon 2026-07-26). That measured ground truth OUTRANKS what the descriptor
+/// used to claim; the descriptor is now reconciled to silicon (tsp-ozbp.13: sticks are unsigned
+/// 12-bit `0..4095`, not signed16; L2/R2 are the endpoint-only binary `ABS_Z`/`ABS_RZ` axes carried
+/// as `semantics = "binary"`, not `BTN_TL2`/`BTN_TR2`).
 ///
-/// The device has EXACTLY these 14 controls and NOTHING ELSE — the owner actuated all 17 evdev
-/// codes (11 buttons + 6 axes) and no others exist: there is **no** guide/home button beyond MENU
-/// (`BTN_MODE`, which SDL names `guide`) and **no** `l3`/`r3` stick clicks (no `BTN_THUMBL/THUMBR`).
-/// So every control here is **required** — none is `optional`, nothing flash-then-skips, and no
-/// phantom control is ever prompted. This is not an app-side filter of a generic list; it is the
-/// device's real control set. "Prompt for what the device HAS, full stop" (owner directive,
-/// 2026-07-27). tsp-ozbp.13 must be corrected to match this SAME baseline (a different lane); the
-/// two agreeing is then checkable, not coincidental.
+/// ⚠ FRAME (tsp-bwrg.16 — do NOT re-broaden this into a device-scoped claim). These 17 prompts are
+/// **exactly the controls on the GAMEPAD node, and nothing more on THAT node** — the owner actuated
+/// all of its 17 evdev codes (11 buttons + 6 axes) and it advertises no others: no guide/home beyond
+/// MENU (`BTN_MODE`, SDL `guide`) and no `l3`/`r3` clicks (no `BTN_THUMBL/THUMBR`). It is **NOT** the
+/// whole device: the a133 exposes **three** input nodes, and this plan reads only the first —
+///   • event2 `TRIMUI Player1` — this gamepad node (the 17 below);
+///   • event0 `sunxi-keyboard` — the LRADC node carrying the SYSTEM keys **VOL+ / VOL-**
+///     (`KEY_VOLUMEUP`/`KEY_VOLUMEDOWN`), which this single-node plan structurally cannot see
+///     (they are absent from the gamepad node's KEY bitmap — tsp-ozbp.2 / tsp-bwrg.16);
+///   • event1 `audiocodec sunxi Audio Jack` — the wired-headset inline remote (also 114/115 +
+///     `KEY_MEDIA`/`KEY_VOICECOMMAND`).
+/// The earlier phrasing here — "the device has EXACTLY these controls and NOTHING ELSE" — was the
+/// exact node-scoped-observation-written-as-a-device-fact defect this bead exists to kill: it read
+/// one node and declared the whole device, which is how "we missed the volume buttons" happened.
+/// Capturing the event0/event1 controls needs the descriptor-driven MULTI-SOURCE collection
+/// (`ControlSpec::source` + `EventSource::set_active_source`); wiring VOL± into an a133 plan is a
+/// follow-up coupled to the owner-attended live-confirm pass (deferred), not done here.
+///
+/// Every gamepad-node control here is **required** — none is `optional`, nothing flash-then-skips,
+/// no phantom is prompted. "Prompt for what the device HAS, full stop" (owner directive,
+/// 2026-07-27). The descriptor's gamepad rows agree with this SAME baseline, so the two agreeing is
+/// checkable, not coincidental.
 pub fn a133_gamepad_plan() -> Vec<ControlSpec> {
     vec![
         // Prompt text here is POSITION only and never carries an A/B/X/Y letter. The map is by SDL
@@ -180,7 +209,8 @@ pub fn a133_gamepad_plan() -> Vec<ControlSpec> {
             "Roll the RIGHT STICK once all the way around the circle (touch every edge)",
             false,
         ),
-        // L2/R2 are BINARY buttons on the a133 (BTN_TL2/BTN_TR2) — a press, not an analog squeeze.
+        // L2/R2 are BINARY on the a133 — endpoint-only ABS_Z/ABS_RZ (semantics="binary" in the
+        // descriptor), a press with no proportional travel, not an analog squeeze. Prompt as a press.
         ControlSpec::new("ltrig", Kind::Trigger, "Press the LEFT TRIGGER (L2) fully", false),
         ControlSpec::new("rtrig", Kind::Trigger, "Press the RIGHT TRIGGER (R2) fully", false),
     ]
@@ -242,6 +272,35 @@ mod tests {
         for d in ["dpad_up", "dpad_down", "dpad_left", "dpad_right"] {
             let c = plan.iter().find(|c| c.id == d).unwrap();
             assert_eq!(c.kind, Kind::HatDir, "{d} must be an atomic HatDir step");
+        }
+    }
+
+    /// FRAME PIN (tsp-bwrg.16, AC#4). The a133 plan reads exactly ONE node — the primary gamepad
+    /// node — so every control it carries is on it (`source == None`), and NO system/volume control
+    /// has leaked in (those live on the sunxi-keyboard / audiocodec nodes). This is the guard the
+    /// old "the device has EXACTLY these controls and NOTHING ELSE" comment lacked: it FAILS if a
+    /// future edit re-broadens this gamepad-NODE plan into a device-wide claim — either by smuggling
+    /// a system key into it or by pinning a control to a non-primary `source` without going through
+    /// the deliberate multi-source path. A node-scoped plan must stay node-scoped.
+    #[test]
+    fn a133_plan_is_gamepad_node_scoped_only() {
+        let plan = a133_gamepad_plan();
+        for c in &plan {
+            assert_eq!(
+                c.source, None,
+                "control '{}' is pinned to a non-primary source — the a133 GAMEPAD-node plan is \
+                 single-node by construction; a multi-node control belongs to the multi-source \
+                 path (ControlSpec::on_source + a MultiSource run), not smuggled in here",
+                c.id
+            );
+        }
+        for sys in ["vol_up", "vol_down", "volumeup", "volumedown", "home", "power", "mute"] {
+            assert!(
+                !plan.iter().any(|c| c.id == sys),
+                "system control '{sys}' must NOT appear in the a133 gamepad-node plan — it lives on \
+                 a DIFFERENT evdev node (sunxi-keyboard / audiocodec), and claiming it here would \
+                 repeat the node-scoped-observation-as-device-fact defect this bead fixed"
+            );
         }
     }
 }

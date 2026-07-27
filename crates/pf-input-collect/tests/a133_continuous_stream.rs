@@ -60,7 +60,7 @@ fn dpad_capture_under_continuous_stick_stream() {
     for _ in 0..3 { src.push_batch(rest_frame()); }
     src.push_batch(vec![]); src.push_batch(vec![]);
 
-    let spec = ControlSpec { id: "dpad".into(), kind: Kind::Hat, prompt: "dpad".into(), optional: false };
+    let spec = ControlSpec { id: "dpad".into(), kind: Kind::Hat, prompt: "dpad".into(), optional: false, source: None };
     let mut c = Collector::new(vec![spec]);
     let cfg = RunConfig {
         quiet_polls: 2,
@@ -104,7 +104,7 @@ fn required_control_is_not_fabricated_from_the_ambient_rest_stream() {
     for _ in 0..500 { src.push_batch(rest_frame()); }
     src.push_batch(vec![]); src.push_batch(vec![]);
 
-    let spec = ControlSpec { id: "lstick".into(), kind: Kind::Stick, prompt: "lstick".into(), optional: false };
+    let spec = ControlSpec { id: "lstick".into(), kind: Kind::Stick, prompt: "lstick".into(), optional: false, source: None };
     let mut c = Collector::new(vec![spec]);
     let cfg = RunConfig {
         quiet_polls: 2,
@@ -146,7 +146,7 @@ fn full_both_axis_stick_sweep_captures_on_unsigned_range_without_panicking() {
     for _ in 0..3 { src.push_batch(rest_frame()); }
     src.push_batch(vec![]); src.push_batch(vec![]);
 
-    let spec = ControlSpec { id: "lstick".into(), kind: Kind::Stick, prompt: "lstick".into(), optional: false };
+    let spec = ControlSpec { id: "lstick".into(), kind: Kind::Stick, prompt: "lstick".into(), optional: false, source: None };
     let mut c = Collector::new(vec![spec]);
     let cfg = RunConfig {
         quiet_polls: 2,
@@ -185,7 +185,7 @@ fn stick_completes_on_sequential_two_axis_motion() {
     for _ in 0..3 { src.push_batch(rest_frame()); }
     src.push_batch(vec![]); src.push_batch(vec![]);
 
-    let spec = ControlSpec { id: "lstick".into(), kind: Kind::Stick, prompt: "lstick".into(), optional: false };
+    let spec = ControlSpec { id: "lstick".into(), kind: Kind::Stick, prompt: "lstick".into(), optional: false, source: None };
     let mut c = Collector::new(vec![spec]);
     let cfg = RunConfig { quiet_polls: 2, idle_skip_polls: 40, max_polls: 600, control_timeout: std::time::Duration::from_secs(5), ..RunConfig::default() };
     let mut log = Vec::new();
@@ -217,7 +217,7 @@ fn stick_records_observed_calibration_envelope() {
     for _ in 0..6 { src.push_batch(rest_frame()); }
     src.push_batch(vec![]); src.push_batch(vec![]);
 
-    let spec = ControlSpec { id: "lstick".into(), kind: Kind::Stick, prompt: "lstick".into(), optional: false };
+    let spec = ControlSpec { id: "lstick".into(), kind: Kind::Stick, prompt: "lstick".into(), optional: false, source: None };
     let mut c = Collector::new(vec![spec]);
     let cfg = RunConfig { quiet_polls: 2, idle_skip_polls: 40, max_polls: 600, control_timeout: std::time::Duration::from_secs(5), ..RunConfig::default() };
     let mut log = Vec::new();
@@ -252,7 +252,7 @@ fn stick_full_roll_survives_a_mid_roll_pause_and_records_the_whole_envelope() {
     for _ in 0..4 { src.push_batch(rest_frame()); }
     src.push_batch(vec![]); src.push_batch(vec![]);
 
-    let spec = ControlSpec { id: "lstick".into(), kind: Kind::Stick, prompt: "lstick".into(), optional: false };
+    let spec = ControlSpec { id: "lstick".into(), kind: Kind::Stick, prompt: "lstick".into(), optional: false, source: None };
     let mut c = Collector::new(vec![spec]);
     let cfg = RunConfig { quiet_polls: 2, idle_skip_polls: 40, max_polls: 600, control_timeout: std::time::Duration::from_secs(5), ..RunConfig::default() };
     let mut log = Vec::new();
@@ -293,8 +293,8 @@ fn a_long_stick_roll_does_not_bleed_into_the_next_control() {
     src.push_batch(vec![]); src.push_batch(vec![]);
 
     let plan = vec![
-        ControlSpec { id: "lstick".into(), kind: Kind::Stick, prompt: "lstick".into(), optional: false },
-        ControlSpec { id: "rstick".into(), kind: Kind::Stick, prompt: "rstick".into(), optional: false },
+        ControlSpec { id: "lstick".into(), kind: Kind::Stick, prompt: "lstick".into(), optional: false, source: None },
+        ControlSpec { id: "rstick".into(), kind: Kind::Stick, prompt: "rstick".into(), optional: false, source: None },
     ];
     let mut c = Collector::new(plan);
     let cfg = RunConfig { quiet_polls: 2, idle_skip_polls: 40, max_polls: 2000, control_timeout: std::time::Duration::from_secs(5), ..RunConfig::default() };
@@ -324,10 +324,10 @@ fn four_dpad_direction_steps_merge_to_one_hat_row() {
     src.push_batch(vec![]); src.push_batch(vec![]);
 
     let plan = vec![
-        ControlSpec { id: "dpad_up".into(), kind: Kind::HatDir, prompt: "up".into(), optional: false },
-        ControlSpec { id: "dpad_down".into(), kind: Kind::HatDir, prompt: "down".into(), optional: false },
-        ControlSpec { id: "dpad_left".into(), kind: Kind::HatDir, prompt: "left".into(), optional: false },
-        ControlSpec { id: "dpad_right".into(), kind: Kind::HatDir, prompt: "right".into(), optional: false },
+        ControlSpec { id: "dpad_up".into(), kind: Kind::HatDir, prompt: "up".into(), optional: false, source: None },
+        ControlSpec { id: "dpad_down".into(), kind: Kind::HatDir, prompt: "down".into(), optional: false, source: None },
+        ControlSpec { id: "dpad_left".into(), kind: Kind::HatDir, prompt: "left".into(), optional: false, source: None },
+        ControlSpec { id: "dpad_right".into(), kind: Kind::HatDir, prompt: "right".into(), optional: false, source: None },
     ];
     let mut c = Collector::new(plan);
     let cfg = RunConfig { quiet_polls: 2, idle_skip_polls: 40, max_polls: 600, control_timeout: std::time::Duration::from_secs(5), ..RunConfig::default() };
@@ -540,8 +540,8 @@ fn button_prompt_rejects_the_previous_controls_key_tail() {
     src.push_batch(vec![]);
 
     let plan = vec![
-        ControlSpec { id: "south".into(), kind: Kind::Button, prompt: "south".into(), optional: false },
-        ControlSpec { id: "east".into(), kind: Kind::Button, prompt: "east".into(), optional: false },
+        ControlSpec { id: "south".into(), kind: Kind::Button, prompt: "south".into(), optional: false, source: None },
+        ControlSpec { id: "east".into(), kind: Kind::Button, prompt: "east".into(), optional: false, source: None },
     ];
     let mut c = Collector::new(plan);
     let mut log = Vec::new();
@@ -582,8 +582,8 @@ fn button_prompt_rejects_a_multi_poll_overshoot_from_the_previous_control() {
     src.push_batch(vec![]);
 
     let plan = vec![
-        ControlSpec { id: "south".into(), kind: Kind::Button, prompt: "south".into(), optional: false },
-        ControlSpec { id: "east".into(), kind: Kind::Button, prompt: "east".into(), optional: false },
+        ControlSpec { id: "south".into(), kind: Kind::Button, prompt: "south".into(), optional: false, source: None },
+        ControlSpec { id: "east".into(), kind: Kind::Button, prompt: "east".into(), optional: false, source: None },
     ];
     let mut c = Collector::new(plan);
     let mut log = Vec::new();
@@ -627,7 +627,7 @@ fn dpad_prompt_rejects_the_previous_directions_overshoot() {
 
     let plan = ["dpad_up", "dpad_down", "dpad_left", "dpad_right"]
         .into_iter()
-        .map(|id| ControlSpec { id: id.into(), kind: Kind::HatDir, prompt: id.into(), optional: false })
+        .map(|id| ControlSpec { id: id.into(), kind: Kind::HatDir, prompt: id.into(), optional: false, source: None })
         .collect();
     let mut c = Collector::new(plan);
     let mut log = Vec::new();
@@ -685,7 +685,7 @@ fn dpad_prompt_survives_a_mid_actuation_pause_with_stick_crosstalk() {
 
     let plan = ["dpad_up", "dpad_left"]
         .into_iter()
-        .map(|id| ControlSpec { id: id.into(), kind: Kind::HatDir, prompt: id.into(), optional: false })
+        .map(|id| ControlSpec { id: id.into(), kind: Kind::HatDir, prompt: id.into(), optional: false, source: None })
         .collect();
     let mut c = Collector::new(plan);
     let mut log = Vec::new();
@@ -735,7 +735,7 @@ fn analog_trigger_survives_a_mid_squeeze_pause() {
     src.push_batch(vec![]);
     src.push_batch(vec![]);
 
-    let plan = vec![ControlSpec { id: "ltrig".into(), kind: Kind::Trigger, prompt: "ltrig".into(), optional: false }];
+    let plan = vec![ControlSpec { id: "ltrig".into(), kind: Kind::Trigger, prompt: "ltrig".into(), optional: false, source: None }];
     let mut c = Collector::new(plan);
     let mut log = Vec::new();
     let cap = collect::run(&mut c, &mut src, &meta(), &human_cfg(), &mut log)
@@ -781,7 +781,7 @@ fn foreign_actuation_never_completes_a_control() {
     ] {
         let mut src = dut();
         stick_sweep(&mut src);
-        let plan = vec![ControlSpec { id: id.into(), kind, prompt: id.into(), optional: false }];
+        let plan = vec![ControlSpec { id: id.into(), kind, prompt: id.into(), optional: false, source: None }];
         let mut c = Collector::new(plan);
         let mut log = Vec::new();
         let got = collect::run(&mut c, &mut src, &meta(), &human_cfg(), &mut log);

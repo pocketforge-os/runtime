@@ -67,6 +67,19 @@ pub struct Input {
     /// as an `EV_KEY` button thresholded on `range`. Absent ⇒ analog (backward-compatible).
     #[serde(default)]
     pub semantics: Option<String>,
+    /// Control class (tsp-bwrg.16): `"gamepad"` (default, absent) or `"system"`. A `system` control
+    /// (e.g. the VOL± rocker) is a real physical control but is NOT app-bindable: the broker MUST
+    /// NOT synthesize it into the virtual gamepad or hand it to apps as a gamepad binding — access
+    /// to system keys is a platform/settings concern, gated elsewhere. Absent ⇒ gamepad (an
+    /// ordinary bindable control), so existing descriptors are unchanged.
+    #[serde(default)]
+    pub class: Option<String>,
+    /// The evdev NODE this control lives on, by name (tsp-bwrg.16). Absent ⇒ the PRIMARY gamepad
+    /// node (`identity.match.evdev_name`). Named explicitly when the control is on a different node
+    /// — the a133 has three (the gamepad node, the `sunxi-keyboard` LRADC where VOL± live, the
+    /// `audiocodec` Audio Jack) — so multi-source collection reads each control from the right node.
+    #[serde(default)]
+    pub source: Option<String>,
     #[serde(default)]
     pub label: Option<String>,
     #[serde(default)]
@@ -79,6 +92,14 @@ pub struct Input {
     pub x: Option<Axis>,
     #[serde(default)]
     pub y: Option<Axis>,
+}
+
+impl Input {
+    /// True for a `class = "system"` control — NOT app-bindable, so the broker excludes it from the
+    /// synthesized gamepad (tsp-bwrg.16). Absent/`"gamepad"` ⇒ false (an ordinary bindable control).
+    pub fn is_system(&self) -> bool {
+        self.class.as_deref() == Some("system")
+    }
 }
 
 /// An analog axis's calibration (mirrors `input_absinfo`).
