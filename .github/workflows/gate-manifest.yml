@@ -1,0 +1,79 @@
+# =============================================================================
+# gate-manifest — the META-GATE (tsp-1x04)
+# =============================================================================
+#
+# WHY THIS EXISTS — do not delete it as ceremony. In one week this repo produced
+# THREE quality gates that LOOKED like coverage while checking nothing, all in
+# this same .github/workflows/ surface:
+#   * tsp-ozbp.16 — a drift guard that compared NOTHING and reported ok forever.
+#   * tsp-7rts   — the clippy gate did not EXIST; a lint failure hid behind its absence.
+#   * tsp-ovee   — `--locked` was passed NOWHERE; cargo silently rewrote Cargo.lock and went green.
+# A check-shaped absence keeps reading as coverage. Nothing stated what the
+# gates WERE, so a missing gate had no shape. This job fixes that: it reads the
+# committed manifest (../quality-gates.toml) and turns a missing/neutered
+# required gate into a RED instead of a silence.
+#
+# NO `paths:` FILTER — DELIBERATE. A gate can be removed by editing ONLY a
+# workflow file, which a `crates/**` paths filter would not trigger on. A
+# meta-gate about ABSENCE must not itself be filterable into absence, so this
+# runs on EVERY PR to main. It is a ~1s pure-Python check; running it always is free.
+#
+# This job does TWO things, and the second is what makes the first trustworthy:
+#   1. check_gates.py against the REAL workflows — red when a required gate is gone.
+#   2. selftest.py — proves check_gates.py CAN go red, by mutating the real
+#      workflows (remove a gate, neuter a step, drop a matrix row, strip --locked,
+#      exclude a path…) and asserting the checker fails for the RIGHT gate each
+#      time, then passes on the unmutated tree. A guard you have not seen fail is
+#      not a guard; this keeps proving it fails, on every run, not once in a
+#      pasted transcript (guards-must-be-shown-to-fail).
+#
+# NOTE ON TEETH (Layer 2): a RED here only BLOCKS a merge once `gate-manifest`
+# is a required status check. Today the only required check on runtime/main is
+# `pf-pr-review / review`; wiring this (and the cargo gates) as required checks
+# is an OWNER/admin action tracked in tsp-i9xs. See ../quality-gates.toml.
+
+name: gate-manifest
+
+on:
+  pull_request:
+    branches: [main]
+    # Intentionally NO `paths:` — see the header. This must run on every PR.
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gate-manifest-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: quality-gate manifest is honored
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+
+      # PyYAML is preinstalled on GitHub-hosted ubuntu runners and tomllib is
+      # stdlib (3.11+). The checker fail-CLOSES with exit 2 if PyYAML is somehow
+      # absent, so this never silently skips.
+      - name: Python + PyYAML sanity (fail closed, never skip)
+        run: |
+          python3 --version
+          python3 -c "import yaml, tomllib; print('pyyaml', yaml.__version__)"
+
+      # 1. The meta-gate itself: every required gate present + reachable.
+      - name: check_gates.py — required gates are present in CI
+        run: |
+          python3 .github/gate-manifest/check_gates.py --root .
+
+      # 2. The guard-of-the-guard: prove check_gates.py can go RED, and does so
+      #    for the right gate, then passes clean. This is what keeps the meta-gate
+      #    from silently becoming instance #4.
+      - name: selftest.py — the meta-gate is PROVEN able to fail
+        run: |
+          python3 .github/gate-manifest/selftest.py --root .
