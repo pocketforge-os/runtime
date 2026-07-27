@@ -78,6 +78,18 @@ fn control_timeout_from_env(default_secs: u64) -> Duration {
     Duration::from_secs(secs)
 }
 
+/// A demo dwell (milliseconds) read from `var`, defaulting to `default_ms`. The demo's per-step
+/// pre/post dwell is overridable so an operator can widen it — e.g. hold one control frame far
+/// longer than the webcam's ~10-15s capture lag (tsp-gk9x) for a stable on-panel display check.
+/// An unparseable value falls back to the default; `0` is honored (an explicit no-dwell).
+fn demo_dwell_from_env(var: &str, default_ms: u64) -> Duration {
+    let ms = std::env::var(var)
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(default_ms);
+    Duration::from_millis(ms)
+}
+
 impl Timing {
     /// Live: engine-parity, no artificial dwell.
     pub fn live() -> Timing {
@@ -92,11 +104,13 @@ impl Timing {
         }
     }
 
-    /// Demo: hold each control long enough for a person / the webcam to see it.
+    /// Demo: hold each control long enough for a person / the webcam to see it. The dwells are
+    /// overridable via PF_COLLECT_UI_PRE_DWELL_MS / PF_COLLECT_UI_POST_DWELL_MS (used by demorun.sh
+    /// and to widen a single-frame hold past the webcam capture lag for display verification).
     pub fn demo() -> Timing {
         Timing {
-            pre_dwell: Duration::from_millis(950),
-            post_dwell: Duration::from_millis(650),
+            pre_dwell: demo_dwell_from_env("PF_COLLECT_UI_PRE_DWELL_MS", 950),
+            post_dwell: demo_dwell_from_env("PF_COLLECT_UI_POST_DWELL_MS", 650),
             ..Timing::live()
         }
     }
