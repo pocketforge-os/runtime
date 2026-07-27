@@ -64,6 +64,20 @@ pub struct Timing {
     pub post_dwell: Duration,
 }
 
+/// The per-control wall-clock window, defaulting to `default_secs` but overridable at runtime with
+/// `PF_COLLECT_UI_CONTROL_TIMEOUT_S`. The default (45s) is the generous window a person needs during
+/// a real collection; the override widens it for on-panel display verification, where a stable frame
+/// must outlast the webcam's ~10-15s capture lag (tsp-gk9x) so a mistimed grab can't read a stale
+/// pre-park frame as "not displayed". A non-positive / unparseable value falls back to the default.
+fn control_timeout_from_env(default_secs: u64) -> Duration {
+    let secs = std::env::var("PF_COLLECT_UI_CONTROL_TIMEOUT_S")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|&s| s > 0)
+        .unwrap_or(default_secs);
+    Duration::from_secs(secs)
+}
+
 impl Timing {
     /// Live: engine-parity, no artificial dwell.
     pub fn live() -> Timing {
@@ -71,8 +85,8 @@ impl Timing {
             poll_step: Duration::from_millis(50),
             quiet_polls: 3,
             idle_skip_polls: 40,
-            max_polls: 100_000,                       // runaway guard only
-            control_timeout: Duration::from_secs(45), // generous per-control window (err long)
+            max_polls: 100_000,                          // runaway guard only
+            control_timeout: control_timeout_from_env(45), // 45s default; err long
             pre_dwell: Duration::ZERO,
             post_dwell: Duration::ZERO,
         }
