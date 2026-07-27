@@ -87,6 +87,16 @@ pub trait EventSource {
     /// empty if the timeout elapsed with nothing pending). `EV_SYN` boundaries are filtered
     /// out by the source — the engine only ever sees `EV_KEY`/`EV_ABS` payload events.
     fn poll(&mut self, timeout: Duration) -> io::Result<Vec<RawEvent>>;
+
+    /// Route subsequent `poll`/`absinfo` calls to the node named `node` (a control's descriptor
+    /// `source`), or to the PRIMARY node when `None` (tsp-bwrg.16). The engine calls this before
+    /// pumping each control so a multi-node device reads each control from the right evdev node.
+    ///
+    /// DEFAULT = NO-OP: a single-node source (the live [`EvdevSource`], the [`ScriptedSource`])
+    /// has exactly one node and ignores the hint, so single-source collection is unchanged. Only
+    /// [`MultiSource`] overrides this to actually switch nodes. `identity()` is UNAFFECTED — it
+    /// always reports the device's PRIMARY-node identity regardless of the active routing.
+    fn set_active_source(&mut self, _node: Option<&str>) {}
 }
 
 // -------------------------------------------------------------------------------------------
@@ -270,5 +280,96 @@ impl EventSource for ScriptedSource {
 
     fn poll(&mut self, _timeout: Duration) -> io::Result<Vec<RawEvent>> {
         Ok(self.batches.pop_front().unwrap_or_default())
+    }
+}
+
+// -------------------------------------------------------------------------------------------
+// Multi-node source: route each control to the evdev node it lives on (tsp-bwrg.16).
+// -------------------------------------------------------------------------------------------
+
+/// A router over N per-node event sources for a MULTI-NODE device. A device like the a133 exposes
+/// several evdev nodes (the `TRIMUI Player1` gamepad, the `sunxi-keyboard` LRADC where VOL± live,
+/// the `audiocodec` Audio Jack); each control's descriptor `source` names its node. The engine
+/// calls [`EventSource::set_active_source`] before pumping each control, and this router forwards
+/// `poll`/`absinfo` to the matching sub-source.
+///
+/// `identity()` ALWAYS reports the PRIMARY node's identity (the device identity stamped onto the
+/// emitted descriptor), independent of the active routing — routing changes which node we READ, not
+/// who the device IS.
+///
+/// A control naming an UNKNOWN node routes to the primary and records the miss
+/// ([`MultiSource::last_route_missed`]); it never fabricates events, so a control whose node is
+/// unregistered simply captures nothing (the engine's existing NoActivity / optional-skip handling
+/// applies). This makes single-vs-multi source a pure superset: a `MultiSource` with only the
+/// primary registered behaves exactly like the single [`EvdevSource`] it wraps.
+pub struct MultiSource {
+    sources: std::collections::HashMap<String, Box<dyn EventSource>>,
+    primary: String,
+    active: String,
+    last_route_missed: bool,
+}
+
+impl MultiSource {
+    /// Build a router around the PRIMARY gamepad node (`primary` = its evdev name).
+    pub fn new(primary: &str, primary_src: Box<dyn EventSource>) -> MultiSource {
+        let mut sources = std::collections::HashMap::new();
+        sources.insert(primary.to_string(), primary_src);
+        MultiSource {
+            sources,
+            primary: primary.to_string(),
+            active: primary.to_string(),
+            last_route_missed: false,
+        }
+    }
+
+    /// Register an additional node's source under its evdev NAME (e.g. `"sunxi-keyboard"`).
+    pub fn add_source(&mut self, node: &str, src: Box<dyn EventSource>) {
+        self.sources.insert(node.to_string(), src);
+    }
+
+    /// Whether the most recent [`set_active_source`](EventSource::set_active_source) named a node
+    /// with no registered source (routed to primary as a fallback). Lets a caller surface a
+    /// descriptor that references a node the run did not open, instead of silently misreading.
+    pub fn last_route_missed(&self) -> bool {
+        self.last_route_missed
+    }
+
+    fn active_mut(&mut self) -> &mut Box<dyn EventSource> {
+        // `active` is only ever set to a registered key (set_active_source falls back to primary),
+        // and primary is inserted at construction — so this key is always present.
+        self.sources.get_mut(&self.active).expect("active source is always a registered node")
+    }
+}
+
+impl EventSource for MultiSource {
+    fn identity(&mut self) -> io::Result<Identity> {
+        let p = self.primary.clone();
+        self.sources.get_mut(&p).expect("primary source is registered at construction").identity()
+    }
+
+    fn absinfo(&mut self, abs_code: u16) -> io::Result<AbsInfo> {
+        self.active_mut().absinfo(abs_code)
+    }
+
+    fn poll(&mut self, timeout: Duration) -> io::Result<Vec<RawEvent>> {
+        self.active_mut().poll(timeout)
+    }
+
+    fn set_active_source(&mut self, node: Option<&str>) {
+        match node {
+            None => {
+                self.active = self.primary.clone();
+                self.last_route_missed = false;
+            }
+            Some(n) if self.sources.contains_key(n) => {
+                self.active = n.to_string();
+                self.last_route_missed = false;
+            }
+            Some(_) => {
+                // Unknown node: fall back to primary, record the miss (never fabricate).
+                self.active = self.primary.clone();
+                self.last_route_missed = true;
+            }
+        }
     }
 }

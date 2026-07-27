@@ -265,6 +265,7 @@ fn analog_trigger_is_classified_analog() {
         kind: pf_input_collect::plan::Kind::Trigger,
         prompt: "squeeze".into(),
         optional: false,
+        source: None,
     }]);
     // Smooth ramp 0 -> 255 with real intermediate values.
     src.push_batch((0..=255).step_by(5).map(|v| abs(ABS_Z, v)).collect());

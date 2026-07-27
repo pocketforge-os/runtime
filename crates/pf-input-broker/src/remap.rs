@@ -210,6 +210,13 @@ impl Remap {
         let mut binary: HashMap<u16, BinaryTrigger> = HashMap::new();
 
         for inp in &d.inputs {
+            // SYSTEM controls (class="system", e.g. VOL±) are NOT part of the virtual gamepad
+            // (tsp-bwrg.16, owner ruling): the broker must never synthesize them into the pad or
+            // hand them to apps as a gamepad binding — describe the whole device, gate system-key
+            // access elsewhere. Skip them here so they never reach `spec.keys`/`key_map`/`binary`.
+            if inp.is_system() {
+                continue;
+            }
             let names: Vec<&str> = inp.code.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
             match inp.ev_type.as_str() {
                 "EV_KEY" => {
@@ -506,5 +513,56 @@ code = "BTN_Y"
         assert!(!a133.spec().keys.contains(&172), "a133 has no home");
         assert!(a523.spec().keys.contains(&172), "a523 home present");
         assert!(a523.spec().keys.contains(&0x13d) && a523.spec().keys.contains(&0x13e), "a523 L3/R3");
+    }
+
+    /// SYSTEM controls are excluded from the virtual gamepad (tsp-bwrg.16, owner ruling pt 1/3):
+    /// a `class = "system"` row (VOL±) is a real device control but must NEVER be synthesized into
+    /// the pad or reach an app as a gamepad binding — access is gated elsewhere, not by omitting the
+    /// row from the descriptor. PROVEN-TO-FAIL: drop the `is_system()` skip in `from_descriptor` and
+    /// this goes RED — `KEY_VOLUMEUP` is not a gamepad key code, so the un-skipped row makes
+    /// `from_descriptor` error (`unknown key code KEY_VOLUMEUP`) and the `.unwrap()` panics.
+    #[test]
+    fn system_class_rows_are_excluded_from_the_virtual_gamepad() {
+        let d = Descriptor::from_toml(
+            r#"
+[identity]
+id = "systest"
+manufacturer = "PocketForge"
+model = "System-key test rig (synthetic)"
+sdl_guid = "030000005e0400008e02000010010000"
+
+[[inputs]]
+id = "south"
+kind = "button"
+ev_type = "EV_KEY"
+code = "BTN_A"
+[[inputs]]
+id = "vol_up"
+kind = "button"
+ev_type = "EV_KEY"
+code = "KEY_VOLUMEUP"
+class = "system"
+source = "sunxi-keyboard"
+[[inputs]]
+id = "vol_down"
+kind = "button"
+ev_type = "EV_KEY"
+code = "KEY_VOLUMEDOWN"
+class = "system"
+source = "sunxi-keyboard"
+"#,
+        )
+        .unwrap();
+        let r = Remap::from_descriptor(&d).unwrap();
+        let keys = &r.spec().keys;
+        assert!(keys.contains(&0x130), "the real gamepad button (BTN_A/south) IS advertised");
+        // KEY_VOLUMEUP=115(0x73), KEY_VOLUMEDOWN=114(0x72) must NOT be synthesized as gamepad keys.
+        assert!(
+            !keys.contains(&0x73) && !keys.contains(&0x72),
+            "system VOL± must NOT leak into the virtual gamepad keys: {keys:?}"
+        );
+        assert_eq!(keys.len(), 1, "only the one non-system button is advertised: {keys:?}");
+        // A system code is never remapped into the pad (identity fallthrough, never a mapping entry).
+        assert_eq!(r.remap_key(0x73), 0x73, "VOL+ has no gamepad remap entry");
     }
 }
