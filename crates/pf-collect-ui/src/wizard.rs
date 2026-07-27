@@ -12,7 +12,7 @@
 use std::time::{Duration, Instant};
 
 use pf_input_collect::codes::{EV_ABS, EV_KEY};
-use pf_input_collect::collect::{self, DeviceMeta};
+use pf_input_collect::collect::{self, CommitOutcome, DeviceMeta};
 use pf_input_collect::emit::Capabilities;
 use pf_input_collect::source::{AbsInfo, EventSource, Identity, RawEvent, ScriptedSource};
 use pf_input_collect::{collect::CollectError, plan, Collector};
@@ -26,6 +26,13 @@ pub const TITLE: &str = "POCKETFORGE INPUT COLLECTION";
 /// A frame sink — where a rendered canvas goes (the panel, or nowhere in a test).
 pub trait Sink {
     fn present(&mut self, canvas: &Canvas);
+
+    /// Observe the SEMANTIC content of the frame being presented (the status line, prompt, and
+    /// highlighted control) — a default no-op so the on-panel/dump sinks are untouched. The
+    /// status line is the operator's ONLY feedback channel, so a test sink overrides this to pin
+    /// the wizard's state PROGRESSION (idle → CAPTURING → RECOGNIZED / re-prompt), which the
+    /// rendered pixels cannot be asserted on cheaply. Called for every frame `present` emits.
+    fn observe_frame(&mut self, _status: &str, _prompt: &str, _active_id: Option<&str>) {}
 }
 
 /// Discards frames — for host-side tests of the drive logic.
@@ -155,6 +162,7 @@ fn present<K: Sink>(sink: &mut K, canvas: &mut Canvas, skin: &SkinSet, collector
         done: v.done,
     };
     render_frame(canvas, skin, &st);
+    sink.observe_frame(v.status, v.prompt, v.active_id);
     sink.present(canvas);
 }
 
@@ -186,6 +194,27 @@ fn labeled_prompt(base: String, skin: &SkinSet, id: &str) -> String {
     }
 }
 
+/// The positive acknowledgment shown AFTER a control is captured and BEFORE the next prompt — the
+/// success half of the wizard's feedback vocabulary. Until tsp-bwrg.15 the wizard's only state
+/// feedback was the FAILURE re-prompt (`reprompt_hint` / "LET'S TRY THAT ONE AGAIN"); a successful
+/// press was SILENT, so a captured press and a not-yet-registered one looked identical until the
+/// screen changed (owner-observed on the live 17-prompt run). This NAMES the control just
+/// recognized — the operator's real question is "did it get the RIGHT one?", acute given the
+/// face-button frame history (tsp-ozbp.14) — using the device's PRINTED faceplate glyph (descriptor
+/// `label`, e.g. "B" on a Nintendo-arranged chassis) when it has one, else the positional id
+/// (SELECT, LSTICK, DPAD UP). ASCII only — the 5x7 bitmap font renders a hollow box for non-ASCII
+/// (the em-dash the owner saw on pass #5), so no dash/arrow glyphs.
+///
+/// `pub(crate)` so the headless `--dump-dir` render ([`crate::dump`]) shows the identical ack state
+/// the panel does — one source of the wording, not two.
+pub(crate) fn ack_status(skin: &SkinSet, id: &str) -> String {
+    let name = skin
+        .label_for(id)
+        .map(|l| l.to_string())
+        .unwrap_or_else(|| id.to_uppercase().replace('_', " "));
+    format!("RECOGNIZED: {name}")
+}
+
 /// Drive the full guided sequence against a live source, rendering each step. Engine-parity pump.
 pub fn drive_live<S: EventSource, K: Sink>(
     src: &mut S,
@@ -204,6 +233,9 @@ pub fn drive_live<S: EventSource, K: Sink>(
         // discarded ten good controls). It just re-prompts, with a clarifying hint. Only a HARD
         // engine error (an unknown code, an EVIOCGABS failure) aborts.
         let mut attempt = 0usize;
+        // Set exactly once, when a control commits (the `break` arm below); the loop only exits via
+        // that break or an early `return` on a hard error, so it is definitely-assigned after.
+        let outcome: CommitOutcome;
         loop {
             attempt += 1;
             let base = if attempt == 1 { spec.prompt.clone() } else { reprompt_hint(&spec) };
@@ -252,7 +284,10 @@ pub fn drive_live<S: EventSource, K: Sink>(
             collector.record(window.events());
             match collector.commit_current(src) {
                 // Captured — or an OPTIONAL control that saw nothing was cleanly skipped. Advance.
-                Ok(_) => break,
+                Ok(o) => {
+                    outcome = o;
+                    break;
+                }
                 // Not enough of this control was actuated — RE-PROMPT it (never abort+discard). The
                 // next loop iteration re-presents with `reprompt_hint`. commit_current already took
                 // the working buffer on error; clear_working is belt-and-suspenders.
@@ -265,15 +300,39 @@ pub fn drive_live<S: EventSource, K: Sink>(
             }
         }
         collector.advance();
-        present(sink, &mut canvas, skin, &collector, StepView { active_id: None, prompt: &spec.prompt, status: "PRESS THE HIGHLIGHTED CONTROL", done: collector.is_done() });
+        // POSITIVE ACK (tsp-bwrg.15). A successful capture was previously silent — the only state
+        // feedback the wizard had was the FAILURE re-prompt, so "advanced" was the only sign a press
+        // registered. Show an explicit "RECOGNIZED: <control>" naming what was captured, with the
+        // control still highlighted, BEFORE the next prompt.
+        //
+        // ⚠ Rendered in the tsp-bwrg.12 inter-control seam — the double-tap / stale-queue drain
+        // class lives here. The ack is a PURE RENDER: it adds NO sleep and consumes NO poll. Its
+        // on-screen dwell is BORROWED from the `drain_between_controls` window that runs right after
+        // (a FIXED dead-time window that already DISCARDS input in this gap, safe by construction),
+        // so there is deliberately no independent ack-dwell constant to swallow or defer the next
+        // control's first input. A blocking sleep or a poll-consuming dwell HERE would reintroduce
+        // exactly the class this seam guards — see the no-event-lost test in this module.
+        match outcome {
+            CommitOutcome::Captured(_) => {
+                let status = ack_status(skin, &spec.id);
+                let ack_prompt = labeled_prompt(spec.prompt.clone(), skin, &spec.id);
+                present(sink, &mut canvas, skin, &collector, StepView { active_id: Some(&spec.id), prompt: &ack_prompt, status: &status, done: collector.is_done() });
+            }
+            // An optional control that produced nothing is an OMISSION, not a capture — no positive
+            // ack (there is nothing "recognized"). Keep the prior neutral advance frame.
+            CommitOutcome::Skipped => {
+                present(sink, &mut canvas, skin, &collector, StepView { active_id: None, prompt: &spec.prompt, status: "PRESS THE HIGHLIGHTED CONTROL", done: collector.is_done() });
+            }
+        }
         if !timing.post_dwell.is_zero() {
             std::thread::sleep(timing.post_dwell);
         }
         // Discard this control's tail before the NEXT control is prompted, so an overshoot or a
         // "did that take?" re-press cannot satisfy the next prompt (tsp-bwrg.12). Deliberately
-        // AFTER the post-dwell: the backlog the device buffered while that frame was held is
+        // AFTER the post-dwell + ack: the backlog the device buffered while that frame was held is
         // exactly what would otherwise be the next control's first poll. The owner has not been
-        // asked the next question yet, so nothing arriving here can be an answer to it.
+        // asked the next question yet, so nothing arriving here can be an answer to it. The ack
+        // frame above stays on-panel for the whole of this window (its dwell).
         if !collector.is_done() {
             collect::drain_between_controls(src, &timing.run_config())
                 .map_err(|e| CollectError::AbsInfo { code: 0, source: e })?;
@@ -307,9 +366,20 @@ pub fn drive_demo<K: Sink>(
             present(sink, &mut canvas, skin, &collector, StepView { active_id: Some(&spec.id), prompt: &spec.prompt, status: "CAPTURING...", done: false });
             collector.record(&evs);
         }
-        let _ = collector.commit_current(src)?;
+        let outcome = collector.commit_current(src)?;
         collector.advance();
-        present(sink, &mut canvas, skin, &collector, StepView { active_id: None, prompt: &spec.prompt, status: "GUIDED COLLECTION (DEMO) - AUTO-ADVANCING", done: collector.is_done() });
+        // Mirror drive_live's positive ack (tsp-bwrg.15) so the demo/on-panel review shows the new
+        // state too. The demo drives a scripted source with no inter-control drain, so this is a
+        // plain render frame held for `post_dwell`.
+        match outcome {
+            CommitOutcome::Captured(_) => {
+                let status = ack_status(skin, &spec.id);
+                present(sink, &mut canvas, skin, &collector, StepView { active_id: Some(&spec.id), prompt: &spec.prompt, status: &status, done: collector.is_done() });
+            }
+            CommitOutcome::Skipped => {
+                present(sink, &mut canvas, skin, &collector, StepView { active_id: None, prompt: &spec.prompt, status: "GUIDED COLLECTION (DEMO) - AUTO-ADVANCING", done: collector.is_done() });
+            }
+        }
         if !timing.post_dwell.is_zero() {
             std::thread::sleep(timing.post_dwell);
         }
@@ -525,5 +595,197 @@ mod tests {
         // The dpad merged to the two HAT axes — not a stick axis picked up as a direction.
         let dpad = caps.inputs.iter().find(|i| i.id == "dpad").expect("dpad row");
         assert_eq!(dpad.code, "ABS_HAT0X,ABS_HAT0Y");
+    }
+
+    /// A sink that records the STATUS line of every frame (the operator's only feedback channel),
+    /// so a test can assert the wizard's state PROGRESSION — not just the emitted candidate.
+    #[derive(Default)]
+    struct RecordingSink {
+        statuses: Vec<String>,
+    }
+    impl Sink for RecordingSink {
+        fn present(&mut self, _c: &Canvas) {}
+        fn observe_frame(&mut self, status: &str, _prompt: &str, _active: Option<&str>) {
+            self.statuses.push(status.to_string());
+        }
+    }
+
+    /// Build a full-a133-plan scripted source in ONE pass (no fragile re-polling). Control order is
+    /// the plan's: south, east, west, north, select, start, guide, l1, r1, four dpad dirs, l/r stick,
+    /// l/r trigger — every control fed its OWN positional code so the emitted map is per-control
+    /// checkable. Knobs:
+    ///  - `fumble_south`: prepend `fumble_polls` dead polls so south's FIRST window elapses
+    ///    (NoActivity -> re-prompt) before its real press lands — exercises the re-prompt path.
+    ///  - `quiet_gap`: empty polls after each control (>= drain_polls, so every boundary keeps
+    ///    enough slack that the drain never eats the NEXT control's press).
+    ///  - `ltrig_gap`: empty polls after ltrig (the SECOND-TO-LAST control), i.e. the gap BEFORE
+    ///    rtrig. Set to the engine `drain_polls` for a NO-CUSHION boundary — the drain consumes
+    ///    exactly these, so rtrig's window opens directly on rtrig's press and a poll-consuming ack
+    ///    would swallow it. Deliberately the LAST boundary: a swallowed rtrig press shifts only
+    ///    rtrig (nothing follows it to cascade into), so the regression fails on a clean wrong-code
+    ///    assertion rather than a type-mismatch re-prompt hang (a Button window fed a hat event).
+    ///  - `pad`: trailing (press, quiet) pairs so a shifted rtrig still finds a press (the run
+    ///    COMPLETES and fails on a wrong code, instead of starving the last control into a hang).
+    fn scripted_a133(fumble_south: bool, quiet_gap: usize, ltrig_gap: usize, fumble_polls: usize, pad: usize) -> ScriptedSource {
+        use pf_input_decode::codes::{
+            BTN_EAST, BTN_MODE, BTN_NORTH, BTN_SELECT, BTN_SOUTH, BTN_START, BTN_TL, BTN_TL2,
+            BTN_TR, BTN_TR2, BTN_WEST,
+        };
+        const EV_ABS: u16 = 0x03;
+        let stick = AbsInfo { min: 0, max: 4095, fuzz: 0, flat: 0, resolution: 0 };
+        let hat = AbsInfo { min: -1, max: 1, fuzz: 0, flat: 0, resolution: 0 };
+        let ident = Identity { name: "a133".into(), bus: 3, vid: 0x045e, pid: 0x028e, version: 0x0110 };
+        let mut src = ScriptedSource::new(ident)
+            .with_abs(0x0, stick).with_abs(0x1, stick).with_abs(0x3, stick).with_abs(0x4, stick)
+            .with_abs(0x10, hat).with_abs(0x11, hat);
+        let press = |code: u16| vec![RawEvent::new(EV_KEY, code, 1), RawEvent::new(EV_KEY, code, 0)];
+        let hatdir = |code: u16, v: i32| vec![RawEvent::new(EV_ABS, code, v), RawEvent::new(EV_ABS, code, 0)];
+        let abs2 = |ca: u16, cb: u16, v: i32| vec![RawEvent::new(EV_ABS, ca, v), RawEvent::new(EV_ABS, cb, v)];
+        let quiet = |s: &mut ScriptedSource, n: usize| { for _ in 0..n { s.push_batch(vec![]); } };
+
+        if fumble_south {
+            quiet(&mut src, fumble_polls); // south's first window elapses -> re-prompt
+        }
+        for code in [BTN_SOUTH, BTN_EAST, BTN_WEST, BTN_NORTH, BTN_SELECT, BTN_START, BTN_MODE, BTN_TL, BTN_TR] {
+            src.push_batch(press(code));
+            quiet(&mut src, quiet_gap);
+        }
+        for (code, v) in [(0x11u16, -1), (0x11, 1), (0x10, -1), (0x10, 1)] {
+            src.push_batch(hatdir(code, v));
+            quiet(&mut src, quiet_gap);
+        }
+        for (cx, cy) in [(0x0u16, 0x1u16), (0x3, 0x4)] {
+            src.push_batch(abs2(cx, cy, 4095));
+            src.push_batch(abs2(cx, cy, 0));
+            quiet(&mut src, quiet_gap);
+        }
+        // ltrig -> rtrig is the tested boundary: ltrig's cushion is `ltrig_gap` (tight = drain_polls).
+        src.push_batch(press(BTN_TL2));
+        quiet(&mut src, ltrig_gap);
+        src.push_batch(press(BTN_TR2));
+        quiet(&mut src, quiet_gap);
+        for _ in 0..pad {
+            src.push_batch(press(BTN_SOUTH));
+            quiet(&mut src, quiet_gap);
+        }
+        src
+    }
+
+    /// The timing tsp-bwrg.12's drive_live test uses: a short wall-clock window + small poll counts
+    /// so a mis-fed control fails fast in-test rather than idling 45s. `drain_polls` comes from
+    /// `Timing::live()` (the engine default, 8) — the value the fixtures are gapped against.
+    fn fast_test_timing() -> Timing {
+        Timing { max_polls: 8, idle_skip_polls: 1, quiet_polls: 1, post_dwell: Duration::ZERO, control_timeout: Duration::from_secs(2), ..Timing::live() }
+    }
+
+    /// tsp-bwrg.15 acceptance #3 — the positive ack is shown ON a successful capture and NOT on the
+    /// re-prompt (failure) path. south is FUMBLED once (its first window elapses with no input,
+    /// forcing a NoActivity re-prompt), then captured on the retry. We assert on the recorded
+    /// status sequence that:
+    ///   - "RECOGNIZED: ..." appears EXACTLY ONCE PER CONTROL (17), never an 18th from the fumble —
+    ///     an ack leaking onto the re-prompt path would push this to 18.
+    ///   - the re-prompt path WAS exercised ("LET'S TRY THAT ONE AGAIN" present), so that count is
+    ///     meaningful, and the first ack comes strictly AFTER that re-prompt (a capture, not a
+    ///     re-prompt, is what produces it).
+    ///   - the ack NAMES the control (south, and a stick) — acceptance #1.
+    ///
+    /// This FAILS against the pre-change build, which emitted no "RECOGNIZED" status at all (success
+    /// was silent) — so the very first assertion goes red for the right reason.
+    #[test]
+    fn positive_ack_is_shown_on_capture_and_not_on_the_reprompt_path() {
+        const MAX_POLLS: usize = 8;
+        const QUIET: usize = 12;
+
+        // south fumbled once (its first window elapses), captured on the retry; all others clean.
+        let mut src = scripted_a133(true, QUIET, QUIET, MAX_POLLS, 0);
+        let mut sink = RecordingSink::default();
+        let skin = demo_skin(); // no faceplate labels -> the ack falls back to the positional id
+        let meta = DeviceMeta { id: "a133".into(), manufacturer: "TrimUI".into(), model: "Smart Pro".into() };
+        let timing = Timing { max_polls: MAX_POLLS, ..fast_test_timing() };
+
+        let caps = drive_live(&mut src, &mut sink, &skin, &meta, &timing)
+            .expect("the fumbled south must re-prompt and the run must complete");
+        assert_eq!(caps.inputs.len(), 14, "all 17 prompts collapse to 14 rows (4 dpad dirs merge)"); // sanity
+
+        let recognized: Vec<&String> = sink.statuses.iter().filter(|s| s.starts_with("RECOGNIZED")).collect();
+        assert!(
+            !recognized.is_empty(),
+            "the wizard emitted NO 'RECOGNIZED' status — success is still silent (pre-change behaviour); \
+             statuses seen: {:?}",
+            sink.statuses
+        );
+        assert_eq!(
+            recognized.len(),
+            17,
+            "expected exactly one positive ack per CAPTURED control (17) — an 18th means the ack \
+             leaked onto the fumbled south's re-prompt path. acks: {recognized:?}"
+        );
+        // The re-prompt path was actually exercised (so 'not 18' is a real signal, not luck).
+        let reprompt_at = sink.statuses.iter().position(|s| s == "LET'S TRY THAT ONE AGAIN")
+            .expect("south should have fumbled and shown the re-prompt");
+        let first_ack_at = sink.statuses.iter().position(|s| s.starts_with("RECOGNIZED")).unwrap();
+        assert!(
+            first_ack_at > reprompt_at,
+            "the first ack (idx {first_ack_at}) must come AFTER south's re-prompt (idx {reprompt_at}) — \
+             it is produced by the CAPTURE, never by the re-prompt"
+        );
+        // The ack NAMES the control it recognized (acceptance #1).
+        assert!(sink.statuses.iter().any(|s| s == "RECOGNIZED: SOUTH"), "ack should name south: {:?}", recognized);
+        assert!(sink.statuses.iter().any(|s| s == "RECOGNIZED: LSTICK"), "ack should name the left stick: {:?}", recognized);
+    }
+
+    /// tsp-bwrg.15 acceptance #4 — the REGRESSION THAT MATTERS: no event is lost across the ack.
+    /// ltrig's press is followed by EXACTLY `drain_polls` empty polls (which the inter-control drain
+    /// consumes) and then rtrig's press with NO further cushion — so rtrig's window opens directly on
+    /// rtrig's press. The ack is a pure render that consumes no poll, so BOTH are captured with their
+    /// own codes. A blocking / poll-consuming ack (a dwell that polls the source in this seam) would
+    /// swallow rtrig's press; rtrig would then capture the PAD press instead and record the wrong
+    /// code. Proven live against the regression: injecting one `src.poll()` into the ack seam makes
+    /// this test fail `rtrig got BTN_A, want BTN_TR2` (recorded in the bead), while the real
+    /// pure-render ack passes. The tested boundary is the LAST one on purpose — a swallowed rtrig
+    /// press shifts only rtrig (nothing follows to cascade into), so the failure is a clean wrong-code
+    /// assertion, not a type-mismatch re-prompt hang. The pad guarantees the shifted rtrig still
+    /// finds a press so the run COMPLETES and fails on the assertion.
+    ///
+    /// Anchored on POSITION (`pf_input_decode::codes`, Frame C) fed in, translated to the emitted
+    /// Frame-D name via `pf_input_collect::codes::key_name` — never a bare glyph letter (tsp-ozbp.14).
+    #[test]
+    fn no_event_is_lost_across_the_positive_ack() {
+        use pf_input_collect::codes::key_name;
+        use pf_input_decode::codes::{BTN_TL2, BTN_TR2};
+
+        let timing = fast_test_timing();
+        let drain = timing.drain_polls; // the gap the inter-control drain consumes (engine default 8)
+        const QUIET: usize = 12;
+
+        // Tight (no-cushion) ltrig -> rtrig boundary: after ltrig's press, EXACTLY `drain` empties,
+        // then rtrig's press. A pad guards against a hang if a regressed ack shifts rtrig's capture.
+        let mut src = scripted_a133(false, QUIET, drain, 0, 4);
+        let mut sink = CountingSink::default();
+        let skin = demo_skin();
+        let meta = DeviceMeta { id: "a133".into(), manufacturer: "TrimUI".into(), model: "Smart Pro".into() };
+
+        let caps = drive_live(&mut src, &mut sink, &skin, &meta, &timing)
+            .expect("the run must complete");
+
+        let code_of = |id: &str| caps.inputs.iter().find(|i| i.id == id).map(|i| i.code.clone());
+        // Every control landed (the ack lost nobody's event) and both trigger rows are present.
+        assert_eq!(caps.inputs.len(), 14, "all 17 prompts collapse to 14 rows (4 dpad dirs merge)");
+        // ltrig recorded its own press...
+        assert_eq!(
+            code_of("ltrig").as_deref(),
+            key_name(BTN_TL2),
+            "ltrig lost or shifted its capture; got {:?}",
+            code_of("ltrig")
+        );
+        // ...and rtrig recorded ITS OWN press across the no-cushion ack boundary — the crux. A
+        // poll-consuming ack would have swallowed rtrig's press and rtrig would carry the pad's code.
+        assert_eq!(
+            code_of("rtrig").as_deref(),
+            key_name(BTN_TR2),
+            "rtrig did NOT record its own press across the no-cushion ack boundary — the ack swallowed \
+             rtrig's event (a blocking/poll-consuming ack). rtrig got {:?}",
+            code_of("rtrig")
+        );
     }
 }
