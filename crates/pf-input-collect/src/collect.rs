@@ -287,6 +287,15 @@ fn measured_axis(a: &AbsInfo, cal: (i32, i32, i32)) -> Axis {
     Axis { min, max, fuzz: a.fuzz, flat: a.flat, resolution: a.resolution, value: Some(centre) }
 }
 
+/// The `ABS_HAT*` axis codes (`ABS_HAT0X`=0x10 … `ABS_HAT3Y`=0x17) — the kernel's D-PAD convention.
+///
+/// Distinguishing hat axes from proportional ones is what keeps a control of one class from being
+/// completed by another class's actuation: a thumbstick brushed on the way to the D-PAD must not
+/// satisfy a dpad prompt, and a set of dpad presses must not satisfy a stick prompt (tsp-bwrg.12).
+pub fn is_hat_axis(code: u16) -> bool {
+    (0x10..=0x17).contains(&code)
+}
+
 /// Whether a control has been actuated ENOUGH to complete. A 1-axis control needs only activity
 /// (the caller already gates on `saw_activity`). A 2-axis control (a stick) needs BOTH axes swept
 /// near their declared extremes in BOTH directions — a real full circular sweep, not a quarter-
@@ -493,7 +502,9 @@ fn finalize(
             Ok(Recorded::Button { code })
         }
         Kind::Hat => {
-            let axes = active_abs_codes(events, src);
+            // A hat records HAT axes only — a swept thumbstick is not a D-PAD (tsp-bwrg.12).
+            let axes: Vec<u16> =
+                active_abs_codes(events, src).into_iter().filter(|&c| is_hat_axis(c)).collect();
             if axes.is_empty() {
                 return Err(CollectError::NoActivity { id: spec.id.clone() });
             }
@@ -510,22 +521,26 @@ fn finalize(
             Ok(Recorded::Hat { x_code: axes[0], y_code: axes[1] })
         }
         Kind::HatDir => {
-            // ONE dpad direction: a single hat axis actuated. Record WHICH hat axis (merged into the
-            // single hat row at emit). Prefer a real HAT axis over any stick crosstalk from a brushed
-            // thumbstick; the continuous at-rest stick stream is already filtered by significance.
-            let axes = active_abs_codes(events, src);
-            let code = axes
-                .iter()
-                .copied()
-                .find(|&c| c == 0x10 || c == 0x11) // ABS_HAT0X / ABS_HAT0Y
-                .or_else(|| axes.first().copied());
+            // ONE dpad direction: a single HAT axis actuated. Record WHICH hat axis (merged into the
+            // single hat row at emit).
+            //
+            // Only a real `ABS_HAT*` axis counts. The old `.or_else(|| axes.first())` fallback
+            // recorded whatever else happened to be moving — a thumbstick brushed on the way across
+            // to the D-PAD — as the direction, which is how a STICK axis ended up inside the emitted
+            // D-PAD row (tsp-bwrg.12). When no hat axis actuated there is nothing honest to record:
+            // report `NoActivity` so the wizard re-prompts, rather than fabricate a row. Same
+            // never-fabricate bar as the ambient-rest-stream case (tsp-bwrg.6).
+            let code = active_abs_codes(events, src).into_iter().find(|&c| is_hat_axis(c));
             match code {
                 Some(code) => Ok(Recorded::HatAxis { code }),
                 None => Err(CollectError::NoActivity { id: spec.id.clone() }),
             }
         }
         Kind::Stick => {
-            let axes = active_abs_codes(events, src);
+            // A stick records PROPORTIONAL axes only — a set of D-PAD presses drives both hat axes
+            // to both extremes and would otherwise rank as a stick (tsp-bwrg.12).
+            let axes: Vec<u16> =
+                active_abs_codes(events, src).into_iter().filter(|&c| !is_hat_axis(c)).collect();
             if axes.is_empty() {
                 return Err(CollectError::NoActivity { id: spec.id.clone() });
             }
@@ -561,7 +576,9 @@ fn finalize(
                 .iter()
                 .find(|e| e.ev_type == EV_KEY && e.value == 1)
                 .map(|e| e.code);
-            let axes = active_abs_codes(events, src);
+            // Proportional axes only: a D-PAD press caught in the window is not a trigger axis.
+            let axes: Vec<u16> =
+                active_abs_codes(events, src).into_iter().filter(|&c| !is_hat_axis(c)).collect();
             if !axes.is_empty() {
                 let code = rank_axes_by_span(events, &axes)[0];
                 let abs = src.absinfo(code).map_err(|e| CollectError::AbsInfo { code, source: e })?;
@@ -670,6 +687,9 @@ pub struct RunConfig {
     /// poll count burns through in a few seconds (tsp-bwrg.6). A generous wall-clock window gives a
     /// human time to react on every control.
     pub control_timeout: Duration,
+    /// Polls discarded in the gap BETWEEN two controls — a FIXED dead-time window, not a
+    /// drain-until-quiet (see [`drain_between_controls`] for why the distinction matters).
+    pub drain_polls: usize,
     /// Infinite-loop guard (NOT the timing bound — that is `control_timeout`).
     pub max_polls: usize,
 }
@@ -681,9 +701,277 @@ impl Default for RunConfig {
             quiet_polls: 3,
             idle_skip_polls: 40,
             control_timeout: Duration::from_secs(45), // generous per-control window (err long)
-            max_polls: 100_000,                       // pure runaway guard
+            // ~400ms of dead time between controls: long enough to cover the beat-then-re-press a
+            // person produces when unsure a press registered, and the backlog the device buffers
+            // while the next prompt renders; short enough that the next prompt still feels
+            // immediate. Deliberately expressed in POLLS, not wall-clock: against a source whose
+            // `poll()` returns instantly (the scripted test source) a wall-clock drain would spin
+            // through the entire script.
+            drain_polls: 8,
+            max_polls: 100_000, // pure runaway guard
         }
     }
+}
+
+/// Read (and cache) an axis's driver-declared `EVIOCGABS` range. A code the source cannot describe
+/// degrades to an all-zero range, which the significance test then reads as "never active" — the
+/// safe direction (an undescribable axis cannot complete a control).
+fn declared_abs(cache: &mut HashMap<u16, AbsInfo>, code: u16, src: &mut dyn EventSource) -> AbsInfo {
+    if let Some(a) = cache.get(&code) {
+        return *a;
+    }
+    let a = src.absinfo(code).unwrap_or_default();
+    cache.insert(code, a);
+    a
+}
+
+/// What a control's capture window should do next — the output of the one completion policy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Verdict {
+    /// Not enough has been actuated yet. Keep the window open.
+    Open,
+    /// The control is structurally complete. Close the window and finalize it.
+    Complete,
+    /// An OPTIONAL control that was never actuated at all. Close the window; its row is omitted.
+    Skip,
+}
+
+/// Whether the accumulated actuation SATISFIES the control's kind — the coverage half of the
+/// policy, deliberately separate from the settle half.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Coverage {
+    /// Nothing this kind of control could legitimately be has been actuated yet.
+    None,
+    /// Satisfied, but the input is a SWEEP that must be recorded to its end — hold the window until
+    /// it settles, so the whole envelope lands in this control and its tail cannot bleed onward.
+    Settling,
+    /// Satisfied by a DISCRETE actuation. Nothing further can be learned by waiting.
+    Complete,
+}
+
+/// One control's capture window: the events recorded for it, plus the structural evidence the
+/// completion policy is judged on.
+///
+/// # This is the ONE completion policy — do not inline a second copy (tsp-bwrg.12)
+///
+/// Both pumps drive this type: the headless engine ([`run`]) and the on-panel wizard
+/// (`pf_collect_ui::wizard::drive_live`, which owns its own render loop but must not own its own
+/// completion rules). The two previously carried separate hand-kept-in-sync copies of the same
+/// logic, which is this codebase's characteristic defect class — duplicated truth with no drift
+/// check. If a caller ever genuinely needs different rules, add them HERE behind an explicit knob;
+/// do not fork the loop.
+///
+/// # The invariant: quiet NEVER completes a control
+///
+/// Completion is judged from WHAT WAS ACTUATED, never from how long input has been quiet. Quiet is
+/// only ever:
+///   - a SETTLE condition applied AFTER [`Coverage::Settling`] is already reached (so a sweep is
+///     recorded to its end), or
+///   - the trigger for [`Verdict::Skip`] on an OPTIONAL control that was never actuated at all —
+///     which omits the row, and is the one outcome quiet may cause. It never CAPTURES anything.
+///
+/// Quiet-driven completion was the shared root cause of every defect across five owner-attended
+/// collection passes: a control "completed" the moment input went quiet, so a pause mid-actuation
+/// mis-completed it and a fast overshoot bled into the next control. tsp-bwrg.6 fixed it for the
+/// STICK class; this type generalizes the fix to every class.
+pub struct Window {
+    kind: Kind,
+    optional: bool,
+    events: Vec<RawEvent>,
+    /// A key-DOWN was observed (any `EV_KEY` value 1).
+    key_down: bool,
+    /// `EV_ABS` codes observed at a SIGNIFICANT (midpoint-relative) deviation — i.e. really
+    /// actuated, as opposed to a continuously-streaming axis sitting at rest.
+    actuated: std::collections::HashSet<u16>,
+    /// Observed `(min, max)` per `EV_ABS` code across the whole window.
+    span: HashMap<u16, (i32, i32)>,
+    /// `EVIOCGABS` cache.
+    declared: HashMap<u16, AbsInfo>,
+    saw_actuation: bool,
+    quiet: usize,
+}
+
+impl Window {
+    /// Open a capture window for one control.
+    pub fn new(spec: &ControlSpec) -> Window {
+        Window {
+            kind: spec.kind,
+            optional: spec.optional,
+            events: Vec::new(),
+            key_down: false,
+            actuated: std::collections::HashSet::new(),
+            span: HashMap::new(),
+            declared: HashMap::new(),
+            saw_actuation: false,
+            quiet: 0,
+        }
+    }
+
+    /// Feed one poll's worth of events. Returns whether THIS poll carried a real actuation of this
+    /// control's kind — a caller can use it to show a "CAPTURING…" state — and maintains the quiet
+    /// run the settle/skip conditions read.
+    pub fn observe(&mut self, evs: &[RawEvent], src: &mut dyn EventSource) -> bool {
+        let mut actuated_now = false;
+        for e in evs {
+            if e.ev_type == EV_KEY && e.value == 1 {
+                self.key_down = true;
+            }
+            if e.ev_type == EV_ABS {
+                let ai = declared_abs(&mut self.declared, e.code, src);
+                let ent = self.span.entry(e.code).or_insert((e.value, e.value));
+                if e.value < ent.0 {
+                    ent.0 = e.value;
+                }
+                if e.value > ent.1 {
+                    ent.1 = e.value;
+                }
+                if abs_value_is_active(e.value, &ai) {
+                    self.actuated.insert(e.code);
+                }
+            }
+            if poll_event_active(self.kind, e, src, &mut self.declared) {
+                actuated_now = true;
+            }
+            self.events.push(*e);
+        }
+        if actuated_now {
+            self.saw_actuation = true;
+            self.quiet = 0;
+        } else {
+            self.quiet += 1;
+        }
+        actuated_now
+    }
+
+    /// The completion verdict for this window so far.
+    pub fn verdict(&self, cfg: &RunConfig) -> Verdict {
+        match self.coverage() {
+            Coverage::Complete => Verdict::Complete,
+            Coverage::Settling => {
+                if self.quiet >= cfg.quiet_polls {
+                    Verdict::Complete
+                } else {
+                    Verdict::Open
+                }
+            }
+            // The ONLY thing quiet alone may decide, and it decides to record NOTHING.
+            Coverage::None => {
+                if self.optional && !self.saw_actuation && self.quiet >= cfg.idle_skip_polls {
+                    Verdict::Skip
+                } else {
+                    Verdict::Open
+                }
+            }
+        }
+    }
+
+    /// The events recorded for this control.
+    pub fn events(&self) -> &[RawEvent] {
+        &self.events
+    }
+
+    /// Consume the window, yielding its recorded events.
+    pub fn into_events(self) -> Vec<RawEvent> {
+        self.events
+    }
+
+    /// THE PER-CLASS COMPLETION PREDICATE. Every control class is gated on ACTUATION or COVERAGE;
+    /// none is gated on quiet.
+    fn coverage(&self) -> Coverage {
+        match self.kind {
+            // A press is discrete: the key-down IS the whole actuation.
+            Kind::Button | Kind::StickClick => {
+                if self.key_down { Coverage::Complete } else { Coverage::None }
+            }
+            // Two shapes on the wire. A binary trigger realized as a BUTTON (the a133 L2/R2, which
+            // the MCU reports as a bit and the decoder emits as `BTN_TL2`/`BTN_TR2`) is discrete. A
+            // genuinely ANALOG trigger must actually REACH a full press — a partial squeeze followed
+            // by a human pause used to close the window at partial travel, and `finalize` then
+            // failed the whole run with "never reached a full press" (tsp-bwrg.12).
+            Kind::Trigger => {
+                if self.key_down {
+                    Coverage::Complete
+                } else if self.axis_reached_full_press() {
+                    Coverage::Settling
+                } else {
+                    Coverage::None
+                }
+            }
+            // ONE dpad direction: a HAT axis must have actuated. Not "something moved" — a brushed
+            // thumbstick is not a D-PAD press (tsp-bwrg.12). Settling, not Complete, so the return
+            // to centre is recorded inside this control rather than leaking into the next one.
+            Kind::HatDir => {
+                if self.actuated.iter().any(|&c| is_hat_axis(c)) {
+                    Coverage::Settling
+                } else {
+                    Coverage::None
+                }
+            }
+            // A lumped hat: BOTH hat axes swept to both extremes.
+            Kind::Hat => {
+                if self.class_axes_fully_swept(true, 2) { Coverage::Settling } else { Coverage::None }
+            }
+            // A stick: BOTH proportional axes swept to both extremes — a real full circle, not a
+            // quarter-roll (tsp-bwrg.6). Hat axes are excluded so a set of D-PAD presses, which
+            // drives both hat axes to both extremes, cannot satisfy a stick prompt.
+            Kind::Stick => {
+                if self.class_axes_fully_swept(false, 2) { Coverage::Settling } else { Coverage::None }
+            }
+        }
+    }
+
+    /// Whether `need` axes OF THIS CLASS (hat vs proportional) have each been swept to within 30%
+    /// of both declared extremes. Shares [`axes_fully_swept`]'s sweep maths — one implementation.
+    fn class_axes_fully_swept(&self, hat: bool, need: usize) -> bool {
+        let axes: std::collections::HashSet<u16> =
+            self.actuated.iter().copied().filter(|&c| is_hat_axis(c) == hat).collect();
+        axes.len() >= need && axes_fully_swept(&axes, &self.span, &self.declared, need)
+    }
+
+    /// Whether some proportional axis actually reached a FULL press — the same endpoint test
+    /// `finalize` applies to a trigger, so the window closes exactly when finalize would accept it.
+    fn axis_reached_full_press(&self) -> bool {
+        self.actuated.iter().filter(|&&c| !is_hat_axis(c)).any(|c| {
+            match (self.span.get(c), self.declared.get(c)) {
+                (Some(&(_, hi)), Some(ai)) => {
+                    let span = (ai.max - ai.min).max(1);
+                    hi >= ai.max - (span / 16).max(1)
+                }
+                _ => false,
+            }
+        })
+    }
+}
+
+/// Discard input in the gap BETWEEN two controls, so a tail from control N cannot enter control
+/// N+1's window (tsp-bwrg.12).
+///
+/// Without this the wizard commits control N and opens control N+1's window in the same breath, so
+/// whatever the device emits in between — a "did that take?" re-press, an overshoot past the
+/// prompted direction, the backlog buffered while the next prompt renders — is the first thing the
+/// NEXT control sees, and can satisfy it outright. The next control then records the PREVIOUS
+/// control's input and the wizard advances past a control the owner never actuated. It is silent:
+/// the emitted map can still look plausible while every capture is shifted by one.
+///
+/// Discarding is safe BY CONSTRUCTION because of WHERE this runs: after a control commits and
+/// BEFORE the next prompt is shown. The owner has not been asked for anything yet, so anything
+/// arriving in this interval is by definition a tail of the control just finished, never an answer
+/// to the question about to be asked.
+///
+/// It is a FIXED dead-time window (`cfg.drain_polls` polls, unconditionally), NOT a drain-until-
+/// quiet. That distinction is the whole point and was got wrong first: the realistic tail is
+/// QUIET-THEN-INPUT, not a contiguous burst. A person presses, WAITS to see whether the prompt
+/// advanced, decides it did not, and presses again — so a drain that stops at the first couple of
+/// quiet polls stops in the pause and hands the re-press straight to the next control, i.e. it
+/// exits precisely before the thing it exists to absorb. A fixed window has no such hole, needs no
+/// significance heuristic, and is trivially predictable.
+///
+/// Returns how many polls it consumed.
+pub fn drain_between_controls<S: EventSource>(src: &mut S, cfg: &RunConfig) -> io::Result<usize> {
+    for _ in 0..cfg.drain_polls {
+        let _discarded = src.poll(cfg.poll_step)?;
+    }
+    Ok(cfg.drain_polls)
 }
 
 /// Whether one event counts as a real actuation of a control of `kind` — used by the pump to drive
@@ -720,79 +1008,27 @@ fn poll_event_active(
     }
 }
 
-/// Pump one control's events off the source per the completion heuristic for its kind. Bounded by a
-/// WALL-CLOCK window (`control_timeout`) — robust to a continuously-streaming device — and settled
-/// by a run of inactive polls after real activity.
+/// Pump one control's events off the source until its [`Window`] reaches a terminal [`Verdict`].
+/// Bounded by a WALL-CLOCK window (`control_timeout`) — robust to a continuously-streaming device —
+/// with `max_polls` as a pure runaway guard.
+///
+/// The completion RULES live entirely in [`Window`] (the one policy both pumps share); this loop
+/// only supplies polls and honours the verdict.
 fn pump<S: EventSource>(src: &mut S, spec: &ControlSpec, cfg: &RunConfig) -> io::Result<Vec<RawEvent>> {
-    let mut buf: Vec<RawEvent> = Vec::new();
-    let mut saw_activity = false;
-    let mut quiet = 0usize;
-    let mut absc: HashMap<u16, AbsInfo> = HashMap::new();
-    // A 2-axis control (hat/stick) is actuated SEQUENTIALLY by a human — the dpad's four directions
-    // are discrete (up/down move HAT0Y, left/right move HAT0X, one at a time), and a stick can be
-    // pushed one axis at a time — so the capture window must NOT close when the FIRST axis settles.
-    // Track which abs axes have actuated and hold the window open until BOTH are seen. Without this,
-    // a settle after one axis closes the window and finalize rejects the one-axis buffer as
-    // Incomplete forever — the dpad never advanced on the real device (tsp-bwrg.6).
-    let mut seen_axes: std::collections::HashSet<u16> = std::collections::HashSet::new();
-    // Per-axis observed extent (min,max) over the window — feeds the full-sweep completion gate.
-    let mut axis_span: HashMap<u16, (i32, i32)> = HashMap::new();
-    let need_axes = spec.kind.expected_axes();
+    let mut window = Window::new(spec);
     let deadline = Instant::now() + cfg.control_timeout;
     let mut iters = 0usize;
 
     while Instant::now() < deadline && iters < cfg.max_polls {
         iters += 1;
         let evs = src.poll(cfg.poll_step)?;
-        let mut active_now = false;
-        let mut key_down = false;
-        for e in &evs {
-            if e.ev_type == EV_KEY && e.value == 1 {
-                key_down = true;
-            }
-            if poll_event_active(spec.kind, e, src, &mut absc) {
-                active_now = true;
-                if e.ev_type == EV_ABS {
-                    seen_axes.insert(e.code);
-                }
-            }
-            if e.ev_type == EV_ABS {
-                let ent = axis_span.entry(e.code).or_insert((e.value, e.value));
-                if e.value < ent.0 { ent.0 = e.value; }
-                if e.value > ent.1 { ent.1 = e.value; }
-            }
-            buf.push(*e);
-        }
-        // A button/click — and a trigger realized as a binary button (a133 L2/R2) — completes the
-        // instant a key-down is seen. A genuinely analog trigger emits no key, so its sweep is not
-        // short-circuited.
-        if matches!(spec.kind, Kind::Button | Kind::StickClick | Kind::Trigger) && key_down {
-            break;
-        }
-        if active_now {
-            saw_activity = true;
-            quiet = 0;
-        } else {
-            quiet += 1;
-            if !saw_activity {
-                if spec.optional && quiet >= cfg.idle_skip_polls {
-                    break; // optional & never actuated → skip
-                }
-            } else {
-                // A 2-axis control (stick) completes only once BOTH axes have been swept near their
-                // extremes — a full circle, not a quarter-roll — AND it has settled at rest. A
-                // 1-axis control settles as soon as it goes quiet after activity. Without the
-                // full-sweep gate the window closed on a brief mid-roll centre-transit (tsp-bwrg.6:
-                // the stick advanced after ~0.25s and cascaded the rest of the roll into later
-                // controls); the gate also guarantees the full min/max calibration envelope.
-                let swept = axes_fully_swept(&seen_axes, &axis_span, &absc, need_axes);
-                if swept && quiet >= cfg.quiet_polls {
-                    break; // fully actuated (both axes swept, if 2-axis) then settled
-                }
-            }
+        window.observe(&evs, src);
+        match window.verdict(cfg) {
+            Verdict::Open => {}
+            Verdict::Complete | Verdict::Skip => break,
         }
     }
-    Ok(buf)
+    Ok(window.into_events())
 }
 
 /// Run the full guided sequence headlessly against `src`, writing prompts/results to `out`, and
@@ -814,6 +1050,12 @@ pub fn run<S: EventSource, W: Write>(
             CommitOutcome::Skipped => writeln!(out, "    skipped (optional, no activity)").ok(),
         };
         collector.advance();
+        // Discard this control's tail BEFORE the next prompt is written — see
+        // `drain_between_controls` for why discarding here is safe by construction.
+        if !collector.is_done() {
+            drain_between_controls(src, cfg)
+                .map_err(|e| CollectError::AbsInfo { code: 0, source: e })?;
+        }
     }
     collector.emit(src, meta)
 }

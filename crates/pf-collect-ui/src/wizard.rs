@@ -9,11 +9,10 @@
 //!    scripted source, so the FULL render + prompt sequence is demonstrable on the panel WITHOUT
 //!    the live pad decoder. This proves this bead's on-panel acceptance.
 
-use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use pf_input_collect::codes::{EV_ABS, EV_KEY};
-use pf_input_collect::collect::DeviceMeta;
+use pf_input_collect::collect::{self, DeviceMeta};
 use pf_input_collect::emit::Capabilities;
 use pf_input_collect::source::{AbsInfo, EventSource, Identity, RawEvent, ScriptedSource};
 use pf_input_collect::{collect::CollectError, plan, Collector};
@@ -60,6 +59,9 @@ pub struct Timing {
     /// STREAMS continuously (the a133 pad ~48fps): `poll()` never blocks so a fixed count burns
     /// through in seconds, far too short for a person to react (tsp-bwrg.6). Generous = err long.
     pub control_timeout: Duration,
+    /// Polls discarded in the gap between two controls — a FIXED dead-time window
+    /// (`pf_input_collect::collect::drain_between_controls`).
+    pub drain_polls: usize,
     pub pre_dwell: Duration,
     pub post_dwell: Duration,
 }
@@ -93,14 +95,30 @@ fn demo_dwell_from_env(var: &str, default_ms: u64) -> Duration {
 impl Timing {
     /// Live: engine-parity, no artificial dwell.
     pub fn live() -> Timing {
+        let engine = collect::RunConfig::default();
         Timing {
-            poll_step: Duration::from_millis(50),
-            quiet_polls: 3,
-            idle_skip_polls: 40,
-            max_polls: 100_000,                          // runaway guard only
-            control_timeout: control_timeout_from_env(45), // 45s default; err long
+            poll_step: engine.poll_step,
+            quiet_polls: engine.quiet_polls,
+            idle_skip_polls: engine.idle_skip_polls,
+            max_polls: engine.max_polls,                    // runaway guard only
+            control_timeout: control_timeout_from_env(45),  // 45s default; err long
+            drain_polls: engine.drain_polls,
             pre_dwell: Duration::ZERO,
             post_dwell: Duration::ZERO,
+        }
+    }
+
+    /// The engine [`collect::RunConfig`] these knobs express. The wizard drives the SAME completion
+    /// policy the headless engine does (`collect::Window`), so its knobs must reach that policy
+    /// rather than be re-interpreted by a second loop here — see `drive_live` (tsp-bwrg.12).
+    pub fn run_config(&self) -> collect::RunConfig {
+        collect::RunConfig {
+            poll_step: self.poll_step,
+            quiet_polls: self.quiet_polls,
+            idle_skip_polls: self.idle_skip_polls,
+            control_timeout: self.control_timeout,
+            drain_polls: self.drain_polls,
+            max_polls: self.max_polls,
         }
     }
 
@@ -138,38 +156,6 @@ fn present<K: Sink>(sink: &mut K, canvas: &mut Canvas, skin: &SkinSet, collector
     };
     render_frame(canvas, skin, &st);
     sink.present(canvas);
-}
-
-/// Whether one event is a real ACTUATION of a control of `kind` — the identical continuous-stream-
-/// safe test the engine's pump uses (`pf_input_collect::collect::poll_event_active`): a button/click
-/// actuates on a key-DOWN; a hat/stick/trigger on a SIGNIFICANT abs deviation (so the a133's ~48fps
-/// at-rest stick stream is NOT read as activity) or, for a trigger, a key-down.
-fn poll_active(
-    kind: plan::Kind,
-    e: &RawEvent,
-    src: &mut dyn EventSource,
-    cache: &mut HashMap<u16, AbsInfo>,
-) -> bool {
-    match kind {
-        plan::Kind::Button | plan::Kind::StickClick => e.ev_type == EV_KEY && e.value == 1,
-        plan::Kind::Hat | plan::Kind::Stick | plan::Kind::Trigger | plan::Kind::HatDir => {
-            if e.ev_type == EV_KEY {
-                return e.value == 1;
-            }
-            if e.ev_type != EV_ABS {
-                return false;
-            }
-            let ai = match cache.get(&e.code) {
-                Some(a) => a.clone(),
-                None => {
-                    let a = src.absinfo(e.code).unwrap_or(AbsInfo { min: 0, max: 0, fuzz: 0, flat: 0, resolution: 0 });
-                    cache.insert(e.code, a.clone());
-                    a
-                }
-            };
-            pf_input_collect::collect::abs_value_is_active(e.value, &ai)
-        }
-    }
 }
 
 /// The clarifying re-prompt shown when a control did NOT capture on the first try — a partial
@@ -225,11 +211,13 @@ pub fn drive_live<S: EventSource, K: Sink>(
             let status = if attempt == 1 { "PRESS THE HIGHLIGHTED CONTROL" } else { "LET'S TRY THAT ONE AGAIN" };
             present(sink, &mut canvas, skin, &collector, StepView { active_id: Some(&spec.id), prompt: &prompt_text, status, done: false });
 
-            let mut buf: Vec<RawEvent> = Vec::new();
-            let mut saw = false;
-            let mut quiet = 0usize;
+            // The ONE completion policy, CONSUMED from the engine — never a second copy here
+            // (tsp-bwrg.12). This loop owns rendering and nothing else about when a control is done:
+            // duplicated-truth-with-no-drift-check is how the quiet-based bug survived in the UI
+            // after the engine had moved on.
+            let cfg = timing.run_config();
+            let mut window = collect::Window::new(&spec);
             let mut showed_capturing = false;
-            let mut absc: HashMap<u16, AbsInfo> = HashMap::new();
             // WALL-CLOCK per-control window — the a133 streams continuously so a poll count would burn
             // through in seconds (tsp-bwrg.6). `max_polls` is only a runaway guard now.
             let deadline = Instant::now() + timing.control_timeout;
@@ -241,35 +229,11 @@ pub fn drive_live<S: EventSource, K: Sink>(
             // control within ~1.5s regardless, and keep a parked panel live.
             let mut last_present = Instant::now();
             let keepalive = std::time::Duration::from_millis(1500);
-            // A 2-axis control (hat/stick) holds its window open until BOTH axes actuate — a human
-            // presses the dpad directions / stick axes SEQUENTIALLY, so a settle after one axis must
-            // not close the window (tsp-bwrg.6: the dpad never advanced). Mirrors the engine pump.
-            let mut seen_axes: std::collections::HashSet<u16> = std::collections::HashSet::new();
-            let mut axis_span: HashMap<u16, (i32, i32)> = HashMap::new();
-            let need_axes = spec.kind.expected_axes();
             while Instant::now() < deadline && iters < timing.max_polls {
                 iters += 1;
                 let evs = src.poll(timing.poll_step).map_err(|e| CollectError::AbsInfo { code: 0, source: e })?;
-                let mut active_now = false;
-                let mut key_down = false;
-                for e in &evs {
-                    if e.ev_type == EV_KEY && e.value == 1 {
-                        key_down = true;
-                    }
-                    if poll_active(spec.kind, e, src, &mut absc) {
-                        active_now = true;
-                        if e.ev_type == EV_ABS {
-                            seen_axes.insert(e.code);
-                        }
-                    }
-                    if e.ev_type == EV_ABS {
-                        let ent = axis_span.entry(e.code).or_insert((e.value, e.value));
-                        if e.value < ent.0 { ent.0 = e.value; }
-                        if e.value > ent.1 { ent.1 = e.value; }
-                    }
-                    buf.push(*e);
-                }
-                if active_now && !showed_capturing {
+                let actuated_now = window.observe(&evs, src);
+                if actuated_now && !showed_capturing {
                     present(sink, &mut canvas, skin, &collector, StepView { active_id: Some(&spec.id), prompt: &prompt_text, status: "CAPTURING...", done: false });
                     showed_capturing = true;
                     last_present = Instant::now();
@@ -279,39 +243,13 @@ pub fn drive_live<S: EventSource, K: Sink>(
                     present(sink, &mut canvas, skin, &collector, StepView { active_id: Some(&spec.id), prompt: &prompt_text, status, done: false });
                     last_present = Instant::now();
                 }
-                // A button/click — and a trigger realized as a binary button (a133 L2/R2) — completes
-                // the instant a key-down is seen. A genuinely analog trigger emits no key, so its sweep
-                // is never short-circuited.
-                if matches!(spec.kind, plan::Kind::Button | plan::Kind::StickClick | plan::Kind::Trigger)
-                    && key_down
-                {
-                    break;
-                }
-                if active_now {
-                    saw = true;
-                    quiet = 0;
-                } else {
-                    quiet += 1;
-                    if !saw {
-                        if spec.optional && quiet >= timing.idle_skip_polls {
-                            break; // optional & never actuated → skip
-                        }
-                    } else {
-                        // A 2-axis control (stick) completes only after BOTH axes are swept near
-                        // their extremes (a full circle, not a quarter-roll) AND it settles at rest.
-                        // A 1-axis control settles on quiet. The full-sweep gate stops the window
-                        // closing on a brief mid-roll centre-transit — the tsp-bwrg.6 defect where
-                        // the stick advanced after ~0.25s and cascaded the rest of the roll into
-                        // later controls — and guarantees the full min/max calibration envelope.
-                        let swept = pf_input_collect::collect::axes_fully_swept(&seen_axes, &axis_span, &absc, need_axes);
-                        if swept && quiet >= timing.quiet_polls {
-                            break; // fully actuated (both axes swept, if 2-axis) then settled
-                        }
-                    }
+                match window.verdict(&cfg) {
+                    collect::Verdict::Open => {}
+                    collect::Verdict::Complete | collect::Verdict::Skip => break,
                 }
             }
 
-            collector.record(&buf);
+            collector.record(window.events());
             match collector.commit_current(src) {
                 // Captured — or an OPTIONAL control that saw nothing was cleanly skipped. Advance.
                 Ok(_) => break,
@@ -330,6 +268,15 @@ pub fn drive_live<S: EventSource, K: Sink>(
         present(sink, &mut canvas, skin, &collector, StepView { active_id: None, prompt: &spec.prompt, status: "PRESS THE HIGHLIGHTED CONTROL", done: collector.is_done() });
         if !timing.post_dwell.is_zero() {
             std::thread::sleep(timing.post_dwell);
+        }
+        // Discard this control's tail before the NEXT control is prompted, so an overshoot or a
+        // "did that take?" re-press cannot satisfy the next prompt (tsp-bwrg.12). Deliberately
+        // AFTER the post-dwell: the backlog the device buffered while that frame was held is
+        // exactly what would otherwise be the next control's first poll. The owner has not been
+        // asked the next question yet, so nothing arriving here can be an answer to it.
+        if !collector.is_done() {
+            collect::drain_between_controls(src, &timing.run_config())
+                .map_err(|e| CollectError::AbsInfo { code: 0, source: e })?;
         }
     }
 
@@ -497,13 +444,29 @@ mod tests {
     }
 
     /// The re-prompt fix (tsp-bwrg.6): a control that does not capture on the first try (here SOUTH,
-    /// fed two empty polls before its press) must be RE-PROMPTED — never abort the run and discard
+    /// whose window elapses before the press) must be RE-PROMPTED — never abort the run and discard
     /// the controls already collected. Drives the full a133 plan to completion with south fumbled
     /// once, and asserts the run returns Ok with EVERY control (including the fumbled south and the
     /// MENU/guide button) captured.
+    ///
+    /// HUMAN-TIMED FIXTURE (re-timed in tsp-bwrg.12). This script previously packed one batch per
+    /// control with NO separator between most of them — machine-timed input, the fixture profile
+    /// that lets a completion bug hide (tsp-bwrg.6 named finding). It also could not survive the
+    /// inter-control drain, which by design consumes the gap between two controls: with no gap to
+    /// consume, the drain would eat the NEXT control's only batch. Every control now gets its own
+    /// actuation followed by real quiet, exactly as a person produces.
+    ///
+    /// Face-button codes come from `pf_input_decode::codes` — POSITIONAL (Frame C), never a letter
+    /// (tsp-ozbp.14 / runtime#33): on this Nintendo-arranged chassis a glyph-keyed constant is right
+    /// exactly half the time.
     #[test]
     fn drive_live_reprompts_a_fumbled_control_and_keeps_prior_captures() {
+        use pf_input_decode::codes::{
+            BTN_EAST, BTN_MODE, BTN_NORTH, BTN_SELECT, BTN_SOUTH, BTN_START, BTN_TL, BTN_TL2,
+            BTN_TR, BTN_TR2, BTN_WEST,
+        };
         const EV_ABS: u16 = 0x03;
+        const QUIET: usize = 12; // per-control trailing quiet: the settle, THEN the fixed drain
         let stick = AbsInfo { min: 0, max: 4095, fuzz: 0, flat: 0, resolution: 0 };
         let hat = AbsInfo { min: -1, max: 1, fuzz: 0, flat: 0, resolution: 0 };
         let ident = Identity { name: "a133".into(), bus: 3, vid: 0x045e, pid: 0x028e, version: 0x0110 };
@@ -511,37 +474,44 @@ mod tests {
             .with_abs(0x0, stick).with_abs(0x1, stick).with_abs(0x3, stick).with_abs(0x4, stick)
             .with_abs(0x10, hat).with_abs(0x11, hat);
         let press = |code: u16| vec![RawEvent::new(EV_KEY, code, 1), RawEvent::new(EV_KEY, code, 0)];
-
-        // A single hat DIRECTION press (one axis, then release) + a quiet separator batch so the
-        // 1-axis HatDir control settles on the empty poll instead of consuming the next control.
         let hatdir = |code: u16, v: i32| vec![RawEvent::new(EV_ABS, code, v), RawEvent::new(EV_ABS, code, 0)];
-        // south — FUMBLE: two empty polls (no activity, bounded by max_polls=2) force a NoActivity →
-        // re-prompt, THEN the press on the retry.
-        src.push_batch(vec![]);
-        src.push_batch(vec![]);
-        src.push_batch(press(0x130)); // BTN_A
-        for code in [0x131u16, 0x133, 0x134, 0x13a, 0x13b, 0x13c, 0x136, 0x137] {
-            src.push_batch(press(code)); // east,west,north,select,start,guide(MODE),l1,r1
+        let abs2 = |ca: u16, cb: u16, v: i32| vec![RawEvent::new(EV_ABS, ca, v), RawEvent::new(EV_ABS, cb, v)];
+        // max_polls bounds each attempt's window; the FUMBLE is that many quiet polls with no press.
+        const MAX_POLLS: usize = 8;
+        let quiet = |s: &mut ScriptedSource, n: usize| { for _ in 0..n { s.push_batch(vec![]); } };
+
+        // south — FUMBLE: the window elapses with no activity, forcing NoActivity -> re-prompt ...
+        quiet(&mut src, MAX_POLLS);
+        // ... then the press lands on the retry.
+        src.push_batch(press(BTN_SOUTH));
+        quiet(&mut src, QUIET);
+        for code in [BTN_EAST, BTN_WEST, BTN_NORTH, BTN_SELECT, BTN_START, BTN_MODE, BTN_TL, BTN_TR] {
+            src.push_batch(press(code));
+            quiet(&mut src, QUIET);
         }
-        // dpad — now FOUR atomic direction steps (HatDir): up/down actuate HAT0Y, left/right HAT0X.
-        // Each is one actuation batch + one empty separator; they MERGE at emit into the single hat row.
-        src.push_batch(hatdir(0x11, -1)); src.push_batch(vec![]); // dpad_up   (HAT0Y-)
-        src.push_batch(hatdir(0x11, 1));  src.push_batch(vec![]); // dpad_down (HAT0Y+)
-        src.push_batch(hatdir(0x10, -1)); src.push_batch(vec![]); // dpad_left (HAT0X-)
-        src.push_batch(hatdir(0x10, 1));  src.push_batch(vec![]); // dpad_right(HAT0X+)
-        // lstick + rstick (both axes to full deflection in one batch), each with a quiet separator.
-        src.push_batch(vec![RawEvent::new(EV_ABS, 0x0, 4095), RawEvent::new(EV_ABS, 0x1, 4095)]);
-        src.push_batch(vec![]);
-        src.push_batch(vec![RawEvent::new(EV_ABS, 0x3, 4095), RawEvent::new(EV_ABS, 0x4, 4095)]);
-        src.push_batch(vec![]);
-        src.push_batch(press(0x138)); // BTN_TL2 (ltrig, binary)
-        src.push_batch(press(0x139)); // BTN_TR2 (rtrig, binary)
+        // dpad — FOUR atomic direction steps (HatDir): up/down actuate HAT0Y, left/right HAT0X.
+        // They MERGE at emit into the single hat row.
+        for (code, v) in [(0x11u16, -1), (0x11, 1), (0x10, -1), (0x10, 1)] {
+            src.push_batch(hatdir(code, v));
+            quiet(&mut src, QUIET);
+        }
+        // lstick + rstick — a real full sweep: BOTH axes to BOTH extremes (the coverage gate), which
+        // a single-corner deflection does not satisfy.
+        for (cx, cy) in [(0x0u16, 0x1u16), (0x3, 0x4)] {
+            src.push_batch(abs2(cx, cy, 4095));
+            src.push_batch(abs2(cx, cy, 0));
+            quiet(&mut src, QUIET);
+        }
+        for code in [BTN_TL2, BTN_TR2] {
+            src.push_batch(press(code)); // binary triggers, realized as buttons
+            quiet(&mut src, QUIET);
+        }
 
         let mut sink = CountingSink::default();
         let skin = demo_skin();
         let meta = DeviceMeta { id: "a133".into(), manufacturer: "TrimUI".into(), model: "Smart Pro".into() };
         // control_timeout kept short so a mis-fed control fails fast in-test rather than idling 45s.
-        let timing = Timing { max_polls: 2, idle_skip_polls: 1, quiet_polls: 1, post_dwell: Duration::ZERO, control_timeout: Duration::from_secs(2), ..Timing::live() };
+        let timing = Timing { max_polls: MAX_POLLS, idle_skip_polls: 1, quiet_polls: 1, post_dwell: Duration::ZERO, control_timeout: Duration::from_secs(2), ..Timing::live() };
 
         let caps = drive_live(&mut src, &mut sink, &skin, &meta, &timing)
             .expect("a fumbled control must re-prompt and the run must complete, not abort");
@@ -552,5 +522,8 @@ mod tests {
         {
             assert!(ids.contains(&want), "control {want} missing from the completed run: {ids:?}");
         }
+        // The dpad merged to the two HAT axes — not a stick axis picked up as a direction.
+        let dpad = caps.inputs.iter().find(|i| i.id == "dpad").expect("dpad row");
+        assert_eq!(dpad.code, "ABS_HAT0X,ABS_HAT0Y");
     }
 }
