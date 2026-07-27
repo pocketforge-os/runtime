@@ -55,8 +55,24 @@ const STICK: AbsInfo = AbsInfo { min: -32768, max: 32767, fuzz: 16, flat: 128, r
 const TRIG: AbsInfo = AbsInfo { min: 0, max: 255, fuzz: 0, flat: 0, resolution: 0 };
 const HAT: AbsInfo = AbsInfo { min: -1, max: 1, fuzz: 0, flat: 0, resolution: 0 };
 
-/// Build the synthetic a133 source. Batches are queued in PLAN ORDER; empty batches act as the
-/// inter-control "quiet" separators the sweep-settle / optional-skip heuristics key on.
+/// A human INTER-CONTROL gap, in polls. It must outlast BOTH the settle that closes a control's
+/// window AND the inter-control drain that follows it (tsp-bwrg.12) — a person letting go, reading
+/// the next prompt, and reaching for the next control takes far longer than either.
+///
+/// The prior fixture had NO separator at all between the button presses ("Buttons complete on
+/// key-down, so a single batch each; no separator needed"). That is MACHINE-timed input fed to a UI
+/// built for human-timed input, which is the named reason this suite stayed green while the
+/// completion bugs shipped (tsp-bwrg.6): with no gap, a fixture can never exercise what happens to
+/// the input that arrives BETWEEN two controls — which is where the bleed lives.
+const HUMAN_GAP: usize = 12;
+
+fn gap(s: &mut ScriptedSource) {
+    for _ in 0..HUMAN_GAP {
+        s.push_batch(vec![]);
+    }
+}
+
+/// Build the synthetic a133 source. Batches are queued in PLAN ORDER, separated by human gaps.
 fn a133_source() -> ScriptedSource {
     let ident = Identity {
         name: "TRIMUI Player1".to_string(),
@@ -78,46 +94,44 @@ fn a133_source() -> ScriptedSource {
         .with_abs(ABS_HAT0X, HAT)
         .with_abs(ABS_HAT0Y, HAT);
 
-    // Buttons complete on key-down, so a single batch each; no separator needed.
+    // Buttons complete on key-down; each press is followed by a human gap before the next control.
     for code in [BTN_A, BTN_B, BTN_X, BTN_Y, BTN_SELECT, BTN_START, BTN_MODE, BTN_TL, BTN_TR] {
         s.push_batch(vec![key(code, 1), key(code, 0)]);
+        gap(&mut s);
     }
 
-    // dpad hat — both axes actuated; then two empties to settle (quiet_polls=2).
+    // dpad hat — both axes actuated; then the settle + inter-control gap.
     s.push_batch(vec![
         abs(ABS_HAT0X, -1), abs(ABS_HAT0X, 0), abs(ABS_HAT0X, 1), abs(ABS_HAT0X, 0),
         abs(ABS_HAT0Y, -1), abs(ABS_HAT0Y, 0), abs(ABS_HAT0Y, 1), abs(ABS_HAT0Y, 0),
     ]);
-    s.push_batch(vec![]);
-    s.push_batch(vec![]);
+    gap(&mut s);
 
     // left stick sweep — full swing both axes; settle.
     s.push_batch(vec![
         abs(ABS_X, -32768), abs(ABS_X, 0), abs(ABS_X, 32767), abs(ABS_X, 0),
         abs(ABS_Y, -32768), abs(ABS_Y, 0), abs(ABS_Y, 32767), abs(ABS_Y, 0),
     ]);
-    s.push_batch(vec![]);
-    s.push_batch(vec![]);
+    gap(&mut s);
 
     // right stick sweep; settle.
     s.push_batch(vec![
         abs(ABS_RX, -32768), abs(ABS_RX, 32767), abs(ABS_RX, 0),
         abs(ABS_RY, -32768), abs(ABS_RY, 32767), abs(ABS_RY, 0),
     ]);
-    s.push_batch(vec![]);
-    s.push_batch(vec![]);
+    gap(&mut s);
 
-    // l3 + r3 stick-clicks — NOT on the base unit: no activity → optional-skip (idle_skip_polls=2).
-    for _ in 0..2 {
-        s.push_batch(vec![]);
-    }
-    for _ in 0..2 {
-        s.push_batch(vec![]);
+    // l3 + r3 stick-clicks — NOT on the base unit: no activity at all, so each is optional-SKIPPED
+    // after `idle_skip_polls` quiet polls. Each absent control needs enough quiet for its own skip
+    // AND the drain that follows it (the drain runs after a SKIP too — one uniform rule).
+    for _ in 0..4 {
+        gap(&mut s);
     }
 
     // ltrig — a BINARY trigger realized as a BUTTON: the a133 L2 fires BTN_TL2 (no analog axis).
     // Completes on key-down, like the face buttons.
     s.push_batch(vec![key(BTN_TL2, 1), key(BTN_TL2, 0)]);
+    gap(&mut s);
 
     // rtrig — R2 fires BTN_TR2.
     s.push_batch(vec![key(BTN_TR2, 1), key(BTN_TR2, 0)]);
@@ -128,7 +142,12 @@ fn a133_source() -> ScriptedSource {
 fn test_cfg() -> RunConfig {
     RunConfig {
         quiet_polls: 2,
-        idle_skip_polls: 2,
+        // The optional-SKIP threshold must exceed the quiet a present control can legitimately sit
+        // through before its actuation — here the tail of the previous control's HUMAN_GAP that the
+        // inter-control drain did not consume. Set it too low and a present-but-not-yet-pressed
+        // optional control (`guide`, `dpad`) is skipped out from under the owner. This is the one
+        // decision quiet is still allowed to make, and it may only ever OMIT a row, never record one.
+        idle_skip_polls: 6,
         max_polls: 2000,
         control_timeout: std::time::Duration::from_secs(5),
         ..RunConfig::default()

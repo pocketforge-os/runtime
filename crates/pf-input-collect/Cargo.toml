@@ -24,3 +24,15 @@ path = "src/bin/pf-input-collect.rs"
 # aarch64-unknown-linux-musl (static) AND stays decoupled from in-flight pf-input-broker edits.
 # Same "one place raw syscalls are unavoidable" rationale as pf-input-broker / pf-hw-exerciser.
 libc = { workspace = true }
+
+[dev-dependencies]
+# TESTS ONLY — the FRAME vocabulary, consumed rather than re-derived (tsp-ozbp.14 / runtime#33).
+# `pf_input_decode::codes` is where the two evdev code frames are DEFINED (Frame D = driver-emitted,
+# what a `capabilities.toml` `code` records; Frame C = kernel-canonical POSITIONAL, what this
+# decoder emits and what the broker re-emits), and it exports the positional constants
+# `BTN_SOUTH`/`BTN_EAST`/`BTN_WEST`/`BTN_NORTH`. Test fixtures here anchor on THOSE constants so a
+# button is named by its physical position, never by a printed glyph and never by a bare number
+# whose frame is unstated. Writing a second local `const BTN_… = 0x13…` table would be a second
+# independent derivation — i.e. a second chance to invert it, which is the exact bug tsp-ozbp.14
+# fixed. This is a dev-dependency: the shipped engine binary does not link the decoder.
+pf-input-decode = { path = "../pf-input-decode", version = "0.0.1" }

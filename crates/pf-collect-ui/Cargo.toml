@@ -36,3 +36,10 @@ libc = { workspace = true }
 png = "0.17"
 toml = { workspace = true }
 serde = { workspace = true }
+
+[dev-dependencies]
+# TESTS ONLY — the POSITIONAL (Frame C) face-button constants, CONSUMED rather than re-derived
+# (tsp-ozbp.14 / runtime#33). A local `const BTN_SOUTH = 0x130` in a fixture would be a second
+# independent derivation of the mapping, and a letter-spelled one is right only half the time on
+# this Nintendo-arranged chassis. The shipped UI binary does not link the decoder.
+pf-input-decode = { path = "../pf-input-decode", version = "0.0.1" }
