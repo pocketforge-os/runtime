@@ -36,16 +36,24 @@ fn abses(evs: &[Ev]) -> Vec<(u16, i32)> {
     evs.iter().filter(|e| e.ev_type == codes::EV_ABS).map(|e| (e.code, e.value)).collect()
 }
 
-/// EVERY right-cluster button (ttyS3), press then release, mapped to its ground-truth code.
+/// EVERY right-cluster button (ttyS3), press then release, through the real scanner + decoder.
+///
+/// ⚠ For the four FACE rows this is a MIRROR of the decoder's own table, not an independent
+/// check of it (`tsp-ozbp.14`): the expectation is the same mapping written a second time, so it
+/// catches an unintended change but can never catch a *wrong* mapping — making a wrong mapping
+/// green needs only the same edit here. It is also why the pre-fix labels read "A"/"B": they
+/// named the printed glyph, so a genuine correction surfaced as `A press → 0x130 ... left: 305`
+/// and looked like the fix was the bug. Rows are labelled by POSITION now, and the truth-check
+/// against physical position lives in `face_position_frame.rs`.
 #[test]
 fn right_cluster_every_button() {
     let table = [
         (0x01u8, codes::BTN_TR, "R1"),
         (0x02, codes::BTN_TR2, "R2"),
-        (0x04, codes::BTN_X, "X"),
-        (0x08, codes::BTN_Y, "Y"),
-        (0x10, codes::BTN_A, "A"),
-        (0x20, codes::BTN_B, "B"),
+        (0x04, codes::BTN_NORTH, "north (top)"),
+        (0x08, codes::BTN_WEST, "west (left)"),
+        (0x10, codes::BTN_EAST, "east (right)"),
+        (0x20, codes::BTN_SOUTH, "south (bottom)"),
         (0x40, codes::BTN_SELECT, "Select"),
         (0x80, codes::BTN_START, "Start"),
     ];
@@ -111,13 +119,13 @@ fn both_sticks_full_scale() {
 /// in one report, and nothing spurious.
 #[test]
 fn combined_press_and_move_in_one_frame() {
-    // Right side: A (0x10) + R1 (0x01) held, right stick pushed.
+    // Right side: east/right face button (0x10) + R1 (0x01) held, right stick pushed.
     let evs = run(Side::Right, &[wire(0x00, CENTER, CENTER), wire(0x11, 3000, 1000)]);
     let mut k = keys(&evs);
     k.sort();
-    let mut want = vec![(codes::BTN_TR, 1), (codes::BTN_A, 1)];
+    let mut want = vec![(codes::BTN_TR, 1), (codes::BTN_EAST, 1)];
     want.sort();
-    assert_eq!(k, want, "A + R1 both press in one report");
+    assert_eq!(k, want, "east + R1 both press in one report");
     assert_eq!(abses(&evs), vec![(codes::ABS_RX, 3000), (codes::ABS_RY, 1000)]);
 }
 
@@ -127,7 +135,7 @@ fn combined_press_and_move_in_one_frame() {
 fn decodes_through_stream_noise() {
     let mut scanner = FrameScanner::new();
     let mut decoder = SideDecoder::new(Side::Right);
-    // Junk, a false 0xFF, then a clean "B pressed" frame split across two reads.
+    // Junk, a false 0xFF, then a clean "south pressed" frame split across two reads.
     let clean = wire(0x20, CENTER, CENTER);
     let mut stream = vec![0x00, 0xAB, 0xFF, 0x77];
     stream.extend_from_slice(&clean[..4]);
@@ -138,5 +146,5 @@ fn decodes_through_stream_noise() {
     for f in scanner.push(&clean[4..]) {
         evs = decoder.apply(f);
     }
-    assert_eq!(keys(&evs), vec![(codes::BTN_B, 1)], "B decoded through noise + a torn frame");
+    assert_eq!(keys(&evs), vec![(codes::BTN_SOUTH, 1)], "south decoded through noise + a torn frame");
 }

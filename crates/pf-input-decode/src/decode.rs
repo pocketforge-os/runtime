@@ -5,13 +5,31 @@
 //! capabilities.toml` descriptor, and exercised by [`crate::tests`] + the synthetic integration
 //! test against EVERY control.
 //!
-//! ## Ground truth (`tsp-ozbp.2`)
+//! ## Ground truth (`tsp-ozbp.2`, with the face bits re-anchored by `tsp-ozbp.14`)
 //!
 //! - **`ttyS3` = RIGHT** stick + these `byte2` bits:
-//!   `0x01`=R1 `0x02`=R2 `0x04`=X `0x08`=Y `0x10`=A `0x20`=B `0x40`=Select `0x80`=Start.
+//!   `0x01`=R1 `0x02`=R2 `0x04`=**north** `0x08`=**west** `0x10`=**east** `0x20`=**south**
+//!   `0x40`=Select `0x80`=Start.
 //! - **`ttyS4` = LEFT** stick + these `byte2` bits:
 //!   `0x01`=L1 `0x02`=L2 `0x04`=Dup `0x08`=Dleft `0x10`=Dright `0x20`=Ddown `0x40`=unused(Pro-S)
 //!   `0x80`=Menu.
+//!
+//! ⚠ The `tsp-ozbp.2` map wrote the four face bits as bare LETTERS (`0x10`=A, `0x20`=B). A letter
+//! is ambiguous between the printed glyph and the canonical position, and on this
+//! Nintendo-arranged chassis those two disagree — so that map is **not a usable position source**
+//! and the letters are deliberately not reproduced above. The bit↔POSITION rows are re-anchored
+//! on the position-prompted, owner-confirmed `tsp-bwrg.6` candidate; the derivation is spelled
+//! out in `tests/face_position_frame.rs`, which is also the regression bar.
+//!
+//! ## Which frame does this emit? — **FRAME C, kernel-canonical positional**
+//!
+//! See [`crate::codes`] for the full two-frame contract (Frame D = driver-emitted/wire,
+//! Frame C = kernel-canonical positional). The table below is the ONE place the physical
+//! position→code decision is made, so it is the one place the frame can be got wrong: it MUST be
+//! keyed on where the button physically is, never on the letter printed on it. Keying it on the
+//! glyph is exactly the shipped `tsp-ozbp.14` defect — and because the kernel aliases
+//! `BTN_X == BTN_NORTH` / `BTN_Y == BTN_WEST`, a glyph-keyed table is *coincidentally correct*
+//! on west/north here, so it looks half-right and reads as a typo rather than a frame error.
 //!
 //! L2/R2 are physically binary → BUTTONS (`BTN_TL2`/`BTN_TR2`), matching `pf-input-broker`.
 //! The d-pad (LEFT only) is emitted as an `ABS_HAT0X`/`ABS_HAT0Y` hat, per the descriptor's
@@ -56,13 +74,16 @@ impl Ev {
 // the table (rather than XOR-ing the raw byte) means those bits can never leak out as buttons.
 
 /// RIGHT UART (`ttyS3`) `byte2` bit → evdev button code.
+///
+/// The four face rows are keyed on PHYSICAL POSITION (Frame C) — the glyph printed on each is
+/// noted only so a human at the bench can find the button. Do not re-key this on the glyph.
 const RIGHT_BTN: &[(u8, u16)] = &[
     (0x01, codes::BTN_TR),     // R1
     (0x02, codes::BTN_TR2),    // R2 (binary trigger → button)
-    (0x04, codes::BTN_X),      // X
-    (0x08, codes::BTN_Y),      // Y
-    (0x10, codes::BTN_A),      // A
-    (0x20, codes::BTN_B),      // B
+    (0x04, codes::BTN_NORTH),  // TOP face button    (printed "X")
+    (0x08, codes::BTN_WEST),   // LEFT face button   (printed "Y")
+    (0x10, codes::BTN_EAST),   // RIGHT face button  (printed "A")
+    (0x20, codes::BTN_SOUTH),  // BOTTOM face button (printed "B")
     (0x40, codes::BTN_SELECT), // Select
     (0x80, codes::BTN_START),  // Start
 ];
@@ -224,21 +245,26 @@ mod tests {
     #[test]
     fn right_side_first_frame_emits_both_axes_and_held_buttons() {
         let mut d = SideDecoder::new(Side::Right);
-        // A held (bit 0x10) + centre-ish sticks.
+        // The RIGHT/east face button held (bit 0x10) + centre-ish sticks.
         let evs = d.apply(f(0x10, 2048, 2050));
-        assert_eq!(keys(&evs), vec![(codes::BTN_A, 1)], "A pressed at startup");
+        assert_eq!(keys(&evs), vec![(codes::BTN_EAST, 1)], "east pressed at startup");
         assert_eq!(abses(&evs), vec![(codes::ABS_RX, 2048), (codes::ABS_RY, 2050)]);
     }
 
+    /// ⚠ A MIRROR of [`RIGHT_BTN`], not an independent check of it: the cases below are the same
+    /// table written twice, so this test can only catch an UNINTENDED change to the mapping — it
+    /// cannot tell you the mapping is semantically wrong, because a wrong mapping is made green
+    /// simply by editing this copy too. The truth-check against physical position lives in
+    /// `tests/face_position_frame.rs`; see `tsp-ozbp.14` for why the distinction mattered.
     #[test]
     fn every_right_button_maps_to_its_ground_truth_code() {
         let cases = [
             (0x01u8, codes::BTN_TR),
             (0x02, codes::BTN_TR2),
-            (0x04, codes::BTN_X),
-            (0x08, codes::BTN_Y),
-            (0x10, codes::BTN_A),
-            (0x20, codes::BTN_B),
+            (0x04, codes::BTN_NORTH),
+            (0x08, codes::BTN_WEST),
+            (0x10, codes::BTN_EAST),
+            (0x20, codes::BTN_SOUTH),
             (0x40, codes::BTN_SELECT),
             (0x80, codes::BTN_START),
         ];

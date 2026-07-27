@@ -46,7 +46,19 @@ pub struct Input {
     pub id: String,
     pub kind: String,
     pub ev_type: String,
-    /// One or two canonical Linux input-event codes, comma-joined (e.g. `"ABS_X,ABS_Y"`).
+    /// One or two Linux input-event codes, comma-joined (e.g. `"ABS_X,ABS_Y"`).
+    ///
+    /// **FRAME D — driver-emitted, NOT canonical-positional** (`tsp-ozbp.14`). For a face button
+    /// this field records what the underlying driver actually puts on the wire for the control
+    /// named by [`Self::id`], which is an OBSERVATION and may disagree with the kernel's
+    /// positional convention — the `id` is the position, the `code` is the wire. The two frames
+    /// are inverses on some hardware, and an `EV_KEY` number carries no statement of which one it
+    /// is in, so a consumer that compares or re-emits codes must say which frame it means.
+    ///
+    /// `pf-input-broker`'s remap is precisely the D→C translation: it reads this field as the
+    /// SOURCE code and re-emits the canonical positional code for the `id`, so an app sees
+    /// **Frame C** and never the driver quirk. Contract + the alias/glyph table:
+    /// `pf_input_decode::codes`.
     pub code: String,
     /// How the control behaves at the API surface, when the wire encoding lies about it.
     /// `"analog"` (or absent) = report the axis/key as-is; `"binary"` = a control that reports
