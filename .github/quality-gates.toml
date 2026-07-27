@@ -1,0 +1,190 @@
+# =============================================================================
+# runtime workspace — REQUIRED QUALITY GATES manifest  (tsp-1x04)
+# =============================================================================
+#
+# WHY THIS FILE EXISTS — do not delete it as ceremony.
+#
+# In one week this repo produced THREE gates that LOOKED like coverage while
+# checking nothing, all in the same workflow surface:
+#   * tsp-ozbp.16 — the `fixtures_track_platform` drift guard reported "ok" on
+#     every run it ever made while comparing nothing (VACUOUS; deleted).
+#   * tsp-7rts   — there was NO clippy gate at all; a lint failure sat in the
+#     tree with nothing able to report it (ABSENT).
+#   * tsp-ovee   — `--locked` was passed NOWHERE, so cargo silently rewrote
+#     Cargo.lock in the runner and went green while the lock was stale (ABSENT).
+#
+# The systemic cause was not three coincidences: NOTHING in this repo stated
+# what its quality gates ARE, so an absent gate had no shape and could not be
+# noticed. A green tick read as "checked" whether a gate was present, vacuous,
+# or missing. As the tsp-ovee worker put it: a CHECK-SHAPED ABSENCE KEEPS
+# READING AS COVERAGE.
+#
+# This manifest is the missing statement. It is the single, committed source of
+# truth for the workspace's required gates. `.github/gate-manifest/check_gates.py`
+# reads it and FAILS CI (the `gate-manifest` job) when a declared gate is absent
+# from, or neutered in, the workflows — so a missing gate becomes a RED, not a
+# silence. The checker is itself guarded by a committed selftest
+# (`.github/gate-manifest/selftest.py`) that keeps proving it can go red; see
+# `.github/gate-manifest/README.md` for the design, the reachability analysis it
+# performs instead of a naive text grep, and — importantly — the HONEST BOUND on
+# what it can and cannot catch.
+#
+# To ADD a gate: add its `[[gate]]` block here AND its invocation to a workflow.
+# The checker will red until both exist. That is the point.
+#
+# -----------------------------------------------------------------------------
+# REQUIRED-CHECK REALITY (Layer 2) — read before trusting a green tick to gate.
+# -----------------------------------------------------------------------------
+# A gate being INVOKED in a workflow (what this manifest + checker enforce) is
+# NOT the same as a RED result BLOCKING a merge. As of 2026-07-27 the ONLY
+# required status check on `runtime`'s `main` branch is `pf-pr-review / review`
+# (org ruleset id 18463042, enforcement active). The `runtime-tests` and
+# `prefs-e2e` workflows RUN on every relevant PR but are in NO ruleset's
+# `required_status_checks`, so a RED cargo-test / clippy / lockfile / musl
+# result does NOT currently block a merge — they are visible-but-non-blocking.
+#
+# RECOMMENDATION: the gates below whose `should_be_required_check = true`
+# (including the `gate-manifest` meta-gate itself) SHOULD be wired as required
+# status checks so a red actually has teeth. That change needs repository ADMIN
+# (the agent App token has none by design) and is a durable merge-gating
+# convention decision — an OWNER action. It is tracked in **tsp-i9xs** (sibling
+# class of tsp-9ow6). This manifest documents the requirement; tsp-i9xs wires it.
+#
+# The checker DELIBERATELY does NOT try to verify Layer 2 in CI: reading the
+# ruleset needs admin:read the CI token lacks, and a check that SKIPS when it
+# cannot read its input is a fail-OPEN skip — the exact anti-pattern this bead
+# exists to kill. Layer 2 is declared-and-tracked here, not silently half-checked.
+# =============================================================================
+
+# The default trigger a gate's job must fire on unless a gate overrides it.
+# A gate not reachable on `pull_request` to `main` is treated as ABSENT.
+[defaults]
+trigger_event = "pull_request"
+trigger_branch = "main"
+
+# -----------------------------------------------------------------------------
+# UNIVERSAL invariant (a property over ALL workflows, not a single step).
+# This is the tsp-ovee gate stated as what it really is: EVERY lock-consuming
+# cargo invocation, in every workflow, must carry `--locked`. Checking one step
+# for `--locked` would miss a later step that rewrites the lock; the invariant
+# is universal, so the check is too.
+# -----------------------------------------------------------------------------
+[[universal]]
+id = "no-unlocked-cargo"
+invariant = "No lock-consuming cargo invocation in any workflow may omit --locked (cargo must never silently rewrite Cargo.lock in the runner; the image cross-build uses --locked)."
+# cargo subcommands that read/resolve the lockfile. `--version`/`--help` forms
+# and non-lock subcommands (e.g. `cargo fmt`) are exempt (handled in the checker).
+lock_consuming_subcommands = ["build", "test", "run", "metadata", "check", "clippy", "bench", "doc", "install", "tree"]
+required_flag = "--locked"
+origin = "tsp-ovee"
+
+# -----------------------------------------------------------------------------
+# STEP-INVOCATION gates: a named job must contain a reachable, non-neutered step
+# whose `run:` carries ALL of `required_tokens`. "Reachable" = the job fires on
+# the required trigger, the job's `paths` filter (if any) covers `guards_paths`,
+# and neither the job nor the step is `if:`-gated, `continue-on-error`, or
+# `|| true`-neutered. See README.md "Reachability" for exactly what is modelled.
+# -----------------------------------------------------------------------------
+
+[[gate]]
+id = "lockfile-up-to-date"
+invariant = "Cargo.lock already satisfies every manifest — dependency resolution does not need to change it. Catches a manifest edit landed without the matching lock entries (the runtime#35 / tsp-ovee case)."
+workflow = ".github/workflows/runtime-tests.yml"
+job = "test"
+required_tokens = ["cargo metadata", "--locked"]
+guards_paths = ["crates/**", "Cargo.toml", "Cargo.lock"]
+should_be_required_check = true
+origin = "tsp-ovee"
+
+[[gate]]
+id = "workspace-tests"
+invariant = "The WHOLE workspace's tests pass with the real platform assets present, so the platform-backed acceptance tests actually RUN instead of silently skipping (the tsp-bwrg.8 / tsp-ozbp.16 design)."
+workflow = ".github/workflows/runtime-tests.yml"
+job = "test"
+required_tokens = ["cargo test", "--locked", "--workspace"]
+# Anti-vacuity: the platform-backed tests SKIP (read as green while checking
+# nothing) unless PF_PLATFORM_DIR is set AND the platform repo is checked out.
+# Requiring both structurally is a partial defense against the fixtures_track_
+# platform vacuity recurring in this step. See README "The residual vacuous gap".
+requires_env = ["PF_PLATFORM_DIR"]
+requires_checkout = ["pocketforge-os/platform"]
+guards_paths = ["crates/**", "Cargo.toml", "Cargo.lock"]
+should_be_required_check = true
+origin = "tsp-bwrg.8"
+
+[[gate]]
+id = "musl-cross-build"
+invariant = "The a133 device binaries (pf-input-collect, pf-collect-ui) link for aarch64-unknown-linux-musl with NO per-invocation RUSTFLAGS override — proving the workspace .cargo/config.toml linker pin works on a stock runner."
+workflow = ".github/workflows/runtime-tests.yml"
+job = "test"
+required_tokens = ["cargo build", "--locked", "--target aarch64-unknown-linux-musl"]
+guards_paths = ["crates/**", "Cargo.toml", "Cargo.lock", ".cargo/config.toml"]
+should_be_required_check = true
+origin = "tsp-bwrg"
+
+[[gate]]
+id = "clippy-workspace"
+invariant = "The whole workspace lints clean with warnings-as-errors across all targets (lib+bin+tests+benches). A hand-listed -p set or a missing -D warnings re-creates the absent-gate defect one level up."
+workflow = ".github/workflows/runtime-tests.yml"
+job = "test"
+required_tokens = ["cargo clippy", "--locked", "--workspace", "--all-targets", "-D warnings"]
+guards_paths = ["crates/**", "Cargo.toml", "Cargo.lock"]
+should_be_required_check = true
+origin = "tsp-7rts"
+
+[[gate]]
+id = "prefs-e2e-unification"
+invariant = "The accessibility/preference sim E2E passes on BOTH the a133 and a523 descriptors with byte-for-byte identical test code — the E4 unification proof (tsp-xubv.4)."
+workflow = ".github/workflows/prefs-e2e.yml"
+job = "matrix-row"
+required_tokens = ["cargo test", "--locked", "-p pf-settings", "--test prefs_e2e"]
+# The unification proof is meaningless with only one row: assert both descriptors
+# are still in the matrix. Silently dropping a row would leave a green single-row
+# run reading as the two-row unification proof.
+require_matrix = { key = "descriptor", values = ["a133", "a523"] }
+guards_paths = ["*"]  # prefs-e2e.yml has no paths filter today; it runs on all PRs.
+should_be_required_check = true
+origin = "tsp-xubv.4"
+
+[[gate]]
+id = "peer-review-gate"
+invariant = "Every non-draft PR is gated by the org peer-review workflow (the ONE check that is ALREADY a required status check on main)."
+workflow = ".github/workflows/pr-review.yml"
+job = "pf-pr-review"
+# A `uses:` caller, not a `run:` step — the checker matches the reusable-workflow
+# reference for this job.
+required_uses = "pocketforge-os/shared-workflows/.github/workflows/pr-review-gate.yml"
+# This job carries a job-level `if:` that skips TITLE-ONLY edits (never a code
+# PR — it always runs on opened/synchronize/reopened/ready_for_review). The
+# checker treats an `if:` on a required job as skippable unless whitelisted,
+# because it does not evaluate GitHub expression truthiness for arbitrary
+# events; this one is explicitly acknowledged and it is already the enforced
+# required check (ruleset 18463042). See README "Modelling choices".
+allow_if = true
+guards_paths = ["*"]  # runs on all PRs (no paths filter).
+should_be_required_check = true   # and IS, today (ruleset 18463042).
+origin = "tsp-8ny"
+
+# -----------------------------------------------------------------------------
+# The meta-gate guards the others; this entry makes the meta-gate guard ITSELF
+# against being neutered (its trigger stripped, its steps if-skipped, etc.).
+# It CANNOT protect against the whole gate-manifest.yml file being deleted while
+# the checker is not running — that is only stopped by making `gate-manifest` a
+# required status check (Layer 2, tsp-i9xs). Stated plainly, not papered over.
+# -----------------------------------------------------------------------------
+[[gate]]
+id = "gate-manifest-self"
+invariant = "The meta-gate runs on every PR: it invokes the checker against the real workflows AND runs the selftest that proves the checker can go red."
+workflow = ".github/workflows/gate-manifest.yml"
+job = "verify"
+required_tokens = ["check_gates.py", "selftest.py"]
+# These are two distinct steps (check the real tree; run the selftest), not one
+# invocation — each must be run by a non-neutered step.
+tokens_in_separate_steps = true
+# NO paths filter on gate-manifest.yml by design (guards_paths = everything): a
+# gate can be removed by editing ONLY a workflow file, which a crates/** paths
+# filter would not trigger on. The meta-gate about absence must not itself be
+# filterable into absence.
+guards_paths = ["*"]
+should_be_required_check = true
+origin = "tsp-1x04"
