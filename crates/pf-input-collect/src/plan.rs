@@ -7,7 +7,8 @@
 //! point of guided collection: a brand-new device has no descriptor, so the codes cannot be
 //! known ahead of time; only the *shape* of a gamepad (which controls to ask for) is known.
 
-/// The kind of a control — mirrors the schema's `input.kind` enum exactly.
+/// The kind of a control — mirrors the schema's `input.kind` enum, plus `HatDir` (an internal
+/// PROMPT-only kind, never emitted).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
     Button,
@@ -15,10 +16,18 @@ pub enum Kind {
     Stick,
     StickClick,
     Trigger,
+    /// One D-PAD DIRECTION (up/down/left/right) captured as its own atomic step — a single hat-axis
+    /// actuation. The owner presses one direction and the prompt advances (tsp-bwrg.6: the lumped
+    /// "press all four" hat step could never satisfy its own two-axis completion on a human's
+    /// sequential presses). This kind is PROMPT-only: the four dpad direction captures are MERGED at
+    /// emit into the single `hat` row (`ABS_HAT0X,ABS_HAT0Y`), so the collected map is unchanged and
+    /// `hat` is never a schema `input.kind` value emitted from a HatDir.
+    HatDir,
 }
 
 impl Kind {
-    /// The schema spelling (`input.kind`).
+    /// The schema spelling (`input.kind`). `HatDir` reports `hat` for completeness but is never
+    /// emitted directly (its captures merge into one `hat` row at emit).
     pub fn as_str(self) -> &'static str {
         match self {
             Kind::Button => "button",
@@ -26,14 +35,16 @@ impl Kind {
             Kind::Stick => "stick",
             Kind::StickClick => "stick-click",
             Kind::Trigger => "trigger",
+            Kind::HatDir => "hat",
         }
     }
 
-    /// How many distinct axis codes this kind expects to record (buttons/clicks record one
-    /// `EV_KEY` code; a hat and a stick record two `EV_ABS` axes; a trigger records one).
+    /// How many distinct axis codes this kind expects to record. Buttons/clicks/triggers record one
+    /// `EV_KEY`/axis; a hat and a stick record two `EV_ABS` axes; a single dpad DIRECTION (`HatDir`)
+    /// records ONE axis atomically (the four directions merge to the two hat axes at emit).
     pub fn expected_axes(self) -> usize {
         match self {
-            Kind::Button | Kind::StickClick | Kind::Trigger => 1,
+            Kind::Button | Kind::StickClick | Kind::Trigger | Kind::HatDir => 1,
             Kind::Hat | Kind::Stick => 2,
         }
     }
@@ -138,13 +149,16 @@ pub fn a133_gamepad_plan() -> Vec<ControlSpec> {
         ControlSpec::new("guide", Kind::Button, "Press the MENU button", false),
         ControlSpec::new("l1", Kind::Button, "Press the LEFT shoulder (L1)", false),
         ControlSpec::new("r1", Kind::Button, "Press the RIGHT shoulder (R1)", false),
-        // A hat needs BOTH axes (HAT0X and HAT0Y), so ask for all four directions.
-        ControlSpec::new(
-            "dpad",
-            Kind::Hat,
-            "Press ALL FOUR D-PAD directions: UP, DOWN, LEFT, RIGHT",
-            false,
-        ),
+        // The D-PAD as FOUR atomic per-direction steps (owner-directed, tsp-bwrg.6). Each is its own
+        // saw-it→advance capture (a single hat-axis actuation), so the fragile lumped "press all
+        // four" two-axis completion — which a human's sequential presses could never satisfy — is
+        // gone entirely. The four captures MERGE at emit into the single hat row
+        // (`ABS_HAT0X,ABS_HAT0Y`), so the collected map is UNCHANGED — only the prompt UX splits.
+        // With these four, the plan is exactly the 17 prompts of the tsp-ozbp.9 frozen baseline 1:1.
+        ControlSpec::new("dpad_up", Kind::HatDir, "Press UP on the D-PAD", false),
+        ControlSpec::new("dpad_down", Kind::HatDir, "Press DOWN on the D-PAD", false),
+        ControlSpec::new("dpad_left", Kind::HatDir, "Press LEFT on the D-PAD", false),
+        ControlSpec::new("dpad_right", Kind::HatDir, "Press RIGHT on the D-PAD", false),
         // A stick needs BOTH axes actuated — a partial arc only moves one, so ask for a full circle.
         ControlSpec::new(
             "lstick",
@@ -192,25 +206,34 @@ mod tests {
     }
 
     #[test]
-    fn a133_plan_is_exactly_the_frozen_baseline_controls_all_required() {
+    fn a133_plan_is_the_17_prompt_frozen_baseline_one_to_one() {
         let plan = a133_gamepad_plan();
         let ids: Vec<&str> = plan.iter().map(|c| c.id.as_str()).collect();
-        // EXACTLY the tsp-ozbp.9 frozen-baseline controls, in press-friendly order — no more, no less.
+        // 17 PROMPTS, 1:1 with the tsp-ozbp.9 frozen parity baseline: 9 buttons + 4 dpad DIRECTIONS
+        // + 2 sticks + 2 triggers. The dpad is four atomic direction prompts that MERGE to one hat
+        // row at emit (see collect::Collector::emit), so the prompt plan and the measured ground
+        // truth are now the same 17-item list (no lumped/collapsed entry).
         assert_eq!(
             ids,
             [
-                "south", "east", "west", "north", "select", "start", "guide", "l1", "r1", "dpad",
+                "south", "east", "west", "north", "select", "start", "guide", "l1", "r1",
+                "dpad_up", "dpad_down", "dpad_left", "dpad_right",
                 "lstick", "rstick", "ltrig", "rtrig",
             ],
-            "a133 plan must be exactly the frozen-baseline control set"
+            "a133 plan must be exactly the 17-prompt frozen baseline"
         );
-        // The phantom controls the owner tripped on must NOT appear (no home/guide-optional, no L3/R3).
-        for phantom in ["l3", "r3", "home", "capture", "misc"] {
-            assert!(!ids.contains(&phantom), "a133 plan must not prompt phantom control {phantom}");
+        assert_eq!(plan.len(), 17, "the a133 plan is 17 prompts (baseline 1:1)");
+        // No phantom, and NO lumped single "dpad" entry.
+        for phantom in ["l3", "r3", "home", "capture", "misc", "dpad"] {
+            assert!(!ids.contains(&phantom), "a133 plan must not prompt {phantom}");
         }
-        // EVERY control is required — nothing is optional, so nothing can flash-then-skip.
+        // EVERY prompt is required (no flash-then-skip); each dpad direction is an atomic HatDir.
         for c in &plan {
             assert!(!c.optional, "a133 control {} must be required (no flash-then-skip)", c.id);
+        }
+        for d in ["dpad_up", "dpad_down", "dpad_left", "dpad_right"] {
+            let c = plan.iter().find(|c| c.id == d).unwrap();
+            assert_eq!(c.kind, Kind::HatDir, "{d} must be an atomic HatDir step");
         }
     }
 }

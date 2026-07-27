@@ -152,7 +152,7 @@ fn poll_active(
 ) -> bool {
     match kind {
         plan::Kind::Button | plan::Kind::StickClick => e.ev_type == EV_KEY && e.value == 1,
-        plan::Kind::Hat | plan::Kind::Stick | plan::Kind::Trigger => {
+        plan::Kind::Hat | plan::Kind::Stick | plan::Kind::Trigger | plan::Kind::HatDir => {
             if e.ev_type == EV_KEY {
                 return e.value == 1;
             }
@@ -224,6 +224,11 @@ pub fn drive_live<S: EventSource, K: Sink>(
             // control within ~1.5s regardless, and keep a parked panel live.
             let mut last_present = Instant::now();
             let keepalive = std::time::Duration::from_millis(1500);
+            // A 2-axis control (hat/stick) holds its window open until BOTH axes actuate — a human
+            // presses the dpad directions / stick axes SEQUENTIALLY, so a settle after one axis must
+            // not close the window (tsp-bwrg.6: the dpad never advanced). Mirrors the engine pump.
+            let mut seen_axes: std::collections::HashSet<u16> = std::collections::HashSet::new();
+            let need_axes = spec.kind.expected_axes();
             while Instant::now() < deadline && iters < timing.max_polls {
                 iters += 1;
                 let evs = src.poll(timing.poll_step).map_err(|e| CollectError::AbsInfo { code: 0, source: e })?;
@@ -235,6 +240,9 @@ pub fn drive_live<S: EventSource, K: Sink>(
                     }
                     if poll_active(spec.kind, e, src, &mut absc) {
                         active_now = true;
+                        if e.ev_type == EV_ABS {
+                            seen_axes.insert(e.code);
+                        }
                     }
                     buf.push(*e);
                 }
@@ -265,8 +273,14 @@ pub fn drive_live<S: EventSource, K: Sink>(
                         if spec.optional && quiet >= timing.idle_skip_polls {
                             break; // optional & never actuated → skip
                         }
-                    } else if quiet >= timing.quiet_polls {
-                        break; // actuated then settled
+                    } else {
+                        // A 2-axis control settles only once BOTH axes have actuated (else a
+                        // sequential press closes the window on one axis → Incomplete → re-prompt
+                        // forever, the dpad bug). A 1-axis control settles on quiet, as before.
+                        let enough = need_axes < 2 || seen_axes.len() >= need_axes;
+                        if enough && quiet >= timing.quiet_polls {
+                            break; // actuated (both axes if 2-axis) then settled
+                        }
                     }
                 }
             }
@@ -373,12 +387,12 @@ fn synth_events_for(id: &str) -> Vec<RawEvent> {
         "start" => btn(0x13b),
         "l1" => btn(0x136),
         "r1" => btn(0x137),
-        "dpad" => vec![
-            RawEvent::new(EV_ABS, 0x10, -1),
-            RawEvent::new(EV_ABS, 0x10, 1),
-            RawEvent::new(EV_ABS, 0x11, -1),
-            RawEvent::new(EV_ABS, 0x11, 1),
-        ],
+        // Four atomic dpad directions (each a single hat-axis actuation): up/down -> HAT0Y (0x11),
+        // left/right -> HAT0X (0x10). They merge to one hat row at emit.
+        "dpad_up" => vec![RawEvent::new(EV_ABS, 0x11, -1), RawEvent::new(EV_ABS, 0x11, 0)],
+        "dpad_down" => vec![RawEvent::new(EV_ABS, 0x11, 1), RawEvent::new(EV_ABS, 0x11, 0)],
+        "dpad_left" => vec![RawEvent::new(EV_ABS, 0x10, -1), RawEvent::new(EV_ABS, 0x10, 0)],
+        "dpad_right" => vec![RawEvent::new(EV_ABS, 0x10, 1), RawEvent::new(EV_ABS, 0x10, 0)],
         "lstick" => stick(0x0, 0x1),
         "rstick" => stick(0x3, 0x4),
         // Left trigger realized as a binary BUTTON — the real a133 L2/R2 shape (the MCU reports it
@@ -456,18 +470,24 @@ mod tests {
             .with_abs(0x10, hat).with_abs(0x11, hat);
         let press = |code: u16| vec![RawEvent::new(EV_KEY, code, 1), RawEvent::new(EV_KEY, code, 0)];
 
-        // south — FUMBLE: two empty polls (no activity) force a NoActivity → re-prompt, THEN the press.
+        // A single hat DIRECTION press (one axis, then release) + a quiet separator batch so the
+        // 1-axis HatDir control settles on the empty poll instead of consuming the next control.
+        let hatdir = |code: u16, v: i32| vec![RawEvent::new(EV_ABS, code, v), RawEvent::new(EV_ABS, code, 0)];
+        // south — FUMBLE: two empty polls (no activity, bounded by max_polls=2) force a NoActivity →
+        // re-prompt, THEN the press on the retry.
         src.push_batch(vec![]);
         src.push_batch(vec![]);
         src.push_batch(press(0x130)); // BTN_A
         for code in [0x131u16, 0x133, 0x134, 0x13a, 0x13b, 0x13c, 0x136, 0x137] {
             src.push_batch(press(code)); // east,west,north,select,start,guide(MODE),l1,r1
         }
-        // dpad (both hat axes), then a quiet poll to settle.
-        src.push_batch(vec![RawEvent::new(EV_ABS, 0x10, -1), RawEvent::new(EV_ABS, 0x10, 0),
-                            RawEvent::new(EV_ABS, 0x11, 1), RawEvent::new(EV_ABS, 0x11, 0)]);
-        src.push_batch(vec![]);
-        // lstick + rstick (both axes to full deflection), each with a quiet poll to settle.
+        // dpad — now FOUR atomic direction steps (HatDir): up/down actuate HAT0Y, left/right HAT0X.
+        // Each is one actuation batch + one empty separator; they MERGE at emit into the single hat row.
+        src.push_batch(hatdir(0x11, -1)); src.push_batch(vec![]); // dpad_up   (HAT0Y-)
+        src.push_batch(hatdir(0x11, 1));  src.push_batch(vec![]); // dpad_down (HAT0Y+)
+        src.push_batch(hatdir(0x10, -1)); src.push_batch(vec![]); // dpad_left (HAT0X-)
+        src.push_batch(hatdir(0x10, 1));  src.push_batch(vec![]); // dpad_right(HAT0X+)
+        // lstick + rstick (both axes to full deflection in one batch), each with a quiet separator.
         src.push_batch(vec![RawEvent::new(EV_ABS, 0x0, 4095), RawEvent::new(EV_ABS, 0x1, 4095)]);
         src.push_batch(vec![]);
         src.push_batch(vec![RawEvent::new(EV_ABS, 0x3, 4095), RawEvent::new(EV_ABS, 0x4, 4095)]);
@@ -478,7 +498,8 @@ mod tests {
         let mut sink = CountingSink::default();
         let skin = demo_skin();
         let meta = DeviceMeta { id: "a133".into(), manufacturer: "TrimUI".into(), model: "Smart Pro".into() };
-        let timing = Timing { max_polls: 2, idle_skip_polls: 1, quiet_polls: 1, post_dwell: Duration::ZERO, ..Timing::live() };
+        // control_timeout kept short so a mis-fed control fails fast in-test rather than idling 45s.
+        let timing = Timing { max_polls: 2, idle_skip_polls: 1, quiet_polls: 1, post_dwell: Duration::ZERO, control_timeout: Duration::from_secs(2), ..Timing::live() };
 
         let caps = drive_live(&mut src, &mut sink, &skin, &meta, &timing)
             .expect("a fumbled control must re-prompt and the run must complete, not abort");

@@ -154,4 +154,170 @@ fn full_both_axis_stick_sweep_captures_on_unsigned_range_without_panicking() {
     }
 }
 
+/// SEQUENTIAL two-axis STICK completion (tsp-bwrg.6 — this is the owner's lstick ABORT, same root
+/// cause as the dpad wedge). A human roll is not a perfect simultaneous circle: a mid-roll pause,
+/// or moving one axis then the other, puts a GAP between the axes. The window must hold open until
+/// BOTH axes are seen. Before the fix the gap closed the window on one axis -> finalize needs two
+/// -> Incomplete -> the run ABORTED (exactly the owner's "incomplete capture for lstick"). Fed here
+/// as X-sweep, GAP, Y-sweep, settle. Fail-old (Err Incomplete) / pass-new (Ok, both axes).
+#[test]
+fn stick_completes_on_sequential_two_axis_motion() {
+    let mut src = dut();
+    let lx = |x: i32| vec![abs(ABS_X, x), abs(ABS_Y, 2107), abs(ABS_RX, 2013), abs(ABS_RY, 2129)];
+    let ly = |y: i32| vec![abs(ABS_X, 2098), abs(ABS_Y, y), abs(ABS_RX, 2013), abs(ABS_RY, 2129)];
+    // sweep ABS_X only, return to rest
+    src.push_batch(lx(4095)); src.push_batch(lx(0)); src.push_batch(lx(2098));
+    // a real mid-roll PAUSE (closes a one-axis window under the old logic)
+    for _ in 0..3 { src.push_batch(rest_frame()); }
+    // then sweep ABS_Y only
+    src.push_batch(ly(4095)); src.push_batch(ly(0)); src.push_batch(ly(2107));
+    for _ in 0..3 { src.push_batch(rest_frame()); }
+    src.push_batch(vec![]); src.push_batch(vec![]);
+
+    let spec = ControlSpec { id: "lstick".into(), kind: Kind::Stick, prompt: "lstick".into(), optional: false };
+    let mut c = Collector::new(vec![spec]);
+    let cfg = RunConfig { quiet_polls: 2, idle_skip_polls: 40, max_polls: 600, control_timeout: std::time::Duration::from_secs(5), ..RunConfig::default() };
+    let mut log = Vec::new();
+    match collect::run(&mut c, &mut src, &meta(), &cfg, &mut log) {
+        Ok(cap) => {
+            let ls = cap.inputs.iter().find(|i| i.id == "lstick").expect("lstick row");
+            assert_eq!(ls.code, "ABS_X,ABS_Y",
+                "a sequential two-axis stick motion must record BOTH axes, got {}", ls.code);
+        }
+        Err(e) => panic!("stick must COMPLETE on a sequential two-axis motion, not abort \
+            (this IS the owner's lstick abort): {e}"),
+    }
+}
+
+/// CALIBRATION (tsp-bwrg.6, owner-directed): the stick row records the OBSERVED per-axis envelope —
+/// measured min/max TRAVEL plus the rest/centre (`value`) — not the driver-declared 0..4095. A
+/// realistic capture sits mostly at rest (~2098/~2107) with a full sweep to the extremes, so the
+/// median of each axis's samples is its resting value. The recorded centre corroborates
+/// tsp-ozbp.9's L(~2097,~2107) rest values — the concrete calibration validation the owner asked for.
+#[test]
+fn stick_records_observed_calibration_envelope() {
+    let mut src = dut();
+    let lx = |x: i32| vec![abs(ABS_X, x), abs(ABS_Y, 2107), abs(ABS_RX, 2013), abs(ABS_RY, 2129)];
+    let ly = |y: i32| vec![abs(ABS_X, 2097), abs(ABS_Y, y), abs(ABS_RX, 2013), abs(ABS_RY, 2129)];
+    for _ in 0..6 { src.push_batch(rest_frame()); }
+    src.push_batch(lx(12)); src.push_batch(lx(4083));    // X sweep to observed extremes
+    for _ in 0..6 { src.push_batch(rest_frame()); }
+    src.push_batch(ly(9)); src.push_batch(ly(4090));      // Y sweep to observed extremes
+    for _ in 0..6 { src.push_batch(rest_frame()); }
+    src.push_batch(vec![]); src.push_batch(vec![]);
+
+    let spec = ControlSpec { id: "lstick".into(), kind: Kind::Stick, prompt: "lstick".into(), optional: false };
+    let mut c = Collector::new(vec![spec]);
+    let cfg = RunConfig { quiet_polls: 2, idle_skip_polls: 40, max_polls: 600, control_timeout: std::time::Duration::from_secs(5), ..RunConfig::default() };
+    let mut log = Vec::new();
+    let cap = collect::run(&mut c, &mut src, &meta(), &cfg, &mut log).expect("lstick must complete");
+    let ls = cap.inputs.iter().find(|i| i.id == "lstick").expect("lstick row");
+    let x = ls.x.expect("lstick x axis");
+    let y = ls.y.expect("lstick y axis");
+    // Observed TRAVEL, not the declared 0..4095 full-scale.
+    assert_eq!((x.min, x.max), (12, 4083), "x records OBSERVED travel, not declared range");
+    assert_eq!((y.min, y.max), (9, 4090), "y records OBSERVED travel, not declared range");
+    // Rest/centre recorded and corroborating tsp-ozbp.9's rest values.
+    assert!((x.value.expect("x centre recorded") - 2098).abs() <= 3, "x centre ~ rest, got {:?}", x.value);
+    assert!((y.value.expect("y centre recorded") - 2107).abs() <= 3, "y centre ~ rest, got {:?}", y.value);
+}
+
+/// The FOUR atomic dpad direction steps (HatDir) each complete on their own single-axis press —
+/// removing the dpad from the 2-axis-single-window class entirely (owner-directed, tsp-bwrg.6) —
+/// and MERGE at emit into ONE hat row (`ABS_HAT0X,ABS_HAT0Y`), so the collected map is unchanged
+/// from a single hat control. Fed with realistic gaps between directions; no per-direction row leaks.
+#[test]
+fn four_dpad_direction_steps_merge_to_one_hat_row() {
+    let mut src = dut();
+    let dir = |code: u16, v: i32| { let mut f = rest_frame(); f.extend([abs(code, v), abs(code, 0)]); f };
+    src.push_batch(dir(ABS_HAT0Y, -1)); for _ in 0..2 { src.push_batch(rest_frame()); } // up
+    src.push_batch(dir(ABS_HAT0Y, 1));  for _ in 0..2 { src.push_batch(rest_frame()); } // down
+    src.push_batch(dir(ABS_HAT0X, -1)); for _ in 0..2 { src.push_batch(rest_frame()); } // left
+    src.push_batch(dir(ABS_HAT0X, 1));  for _ in 0..2 { src.push_batch(rest_frame()); } // right
+    src.push_batch(vec![]); src.push_batch(vec![]);
+
+    let plan = vec![
+        ControlSpec { id: "dpad_up".into(), kind: Kind::HatDir, prompt: "up".into(), optional: false },
+        ControlSpec { id: "dpad_down".into(), kind: Kind::HatDir, prompt: "down".into(), optional: false },
+        ControlSpec { id: "dpad_left".into(), kind: Kind::HatDir, prompt: "left".into(), optional: false },
+        ControlSpec { id: "dpad_right".into(), kind: Kind::HatDir, prompt: "right".into(), optional: false },
+    ];
+    let mut c = Collector::new(plan);
+    let cfg = RunConfig { quiet_polls: 2, idle_skip_polls: 40, max_polls: 600, control_timeout: std::time::Duration::from_secs(5), ..RunConfig::default() };
+    let mut log = Vec::new();
+    match collect::run(&mut c, &mut src, &meta(), &cfg, &mut log) {
+        Ok(cap) => {
+            let ids: Vec<&str> = cap.inputs.iter().map(|i| i.id.as_str()).collect();
+            assert_eq!(ids, vec!["dpad"], "the four dpad steps must merge to exactly ONE dpad row, got {ids:?}");
+            assert_eq!(cap.inputs[0].code, "ABS_HAT0X,ABS_HAT0Y");
+        }
+        Err(e) => panic!("four dpad direction steps must each complete + merge, not error: {e}"),
+    }
+}
+
+/// The corrected owner-free gate (tsp-e1b-coord's standard): synthesize evdev for the FULL
+/// 17-PROMPT a133 plan — 9 buttons, the FOUR atomic dpad direction steps, both sticks (SEQUENTIAL
+/// two-axis with a gap), the two binary triggers — amid the continuous rest-stick stream, and
+/// assert the run walks the WHOLE plan to the END and emits the 14-control collected map (dpad
+/// merged to one hat row).
+///
+/// NAMED FINDING (tsp-bwrg.6, the third sighting tonight): the OLD suite fed MACHINE-timed input —
+/// presses with NO inter-press gaps — to a UI designed for HUMAN-timed input, which ALWAYS has
+/// gaps. That timing profile never closed a 2-axis window mid-press, so the suite stayed green
+/// while the bug shipped. The GAPS here are LOAD-BEARING: between the stick's two axes sits a real
+/// pause, which is exactly what closed the window on one axis under the pre-fix "settle on first
+/// axis" logic (Err Incomplete -> ABORT). Fail-old / pass-new (seen_axes>=2 + dpad-out-of-class).
+#[test]
+fn full_17_prompt_plan_walks_to_completion() {
+    use pf_input_collect::plan::a133_gamepad_plan;
+    const EV_KEY: u16 = 0x01;
+    let key = |code: u16| { let mut f = rest_frame(); f.extend([RawEvent::new(EV_KEY, code, 1), RawEvent::new(EV_KEY, code, 0)]); f };
+    let dir = |code: u16, v: i32| { let mut f = rest_frame(); f.extend([abs(code, v), abs(code, 0)]); f };
+    let lx = |x: i32| vec![abs(ABS_X, x), abs(ABS_Y, 2107), abs(ABS_RX, 2013), abs(ABS_RY, 2129)];
+    let ly = |y: i32| vec![abs(ABS_X, 2098), abs(ABS_Y, y), abs(ABS_RX, 2013), abs(ABS_RY, 2129)];
+    let rx = |x: i32| vec![abs(ABS_X, 2098), abs(ABS_Y, 2107), abs(ABS_RX, x), abs(ABS_RY, 2129)];
+    let ry = |y: i32| vec![abs(ABS_X, 2098), abs(ABS_Y, 2107), abs(ABS_RX, 2013), abs(ABS_RY, y)];
+    // BTN codes: A,B,X,Y, TL(L1),TR(R1), TL2(L2),TR2(R2), SELECT,START, MODE(Menu)
+    let (a, b, x, y, tl, tr, tl2, tr2, sel, start, mode) =
+        (0x130u16, 0x131, 0x133, 0x134, 0x136, 0x137, 0x138, 0x139, 0x13a, 0x13b, 0x13c);
+    let gap = |src: &mut ScriptedSource, n: usize| { for _ in 0..n { src.push_batch(rest_frame()); } };
+    let mut src = dut();
+    // 9 buttons in plan order — each with a trailing human GAP: south,east,west,north,select,start,guide,l1,r1
+    for code in [a, b, x, y, sel, start, mode, tl, tr] { src.push_batch(key(code)); gap(&mut src, 2); }
+    // 4 dpad directions — each an ATOMIC single-axis press, each followed by a gap (up,down,left,right)
+    for (code, v) in [(ABS_HAT0Y, -1), (ABS_HAT0Y, 1), (ABS_HAT0X, -1), (ABS_HAT0X, 1)] {
+        src.push_batch(dir(code, v)); gap(&mut src, 2);
+    }
+    // lstick — SEQUENTIAL X then a real mid-roll PAUSE then Y (the 2-axis case the fix protects)
+    src.push_batch(lx(4095)); src.push_batch(lx(0)); gap(&mut src, 3);
+    src.push_batch(ly(4095)); src.push_batch(ly(0)); gap(&mut src, 3);
+    // rstick — SEQUENTIAL RX then gap then RY
+    src.push_batch(rx(4095)); src.push_batch(rx(0)); gap(&mut src, 3);
+    src.push_batch(ry(4095)); src.push_batch(ry(0)); gap(&mut src, 3);
+    // ltrig, rtrig — binary buttons (BTN_TL2 / BTN_TR2)
+    src.push_batch(key(tl2)); gap(&mut src, 2);
+    src.push_batch(key(tr2)); gap(&mut src, 2);
+    src.push_batch(vec![]); src.push_batch(vec![]);
+
+    let mut c = Collector::new(a133_gamepad_plan());
+    let cfg = RunConfig { quiet_polls: 2, idle_skip_polls: 40, max_polls: 10000, control_timeout: std::time::Duration::from_secs(5), ..RunConfig::default() };
+    let mut log = Vec::new();
+    match collect::run(&mut c, &mut src, &meta(), &cfg, &mut log) {
+        Ok(cap) => {
+            let ids: Vec<&str> = cap.inputs.iter().map(|i| i.id.as_str()).collect();
+            // Collected MAP = 14 controls (the four dpad PROMPTS merge to ONE dpad hat CONTROL).
+            for want in ["south", "east", "west", "north", "select", "start", "guide", "l1", "r1",
+                "dpad", "lstick", "rstick", "ltrig", "rtrig"]
+            {
+                assert!(ids.contains(&want), "control {want} missing — the walk did not advance through it: {ids:?}");
+            }
+            // Splitting a PROMPT must NEVER split a CONTROL: exactly one dpad row, both hat axes.
+            assert_eq!(ids.iter().filter(|&&i| i == "dpad").count(), 1, "dpad must merge to ONE row: {ids:?}");
+            let dpad = cap.inputs.iter().find(|i| i.id == "dpad").unwrap();
+            assert_eq!(dpad.code, "ABS_HAT0X,ABS_HAT0Y");
+        }
+        Err(e) => panic!("the full 17-prompt plan must walk to completion, not abort: {e}"),
+    }
+}
+
 fn meta() -> DeviceMeta { DeviceMeta { id: "a133".into(), manufacturer: "TrimUI".into(), model: "Smart Pro".into() } }
