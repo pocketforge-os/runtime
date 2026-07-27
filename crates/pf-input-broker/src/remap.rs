@@ -9,6 +9,31 @@
 //! SWAP 0x133↔0x134 onto the canonical `BTN_WEST`/`BTN_NORTH`. The app never sees the driver quirk.
 //!
 //! Built purely from the descriptor (zero per-device code): a133 and a523 differ only by rows.
+//!
+//! # THE TWO-FRAME CONTRACT (`tsp-ozbp.14`) — what this module translates BETWEEN
+//!
+//! A face-button evdev code is meaningless without saying which of two frames it is expressed in,
+//! and nothing in an `EV_KEY` event says which. **Frame D (driver-emitted)** is what a driver
+//! actually puts on the wire — an observation, not a promise; it is what a descriptor row's
+//! `code` field records. **Frame C (kernel-canonical positional)** is `BTN_SOUTH`/`BTN_EAST`/
+//! `BTN_WEST`/`BTN_NORTH` keyed on the button's physical position in the diamond. This module is
+//! the ONLY D→C boundary in the stack: [`Remap::remap_key`] takes a descriptor row's Frame-D
+//! `code` as its input key and emits the [`CANONICAL_BY_ID`] Frame-C code for that row's `id`, so
+//! everything upstream of the broker is Frame D and everything downstream is Frame C. The frames
+//! coincide on some rows and are inverted on others, which is why "it looks right" is never
+//! evidence: on a Nintendo-arranged chassis the kernel aliases (`BTN_X == BTN_NORTH`,
+//! `BTN_Y == BTN_WEST`) make a frame error *coincidentally correct* on west/north while inverting
+//! south/east. Every surface that carries a code names its frame; when you add one, say which.
+//!
+//! **Live state of the a133 rows.** `pf-input-decode` — our OWNED decoder, the raw source on this
+//! device — emits **Frame C directly** as of `tsp-ozbp.14`: it was keyed on the printed glyph and
+//! shipped a south/east inversion, and it was fixed at the source rather than compensated for
+//! here. The a133 descriptor's west/north rows still declare the pre-ownership Frame-D codes, so
+//! this remap is still a real swap for those two rows; correcting them to canonical (which makes
+//! the a133 remap an identity, the honest state once we own the driver) is descriptor territory
+//! and is routed separately — do NOT "fix" it by editing [`CANONICAL_BY_ID`], which is the kernel
+//! ABI and not ours to bend. The X360-quirk reasoning above still applies verbatim to any device
+//! whose driver we do NOT own: describe a quirk you cannot fix, fix one you can.
 
 use std::collections::HashMap;
 

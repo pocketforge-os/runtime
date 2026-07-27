@@ -7,6 +7,20 @@
 //! engine must name a code the SAME way the ground-truth dumper does, or the candidate it
 //! emits would not diff cleanly against a probe capture. Do not hand-extend with codes the
 //! schema's `code` pattern (`^(BTN_|KEY_|ABS_)...`) cannot express.
+//!
+//! # Frame: these names describe **FRAME D** (driver-emitted) — `tsp-ozbp.14`
+//!
+//! Collection prompts BY PHYSICAL POSITION and records the code the device actually emitted for
+//! that position, so a candidate row is `id` = position (Frame C vocabulary) and `code` = the
+//! wire symbol (Frame D). The two disagree on some hardware and the resulting `code` string is an
+//! OBSERVATION, not a claim that the device is canonical — reading a candidate as if it were
+//! canonical is the mis-frame this bead exists to prevent. Frame contract + the alias/glyph
+//! table: `pf_input_decode::codes`.
+//!
+//! ⚠ Note the lettered spellings below (`BTN_A`, `BTN_X`, …) are the SCHEMA VOCABULARY, fixed by
+//! `core/caps.py` + the probe dumper, and must stay exactly as the kernel header spells the
+//! primary name for each number — they are not a statement about which button a letter is
+//! printed on. `0x130` is `BTN_A` here and `BTN_SOUTH` in a positional context; same number.
 
 /// `EV_SYN` — report-boundary event type.
 pub const EV_SYN: u16 = 0x00;

@@ -2,9 +2,45 @@
 //!
 //! Values are the canonical Linux `input-event-codes.h` numbers, restricted to exactly the
 //! controls the A133 pad physically wires (`platform/devices/a133/capabilities.toml` is the
-//! authority for which codes the pad presents). Kept as a small self-contained table — the same
-//! philosophy as `pf-input-collect::codes` and `pf-input-broker::remap` — so a wrong number is a
-//! one-line audit against the kernel ABI, never buried in a struct.
+//! authority for which controls the pad presents). Kept as a small self-contained table — the
+//! same philosophy as `pf-input-collect::codes` and `pf-input-broker::remap` — so a wrong number
+//! is a one-line audit against the kernel ABI, never buried in a struct.
+//!
+//! # THE TWO FRAMES — read this before touching a face-button code (`tsp-ozbp.14`)
+//!
+//! An evdev button code carries no statement of which of two *frames* it is expressed in, and
+//! the two disagree on this chassis. Every surface in this repo that carries a face-button code
+//! names its frame; this module is the origin of the codes, so it defines the vocabulary:
+//!
+//! - **Frame D — driver-emitted (the wire).** Whatever the underlying driver actually puts on
+//!   the evdev node. It is an observation, never a promise; a vendor driver is free to emit
+//!   anything. `capabilities.toml`'s `code` field records Frame D.
+//! - **Frame C — kernel-canonical positional.** `BTN_SOUTH`/`BTN_EAST`/`BTN_WEST`/`BTN_NORTH`
+//!   keyed on the button's PHYSICAL POSITION in the diamond, per the kernel's own gamepad
+//!   convention. `pf-input-broker`'s re-emitted device is Frame C, and that is what an app sees.
+//!
+//! **This module — and therefore everything `pf-input-decode` emits — is FRAME C.** We own this
+//! decoder, so its Frame D *is* Frame C by construction: there is no quirk to describe, and the
+//! honest thing is to emit canonical codes rather than compensate downstream.
+//!
+//! ## Why the face codes are named positionally here, and MUST stay that way
+//!
+//! The kernel aliases the two naming systems onto the same numbers:
+//!
+//! | position | canonical    | value | kernel alias | glyph on THIS chassis |
+//! |----------|--------------|-------|--------------|-----------------------|
+//! | south    | `BTN_SOUTH`  | 0x130 | `BTN_A`      | **B**                 |
+//! | east     | `BTN_EAST`   | 0x131 | `BTN_B`      | **A**                 |
+//! | west     | `BTN_WEST`   | 0x134 | `BTN_Y`      | **Y**                 |
+//! | north    | `BTN_NORTH`  | 0x133 | `BTN_X`      | **X**                 |
+//!
+//! This chassis is NINTENDO-arranged, so the printed glyph and the alias letter agree on
+//! west/north and are INVERTED on south/east. Keying a mapping off the printed glyph therefore
+//! looks correct exactly half the time — which is how the shipped A/B swap survived a full test
+//! suite until `tsp-ozbp.14`. The `BTN_A`/`BTN_B`/`BTN_X`/`BTN_Y` spellings are deliberately
+//! **NOT defined in this crate**: a letter is ambiguous between "the glyph" and "the position",
+//! and removing the ambiguous spelling is what stops the bug being re-introduced by a plausible
+//! one-line edit. Use the positional names; put the glyph in a comment if a reader needs it.
 
 /// `EV_SYN` — report-boundary event type.
 pub const EV_SYN: u16 = 0x00;
@@ -15,19 +51,18 @@ pub const EV_ABS: u16 = 0x03;
 /// `SYN_REPORT` — commit the current event report.
 pub const SYN_REPORT: u16 = 0x00;
 
-// --- face buttons (positional codes; physical label == the like-named BTN_*) -----------------
-// The a133 descriptor declares these as the pad's WIRE codes (south=BTN_A, east=BTN_B,
-// west=BTN_X, north=BTN_Y). We emit them verbatim: the physical A/B/X/Y button emits its
-// identically-named evdev code. See the crate docs for why we do NOT replicate the vendor
-// X360 driver's west↔north code quirk (we are fresh owned source, not that driver).
-/// Physical **A** button.
-pub const BTN_A: u16 = 0x130;
-/// Physical **B** button.
-pub const BTN_B: u16 = 0x131;
-/// Physical **X** button.
-pub const BTN_X: u16 = 0x133;
-/// Physical **Y** button.
-pub const BTN_Y: u16 = 0x134;
+// --- face buttons — FRAME C, keyed on PHYSICAL POSITION, never on the printed glyph ----------
+// See the module docs for the full frame contract and the alias/glyph table. In one line: the
+// button at a given position in the diamond emits that position's canonical code, whatever
+// letter is silkscreened on it.
+/// The **BOTTOM** face button (`BTN_SOUTH`; kernel alias `BTN_A`; printed **B** on this chassis).
+pub const BTN_SOUTH: u16 = 0x130;
+/// The **RIGHT** face button (`BTN_EAST`; kernel alias `BTN_B`; printed **A** on this chassis).
+pub const BTN_EAST: u16 = 0x131;
+/// The **TOP** face button (`BTN_NORTH`; kernel alias `BTN_X`; printed **X** on this chassis).
+pub const BTN_NORTH: u16 = 0x133;
+/// The **LEFT** face button (`BTN_WEST`; kernel alias `BTN_Y`; printed **Y** on this chassis).
+pub const BTN_WEST: u16 = 0x134;
 
 // --- shoulders + triggers --------------------------------------------------------------------
 /// **L1** shoulder.

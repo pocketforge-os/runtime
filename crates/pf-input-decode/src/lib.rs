@@ -18,6 +18,16 @@
 //! the broker grabs. (The broker's own tests grab a real evdev source; before this crate there was
 //! none on the A133.)
 //!
+//! ## Which frame do the codes on that node carry? — **Frame C** (`tsp-ozbp.14`)
+//!
+//! Face-button codes exist in two frames that disagree on this chassis — **Frame D**
+//! (driver-emitted, what a node happens to put on the wire) and **Frame C** (kernel-canonical
+//! positional, `BTN_SOUTH`/`BTN_EAST`/`BTN_WEST`/`BTN_NORTH` by physical position). The evdev
+//! code itself says which is which, so **every surface in this repo that carries one names its
+//! frame.** This crate emits **Frame C**: we own the decoder, so there is no vendor quirk to
+//! describe and the honest thing is to emit canonical codes at the source rather than compensate
+//! downstream. Full contract + the alias/glyph table: [`codes`].
+//!
 //! ## The wire protocol (ground truth `tsp-ozbp.2`)
 //!
 //! Two RX-only UARTs, **19200 8N1**, each streaming an 8-byte frame **continuously at ~48 fps**
@@ -99,12 +109,12 @@ mod tests {
         let s = a133_spec();
         // Identity is the X360 compatibility identity.
         assert_eq!((s.bus, s.vendor, s.product), (0x03, 0x045e, 0x028e));
-        // 11 buttons: A B X Y, L1 R1, L2 R2 (as buttons), Select Start Menu.
+        // 11 buttons: the four face positions, L1 R1, L2 R2 (as buttons), Select Start Menu.
         let expect_keys = [
-            codes::BTN_A,
-            codes::BTN_B,
-            codes::BTN_X,
-            codes::BTN_Y,
+            codes::BTN_SOUTH,
+            codes::BTN_EAST,
+            codes::BTN_NORTH,
+            codes::BTN_WEST,
             codes::BTN_TL,
             codes::BTN_TR,
             codes::BTN_TL2,

@@ -31,13 +31,38 @@ Sticks are 12-bit: `X = (Xhi<<8)|Xlo`, `Y = (Yhi<<8)|Ylo` (masked to `0..=4095`)
 |-------------|-------------------|------------------|
 | `0x01` | R1 → `BTN_TR` | L1 → `BTN_TL` |
 | `0x02` | R2 → `BTN_TR2` | L2 → `BTN_TL2` |
-| `0x04` | X → `BTN_X` | D-up → `ABS_HAT0Y = -1` |
-| `0x08` | Y → `BTN_Y` | D-left → `ABS_HAT0X = -1` |
-| `0x10` | A → `BTN_A` | D-right → `ABS_HAT0X = +1` |
-| `0x20` | B → `BTN_B` | D-down → `ABS_HAT0Y = +1` |
+| `0x04` | **north** (top, printed "X") → `BTN_NORTH` | D-up → `ABS_HAT0Y = -1` |
+| `0x08` | **west** (left, printed "Y") → `BTN_WEST` | D-left → `ABS_HAT0X = -1` |
+| `0x10` | **east** (right, printed "A") → `BTN_EAST` | D-right → `ABS_HAT0X = +1` |
+| `0x20` | **south** (bottom, printed "B") → `BTN_SOUTH` | D-down → `ABS_HAT0Y = +1` |
 | `0x40` | Select → `BTN_SELECT` | (unused on the base unit; Pro-S only) |
 | `0x80` | Start → `BTN_START` | Menu → `BTN_MODE` |
 | stick | right → `ABS_RX` / `ABS_RY` | left → `ABS_X` / `ABS_Y` |
+
+> The four face rows are keyed on **physical position**, and the `tsp-ozbp.2` map's original
+> letters (`0x10`=A, `0x20`=B) are deliberately not reproduced — see the frame contract below.
+
+## The two frames — which one do these codes carry? (`tsp-ozbp.14`)
+
+A face-button evdev code means nothing until you say which of two frames it is in, and an
+`EV_KEY` event carries no such statement. **Frame D — driver-emitted** is whatever a driver
+actually puts on the wire; it is an observation, never a promise, and it is what a descriptor
+row's `code` field records. **Frame C — kernel-canonical positional** is
+`BTN_SOUTH`/`BTN_EAST`/`BTN_WEST`/`BTN_NORTH` keyed on where the button physically sits in the
+diamond; it is what `pf-input-broker` re-emits and therefore what an app sees. The single D→C
+translation point in the stack is the broker's descriptor-driven remap. **This crate emits Frame
+C**: we own the decoder, so there is no vendor quirk to describe and the honest thing is to emit
+canonical codes at the source rather than compensate downstream.
+
+Getting that wrong is unusually easy to ship, because the kernel aliases the two naming systems
+onto the same numbers — `BTN_A == BTN_SOUTH` (0x130), `BTN_B == BTN_EAST` (0x131),
+`BTN_X == BTN_NORTH` (0x133), `BTN_Y == BTN_WEST` (0x134) — while this chassis is
+NINTENDO-arranged and prints **B** on south and **A** on east (but **X** on north and **Y** on
+west). So a map keyed on the printed GLYPH is coincidentally correct on west/north and inverted
+on south/east: a uniform error that looks like a typo and is right half the time. That is exactly
+what shipped from `tsp-ozbp.9` until the owner's bench pass found it, through a fully green test
+suite — because every test of the map was a *mirror* of the map. The truth-check that is not a
+mirror is `tests/face_position_frame.rs`; read its header before changing any face-button code.
 
 ### Mapping decisions
 
