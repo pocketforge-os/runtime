@@ -7,11 +7,21 @@
 //!     of ABS_HAT0X,ABS_HAT0Y.
 //! It documents the CURRENT (broken) behaviour so the fix has a regression target.
 
-use pf_input_collect::collect::{self, DeviceMeta, RunConfig};
+use pf_input_collect::collect::{self, DeviceMeta, Recorded, RunConfig};
 use pf_input_collect::plan::{ControlSpec, Kind};
 use pf_input_collect::source::{AbsInfo, Identity, RawEvent, ScriptedSource};
 use pf_input_collect::Collector;
 
+// FRAME VOCABULARY — CONSUMED, never re-derived (tsp-ozbp.14 / runtime#33). `pf_input_decode::codes`
+// is where the two evdev code frames are defined and where the POSITIONAL (Frame C) face-button
+// constants live. Importing them is deliberate: a local `const BTN_SOUTH: u16 = 0x130` here would be
+// a second independent derivation of the mapping, i.e. a second chance to invert it — the exact bug
+// tsp-ozbp.14 fixed. Never spell a face button by its printed glyph: this chassis is
+// Nintendo-arranged, so the glyph and the kernel's letter alias agree on west/north and are INVERTED
+// on south/east, which makes a glyph-keyed fixture look correct exactly half the time.
+use pf_input_decode::codes::{BTN_EAST, BTN_SOUTH};
+
+const EV_KEY: u16 = 0x01;
 const EV_ABS: u16 = 0x03;
 const ABS_X: u16 = 0x00;
 const ABS_Y: u16 = 0x01;
@@ -272,7 +282,10 @@ fn a_long_stick_roll_does_not_bleed_into_the_next_control() {
     for _ in 0..3 { src.push_batch(rest_frame()); }
     src.push_batch(lx(0)); src.push_batch(ly(0));
     src.push_batch(lx(4095)); src.push_batch(ly(0)); src.push_batch(lx(0)); src.push_batch(ly(4095));
-    for _ in 0..3 { src.push_batch(rest_frame()); }
+    // A real human INTER-CONTROL gap (the owner lets go, reads the next prompt, reaches over). It
+    // must outlast BOTH the settle that closes lstick's window AND the inter-control drain that
+    // follows it (tsp-bwrg.12) — a 3-frame gap was a machine-timed fixture, not a human one.
+    for _ in 0..12 { src.push_batch(rest_frame()); }
     // rstick: its OWN roll on RX/RY.
     src.push_batch(rx(4095)); src.push_batch(rx(0)); src.push_batch(ry(4095)); src.push_batch(ry(0));
     for _ in 0..3 { src.push_batch(rest_frame()); }
@@ -301,10 +314,12 @@ fn a_long_stick_roll_does_not_bleed_into_the_next_control() {
 fn four_dpad_direction_steps_merge_to_one_hat_row() {
     let mut src = dut();
     let dir = |code: u16, v: i32| { let mut f = rest_frame(); f.extend([abs(code, v), abs(code, 0)]); f };
-    src.push_batch(dir(ABS_HAT0Y, -1)); for _ in 0..2 { src.push_batch(rest_frame()); } // up
-    src.push_batch(dir(ABS_HAT0Y, 1));  for _ in 0..2 { src.push_batch(rest_frame()); } // down
-    src.push_batch(dir(ABS_HAT0X, -1)); for _ in 0..2 { src.push_batch(rest_frame()); } // left
-    src.push_batch(dir(ABS_HAT0X, 1));  for _ in 0..2 { src.push_batch(rest_frame()); } // right
+    // Human INTER-CONTROL gaps: long enough to outlast the settle AND the inter-control drain
+    // (tsp-bwrg.12). A 2-frame gap models a machine, not a person moving between directions.
+    src.push_batch(dir(ABS_HAT0Y, -1)); for _ in 0..12 { src.push_batch(rest_frame()); } // up
+    src.push_batch(dir(ABS_HAT0Y, 1));  for _ in 0..12 { src.push_batch(rest_frame()); } // down
+    src.push_batch(dir(ABS_HAT0X, -1)); for _ in 0..12 { src.push_batch(rest_frame()); } // left
+    src.push_batch(dir(ABS_HAT0X, 1));  for _ in 0..12 { src.push_batch(rest_frame()); } // right
     src.push_batch(vec![]); src.push_batch(vec![]);
 
     let plan = vec![
@@ -341,33 +356,53 @@ fn four_dpad_direction_steps_merge_to_one_hat_row() {
 #[test]
 fn full_17_prompt_plan_walks_to_completion() {
     use pf_input_collect::plan::a133_gamepad_plan;
-    const EV_KEY: u16 = 0x01;
+    use pf_input_decode::codes::{
+        BTN_MODE, BTN_NORTH, BTN_SELECT, BTN_START, BTN_TL, BTN_TL2, BTN_TR, BTN_TR2, BTN_WEST,
+    };
     let key = |code: u16| { let mut f = rest_frame(); f.extend([RawEvent::new(EV_KEY, code, 1), RawEvent::new(EV_KEY, code, 0)]); f };
     let dir = |code: u16, v: i32| { let mut f = rest_frame(); f.extend([abs(code, v), abs(code, 0)]); f };
     let lx = |x: i32| vec![abs(ABS_X, x), abs(ABS_Y, 2107), abs(ABS_RX, 2013), abs(ABS_RY, 2129)];
     let ly = |y: i32| vec![abs(ABS_X, 2098), abs(ABS_Y, y), abs(ABS_RX, 2013), abs(ABS_RY, 2129)];
     let rx = |x: i32| vec![abs(ABS_X, 2098), abs(ABS_Y, 2107), abs(ABS_RX, x), abs(ABS_RY, 2129)];
     let ry = |y: i32| vec![abs(ABS_X, 2098), abs(ABS_Y, 2107), abs(ABS_RX, 2013), abs(ABS_RY, y)];
-    // BTN codes: A,B,X,Y, TL(L1),TR(R1), TL2(L2),TR2(R2), SELECT,START, MODE(Menu)
-    let (a, b, x, y, tl, tr, tl2, tr2, sel, start, mode) =
-        (0x130u16, 0x131, 0x133, 0x134, 0x136, 0x137, 0x138, 0x139, 0x13a, 0x13b, 0x13c);
+    // The 9 button prompts IN PLAN ORDER, each paired with the code that PHYSICAL POSITION emits —
+    // taken from `pf_input_decode::codes` (Frame C, positional), never a letter. The prior fixture
+    // spelled these as `(a, b, x, y, …)` and, reading the letters positionally, fed 0x133 to the
+    // WEST prompt and 0x134 to the NORTH prompt — inverted. It never showed up because the test only
+    // asserted that ids were PRESENT, not that each control recorded ITS OWN code. That is the
+    // glyph-vs-position trap in miniature (tsp-ozbp.14): west/north agree by coincidence on this
+    // chassis, so a letter-keyed fixture looks right exactly half the time.
+    let buttons: [(&str, u16); 9] = [
+        ("south", BTN_SOUTH),
+        ("east", BTN_EAST),
+        ("west", BTN_WEST),
+        ("north", BTN_NORTH),
+        ("select", BTN_SELECT),
+        ("start", BTN_START),
+        ("guide", BTN_MODE),
+        ("l1", BTN_TL),
+        ("r1", BTN_TR),
+    ];
+    // A human INTER-CONTROL gap. It must outlast BOTH the settle that closes a control's window AND
+    // the inter-control drain that follows it (tsp-bwrg.12). The old 2-3 frame gaps were
+    // MACHINE-timed — the exact fixture profile that kept this suite green while the bugs shipped.
     let gap = |src: &mut ScriptedSource, n: usize| { for _ in 0..n { src.push_batch(rest_frame()); } };
+    const HUMAN_GAP: usize = 12;
     let mut src = dut();
-    // 9 buttons in plan order — each with a trailing human GAP: south,east,west,north,select,start,guide,l1,r1
-    for code in [a, b, x, y, sel, start, mode, tl, tr] { src.push_batch(key(code)); gap(&mut src, 2); }
+    for (_, code) in buttons { src.push_batch(key(code)); gap(&mut src, HUMAN_GAP); }
     // 4 dpad directions — each an ATOMIC single-axis press, each followed by a gap (up,down,left,right)
     for (code, v) in [(ABS_HAT0Y, -1), (ABS_HAT0Y, 1), (ABS_HAT0X, -1), (ABS_HAT0X, 1)] {
-        src.push_batch(dir(code, v)); gap(&mut src, 2);
+        src.push_batch(dir(code, v)); gap(&mut src, HUMAN_GAP);
     }
     // lstick — SEQUENTIAL X then a real mid-roll PAUSE then Y (the 2-axis case the fix protects)
-    src.push_batch(lx(4095)); src.push_batch(lx(0)); gap(&mut src, 3);
-    src.push_batch(ly(4095)); src.push_batch(ly(0)); gap(&mut src, 3);
+    src.push_batch(lx(4095)); src.push_batch(lx(0)); gap(&mut src, HUMAN_GAP);
+    src.push_batch(ly(4095)); src.push_batch(ly(0)); gap(&mut src, HUMAN_GAP);
     // rstick — SEQUENTIAL RX then gap then RY
-    src.push_batch(rx(4095)); src.push_batch(rx(0)); gap(&mut src, 3);
-    src.push_batch(ry(4095)); src.push_batch(ry(0)); gap(&mut src, 3);
+    src.push_batch(rx(4095)); src.push_batch(rx(0)); gap(&mut src, HUMAN_GAP);
+    src.push_batch(ry(4095)); src.push_batch(ry(0)); gap(&mut src, HUMAN_GAP);
     // ltrig, rtrig — binary buttons (BTN_TL2 / BTN_TR2)
-    src.push_batch(key(tl2)); gap(&mut src, 2);
-    src.push_batch(key(tr2)); gap(&mut src, 2);
+    src.push_batch(key(BTN_TL2)); gap(&mut src, HUMAN_GAP);
+    src.push_batch(key(BTN_TR2)); gap(&mut src, HUMAN_GAP);
     src.push_batch(vec![]); src.push_batch(vec![]);
 
     let mut c = Collector::new(a133_gamepad_plan());
@@ -386,9 +421,386 @@ fn full_17_prompt_plan_walks_to_completion() {
             assert_eq!(ids.iter().filter(|&&i| i == "dpad").count(), 1, "dpad must merge to ONE row: {ids:?}");
             let dpad = cap.inputs.iter().find(|i| i.id == "dpad").unwrap();
             assert_eq!(dpad.code, "ABS_HAT0X,ABS_HAT0Y");
+            // Each button control recorded ITS OWN code — a walk that merely reaches the end proves
+            // nothing about WHICH control captured what, and a bleed shifts every capture by one
+            // while still emitting a full, plausible-looking map (tsp-bwrg.12). Anchored on the
+            // position id -> positional code pairs the fixture was built from.
+            for (id, code) in buttons {
+                assert_eq!(
+                    c.recorded(id),
+                    Some(&Recorded::Button { code }),
+                    "{id} must record the code its own physical position emitted"
+                );
+            }
         }
         Err(e) => panic!("the full 17-prompt plan must walk to completion, not abort: {e}"),
     }
 }
 
 fn meta() -> DeviceMeta { DeviceMeta { id: "a133".into(), manufacturer: "TrimUI".into(), model: "Smart Pro".into() } }
+
+// =============================================================================================
+// tsp-bwrg.12 — ADVERSARIAL HUMAN-TIMED TESTS for the BUTTON and DPAD classes.
+//
+// tsp-bwrg.6 replaced quiet-driven completion for the STICK class (a structural coverage gate:
+// both axes must reach both extremes, THEN settle). The button and dpad classes were left with
+// two holes this section exercises, one per defect:
+//
+//   (A) NO INTER-CONTROL DRAIN. `run()` commits control N and opens control N+1's window with no
+//       gap, so whatever the device emits in between — a "did that take?" re-press, an overshoot
+//       past the prompted direction, a key-up bounce — lands in the NEXT control's buffer and can
+//       satisfy it. The next control then records the PREVIOUS control's input and the wizard
+//       advances past a control the owner never actuated. This is silent: the emitted map can
+//       still look plausible (see `dpad_prompt_rejects_the_previous_directions_overshoot`, where
+//       the merged hat row is correct while every direction is shifted by one).
+//
+//   (B) COMPLETION IS STILL QUIET-DRIVEN FOR THE NON-STICK CLASSES. `axes_fully_swept` returns
+//       `true` unconditionally for a 1-axis control, so a HatDir/Trigger window closes on
+//       `quiet >= quiet_polls` after ANY activity — and "activity" is any significant abs
+//       deviation on ANY axis, or any key-down. A thumb brushing the stick on the way to the
+//       D-PAD is therefore enough to complete a dpad direction, and `finalize`'s
+//       `.or_else(|| axes.first())` fallback then records the STICK axis as that direction.
+//
+// TIMING DISCIPLINE (the tsp-bwrg.6 named finding, applied): every fixture below is HUMAN-timed —
+// real gaps between controls, real pauses mid-actuation. Machine-timed fixtures (presses with no
+// gaps) are what kept the suite green while these bugs shipped; the gaps here are load-bearing.
+//
+// ASSERTION SURFACE: these assert on `Collector::recorded(id)` — the PER-CONTROL capture — not on
+// the emitted rows. The emitted dpad row is the merged SET of hat axes, which stays correct even
+// when every direction captured the wrong one; asserting on the emitted map is precisely how a
+// test of this defect would pass while the defect shipped.
+//
+// NEGATIVE CONTROL: each of these FAILS against the pre-change quiet-based logic and PASSES after.
+// The per-test pre-change failure is recorded in the PR's test plan.
+// =============================================================================================
+
+fn key(code: u16, val: i32) -> RawEvent { RawEvent::new(EV_KEY, code, val) }
+
+/// A press of `code` riding the continuous at-rest stick stream (down + up in one poll, which is
+/// what a ~48fps decoder emits for a normal human tap).
+fn press_frame(code: u16) -> Vec<RawEvent> {
+    let mut f = rest_frame();
+    f.extend([key(code, 1), key(code, 0)]);
+    f
+}
+
+/// One D-PAD direction actuated on `code` (deflect to `v`, return to centre) amid the rest stream.
+fn hat_frame(code: u16, v: i32) -> Vec<RawEvent> {
+    let mut f = rest_frame();
+    f.extend([abs(code, v), abs(code, 0)]);
+    f
+}
+
+/// A real human INTER-CONTROL gap, in polls: the owner lets go, sees the prompt change, reads it,
+/// and reaches for the next control. It must outlast BOTH the settle that closes a control's window
+/// AND the fixed inter-control drain that follows it — which is the point, because a gap shorter
+/// than the drain is not a human gap at all. Sized well clear of both so these fixtures assert on
+/// the POLICY, not on off-by-one poll accounting.
+const INTER_CONTROL_GAP: usize = 12;
+
+fn push_rest(src: &mut ScriptedSource, n: usize) {
+    for _ in 0..n {
+        src.push_batch(rest_frame());
+    }
+}
+
+/// The human-timed config these tests share: a short settle, and a per-control window bounded only
+/// by the runaway guard (`ScriptedSource::poll` never blocks, so wall-clock is not the bound here).
+fn human_cfg() -> RunConfig {
+    RunConfig {
+        quiet_polls: 2,
+        idle_skip_polls: 40,
+        max_polls: 2000,
+        control_timeout: std::time::Duration::from_secs(5),
+        ..RunConfig::default()
+    }
+}
+
+/// DEFECT (A), BUTTON class, INTER-CONTROL GAP. The owner presses the BOTTOM face button, is not
+/// sure it registered, and presses it AGAIN — a beat after the window already closed. That second
+/// press lands in the gap between controls, and with no drain it is the first key-down in the NEXT
+/// control's buffer, so the RIGHT face button silently records the BOTTOM button's code.
+///
+/// Anchored on POSITION (`BTN_SOUTH`/`BTN_EAST` from `pf_input_decode::codes`), never a glyph: on
+/// this Nintendo-arranged chassis the bottom button is printed "B" and the right one "A".
+///
+/// Fail-pre (east records BTN_SOUTH — the tail) / pass-post (the drain discards the tail; east
+/// records its own BTN_EAST).
+#[test]
+fn button_prompt_rejects_the_previous_controls_key_tail() {
+    let mut src = dut();
+    src.push_batch(press_frame(BTN_SOUTH)); // the owner's south press — window closes on this poll
+    push_rest(&mut src, 2); // a beat: the owner watches to see whether the prompt advanced ...
+    src.push_batch(press_frame(BTN_SOUTH)); // ... decides it did not, and presses AGAIN
+    push_rest(&mut src, INTER_CONTROL_GAP);
+    src.push_batch(press_frame(BTN_EAST)); // the owner's real east press
+    push_rest(&mut src, INTER_CONTROL_GAP);
+    src.push_batch(vec![]);
+    src.push_batch(vec![]);
+
+    let plan = vec![
+        ControlSpec { id: "south".into(), kind: Kind::Button, prompt: "south".into(), optional: false },
+        ControlSpec { id: "east".into(), kind: Kind::Button, prompt: "east".into(), optional: false },
+    ];
+    let mut c = Collector::new(plan);
+    let mut log = Vec::new();
+    let run = collect::run(&mut c, &mut src, &meta(), &human_cfg(), &mut log);
+
+    assert_eq!(
+        c.recorded("south"),
+        Some(&Recorded::Button { code: BTN_SOUTH }),
+        "the south prompt must record the south press"
+    );
+    assert_eq!(
+        c.recorded("east"),
+        Some(&Recorded::Button { code: BTN_EAST }),
+        "the east prompt captured the PRECEDING control's key tail instead of its own press — \
+         an inter-control drain must discard input in the gap (run result: {:?})",
+        run.as_ref().map(|_| "Ok").map_err(|e| e.to_string())
+    );
+}
+
+/// DEFECT (A), BUTTON class, OVERSHOOT. Same mechanism, the other human shape: instead of one
+/// late re-press the owner OVERSHOOTS the instruction and keeps pressing for several more polls
+/// after the window closed. The drain must absorb a multi-poll tail, not just a single stray poll.
+///
+/// Fail-pre (east records BTN_SOUTH from the first overshoot poll) / pass-post (east records
+/// BTN_EAST).
+#[test]
+fn button_prompt_rejects_a_multi_poll_overshoot_from_the_previous_control() {
+    let mut src = dut();
+    src.push_batch(press_frame(BTN_SOUTH)); // window closes here
+    push_rest(&mut src, 1);
+    for _ in 0..3 {
+        src.push_batch(press_frame(BTN_SOUTH)); // overshoot: three more presses past the close
+    }
+    push_rest(&mut src, INTER_CONTROL_GAP);
+    src.push_batch(press_frame(BTN_EAST));
+    push_rest(&mut src, INTER_CONTROL_GAP);
+    src.push_batch(vec![]);
+    src.push_batch(vec![]);
+
+    let plan = vec![
+        ControlSpec { id: "south".into(), kind: Kind::Button, prompt: "south".into(), optional: false },
+        ControlSpec { id: "east".into(), kind: Kind::Button, prompt: "east".into(), optional: false },
+    ];
+    let mut c = Collector::new(plan);
+    let mut log = Vec::new();
+    let _ = collect::run(&mut c, &mut src, &meta(), &human_cfg(), &mut log);
+
+    assert_eq!(
+        c.recorded("east"),
+        Some(&Recorded::Button { code: BTN_EAST }),
+        "a multi-poll overshoot of the PREVIOUS control satisfied the east prompt — the drain must \
+         absorb the whole tail, not one poll of it"
+    );
+}
+
+/// DEFECT (A), DPAD class, OVERSHOOT — and the case that shows why this must be asserted
+/// PER-CONTROL. The owner presses UP and, rocking the D-PAD, overshoots onto LEFT a beat after the
+/// UP window closed. With no drain that overshoot satisfies the DOWN prompt, the owner's real DOWN
+/// press then satisfies the LEFT prompt, and so on: every direction is shifted by one and the
+/// wizard advances past controls the owner never actuated for.
+///
+/// The EMITTED map still looks right (the four captures merge into the set {HAT0X, HAT0Y}), which
+/// is exactly how a map-level test of this defect passes while the defect ships. Assert the
+/// per-direction capture instead: a vertical direction must record the vertical hat axis.
+///
+/// Fail-pre (dpad_down records ABS_HAT0X — the LEFT overshoot) / pass-post (each direction records
+/// its own axis).
+#[test]
+fn dpad_prompt_rejects_the_previous_directions_overshoot() {
+    let mut src = dut();
+    src.push_batch(hat_frame(ABS_HAT0Y, -1)); // UP — window closes 2 quiet polls later
+    push_rest(&mut src, 2);
+    src.push_batch(hat_frame(ABS_HAT0X, -1)); // OVERSHOOT onto LEFT, just past the close
+    push_rest(&mut src, INTER_CONTROL_GAP);
+    src.push_batch(hat_frame(ABS_HAT0Y, 1)); // DOWN
+    push_rest(&mut src, INTER_CONTROL_GAP);
+    src.push_batch(hat_frame(ABS_HAT0X, -1)); // LEFT
+    push_rest(&mut src, INTER_CONTROL_GAP);
+    src.push_batch(hat_frame(ABS_HAT0X, 1)); // RIGHT
+    push_rest(&mut src, INTER_CONTROL_GAP);
+    src.push_batch(vec![]);
+    src.push_batch(vec![]);
+
+    let plan = ["dpad_up", "dpad_down", "dpad_left", "dpad_right"]
+        .into_iter()
+        .map(|id| ControlSpec { id: id.into(), kind: Kind::HatDir, prompt: id.into(), optional: false })
+        .collect();
+    let mut c = Collector::new(plan);
+    let mut log = Vec::new();
+    let _ = collect::run(&mut c, &mut src, &meta(), &human_cfg(), &mut log);
+
+    assert_eq!(
+        c.recorded("dpad_up"),
+        Some(&Recorded::HatAxis { code: ABS_HAT0Y }),
+        "UP must record the VERTICAL hat axis"
+    );
+    assert_eq!(
+        c.recorded("dpad_down"),
+        Some(&Recorded::HatAxis { code: ABS_HAT0Y }),
+        "DOWN recorded the horizontal axis — the UP overshoot bled across the control boundary and \
+         satisfied this prompt, so the owner's real DOWN press was never what completed it"
+    );
+    assert_eq!(
+        c.recorded("dpad_left"),
+        Some(&Recorded::HatAxis { code: ABS_HAT0X }),
+        "LEFT must record the HORIZONTAL hat axis (it captured the cascaded DOWN press instead)"
+    );
+    assert_eq!(
+        c.recorded("dpad_right"),
+        Some(&Recorded::HatAxis { code: ABS_HAT0X }),
+        "RIGHT must record the HORIZONTAL hat axis"
+    );
+}
+
+/// DEFECT (B), DPAD class, MID-ACTUATION PAUSE. The owner's thumb brushes the LEFT STICK on the way
+/// across to the D-PAD (the two sit side by side on this chassis), then they PAUSE while finding
+/// the direction, and only then press UP. The brush is a significant deflection, so it counts as
+/// "activity"; the pause is then enough quiet to close a 1-axis window; and `finalize`'s
+/// no-hat-axis fallback records ABS_X as the dpad direction. Nothing errors — the wizard advances
+/// and the collected map names a STICK axis as part of the D-PAD.
+///
+/// This is pure completion-policy: no drain is involved (the crosstalk is inside the control's own
+/// window). Completion for a dpad direction must be HAT-ACTUATION-gated, not quiet-gated.
+///
+/// Fail-pre (dpad_up records ABS_X) / pass-post (the window stays open through the pause and
+/// records ABS_HAT0Y from the real press).
+#[test]
+fn dpad_prompt_survives_a_mid_actuation_pause_with_stick_crosstalk() {
+    let mut src = dut();
+    // Thumb brushes the left stick reaching across for the D-PAD.
+    let mut brush = rest_frame();
+    brush.extend([abs(ABS_X, 4095), abs(ABS_X, 2098)]);
+    src.push_batch(brush);
+    push_rest(&mut src, 5); // the owner PAUSES, hunting for the direction
+    src.push_batch(hat_frame(ABS_HAT0Y, -1)); // the real UP press
+    push_rest(&mut src, INTER_CONTROL_GAP);
+    src.push_batch(hat_frame(ABS_HAT0X, -1)); // the real LEFT press
+    push_rest(&mut src, INTER_CONTROL_GAP);
+    src.push_batch(vec![]);
+    src.push_batch(vec![]);
+
+    let plan = ["dpad_up", "dpad_left"]
+        .into_iter()
+        .map(|id| ControlSpec { id: id.into(), kind: Kind::HatDir, prompt: id.into(), optional: false })
+        .collect();
+    let mut c = Collector::new(plan);
+    let mut log = Vec::new();
+    let run = collect::run(&mut c, &mut src, &meta(), &human_cfg(), &mut log);
+
+    assert_eq!(
+        c.recorded("dpad_up"),
+        Some(&Recorded::HatAxis { code: ABS_HAT0Y }),
+        "the UP prompt completed on STICK crosstalk plus a human pause and recorded a stick axis as \
+         a D-PAD direction — a dpad direction must complete on a HAT actuation, never on quiet"
+    );
+    assert_eq!(
+        c.recorded("dpad_left"),
+        Some(&Recorded::HatAxis { code: ABS_HAT0X }),
+        "the LEFT prompt must record the horizontal hat axis"
+    );
+    let cap = run.expect("both directions must capture and merge into one hat row");
+    let dpad = cap.inputs.iter().find(|i| i.id == "dpad").expect("merged dpad row");
+    assert_eq!(
+        dpad.code, "ABS_HAT0X,ABS_HAT0Y",
+        "the merged D-PAD row must be the two HAT axes, not a stick axis"
+    );
+}
+
+/// DEFECT (B), TRIGGER class, MID-ACTUATION PAUSE. An ANALOG trigger emits no key-down, so its only
+/// completion path is the 1-axis quiet break — which fires on a partial squeeze. The owner squeezes
+/// most of the way, pauses (a normal thing when told "squeeze it fully"), then finishes the press.
+/// The pause closes the window at partial travel, `finalize` rules the trigger never reached a full
+/// press, and the whole run ABORTS on `Incomplete`.
+///
+/// A trigger must complete on COVERAGE — a key-down (the a133's binary L2/R2 button-triggers) or an
+/// axis that actually reached a full press — never on quiet.
+///
+/// Fail-pre (`Err(Incomplete)`: "trigger never reached a full press") / pass-post (Ok, analog).
+#[test]
+fn analog_trigger_survives_a_mid_squeeze_pause() {
+    const ABS_Z: u16 = 0x02;
+    const TRIG: AbsInfo = AbsInfo { min: 0, max: 255, fuzz: 0, flat: 0, resolution: 0 };
+    let ident = Identity { name: "Generic Pad".into(), bus: 3, vid: 0x1234, pid: 0x5678, version: 1 };
+    let mut src = ScriptedSource::new(ident).with_abs(ABS_Z, TRIG);
+    // Squeeze most of the way — past the activity threshold, short of a full press ...
+    src.push_batch([0, 40, 90, 140, 200].iter().map(|&v| abs(ABS_Z, v)).collect());
+    for _ in 0..5 {
+        src.push_batch(vec![]); // ... then PAUSE mid-squeeze ...
+    }
+    src.push_batch([210, 230, 255].iter().map(|&v| abs(ABS_Z, v)).collect()); // ... then finish it.
+    src.push_batch(vec![]);
+    src.push_batch(vec![]);
+
+    let plan = vec![ControlSpec { id: "ltrig".into(), kind: Kind::Trigger, prompt: "ltrig".into(), optional: false }];
+    let mut c = Collector::new(plan);
+    let mut log = Vec::new();
+    let cap = collect::run(&mut c, &mut src, &meta(), &human_cfg(), &mut log)
+        .expect("a mid-squeeze PAUSE must not complete the trigger at partial travel and abort the run");
+    let t = cap.inputs.iter().find(|i| i.id == "ltrig").expect("ltrig row");
+    assert_eq!(t.code, "ABS_Z");
+    assert_eq!(
+        t.semantics.as_deref(),
+        Some("analog"),
+        "the full squeeze (with its intermediate travel) must be inside the capture window"
+    );
+}
+
+/// THE GENERIC INVARIANT, exercised end-to-end: FOREIGN actuation — real input that is not this
+/// control's own kind of actuation — must NEVER complete a control, for ANY class. Quiet is not a
+/// completion signal, and neither is "something moved".
+///
+/// One row per class, each fed a stream that is busy but carries nothing the control could
+/// legitimately be. A control that cannot be honestly captured must report `NoActivity` (the
+/// wizard sits on it / re-prompts), never a capture synthesized from whatever else was moving —
+/// the same "never fabricate" bar `required_control_is_not_fabricated_from_the_ambient_rest_stream`
+/// set for the ambient case.
+///
+/// Fail-pre (the HatDir row completes on a stick sweep and records ABS_X) / pass-post (NoActivity).
+#[test]
+fn foreign_actuation_never_completes_a_control() {
+    // A full left-stick sweep — loud, unambiguous, real input, and not a button, hat, or trigger.
+    let stick_sweep = |src: &mut ScriptedSource| {
+        for &v in &[4095, 2098, 0, 2098] {
+            let mut f = rest_frame();
+            f.extend([abs(ABS_X, v), abs(ABS_Y, v)]);
+            src.push_batch(f);
+        }
+        push_rest(src, INTER_CONTROL_GAP);
+        src.push_batch(vec![]);
+        src.push_batch(vec![]);
+    };
+
+    for (id, kind) in [
+        ("south", Kind::Button),
+        ("l3", Kind::StickClick),
+        ("dpad_up", Kind::HatDir),
+    ] {
+        let mut src = dut();
+        stick_sweep(&mut src);
+        let plan = vec![ControlSpec { id: id.into(), kind, prompt: id.into(), optional: false }];
+        let mut c = Collector::new(plan);
+        let mut log = Vec::new();
+        let got = collect::run(&mut c, &mut src, &meta(), &human_cfg(), &mut log);
+        // The capture itself is the evidence: a control completed by foreign input has a `recorded`
+        // value naming whatever else happened to be moving. Assert on that FIRST — the run's own
+        // Result can fail later for a downstream reason (a one-axis dpad merge, say) and mask the
+        // fact that the control was captured at all.
+        assert_eq!(
+            c.recorded(id),
+            None,
+            "{id} ({kind:?}) was CAPTURED from a LEFT-STICK SWEEP — foreign actuation must never \
+             complete a control of another class"
+        );
+        match got {
+            Err(collect::CollectError::NoActivity { id: got_id }) => assert_eq!(got_id, id),
+            other => panic!(
+                "{id} ({kind:?}) must report NoActivity when only foreign input was seen; got {:?}",
+                other.map(|c| c.inputs.iter().map(|i| (i.id.clone(), i.code.clone())).collect::<Vec<_>>())
+                     .map_err(|e| e.to_string())
+            ),
+        }
+    }
+}
