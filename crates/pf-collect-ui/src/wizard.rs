@@ -66,9 +66,9 @@ pub struct Timing {
 
 /// The per-control wall-clock window, defaulting to `default_secs` but overridable at runtime with
 /// `PF_COLLECT_UI_CONTROL_TIMEOUT_S`. The default (45s) is the generous window a person needs during
-/// a real collection; the override widens it for on-panel display verification, where a stable frame
-/// must outlast the webcam's ~10-15s capture lag (tsp-gk9x) so a mistimed grab can't read a stale
-/// pre-park frame as "not displayed". A non-positive / unparseable value falls back to the default.
+/// a real collection; the override widens it for an owner-parked wizard that waits far longer per
+/// control (the owner walks up and works through the controls on their own schedule) and for a
+/// stable on-panel hold during verification. A non-positive / unparseable value falls back to the default.
 fn control_timeout_from_env(default_secs: u64) -> Duration {
     let secs = std::env::var("PF_COLLECT_UI_CONTROL_TIMEOUT_S")
         .ok()
@@ -79,9 +79,9 @@ fn control_timeout_from_env(default_secs: u64) -> Duration {
 }
 
 /// A demo dwell (milliseconds) read from `var`, defaulting to `default_ms`. The demo's per-step
-/// pre/post dwell is overridable so an operator can widen it — e.g. hold one control frame far
-/// longer than the webcam's ~10-15s capture lag (tsp-gk9x) for a stable on-panel display check.
-/// An unparseable value falls back to the default; `0` is honored (an explicit no-dwell).
+/// pre/post dwell is overridable (used by demorun.sh) so an operator can widen it — e.g. hold one
+/// control frame long enough for a stable on-panel display check. An unparseable value falls back
+/// to the default; `0` is honored (an explicit no-dwell).
 fn demo_dwell_from_env(var: &str, default_ms: u64) -> Duration {
     let ms = std::env::var(var)
         .ok()
