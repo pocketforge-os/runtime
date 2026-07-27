@@ -33,6 +33,15 @@
 # "guard that does not run" shape as the drift check described above. See the
 # comment on that step for why `--workspace --all-targets -D warnings` specifically.
 #
+# tsp-ovee added the LOCKFILE gate (`cargo metadata --locked`) and put `--locked` on
+# every cargo invocation in this job. That is the THIRD instance in this one file of
+# the same shape as the two above — a class of defect this repo had no check for, so
+# it merged green. runtime#35 added a `pf-input-decode` dev-dependency to two crate
+# manifests without the matching `Cargo.lock` entries; every step here ran without
+# `--locked`, silently updated the lock in the runner, and passed. The image's runtime
+# cross-build DOES use `--locked`, so the break was real but latent, deferred to the
+# next `platform.lock` pin bump in a different repo. See that step's comment.
+#
 # Also builds pf-input-collect + pf-collect-ui for aarch64-unknown-linux-musl
 # (the a133 static device target) without a per-invocation RUSTFLAGS override
 # — proving the workspace `.cargo/config.toml`'s rust-lld linker pin works
@@ -121,6 +130,34 @@ jobs:
           restore-keys: |
             runtime-tests-${{ runner.os }}-
 
+      # LOCKFILE GATE (tsp-ovee). `--locked` makes cargo REFUSE to rewrite Cargo.lock,
+      # so this step is red exactly when the committed lock does not already satisfy the
+      # manifests. Until it existed, no workflow in this repo passed `--locked` anywhere:
+      # every cargo invocation below was free to silently update the lock in the runner's
+      # working tree and go green, which is how runtime#35 merged with `Cargo.lock` missing
+      # the `pf-input-decode` dev-dependency entries its two `Cargo.toml` edits required.
+      #
+      # Why that is not cosmetic: the image's runtime cross-build stage DOES use `--locked`,
+      # so the drift is latent here and surfaces later, in a different repo, at image-build
+      # time on the next `platform.lock` pin bump — far from the commit that caused it.
+      #
+      # `cargo metadata` and not `cargo build`: resolution is the whole check, and metadata
+      # does it in seconds without compiling, so the gate reports before the expensive steps.
+      # It resolves dev-dependencies too, which is what the runtime#35 case needed. The
+      # existing steps below ALSO carry `--locked` now — this step is the fast, clearly-named
+      # signal, and those are defense in depth so a later step cannot rewrite the lock and
+      # launder a drift that this one caught.
+      #
+      # NEGATIVE CONTROL: verified red-then-green rather than assumed. `cargo metadata
+      # --locked` exits 101 against the pre-fix lock and 0 against the fixed one (both on
+      # modelmaker AND as a pushed commit on the tsp-ovee branch, reverted in the next
+      # commit — the tsp-7rts pattern). A gate nobody has watched fail is worth less than
+      # no gate, because we would then trust it.
+      - name: cargo metadata — lockfile is up to date (--locked)
+        working-directory: runtime
+        run: |
+          cargo metadata --locked --format-version 1 > /dev/null
+
       # PF_PLATFORM_DIR points at the sibling checkout. The tests fall back
       # to a `../platform` sibling discovery too (see
       # `discover_platform()` in both crates' test files) — setting the env
@@ -134,7 +171,7 @@ jobs:
           PF_PLATFORM_DIR: ${{ github.workspace }}/platform
         working-directory: runtime
         run: |
-          cargo test --workspace --no-fail-fast -- --nocapture
+          cargo test --locked --workspace --no-fail-fast -- --nocapture
 
       # The point of the cross-build step: prove a plain `cargo build
       # --target aarch64-unknown-linux-musl` links with NO per-invocation
@@ -145,9 +182,9 @@ jobs:
       - name: cargo build — aarch64-unknown-linux-musl (no RUSTFLAGS)
         working-directory: runtime
         run: |
-          cargo build --target aarch64-unknown-linux-musl \
+          cargo build --locked --target aarch64-unknown-linux-musl \
             -p pf-input-collect --bin pf-input-collect
-          cargo build --target aarch64-unknown-linux-musl \
+          cargo build --locked --target aarch64-unknown-linux-musl \
             -p pf-collect-ui --bin pf-collect-ui
 
       # LINT GATE (tsp-7rts). Until this step existed, no workflow in this repo ran
@@ -175,4 +212,4 @@ jobs:
       - name: cargo clippy — whole workspace, warnings are errors
         working-directory: runtime
         run: |
-          cargo clippy --workspace --all-targets -- -D warnings
+          cargo clippy --locked --workspace --all-targets -- -D warnings

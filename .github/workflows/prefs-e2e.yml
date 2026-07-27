@@ -89,7 +89,7 @@ jobs:
           PF_PLATFORM_DIR: ${{ github.workspace }}/platform
         working-directory: runtime
         run: |
-          cargo test -p pf-settings --test prefs_e2e -- --nocapture ${{ matrix.descriptor }}
+          cargo test --locked -p pf-settings --test prefs_e2e -- --nocapture ${{ matrix.descriptor }}
 
       # Additional cross-cutting seams (monoAudio + reduceMotion + brightness) do NOT carry a
       # descriptor tag in their names; run them ONCE on the a523 row to avoid double-counting.
@@ -99,7 +99,7 @@ jobs:
           PF_PLATFORM_DIR: ${{ github.workspace }}/platform
         working-directory: runtime
         run: |
-          cargo test -p pf-settings --test prefs_e2e -- --nocapture \
+          cargo test --locked -p pf-settings --test prefs_e2e -- --nocapture \
             mono_audio_flip_via_external_cli_flips_routing_layer \
             reduce_motion_flip_via_control_plane_fires_observer_and_read_flips \
             brightness_is_contract_only_readable_and_observable_via_external_cli
