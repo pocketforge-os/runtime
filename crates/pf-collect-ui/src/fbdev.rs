@@ -12,6 +12,10 @@ use crate::canvas::{channels, Canvas, Color};
 // Arch-independent fbdev ioctl request numbers (fixed constants in <linux/fb.h>).
 const FBIOGET_VSCREENINFO: libc::Ioctl = 0x4600;
 const FBIOGET_FSCREENINFO: libc::Ioctl = 0x4602;
+// Pan-to-present: on the A133 panel fb0's scan-out is a g2d-rotated copy that refreshes ONLY on
+// FBIOPAN_DISPLAY (tsp-woy3; see apps/pocketforge-menu/src/main.c). A raw write to the mapped page
+// is invisible until we pan to it — so every frame must draw the inactive page, msync, then pan.
+const FBIOPAN_DISPLAY: libc::Ioctl = 0x4606;
 
 #[repr(C)]
 #[derive(Default, Clone, Copy)]
@@ -101,9 +105,20 @@ impl FbFormat {
                 (v as u32 * max + 127) / 255
             }
         };
-        (scale(r, self.r_len) << self.r_off)
+        let rgb = (scale(r, self.r_len) << self.r_off)
             | (scale(g, self.g_len) << self.g_off)
-            | (scale(b, self.b_len) << self.b_off)
+            | (scale(b, self.b_len) << self.b_off);
+        // The sunxi DE2.0 scan-out treats the top (X/alpha) byte of an XRGB8888 pixel as ALPHA and
+        // shows an X=0 pixel as TRANSPARENT (black) — so a pack that leaves it 0 renders the whole
+        // frame black on the panel even though the RGB bytes are correct (root cause, tsp-bwrg.6:
+        // white fill showed because all 4 bytes were 0xFF; colored content did not). The reference
+        // pocketforge-menu writes p[3]=0xFF for every pixel; mirror that for 32bpp so our frames are
+        // opaque. The X byte is the high byte (bits 24..31) in the B,G,R,X memory order.
+        if self.bpp >= 32 {
+            rgb | 0xFF00_0000
+        } else {
+            rgb
+        }
     }
 
     pub fn bytes_per_pixel(&self) -> usize {
@@ -137,6 +152,8 @@ pub struct FbDev {
     map: *mut u8,
     map_len: usize,
     fmt: FbFormat,
+    /// Kept for FBIOPAN_DISPLAY (pan-to-present): we set `yoffset=0` and pass it back each frame.
+    var: FbVarScreeninfo,
 }
 
 impl FbDev {
@@ -169,6 +186,11 @@ impl FbDev {
             b_off: var.blue.offset,
             b_len: var.blue.length,
         };
+        // Single-buffered page 0 (yoffset 0): this is the menu's proven-visible path on the A133
+        // g2d-rotated scan-out. (The panel only reliably reflects page 0; panning to page 1 shows
+        // black — verified live on tsp-bwrg.6, both fb0 pages held content yet a page-1 pan was
+        // dark.) We map just the visible page and always draw + pan it; at the wizard's slow
+        // redraw cadence single-buffering never tears.
         let map_len = fix.line_length as usize * var.yres as usize;
         let map = unsafe {
             libc::mmap(std::ptr::null_mut(), map_len, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_SHARED, fd, 0)
@@ -178,7 +200,7 @@ impl FbDev {
             unsafe { libc::close(fd) };
             return Err(e);
         }
-        Ok(FbDev { fd, map: map as *mut u8, map_len, fmt })
+        Ok(FbDev { fd, map: map as *mut u8, map_len, fmt, var })
     }
 
     pub fn format(&self) -> FbFormat {
@@ -212,6 +234,15 @@ impl FbDev {
                 }
             }
         }
+        // Pan-to-present: flush the drawn page, then FBIOPAN_DISPLAY to page 0. On this panel the
+        // scan-out (a g2d-rotated copy) refreshes ONLY on the pan — a raw write is invisible
+        // without it. We always pan to yoffset 0 (page 0), the menu's proven-visible path.
+        unsafe {
+            libc::msync(self.map as *mut libc::c_void, self.map_len, libc::MS_SYNC);
+            self.var.xoffset = 0;
+            self.var.yoffset = 0;
+            libc::ioctl(self.fd, FBIOPAN_DISPLAY, &mut self.var as *mut _);
+        }
     }
 }
 
@@ -235,9 +266,10 @@ mod tests {
 
     #[test]
     fn pack_xrgb8888() {
-        // 32bpp XRGB: R@16 G@8 B@0, each 8 bits.
+        // 32bpp XRGB: R@16 G@8 B@0, each 8 bits. The X (high) byte is forced to 0xFF (opaque) — the
+        // sunxi DE2.0 scan-out treats it as alpha and shows X=0 as transparent/black (tsp-bwrg.6).
         let f = FbFormat { w: 1, h: 1, bpp: 32, line_length: 4, r_off: 16, r_len: 8, g_off: 8, g_len: 8, b_off: 0, b_len: 8 };
-        assert_eq!(f.pack(rgb(0xAB, 0xCD, 0xEF)), 0x00AB_CDEF);
+        assert_eq!(f.pack(rgb(0xAB, 0xCD, 0xEF)), 0xFFAB_CDEF);
         assert_eq!(f.bytes_per_pixel(), 4);
     }
 
