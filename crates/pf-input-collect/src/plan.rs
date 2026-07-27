@@ -110,6 +110,60 @@ pub fn default_gamepad_plan() -> Vec<ControlSpec> {
     ]
 }
 
+/// The **A133 (TrimUI Smart Pro)** prompt plan — the controls THIS device actually has, sourced
+/// from the **tsp-ozbp.9 frozen parity baseline** (owner-verified, actuated on real silicon
+/// 2026-07-26). That measured ground truth OUTRANKS the known-wrong `a133/capabilities.toml`
+/// descriptor (tsp-ozbp.13: it lists analog `ABS_Z`/`ABS_RZ` triggers when L2/R2 are binary
+/// `BTN_TL2`/`BTN_TR2`, and signed16 stick ranges when the real axes are unsigned 0..4095).
+///
+/// The device has EXACTLY these 14 controls and NOTHING ELSE — the owner actuated all 17 evdev
+/// codes (11 buttons + 6 axes) and no others exist: there is **no** guide/home button beyond MENU
+/// (`BTN_MODE`, which SDL names `guide`) and **no** `l3`/`r3` stick clicks (no `BTN_THUMBL/THUMBR`).
+/// So every control here is **required** — none is `optional`, nothing flash-then-skips, and no
+/// phantom control is ever prompted. This is not an app-side filter of a generic list; it is the
+/// device's real control set. "Prompt for what the device HAS, full stop" (owner directive,
+/// 2026-07-27). tsp-ozbp.13 must be corrected to match this SAME baseline (a different lane); the
+/// two agreeing is then checkable, not coincidental.
+pub fn a133_gamepad_plan() -> Vec<ControlSpec> {
+    vec![
+        ControlSpec::new("south", Kind::Button, "Press the BOTTOM face button (A)", false),
+        ControlSpec::new("east", Kind::Button, "Press the RIGHT face button (B)", false),
+        ControlSpec::new("west", Kind::Button, "Press the LEFT face button (X)", false),
+        ControlSpec::new("north", Kind::Button, "Press the TOP face button (Y)", false),
+        ControlSpec::new("select", Kind::Button, "Press SELECT", false),
+        ControlSpec::new("start", Kind::Button, "Press START", false),
+        // Menu button — evdev BTN_MODE, which SDL names `guide` (caps.py 0x13c -> guide). The
+        // device HAS this control; the old generic plan's "GUIDE / MENU (skip if none)" optional
+        // entry is what the owner read as a phantom HOME button. Prompt it plainly as MENU.
+        ControlSpec::new("guide", Kind::Button, "Press the MENU button", false),
+        ControlSpec::new("l1", Kind::Button, "Press the LEFT shoulder (L1)", false),
+        ControlSpec::new("r1", Kind::Button, "Press the RIGHT shoulder (R1)", false),
+        // A hat needs BOTH axes (HAT0X and HAT0Y), so ask for all four directions.
+        ControlSpec::new(
+            "dpad",
+            Kind::Hat,
+            "Press ALL FOUR D-PAD directions: UP, DOWN, LEFT, RIGHT",
+            false,
+        ),
+        // A stick needs BOTH axes actuated — a partial arc only moves one, so ask for a full circle.
+        ControlSpec::new(
+            "lstick",
+            Kind::Stick,
+            "Roll the LEFT STICK all the way around in a FULL CIRCLE (both directions)",
+            false,
+        ),
+        ControlSpec::new(
+            "rstick",
+            Kind::Stick,
+            "Roll the RIGHT STICK all the way around in a FULL CIRCLE (both directions)",
+            false,
+        ),
+        // L2/R2 are BINARY buttons on the a133 (BTN_TL2/BTN_TR2) — a press, not an analog squeeze.
+        ControlSpec::new("ltrig", Kind::Trigger, "Press the LEFT TRIGGER (L2) fully", false),
+        ControlSpec::new("rtrig", Kind::Trigger, "Press the RIGHT TRIGGER (R2) fully", false),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -134,6 +188,29 @@ mod tests {
             "lstick", "rstick", "ltrig", "rtrig"]
         {
             assert!(ids.contains(&want.to_string()), "plan missing {want}");
+        }
+    }
+
+    #[test]
+    fn a133_plan_is_exactly_the_frozen_baseline_controls_all_required() {
+        let plan = a133_gamepad_plan();
+        let ids: Vec<&str> = plan.iter().map(|c| c.id.as_str()).collect();
+        // EXACTLY the tsp-ozbp.9 frozen-baseline controls, in press-friendly order — no more, no less.
+        assert_eq!(
+            ids,
+            [
+                "south", "east", "west", "north", "select", "start", "guide", "l1", "r1", "dpad",
+                "lstick", "rstick", "ltrig", "rtrig",
+            ],
+            "a133 plan must be exactly the frozen-baseline control set"
+        );
+        // The phantom controls the owner tripped on must NOT appear (no home/guide-optional, no L3/R3).
+        for phantom in ["l3", "r3", "home", "capture", "misc"] {
+            assert!(!ids.contains(&phantom), "a133 plan must not prompt phantom control {phantom}");
+        }
+        // EVERY control is required — nothing is optional, so nothing can flash-then-skip.
+        for c in &plan {
+            assert!(!c.optional, "a133 control {} must be required (no flash-then-skip)", c.id);
         }
     }
 }

@@ -113,4 +113,45 @@ fn required_control_is_not_fabricated_from_the_ambient_rest_stream() {
     }
 }
 
+/// CRASH-SAFETY + full-sweep capture (tsp-bwrg.6, tsp-e1b-coord's signed16 worry): a REAL circular
+/// sweep of BOTH left-stick axes across the full UNSIGNED 0..4095 range — amid the continuous rest
+/// stream — must be captured as a `Stick` on `ABS_X,ABS_Y`, and must NOT panic. The collection
+/// engine reads the REAL `AbsInfo` (0..4095) via EVIOCGABS and does all activity/observe math in
+/// i64 with `.max(1)`-guarded divisors, so there is no signed16 (-32768..32767) normalization to
+/// overflow or divide-by-zero on — the "left-thumbstick crash" was in fact an *abort* on a partial
+/// (one-axis) sweep, not a range panic. This test locks BOTH facts: a full both-axis sweep yields
+/// `Ok(Stick)`, and the run reaching this assertion at all proves no panic on the unsigned range.
+#[test]
+fn full_both_axis_stick_sweep_captures_on_unsigned_range_without_panicking() {
+    let mut src = dut();
+    for _ in 0..3 { src.push_batch(rest_frame()); }
+    // A circular sweep: both ABS_X and ABS_Y travel edge-to-edge across the full 0..4095 range
+    // (the extremes a real "roll it all the way around" produces), still amid the rest stream.
+    for &(x, y) in &[(4095, 2048), (2048, 4095), (0, 2048), (2048, 0), (4095, 4095), (0, 0), (2048, 2048)] {
+        let mut f = rest_frame();
+        f.extend([abs(ABS_X, x), abs(ABS_Y, y)]);
+        src.push_batch(f);
+    }
+    for _ in 0..3 { src.push_batch(rest_frame()); }
+    src.push_batch(vec![]); src.push_batch(vec![]);
+
+    let spec = ControlSpec { id: "lstick".into(), kind: Kind::Stick, prompt: "lstick".into(), optional: false };
+    let mut c = Collector::new(vec![spec]);
+    let cfg = RunConfig {
+        quiet_polls: 2,
+        idle_skip_polls: 2,
+        max_polls: 600,
+        control_timeout: std::time::Duration::from_secs(5),
+        ..RunConfig::default()
+    };
+    let mut log = Vec::new();
+    match collect::run(&mut c, &mut src, &meta(), &cfg, &mut log) {
+        Ok(cap) => {
+            let ls = cap.inputs.iter().find(|i| i.id == "lstick").expect("lstick row");
+            assert_eq!(ls.code, "ABS_X,ABS_Y", "a full both-axis sweep must record both stick axes, got {}", ls.code);
+        }
+        Err(e) => panic!("a full both-axis stick sweep must capture cleanly, not error: {e}"),
+    }
+}
+
 fn meta() -> DeviceMeta { DeviceMeta { id: "a133".into(), manufacturer: "TrimUI".into(), model: "Smart Pro".into() } }

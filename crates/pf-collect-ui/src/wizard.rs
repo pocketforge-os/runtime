@@ -172,6 +172,18 @@ fn poll_active(
     }
 }
 
+/// The clarifying re-prompt shown when a control did NOT capture on the first try — a partial
+/// stick sweep (only one axis), a hat with only one axis, or a missed press. It names exactly what
+/// to add so the owner isn't left guessing (tsp-bwrg.6: the parked wizard must recover a fumble in
+/// place, never abort). Sticks and hats both need BOTH axes actuated.
+fn reprompt_hint(spec: &plan::ControlSpec) -> String {
+    match spec.kind {
+        plan::Kind::Stick => "Almost — roll it ALL THE WAY AROUND in a full circle so BOTH directions move".to_string(),
+        plan::Kind::Hat => "Press the OTHER directions too — I need UP/DOWN and LEFT/RIGHT".to_string(),
+        _ => format!("Didn't catch that — {}", spec.prompt),
+    }
+}
+
 /// Drive the full guided sequence against a live source, rendering each step. Engine-parity pump.
 pub fn drive_live<S: EventSource, K: Sink>(
     src: &mut S,
@@ -180,64 +192,87 @@ pub fn drive_live<S: EventSource, K: Sink>(
     meta: &DeviceMeta,
     timing: &Timing,
 ) -> Result<Capabilities, CollectError> {
-    let mut collector = Collector::new(plan::default_gamepad_plan());
+    let mut collector = Collector::new(plan::a133_gamepad_plan());
     let mut canvas = Canvas::new(CANVAS_W as usize, CANVAS_H as usize);
 
     while let Some(spec) = collector.current().cloned() {
-        present(sink, &mut canvas, skin, &collector, StepView { active_id: Some(&spec.id), prompt: &spec.prompt, status: "PRESS THE HIGHLIGHTED CONTROL", done: false });
+        // Owner-paced RETRY: re-prompt the SAME control until it actually captures. A fumble — a
+        // partial stick sweep (one axis), a hat with only one axis, a mis-press — must NEVER abort
+        // the run and discard the controls already collected (tsp-bwrg.6: an lstick partial sweep
+        // discarded ten good controls). It just re-prompts, with a clarifying hint. Only a HARD
+        // engine error (an unknown code, an EVIOCGABS failure) aborts.
+        let mut attempt = 0usize;
+        loop {
+            attempt += 1;
+            let prompt_text = if attempt == 1 { spec.prompt.clone() } else { reprompt_hint(&spec) };
+            let status = if attempt == 1 { "PRESS THE HIGHLIGHTED CONTROL" } else { "LET'S TRY THAT ONE AGAIN" };
+            present(sink, &mut canvas, skin, &collector, StepView { active_id: Some(&spec.id), prompt: &prompt_text, status, done: false });
 
-        let mut buf: Vec<RawEvent> = Vec::new();
-        let mut saw = false;
-        let mut quiet = 0usize;
-        let mut showed_capturing = false;
-        let mut absc: HashMap<u16, AbsInfo> = HashMap::new();
-        // WALL-CLOCK per-control window — the a133 streams continuously so a poll count would burn
-        // through in seconds (tsp-bwrg.6). `max_polls` is only a runaway guard now.
-        let deadline = Instant::now() + timing.control_timeout;
-        let mut iters = 0usize;
-        while Instant::now() < deadline && iters < timing.max_polls {
-            iters += 1;
-            let evs = src.poll(timing.poll_step).map_err(|e| CollectError::AbsInfo { code: 0, source: e })?;
-            let mut active_now = false;
-            let mut key_down = false;
-            for e in &evs {
-                if e.ev_type == EV_KEY && e.value == 1 {
-                    key_down = true;
-                }
-                if poll_active(spec.kind, e, src, &mut absc) {
-                    active_now = true;
-                }
-                buf.push(*e);
-            }
-            if active_now && !showed_capturing {
-                present(sink, &mut canvas, skin, &collector, StepView { active_id: Some(&spec.id), prompt: &spec.prompt, status: "CAPTURING...", done: false });
-                showed_capturing = true;
-            }
-            // A button/click — and a trigger realized as a binary button (a133 L2/R2) — completes
-            // the instant a key-down is seen. A genuinely analog trigger emits no key, so its sweep
-            // is never short-circuited.
-            if matches!(spec.kind, plan::Kind::Button | plan::Kind::StickClick | plan::Kind::Trigger)
-                && key_down
-            {
-                break;
-            }
-            if active_now {
-                saw = true;
-                quiet = 0;
-            } else {
-                quiet += 1;
-                if !saw {
-                    if spec.optional && quiet >= timing.idle_skip_polls {
-                        break; // optional & never actuated → skip
+            let mut buf: Vec<RawEvent> = Vec::new();
+            let mut saw = false;
+            let mut quiet = 0usize;
+            let mut showed_capturing = false;
+            let mut absc: HashMap<u16, AbsInfo> = HashMap::new();
+            // WALL-CLOCK per-control window — the a133 streams continuously so a poll count would burn
+            // through in seconds (tsp-bwrg.6). `max_polls` is only a runaway guard now.
+            let deadline = Instant::now() + timing.control_timeout;
+            let mut iters = 0usize;
+            while Instant::now() < deadline && iters < timing.max_polls {
+                iters += 1;
+                let evs = src.poll(timing.poll_step).map_err(|e| CollectError::AbsInfo { code: 0, source: e })?;
+                let mut active_now = false;
+                let mut key_down = false;
+                for e in &evs {
+                    if e.ev_type == EV_KEY && e.value == 1 {
+                        key_down = true;
                     }
-                } else if quiet >= timing.quiet_polls {
-                    break; // actuated then settled
+                    if poll_active(spec.kind, e, src, &mut absc) {
+                        active_now = true;
+                    }
+                    buf.push(*e);
                 }
+                if active_now && !showed_capturing {
+                    present(sink, &mut canvas, skin, &collector, StepView { active_id: Some(&spec.id), prompt: &prompt_text, status: "CAPTURING...", done: false });
+                    showed_capturing = true;
+                }
+                // A button/click — and a trigger realized as a binary button (a133 L2/R2) — completes
+                // the instant a key-down is seen. A genuinely analog trigger emits no key, so its sweep
+                // is never short-circuited.
+                if matches!(spec.kind, plan::Kind::Button | plan::Kind::StickClick | plan::Kind::Trigger)
+                    && key_down
+                {
+                    break;
+                }
+                if active_now {
+                    saw = true;
+                    quiet = 0;
+                } else {
+                    quiet += 1;
+                    if !saw {
+                        if spec.optional && quiet >= timing.idle_skip_polls {
+                            break; // optional & never actuated → skip
+                        }
+                    } else if quiet >= timing.quiet_polls {
+                        break; // actuated then settled
+                    }
+                }
+            }
+
+            collector.record(&buf);
+            match collector.commit_current(src) {
+                // Captured — or an OPTIONAL control that saw nothing was cleanly skipped. Advance.
+                Ok(_) => break,
+                // Not enough of this control was actuated — RE-PROMPT it (never abort+discard). The
+                // next loop iteration re-presents with `reprompt_hint`. commit_current already took
+                // the working buffer on error; clear_working is belt-and-suspenders.
+                Err(CollectError::NoActivity { .. }) | Err(CollectError::Incomplete { .. }) => {
+                    collector.clear_working();
+                    continue;
+                }
+                // A hard engine error (unknown code / absinfo failure) is not owner-recoverable.
+                Err(e) => return Err(e),
             }
         }
-
-        collector.record(&buf);
-        let _ = collector.commit_current(src)?;
         collector.advance();
         present(sink, &mut canvas, skin, &collector, StepView { active_id: None, prompt: &spec.prompt, status: "PRESS THE HIGHLIGHTED CONTROL", done: collector.is_done() });
         if !timing.post_dwell.is_zero() {
@@ -258,7 +293,7 @@ pub fn drive_demo<K: Sink>(
     meta: &DeviceMeta,
     timing: &Timing,
 ) -> Result<Capabilities, CollectError> {
-    let mut collector = Collector::new(plan::default_gamepad_plan());
+    let mut collector = Collector::new(plan::a133_gamepad_plan());
     let mut canvas = Canvas::new(CANVAS_W as usize, CANVAS_H as usize);
 
     while let Some(spec) = collector.current().cloned() {
@@ -335,6 +370,7 @@ fn synth_events_for(id: &str) -> Vec<RawEvent> {
         "rstick" => stick(0x3, 0x4),
         // Left trigger realized as a binary BUTTON — the real a133 L2/R2 shape (the MCU reports it
         // as a bit; the decoder emits BTN_TL2). Exercises the button-trigger path on the panel.
+        "guide" => btn(0x13c), // BTN_MODE (the MENU button; SDL `guide`)
         "ltrig" => btn(0x138), // BTN_TL2
         // Right trigger ANALOG (intermediate travel) — shows the other classification.
         "rtrig" => vec![
@@ -388,23 +424,57 @@ mod tests {
         assert!(toml.contains("id = \"ltrig\""));
         assert!(toml.contains("semantics = \"binary\""), "left trigger should classify binary:\n{toml}");
         assert!(toml.contains("semantics = \"analog\""), "right trigger should classify analog:\n{toml}");
-        assert!(!toml.contains("id = \"guide\""), "skipped guide must be omitted:\n{toml}");
+        assert!(toml.contains("id = \"guide\""), "the MENU button (guide) must be captured, not skipped:\n{toml}");
     }
 
+    /// The re-prompt fix (tsp-bwrg.6): a control that does not capture on the first try (here SOUTH,
+    /// fed two empty polls before its press) must be RE-PROMPTED — never abort the run and discard
+    /// the controls already collected. Drives the full a133 plan to completion with south fumbled
+    /// once, and asserts the run returns Ok with EVERY control (including the fumbled south and the
+    /// MENU/guide button) captured.
     #[test]
-    fn drive_live_captures_a_button_from_a_scripted_stream() {
-        let ident = Identity { name: "x".into(), bus: 3, vid: 1, pid: 1, version: 1 };
-        let mut src = ScriptedSource::new(ident);
-        src.push_batch(vec![RawEvent::new(EV_KEY, 0x130, 1), RawEvent::new(EV_KEY, 0x130, 0)]);
+    fn drive_live_reprompts_a_fumbled_control_and_keeps_prior_captures() {
+        const EV_ABS: u16 = 0x03;
+        let stick = AbsInfo { min: 0, max: 4095, fuzz: 0, flat: 0, resolution: 0 };
+        let hat = AbsInfo { min: -1, max: 1, fuzz: 0, flat: 0, resolution: 0 };
+        let ident = Identity { name: "a133".into(), bus: 3, vid: 0x045e, pid: 0x028e, version: 0x0110 };
+        let mut src = ScriptedSource::new(ident)
+            .with_abs(0x0, stick).with_abs(0x1, stick).with_abs(0x3, stick).with_abs(0x4, stick)
+            .with_abs(0x10, hat).with_abs(0x11, hat);
+        let press = |code: u16| vec![RawEvent::new(EV_KEY, code, 1), RawEvent::new(EV_KEY, code, 0)];
+
+        // south — FUMBLE: two empty polls (no activity) force a NoActivity → re-prompt, THEN the press.
+        src.push_batch(vec![]);
+        src.push_batch(vec![]);
+        src.push_batch(press(0x130)); // BTN_A
+        for code in [0x131u16, 0x133, 0x134, 0x13a, 0x13b, 0x13c, 0x136, 0x137] {
+            src.push_batch(press(code)); // east,west,north,select,start,guide(MODE),l1,r1
+        }
+        // dpad (both hat axes), then a quiet poll to settle.
+        src.push_batch(vec![RawEvent::new(EV_ABS, 0x10, -1), RawEvent::new(EV_ABS, 0x10, 0),
+                            RawEvent::new(EV_ABS, 0x11, 1), RawEvent::new(EV_ABS, 0x11, 0)]);
+        src.push_batch(vec![]);
+        // lstick + rstick (both axes to full deflection), each with a quiet poll to settle.
+        src.push_batch(vec![RawEvent::new(EV_ABS, 0x0, 4095), RawEvent::new(EV_ABS, 0x1, 4095)]);
+        src.push_batch(vec![]);
+        src.push_batch(vec![RawEvent::new(EV_ABS, 0x3, 4095), RawEvent::new(EV_ABS, 0x4, 4095)]);
+        src.push_batch(vec![]);
+        src.push_batch(press(0x138)); // BTN_TL2 (ltrig, binary)
+        src.push_batch(press(0x139)); // BTN_TR2 (rtrig, binary)
+
         let mut sink = CountingSink::default();
         let skin = demo_skin();
-        let meta = DeviceMeta { id: "x".into(), manufacturer: "x".into(), model: "x".into() };
-        let timing = Timing { max_polls: 2, idle_skip_polls: 1, quiet_polls: 1, ..Timing::live() };
-        let err = drive_live(&mut src, &mut sink, &skin, &meta, &timing).unwrap_err();
-        match err {
-            CollectError::NoActivity { id } => assert_ne!(id, "south", "south should have captured"),
-            other => panic!("unexpected: {other}"),
+        let meta = DeviceMeta { id: "a133".into(), manufacturer: "TrimUI".into(), model: "Smart Pro".into() };
+        let timing = Timing { max_polls: 2, idle_skip_polls: 1, quiet_polls: 1, post_dwell: Duration::ZERO, ..Timing::live() };
+
+        let caps = drive_live(&mut src, &mut sink, &skin, &meta, &timing)
+            .expect("a fumbled control must re-prompt and the run must complete, not abort");
+        let ids: Vec<&str> = caps.inputs.iter().map(|i| i.id.as_str()).collect();
+        // The fumbled south survived the re-prompt, and the MENU/guide button was captured.
+        for want in ["south", "east", "west", "north", "select", "start", "guide", "l1", "r1",
+            "dpad", "lstick", "rstick", "ltrig", "rtrig"]
+        {
+            assert!(ids.contains(&want), "control {want} missing from the completed run: {ids:?}");
         }
-        assert!(sink.frames >= 2, "should have rendered at least the south prompt + result");
     }
 }
