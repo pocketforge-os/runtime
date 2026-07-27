@@ -27,6 +27,12 @@
 # while comparing nothing. There is no longer a copy to guard; see
 # crates/pocketforge/tests/README.md.
 #
+# tsp-7rts added the LINT gate at the end of the job: `cargo clippy --workspace
+# --all-targets -- -D warnings`. Before it, this repo ran clippy nowhere, so lint
+# failures sat in the tree with nothing capable of reporting them — the same
+# "guard that does not run" shape as the drift check described above. See the
+# comment on that step for why `--workspace --all-targets -D warnings` specifically.
+#
 # Also builds pf-input-collect + pf-collect-ui for aarch64-unknown-linux-musl
 # (the a133 static device target) without a per-invocation RUSTFLAGS override
 # — proving the workspace `.cargo/config.toml`'s rust-lld linker pin works
@@ -61,7 +67,7 @@ concurrency:
 
 jobs:
   test:
-    name: cargo test + musl cross-build
+    name: cargo test + musl cross-build + clippy
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -91,13 +97,18 @@ jobs:
           ref: main
           path: platform
 
+      # `--profile minimal` does NOT ship clippy, so the lint gate below needs it
+      # requested explicitly. Without `--component clippy` the clippy step fails with
+      # "no such command: clippy" — which reads as tooling breakage rather than a lint
+      # failure, so name it here where the toolchain is assembled.
       - name: Install stable Rust toolchain + aarch64-musl target
         run: |
-          rustup toolchain install stable --profile minimal --no-self-update
+          rustup toolchain install stable --profile minimal --no-self-update --component clippy
           rustup default stable
           rustup target add aarch64-unknown-linux-musl
           rustc --version
           cargo --version
+          cargo clippy --version
 
       - name: Cache cargo registry + target
         uses: actions/cache@1bd1e32a3bdc45362d1e726936510720a7c30a57  # v4
@@ -138,3 +149,30 @@ jobs:
             -p pf-input-collect --bin pf-input-collect
           cargo build --target aarch64-unknown-linux-musl \
             -p pf-collect-ui --bin pf-collect-ui
+
+      # LINT GATE (tsp-7rts). Until this step existed, no workflow in this repo ran
+      # clippy at all — so lint failures accumulated in the tree with nothing able to
+      # report them. That is the same shape as the drift guard tsp-ozbp.16 deleted:
+      # a check that looks handled and catches nothing.
+      #
+      # `--workspace --all-targets`, deliberately and for the same reason the test step
+      # above uses `--workspace`: a hand-listed `-p` set re-creates the defect one level
+      # up (a new crate slips past because nobody remembered to add it), and
+      # `--all-targets` is what reaches tests/benches/examples rather than lib+bin only.
+      # The lints this gate first caught lived in a `src/` file AND a `tests/` file, so
+      # dropping either flag would have let half of them through.
+      #
+      # `-D warnings` is the whole point — a clippy run whose findings are warnings is a
+      # run nobody acts on. Anything that genuinely must be tolerated gets a narrow,
+      # annotated `#[allow(...)]` at the smallest scope with a comment saying why; never
+      # a crate-root blanket allow, and never a softened `-D warnings`.
+      #
+      # Placed LAST on purpose: a lint-only failure then still leaves the test and
+      # musl-cross-build results visible on the run, and lint is the cheapest of the
+      # three to fix. Note the toolchain is floating `stable` (same as every other step
+      # here), so a new Rust release can introduce lints this step will report — that is
+      # accepted, and the fix is to address the lint, not to pin around it.
+      - name: cargo clippy — whole workspace, warnings are errors
+        working-directory: runtime
+        run: |
+          cargo clippy --workspace --all-targets -- -D warnings

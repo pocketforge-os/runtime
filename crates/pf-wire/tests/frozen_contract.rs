@@ -91,6 +91,13 @@ fn canonical_message_encodings_are_frozen() {
     assert_eq!(rback.flag, 1);
 }
 
+// Written as a fold + `write!` rather than `.map(|x| format!(..)).collect()` so it does not trip
+// `clippy::format_collect` (a per-element `String` allocation) if that lint is ever promoted out of
+// the allow-by-default set. It is not part of the frozen contract — just the assertion pretty-printer.
 fn hex(b: &[u8]) -> String {
-    b.iter().map(|x| format!("{x:02x}")).collect()
+    use std::fmt::Write as _;
+    b.iter().fold(String::with_capacity(b.len() * 2), |mut out, x| {
+        let _ = write!(out, "{x:02x}");
+        out
+    })
 }

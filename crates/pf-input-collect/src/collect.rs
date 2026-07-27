@@ -994,12 +994,12 @@ fn poll_event_active(
                 return false;
             }
             let ai = match cache.get(&e.code) {
-                Some(a) => a.clone(),
+                Some(a) => *a,
                 None => {
                     let a = src.absinfo(e.code).unwrap_or(AbsInfo {
                         min: 0, max: 0, fuzz: 0, flat: 0, resolution: 0,
                     });
-                    cache.insert(e.code, a.clone());
+                    cache.insert(e.code, a);
                     a
                 }
             };
