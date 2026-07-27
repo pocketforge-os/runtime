@@ -49,10 +49,16 @@ wire/WIRE-PROTOCOL.md   the byte-level, reimplementable wire spec (folds in SPIK
 docs/BROKER-DESIGN.md   the broker architecture + threat model + what v0 enforces vs. substrate-gated
 include/pocketforge.h   the hand-maintained C header (matches libpocketforge)
 ctest/                  a gcc C smoke test that links the staticlib and checks the contract
-crates/pocketforge/tests/fixtures/  vendored a133 + a523 capability descriptors (from E1)
+crates/pocketforge/tests/README.md   why this repo vendors NO descriptor copy: the suite reads
+                   platform/devices/<id>/capabilities.toml directly (tsp-ozbp.16)
 ```
 
 ## Build & test (on the build host, `mm@10.0.40.90`)
+
+The test suite reads the a133 / a523 capability descriptors from a **`platform` checkout** — this
+repo keeps no copy of them. Clone `pocketforge-os/platform` beside this repo, or set
+`PF_PLATFORM_DIR=/path/to/platform`; without one the descriptor-backed tests FAIL (loudly, by
+design — they never skip). See `crates/pocketforge/tests/README.md`.
 
 ```sh
 cargo build --workspace                       # build everything

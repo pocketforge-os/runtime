@@ -10,7 +10,7 @@
 
 use std::io::Write as _;
 use std::os::fd::AsRawFd;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use pocketforge::backends::InProcessBackend;
@@ -32,8 +32,10 @@ fn event_bytes(ev_type: u16, code: u16, value: i32) -> [u8; 24] {
     b
 }
 
-fn a133_fixture() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/a133-capabilities.toml")
+/// The REAL a133 descriptor from the `platform` checkout — there is no vendored copy in this
+/// repo (`tsp-ozbp.16`). Panics (never skips) when no checkout is resolvable.
+fn a133_descriptor() -> PathBuf {
+    pocketforge::test_support::try_descriptor_path("a133").unwrap_or_else(|e| panic!("{e}"))
 }
 
 /// Make a unique FIFO path under the temp dir and `mkfifo` it.
@@ -67,7 +69,7 @@ fn read_exact_nonblock(fd: i32, want: usize) -> Vec<u8> {
 /// the one env-touching assertion is sequential (no cross-test `PF_INPUT_NODE` race).
 #[test]
 fn in_process_input_fd_reads_injected_events() {
-    let desc = Arc::new(Descriptor::load(a133_fixture()).expect("load a133 fixture"));
+    let desc = Arc::new(Descriptor::load(a133_descriptor()).expect("load the a133 platform descriptor"));
 
     // --- (1) hardware-absent when no node is provided (input IS present, but nothing to open) ---
     std::env::remove_var("PF_INPUT_NODE");
@@ -136,7 +138,7 @@ fn in_process_input_fd_reads_injected_events() {
 /// never touches `PF_INPUT_NODE` and is parallel-safe alongside the env-touching test above.
 #[test]
 fn input_handle_acquire_fd_matches_facade() {
-    let desc = Arc::new(Descriptor::load(a133_fixture()).expect("load a133 fixture"));
+    let desc = Arc::new(Descriptor::load(a133_descriptor()).expect("load the a133 platform descriptor"));
     let fifo = make_fifo("handle");
     let pf = Pf::over_in_process(Arc::new(InProcessBackend::new(desc).with_input_node(&fifo)));
 

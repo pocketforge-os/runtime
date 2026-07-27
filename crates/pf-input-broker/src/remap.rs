@@ -312,11 +312,10 @@ impl Remap {
 mod tests {
     use super::*;
 
+    /// The REAL device descriptor from the `platform` checkout — no vendored copy (`tsp-ozbp.16`).
+    /// Panics (never skips) when no checkout is found; see `pocketforge::test_support`.
     fn desc(id: &str) -> Descriptor {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../pocketforge/tests/fixtures")
-            .join(format!("{id}-capabilities.toml"));
-        Descriptor::load(path).expect("load fixture")
+        pocketforge::test_support::descriptor(id)
     }
 
     #[test]
@@ -325,14 +324,104 @@ mod tests {
         assert_eq!(parse_sdl_guid("030000005e0400008e02000010010000"), Some((0x0003, 0x045e, 0x028e, 0x0110)));
     }
 
+    /// The D→C invariant, asserted against the CHECKED-OUT descriptor rather than against a
+    /// hardcoded swap-or-identity verdict (`tsp-ozbp.16`).
+    ///
+    /// The a133 remap is a REAL SWAP today: platform's descriptor still declares the pre-ownership
+    /// Frame-D codes (`id=west code=BTN_X` (0x133), `id=north code=BTN_Y` (0x134)), so the broker
+    /// swaps 0x133↔0x134 onto canonical `BTN_WEST`/`BTN_NORTH`. platform PR #92 corrects those two
+    /// rows to canonical, at which point the a133 remap becomes an IDENTITY — the honest state once
+    /// we own the driver.
+    ///
+    /// Since the suite floats on `platform@main` (there is no vendored copy — `tsp-ozbp.16`), a
+    /// test that hardcoded "it is a swap" would go red the instant #92 merged, with no runtime
+    /// commit involved. So it asserts what is true under BOTH descriptors instead: every face row's
+    /// Frame-D `code` remaps onto the Frame-C code for that row's `id`. The bijection clause below
+    /// is why this is stronger than either hardcoded verdict rather than merely more tolerant — it
+    /// catches a HALF-applied correction (west fixed, north not), which is a live-wire mapping bug
+    /// that both "assert a swap" and "assert an identity" would sail straight past.
+    ///
+    /// The remap MECHANISM keeps its own proof in `driver_quirk_swap_still_works_on_a_quirky_driver`
+    /// — still needed for every driver we do NOT own.
     #[test]
     fn west_north_driver_quirk_is_normalized() {
-        let r = Remap::from_descriptor(&desc("a133")).unwrap();
-        // The driver emits BTN_X (0x133) for the physical WEST button → canonical BTN_WEST (0x134).
+        let d = desc("a133");
+        let r = Remap::from_descriptor(&d).unwrap();
+
+        let mut canonical_seen = Vec::new();
+        for id in ["south", "east", "west", "north"] {
+            let row = d
+                .inputs
+                .iter()
+                .find(|i| i.id == id)
+                .unwrap_or_else(|| panic!("a133 descriptor has no {id} face row"));
+            let driver_code = lookup(KEY_CODES, &row.code)
+                .unwrap_or_else(|| panic!("{id}: unknown evdev code name {:?}", row.code));
+            let canonical = lookup(CANONICAL_BY_ID, id).expect("face ids are all canonical");
+            assert_eq!(
+                r.remap_key(driver_code),
+                canonical,
+                "{id}: driver code {driver_code:#x} ({}) must remap to canonical {canonical:#x}",
+                row.code,
+            );
+            canonical_seen.push(canonical);
+        }
+
+        // The four face buttons must land on FOUR DISTINCT canonical codes. A descriptor that
+        // corrected `west` without correcting `north` (or vice versa) would collide two positions
+        // onto one code — every app would read the wrong button — and would still satisfy the
+        // per-row assertion above for the row that was changed.
+        canonical_seen.sort_unstable();
+        canonical_seen.dedup();
+        assert_eq!(canonical_seen, vec![0x130, 0x131, 0x133, 0x134], "face remap is a bijection");
+    }
+
+    /// The SWAP mechanism itself, on an explicitly synthetic quirky-driver descriptor.
+    ///
+    /// `west_north_driver_quirk_is_normalized` is deliberately regime-agnostic, so on its own it
+    /// would still pass if the remap silently degraded to a pass-through and every descriptor
+    /// happened to be canonical. This keeps a device whose driver reports west/north inverted —
+    /// the X360 quirk, and the shape of any driver we do NOT own — so a real swap is always
+    /// exercised regardless of what platform's owned descriptors say.
+    #[test]
+    fn driver_quirk_swap_still_works_on_a_quirky_driver() {
+        let quirky = Descriptor::from_toml(
+            r#"
+[identity]
+id = "synthquirk"
+manufacturer = "PocketForge"
+model = "Quirky X360 Driver Rig (synthetic test descriptor)"
+sdl_guid = "030000005e0400008e02000010010000"
+
+[[inputs]]
+id = "south"
+kind = "button"
+ev_type = "EV_KEY"
+code = "BTN_A"
+[[inputs]]
+id = "east"
+kind = "button"
+ev_type = "EV_KEY"
+code = "BTN_B"
+[[inputs]]
+id = "west"
+kind = "button"
+ev_type = "EV_KEY"
+code = "BTN_X"
+[[inputs]]
+id = "north"
+kind = "button"
+ev_type = "EV_KEY"
+code = "BTN_Y"
+"#,
+        )
+        .expect("parse synthetic quirky descriptor");
+        let r = Remap::from_descriptor(&quirky).unwrap();
+        // Driver emits BTN_X (0x133) for physical WEST → canonical BTN_WEST (0x134), and BTN_Y
+        // (0x134) for NORTH → canonical BTN_NORTH (0x133). A genuine crossover, both ways.
         assert_eq!(r.remap_key(0x133), 0x134, "BTN_X(west) → BTN_WEST");
-        // The driver emits BTN_Y (0x134) for NORTH → canonical BTN_NORTH (0x133).
         assert_eq!(r.remap_key(0x134), 0x133, "BTN_Y(north) → BTN_NORTH");
-        // South/east are already canonical (identity).
+        // South/east are already canonical on this driver (identity) — the swap is targeted.
         assert_eq!(r.remap_key(0x130), 0x130);
         assert_eq!(r.remap_key(0x131), 0x131);
     }
@@ -397,11 +486,16 @@ mod tests {
         for v in [-32768, 0, 128, 32767] {
             assert_eq!(r.classify_abs(0x00, v), AbsAction::Passthrough, "ABS_X analog passthrough");
         }
-        // And a whole device with NO binary rows (a523 triggers carry no semantics in the fixture)
-        // classifies every trigger axis as passthrough.
-        let mut r523 = Remap::from_descriptor(&desc("a523")).unwrap();
-        assert_eq!(r523.classify_abs(0x02, 255), AbsAction::Passthrough, "a523 ABS_Z analog");
-        assert_eq!(r523.classify_abs(0x05, 255), AbsAction::Passthrough, "a523 ABS_RZ analog");
+        // And a whole device with NO binary rows classifies every trigger axis as passthrough.
+        // This half used to run on the a523 — but platform now describes BOTH shipping devices'
+        // L2/R2 as `semantics = "binary"` (SPIKE-0 2026-07-11: endpoint-only full-swing ABS_Z/RZ,
+        // no proportional travel), so the "analog trigger" it relied on only existed in the stale
+        // vendored copy. The shape is real for other hardware, so it gets an honestly SYNTHETIC
+        // device rather than a device pretending to have travel it does not (tsp-ozbp.16).
+        let mut analog =
+            Remap::from_descriptor(&pocketforge::test_support::analog_trigger_descriptor()).unwrap();
+        assert_eq!(analog.classify_abs(0x02, 255), AbsAction::Passthrough, "analog ABS_Z");
+        assert_eq!(analog.classify_abs(0x05, 255), AbsAction::Passthrough, "analog ABS_RZ");
     }
 
     #[test]

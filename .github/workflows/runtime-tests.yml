@@ -1,15 +1,31 @@
-# Runtime test suite for the input bring-up app crates (tsp-bwrg.8).
+# Runtime test suite (tsp-bwrg.8; widened to the whole workspace by tsp-ozbp.16).
 #
-# Runs the cargo tests for pf-input-collect and pf-collect-ui with a `platform`
-# checkout co-located and PF_PLATFORM_DIR set — so the tests that gate on real
-# platform assets ACTUALLY RUN in CI rather than skip. Silently-skipping
-# acceptance tests are the "passes tests while semantically wrong" failure
-# mode that tsp-bwrg.8 targets: pf-input-collect's
+# Runs the cargo tests with a `platform` checkout co-located and PF_PLATFORM_DIR
+# set — so the tests that gate on real platform assets ACTUALLY RUN in CI rather
+# than skip. Silently-skipping acceptance tests are the "passes tests while
+# semantically wrong" failure mode that tsp-bwrg.8 targets: pf-input-collect's
 # `candidate_passes_real_caps_py_validate_when_platform_available`
 # (validates the emitter's output against the real platform/core/caps.py) and
 # pf-collect-ui's `a133_real_skin` tests (proves the SkinSet::load fs+PNG+toml
 # path over the committed platform/skins/a133 + capabilities.toml [skin]
 # tables) both use the same `PF_PLATFORM_DIR` discovery.
+#
+# tsp-ozbp.16 made that discovery LOAD-BEARING for the whole workspace, not just
+# those two crates: the hand-copied a133/a523 descriptor fixtures under
+# crates/pocketforge/tests/fixtures/ are GONE, and every crate that needs a
+# device descriptor now reads platform/devices/<id>/capabilities.toml directly
+# (pocketforge, pf-input-broker, pf-broker, pf-settings). That is why this job
+# runs `cargo test --workspace` rather than a hand-listed crate set: a crate
+# that starts consuming the descriptor must not be able to slip past CI because
+# nobody remembered to add it to a `-p` list, and a descriptor change in
+# platform must turn THIS repo red. The whole suite is seconds of runtime once
+# built, so the coverage is close to free.
+#
+# The old drift guard `fixtures_track_platform` compared the vendored copy to
+# $PF_PLATFORM_DESCRIPTORS and silently returned when that variable was unset —
+# which it was, in every workflow here. It reported ok on every run it ever made
+# while comparing nothing. There is no longer a copy to guard; see
+# crates/pocketforge/tests/README.md.
 #
 # Also builds pf-input-collect + pf-collect-ui for aarch64-unknown-linux-musl
 # (the a133 static device target) without a per-invocation RUSTFLAGS override
@@ -22,9 +38,12 @@ name: Runtime tests (input bring-up)
 on:
   pull_request:
     branches: [main]
+    # Whole-workspace paths: every crate's tests run here now (see the header), so
+    # every crate's sources must be able to trigger the job.
     paths:
-      - 'crates/pf-input-collect/**'
-      - 'crates/pf-collect-ui/**'
+      - 'crates/**'
+      - 'ctest/**'
+      - 'wire/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - '.cargo/config.toml'
@@ -54,9 +73,12 @@ jobs:
           path: runtime
 
       # Platform provides `core/caps.py` + `schemas/capabilities.schema.json`
-      # for the pf-input-collect caps.py-validate test AND the committed
-      # a133 skin assets (`devices/a133/capabilities.toml`,
-      # `skins/a133/*.png`) for the pf-collect-ui real-asset render test.
+      # for the pf-input-collect caps.py-validate test, the committed a133 skin
+      # assets (`skins/a133/*.png`) for the pf-collect-ui real-asset render
+      # test, AND — since tsp-ozbp.16 — the a133/a523 capability descriptors
+      # themselves (`devices/<id>/capabilities.toml`), which this repo no longer
+      # vendors a copy of. Without this checkout the descriptor-backed tests do
+      # not skip, they FAIL: that is the design.
       # Pinned to `main` deliberately: platform is a sibling repo whose
       # committed a133 assets are the ground truth this runtime PR must be
       # green against right now. A stale pin would defeat the test's
@@ -93,12 +115,15 @@ jobs:
       # `discover_platform()` in both crates' test files) — setting the env
       # explicitly is the belt-and-braces path so the acceptance tests
       # cannot silently skip on a layout tweak.
-      - name: cargo test — pf-input-collect + pf-collect-ui (with PF_PLATFORM_DIR)
+      # --workspace, not a `-p` list: see the header. `--no-fail-fast` so one red
+      # crate does not hide the others, which matters most on a platform-side
+      # descriptor change (it typically lights up several crates at once).
+      - name: cargo test — whole workspace (with PF_PLATFORM_DIR)
         env:
           PF_PLATFORM_DIR: ${{ github.workspace }}/platform
         working-directory: runtime
         run: |
-          cargo test -p pf-input-collect -p pf-collect-ui --tests --no-fail-fast -- --nocapture
+          cargo test --workspace --no-fail-fast -- --nocapture
 
       # The point of the cross-build step: prove a plain `cargo build
       # --target aarch64-unknown-linux-musl` links with NO per-invocation

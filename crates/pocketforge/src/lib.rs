@@ -48,6 +48,10 @@ pub mod input;
 pub mod managers;
 pub mod physical_model;
 pub mod server;
+/// Dev/test-only: locate the REAL `platform` device descriptors (`tsp-ozbp.16`). Not part of the
+/// app-facing facade — see the module docs for why the runtime suite has no vendored copy.
+#[doc(hidden)]
+pub mod test_support;
 
 use std::sync::Arc;
 

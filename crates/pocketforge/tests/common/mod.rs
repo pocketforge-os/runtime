@@ -1,65 +1,29 @@
-//! Shared test helpers: fixture loading + a deterministic capability "snapshot" used to prove
+//! Shared test helpers: descriptor loading + a deterministic capability "snapshot" used to prove
 //! that the in-process and out-of-process backends behave IDENTICALLY (the backend-swap proof).
 
 #![allow(dead_code)]
-
-use std::path::PathBuf;
 
 use pocketforge::{
     CapError, Descriptor, PermissionState, Pf, RumbleStatus,
 };
 
-/// The vendored fixtures directory.
-pub fn fixtures_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests").join("fixtures")
-}
-
-/// Path to a fixture descriptor (`"a133"` / `"a523"`).
-pub fn fixture_path(id: &str) -> PathBuf {
-    fixtures_dir().join(format!("{id}-capabilities.toml"))
-}
-
-/// Load a fixture descriptor.
-pub fn descriptor(id: &str) -> Descriptor {
-    Descriptor::load(fixture_path(id)).expect("load fixture descriptor")
-}
-
-/// A SYNTHETIC descriptor that advertises GNSS, used to exercise the default-deny / consent
-/// POLICY (real code) — neither shipping device (a133/a523) advertises GNSS today (DT-unbound
-/// on both SoCs per SPIKE-0 `tsp-9sx.1`, so the E1 descriptors omit it: descriptor = only-
-/// what's-proven). This stands in for a future GNSS-bearing device so the privacy-tier state
-/// machine is still tested.
+/// Load a REAL device descriptor (`"a133"` / `"a523"`) straight from the `platform` checkout.
 ///
-/// `[[sensors]] kind = "gnss"` is now schema-representable (E1 `capabilities.schema.json` post-
-/// `tsp-9sx.6`) and the row honestly OMITS `iio_device` (GNSS is not an IIO sink — gpsd/NMEA/
-/// CUSE stream, not iio sysfs).
-pub fn gnss_descriptor() -> Descriptor {
-    Descriptor::from_toml(
-        r#"
-[identity]
-id = "synthgnss"
-manufacturer = "PocketForge"
-model = "GNSS Policy Rig (synthetic test descriptor)"
-sdl_guid = "00000000000000000000000000000000"
-
-[[inputs]]
-id = "south"
-kind = "button"
-ev_type = "EV_KEY"
-code = "BTN_A"
-
-[[sensors]]
-id = "imu"
-kind = "accel+gyro"
-iio_device = "qmi8658"
-
-[[sensors]]
-id = "gnss"
-kind = "gnss"
-"#,
-    )
-    .expect("parse synthetic gnss descriptor")
+/// There is no vendored copy in this repo (`tsp-ozbp.16`): a snapshot drifts silently from the
+/// device truth it claims to mirror, which is exactly how four tests came to assert an a523 IMU
+/// platform had already removed. Resolution PANICS rather than skips when no checkout is found —
+/// see `pocketforge::test_support` and `tests/README.md`.
+pub fn descriptor(id: &str) -> Descriptor {
+    pocketforge::test_support::descriptor(id)
 }
+
+/// The SYNTHETIC descriptor rigs, re-exported from their single home in
+/// `pocketforge::test_support` so `pf-input-broker`'s unit tests use the same definitions rather
+/// than a second copy of them (`tsp-ozbp.16` — the whole point of this bead is one home per
+/// truth). See that module for what each rig stands in for and why.
+// `common` is compiled into every integration test binary; each uses a different subset.
+#[allow(unused_imports)]
+pub use pocketforge::test_support::{analog_trigger_descriptor, gnss_descriptor, imu_descriptor};
 
 /// The capability names probed by [`snapshot`], in a fixed order.
 pub const PROBE_CAPS: &[&str] = &[

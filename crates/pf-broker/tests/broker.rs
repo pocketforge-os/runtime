@@ -13,11 +13,10 @@ use pf_broker::{
     Violation,
 };
 
+/// The REAL device descriptor from the `platform` checkout — this repo vendors no copy
+/// (`tsp-ozbp.16`). Panics (never skips) when no checkout is resolvable.
 fn descriptor(id: &str) -> Descriptor {
-    let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../pocketforge/tests/fixtures")
-        .join(format!("{id}-capabilities.toml"));
-    Descriptor::load(p).expect("fixture")
+    pocketforge::test_support::descriptor(id)
 }
 
 fn manifest(uses: &[&str]) -> AppManifest {
@@ -29,7 +28,11 @@ fn manifest(uses: &[&str]) -> AppManifest {
 }
 
 fn enforcing(device: &str, uses: &[&str]) -> (Arc<EnforcingBackend>, Arc<InProcessBackend>) {
-    let desc = Arc::new(descriptor(device));
+    enforcing_on(descriptor(device), uses)
+}
+
+fn enforcing_on(desc: Descriptor, uses: &[&str]) -> (Arc<EnforcingBackend>, Arc<InProcessBackend>) {
+    let desc = Arc::new(desc);
     let inner = InProcessBackend::shared(desc.clone());
     let validated = manifest(uses).validate(&desc).expect("manifest validates");
     let eb = Arc::new(EnforcingBackend::new(inner.clone(), &validated));
@@ -40,8 +43,15 @@ fn enforcing(device: &str, uses: &[&str]) -> (Arc<EnforcingBackend>, Arc<InProce
 
 #[test]
 fn launch_validator_rejects_over_broad_and_accepts_well_formed() {
-    // a523 backs imu+rumble: a sane manifest validates.
-    assert!(manifest(&["input", "vibration", "imu", "entropy"]).validate(&descriptor("a523")).is_ok());
+    // A device that BACKS imu: a sane manifest validates. This leg named the a523 until
+    // tsp-ozbp.16 — platform removed the a523 IMU row (qmi8658 DT-present, driver-UNBOUND per
+    // SPIKE-0 2026-07-11), so it only held against the stale vendored descriptor copy. The rule
+    // under test is device-agnostic, so it runs on the synthetic bound-IMU rig.
+    let imu_rig = pocketforge::test_support::imu_descriptor();
+    assert!(manifest(&["input", "vibration", "imu", "entropy"]).validate(&imu_rig).is_ok());
+    // a523 itself backs rumble but NOT a bound imu — required imu is over-broad there too.
+    assert!(manifest(&["input", "vibration", "entropy"]).validate(&descriptor("a523")).is_ok());
+    assert!(manifest(&["imu"]).validate(&descriptor("a523")).is_err());
     // a133 has no IMU: a REQUIRED imu is an over-broad route → rejected.
     assert!(manifest(&["imu"]).validate(&descriptor("a133")).is_err());
     // …but OPTIONAL imu? is allowed (graceful absence at runtime).
@@ -159,9 +169,12 @@ fn undeclared_capability_is_policy_blocked() {
 
 #[test]
 fn declared_present_capability_passes_through_to_inner() {
-    let (eb, _inner) = enforcing("a523", &["input", "vibration", "imu"]);
+    // Needs a device that HAS the declared hardware; no shipping device has a bound IMU today
+    // (tsp-ozbp.16), so this runs on the synthetic rig — which also carries a rumble motor.
+    let (eb, _inner) =
+        enforcing_on(pocketforge::test_support::imu_descriptor(), &["input", "vibration", "imu"]);
     assert!(eb.acquire("imu").is_ok(), "declared + present imu acquires");
-    assert_eq!(eb.rumble_pulse(40), pocketforge::RumbleStatus::Fired, "declared rumble fires (a523 has a motor)");
+    assert_eq!(eb.rumble_pulse(40), pocketforge::RumbleStatus::Fired, "declared rumble fires (the rig has a motor)");
 }
 
 #[test]

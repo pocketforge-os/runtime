@@ -484,11 +484,10 @@ impl AppManifest {
 mod tests {
     use super::*;
 
+    /// The REAL device descriptor from the `platform` checkout — this repo vendors no copy
+    /// (`tsp-ozbp.16`). Panics (never skips) when no checkout is resolvable.
     fn desc(id: &str) -> Descriptor {
-        let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../pocketforge/tests/fixtures")
-            .join(format!("{id}-capabilities.toml"));
-        Descriptor::load(p).expect("fixture")
+        pocketforge::test_support::descriptor(id)
     }
 
     fn manifest(uses: &[&str]) -> AppManifest {
@@ -511,10 +510,19 @@ mod tests {
 
     #[test]
     fn a523_well_formed_manifest_validates() {
-        let m = manifest(&["input", "vibration", "imu", "entropy", "location:approximate?", "egress:steampowered.com"]);
-        let v = m.validate(&desc("a523")).expect("a523 backs imu + rumble");
+        // a523 backs rumble; its IMU and GNSS are DT-present but driver-UNBOUND, so platform
+        // omits both rows (SPIKE-0, 2026-07-11) and a REQUIRED `imu` would be over-broad. The
+        // list asked for a required `imu` until tsp-ozbp.16 and only validated against the stale
+        // vendored copy; `imu?` is the honest declaration for hardware the device may not bind.
+        let m = manifest(&["input", "vibration", "imu?", "entropy", "location:approximate?", "egress:steampowered.com"]);
+        let v = m.validate(&desc("a523")).expect("a523 backs rumble; imu is optional");
         assert!(v.allows("imu") && v.allows("vibration") && v.allows("egress"));
         assert_eq!(v.egress_hosts().collect::<Vec<_>>(), ["steampowered.com"]);
+        // …and a REQUIRED imu on the a523 is now rejected exactly like it is on the a133.
+        assert_eq!(
+            manifest(&["imu"]).validate(&desc("a523")).unwrap_err(),
+            vec![Violation::UndescriptoredRequired("imu".into())],
+        );
     }
 
     #[test]

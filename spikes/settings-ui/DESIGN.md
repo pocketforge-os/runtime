@@ -177,8 +177,9 @@ recipe is E6/C2's separate pin.
 - `crates/pocketforge/src/backends/inproc.rs` — `subscribe_preference`,
   `set_preference`, `reload_prefs`; `crates/pocketforge/tests/prefs_change_event.rs`
   — the observer + primitive-honoring template this spike's harness mirrors.
-- `crates/pocketforge/tests/fixtures/{a133,a523}-capabilities.toml` — the E1
-  descriptors (a133 omits `rumble`) the honest-absent leg reads.
+- `platform/devices/{a133,a523}/capabilities.toml` — the E1 descriptors (a133 omits
+  `rumble`) the honest-absent leg reads, resolved via `pocketforge::test_support`
+  from `$PF_PLATFORM_DIR` or a sibling checkout. This repo vendors no copy (tsp-ozbp.16).
 - `pocketforge-os/sim/fb/README.md` — the pinned tsp-osr-safe recipe.
 - `runtime/STABILITY.md` — the frozen-v1 constraint the harness respects (public API
   only; no wire/ABI touch).
