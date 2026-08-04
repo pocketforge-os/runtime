@@ -155,9 +155,7 @@ gives it teeth.
 - **An `if:` on a required job/step is treated as skippable** unless the manifest
   whitelists it with `allow_if = true`. Evaluating GitHub expression truthiness for
   arbitrary events is out of scope, so the conservative reading is "a conditional
-  required gate might skip". The one whitelisted case is `pr-review.yml`'s caller
-  job, whose `if:` only skips *title-only* edits and never a code PR (and which is
-  already the enforced required check).
+  required gate might skip".
 - **`no-unlocked-cargo` is a universal invariant**, not a single-step presence
   check: *every* lock-consuming `cargo` invocation across *all* workflows must
   carry `--locked` (version/help forms exempt). That is the true shape of the
