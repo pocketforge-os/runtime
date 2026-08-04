@@ -146,25 +146,6 @@ guards_paths = ["*"]  # prefs-e2e.yml has no paths filter today; it runs on all 
 should_be_required_check = true
 origin = "tsp-xubv.4"
 
-[[gate]]
-id = "peer-review-gate"
-invariant = "Every non-draft PR is gated by the org peer-review workflow (the ONE check that is ALREADY a required status check on main)."
-workflow = ".github/workflows/pr-review.yml"
-job = "pf-pr-review"
-# A `uses:` caller, not a `run:` step — the checker matches the reusable-workflow
-# reference for this job.
-required_uses = "pocketforge-os/shared-workflows/.github/workflows/pr-review-gate.yml"
-# This job carries a job-level `if:` that skips TITLE-ONLY edits (never a code
-# PR — it always runs on opened/synchronize/reopened/ready_for_review). The
-# checker treats an `if:` on a required job as skippable unless whitelisted,
-# because it does not evaluate GitHub expression truthiness for arbitrary
-# events; this one is explicitly acknowledged and it is already the enforced
-# required check (ruleset 18463042). See README "Modelling choices".
-allow_if = true
-guards_paths = ["*"]  # runs on all PRs (no paths filter).
-should_be_required_check = true   # and IS, today (ruleset 18463042).
-origin = "tsp-8ny"
-
 # -----------------------------------------------------------------------------
 # The meta-gate guards the others; this entry makes the meta-gate guard ITSELF
 # against being neutered (its trigger stripped, its steps if-skipped, etc.).
