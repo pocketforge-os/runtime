@@ -138,8 +138,10 @@ specific live run's executed-step log. Therefore:
 
 A gate being **invoked** in a workflow (what this meta-gate enforces) is not the
 same as a **red result blocking a merge**. As of 2026-07-27 the only required
-status check on `runtime`'s `main` is **`pf-pr-review / review`** (org ruleset id
-**18463042**). `runtime-tests` and `prefs-e2e` **run but are not required checks**,
+status check on `runtime`'s `main` was the now-retired local-model review gate
+(org ruleset id **18463042**). GitHub Copilot review is now enforced by the
+merge-time gate rather than a CI status check. `runtime-tests` and `prefs-e2e`
+**run but are not required checks**,
 so a red `cargo test` / `clippy` / `--locked` / musl result does **not** currently
 block a merge — the required-check analog of the same defect class ("the job ran
 and turned red but nobody was required to look").

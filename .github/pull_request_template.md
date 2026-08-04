@@ -8,7 +8,7 @@
 
 <!-- How you verified this change — real, checkable steps, not "ran tests".
      Check a box ONLY when that step is actually done; an unchecked box means
-     not-done and the pf-pr-review gate verifies each box against the diff.
+     not-done; GitHub Copilot reviews the checked evidence against the diff.
      Cite a bead or follow-up PR for anything deliberately deferred. -->
 
 - [ ] 
