@@ -36,12 +36,13 @@
 # REQUIRED-CHECK REALITY (Layer 2) — read before trusting a green tick to gate.
 # -----------------------------------------------------------------------------
 # A gate being INVOKED in a workflow (what this manifest + checker enforce) is
-# NOT the same as a RED result BLOCKING a merge. As of 2026-07-27 the ONLY
-# required status check on `runtime`'s `main` branch is `pf-pr-review / review`
-# (org ruleset id 18463042, enforcement active). The `runtime-tests` and
-# `prefs-e2e` workflows RUN on every relevant PR but are in NO ruleset's
-# `required_status_checks`, so a RED cargo-test / clippy / lockfile / musl
-# result does NOT currently block a merge — they are visible-but-non-blocking.
+# NOT the same as a RED result BLOCKING a merge. Peer review is enforced at
+# merge time by `pf-pr-merge.sh`: a non-author Copilot review must be present
+# and every review thread must be resolved. That is not a CI status check. The
+# `runtime-tests` and `prefs-e2e` workflows RUN on every relevant PR but are in
+# NO ruleset's `required_status_checks`, so a RED cargo-test / clippy / lockfile
+# / musl result does NOT currently block a merge — they are
+# visible-but-non-blocking.
 #
 # RECOMMENDATION: the gates below whose `should_be_required_check = true`
 # (including the `gate-manifest` meta-gate itself) SHOULD be wired as required
