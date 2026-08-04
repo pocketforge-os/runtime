@@ -28,9 +28,10 @@
 #      pasted transcript (guards-must-be-shown-to-fail).
 #
 # NOTE ON TEETH (Layer 2): a RED here only BLOCKS a merge once `gate-manifest`
-# is a required status check. Today the only required check on runtime/main is
-# `pf-pr-review / review`; wiring this (and the cargo gates) as required checks
-# is an OWNER/admin action tracked in tsp-i9xs. See ../quality-gates.toml.
+# is a required status check. The former local-model review check is retired;
+# GitHub Copilot review is enforced by the merge-time gate rather than CI.
+# Wiring this (and the cargo gates) as required checks is an OWNER/admin action
+# tracked in tsp-i9xs. See ../quality-gates.toml.
 
 name: gate-manifest
 
