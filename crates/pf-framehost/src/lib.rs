@@ -383,7 +383,7 @@ mod tests {
         fn pan(&mut self, _: RawFd, y: u32) -> io::Result<()> {
             self.calls.lock().unwrap().push(y);
             if self.fail {
-                Err(io::Error::new(io::ErrorKind::Other, "pan failed"))
+                Err(io::Error::other("pan failed"))
             } else {
                 Ok(())
             }
