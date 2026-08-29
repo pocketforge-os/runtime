@@ -1,0 +1,15 @@
+[package]
+name = "pf-theme"
+description = "Validated data-only PocketForge theme packages"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+pf-scene.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+

@@ -15,6 +15,7 @@ members = [
     "crates/pf-collect-ui",
     "crates/pf-scene",
     "crates/pf-ports",
+    "crates/pf-theme",
 ]
 
 # Shared metadata for every crate in the runtime workspace (tsp-e1b.2 / E2).

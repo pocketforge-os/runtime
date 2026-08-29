@@ -194,6 +194,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "pf-theme"
+version = "0.0.1"
+dependencies = [
+ "pf-scene",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "pf-wire"
 version = "0.0.1"
 
