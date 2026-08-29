@@ -613,6 +613,33 @@ impl<S: RemapStore> RemapEngine<S> {
         });
         Ok(TransactionOutcome::Committed)
     }
+    /// Restores every binding shipped by the device contract in one atomic commit.
+    pub fn reset_to_shipped(&mut self) -> Result<(), MapError> {
+        self.pending = None;
+
+        let shipped = self.map.shipped.clone();
+        let changed_actions = self
+            .map
+            .mappings
+            .iter()
+            .filter_map(|mapping| {
+                self.map
+                    .shipped_binding(&mapping.context, &mapping.action)
+                    .filter(|binding| *binding != &mapping.binding)
+                    .map(|_| mapping.action.clone())
+            })
+            .collect();
+
+        // Persistence is the commit point: do not expose the shipped map unless the single
+        // complete-map save succeeds.
+        self.store.save(&self.map.device_id, &shipped)?;
+        self.map.mappings = shipped;
+        self.map.events.push_back(MapEvent::GlyphsUpdated {
+            device_id: self.map.device_id.clone(),
+            actions: changed_actions,
+        });
+        Ok(())
+    }
     pub fn timeout(&mut self) -> Result<TransactionOutcome, MapError> {
         self.rollback(RollbackReason::Timeout)
     }

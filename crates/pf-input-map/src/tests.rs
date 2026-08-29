@@ -147,6 +147,68 @@ fn persistence_failure_is_an_interrupted_commit_with_no_visible_change_or_event(
 }
 
 #[test]
+fn reset_to_shipped_restores_a_chained_move() {
+    let mut engine = RemapEngine::new(map(A133), MemoryStore::default());
+    engine
+        .begin("shell", "Activate", Binding::single("west"))
+        .unwrap();
+    engine.confirm().unwrap();
+    engine
+        .begin("shell", "Back", Binding::single("east"))
+        .unwrap();
+    engine.confirm().unwrap();
+
+    engine.reset_to_shipped().unwrap();
+
+    assert_eq!(engine.map().mappings(), engine.map().shipped);
+}
+
+#[test]
+fn reset_to_shipped_restores_a_pure_swap() {
+    let device = contract(A133);
+    let mut swapped = device.effective_map.clone();
+    let activate = mapping_index(&swapped, "shell", "Activate").unwrap();
+    let back = mapping_index(&swapped, "shell", "Back").unwrap();
+    let activate_binding = swapped[activate].binding.clone();
+    swapped[activate].binding = swapped[back].binding.clone();
+    swapped[back].binding = activate_binding;
+    let effective = EffectiveMap::from_persisted(device, Some(("a133".into(), swapped))).unwrap();
+    let mut engine = RemapEngine::new(effective, MemoryStore::default());
+
+    engine.reset_to_shipped().unwrap();
+
+    assert_eq!(engine.map().mappings(), engine.map().shipped);
+}
+
+#[test]
+fn reset_to_shipped_failure_leaves_the_in_memory_map_unchanged() {
+    let mut effective = map(A133);
+    effective.mappings[0].binding = Binding::single("west");
+    let unchanged = effective.mappings().to_vec();
+    let mut engine = RemapEngine::new(effective, MemoryStore::failing());
+
+    assert!(matches!(
+        engine.reset_to_shipped(),
+        Err(MapError::Persistence(_))
+    ));
+    assert_eq!(engine.map().mappings(), unchanged);
+    assert_eq!(engine.map_mut().next_event(), None);
+}
+
+#[test]
+fn reset_to_shipped_cancels_an_in_flight_preview() {
+    let mut engine = RemapEngine::new(map(A133), MemoryStore::default());
+    engine
+        .begin("shell", "Activate", Binding::single("west"))
+        .unwrap();
+
+    engine.reset_to_shipped().unwrap();
+
+    assert_eq!(engine.confirm(), Err(MapError::NoTransaction));
+    assert_eq!(engine.map().mappings(), engine.map().shipped);
+}
+
+#[test]
 fn rejects_safe_return_collision_across_contexts() {
     let mut engine = RemapEngine::new(map(A133), MemoryStore::default());
     assert_eq!(
