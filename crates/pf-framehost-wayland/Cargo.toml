@@ -1,0 +1,23 @@
+[package]
+name = "pf-framehost-wayland"
+description = "Production wl_shm/xdg-shell FrameHost adapter"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+pf-ports = { workspace = true }
+pf-render = { workspace = true }
+pf-scene = { workspace = true }
+tempfile = "3"
+wayland-client = "=0.31.11"
+wayland-protocols = { version = "=0.32.9", features = ["client"] }
+
+[[example]]
+name = "headless_fixture"
+
+[[example]]
+name = "reconnect_fixture"
