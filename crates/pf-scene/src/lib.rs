@@ -191,7 +191,7 @@ pub enum StateTransition {
 pub struct Scene {
     root: Node,
     default_focus: NodeId,
-    focused: NodeId,
+    focused: Option<NodeId>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -213,19 +213,21 @@ impl fmt::Display for SceneError {
 impl std::error::Error for SceneError {}
 
 impl Scene {
-    /// Validates stable-ID uniqueness and focuses the declared default anchor.
+    /// Validates stable-ID uniqueness and establishes initial focus.
+    ///
+    /// Focus resolves to the declared anchor when it is focusable, then to the first
+    /// focusable node in stable pre-order traversal. If no node is focusable, the scene
+    /// has the explicit no-focus state reported by [`Scene::focused`] as `None`.
     pub fn new(mut root: Node, default_focus: NodeId) -> Result<Self, SceneError> {
         let mut ids = HashSet::new();
         validate_ids(&root, &mut ids)?;
-        let anchor = find(&root, &default_focus)
+        find(&root, &default_focus)
             .ok_or_else(|| SceneError::DefaultFocusMissing(default_focus.clone()))?;
-        if !anchor.is_focusable() {
-            return Err(SceneError::DefaultFocusNotFocusable(default_focus));
-        }
-        set_focus(&mut root, &default_focus);
+        let focused = resolve_focus(&root, &default_focus);
+        set_focus(&mut root, focused.as_ref());
         Ok(Self {
             root,
-            focused: default_focus.clone(),
+            focused,
             default_focus,
         })
     }
@@ -238,23 +240,30 @@ impl Scene {
         &self.default_focus
     }
 
-    pub fn focused(&self) -> &NodeId {
-        &self.focused
+    /// Returns the focused node ID, or `None` when the scene has no focusable node.
+    pub fn focused(&self) -> Option<&NodeId> {
+        self.focused.as_ref()
     }
 
-    pub fn focused_node(&self) -> &Node {
-        find(&self.root, &self.focused).expect("validated focus identifier")
+    /// Returns the focused node, or `None` when the scene has no focusable node.
+    pub fn focused_node(&self) -> Option<&Node> {
+        self.focused
+            .as_ref()
+            .map(|id| find(&self.root, id).expect("validated focus identifier"))
     }
 
     /// Moves toward the nearest focusable node in the requested half-plane.
     /// At an edge it returns `false` and leaves focus unchanged; traversal never wraps.
     pub fn move_focus(&mut self, direction: AxisMove) -> bool {
-        let current = self.focused_node().bounds.center();
+        let Some(focused_node) = self.focused_node() else {
+            return false;
+        };
+        let current = focused_node.bounds.center();
         let mut candidates = Vec::new();
         collect_focusable(&self.root, &mut candidates);
         let next = candidates
             .into_iter()
-            .filter(|node| node.id != self.focused)
+            .filter(|node| Some(&node.id) != self.focused.as_ref())
             .filter_map(|node| {
                 let center = node.bounds.center();
                 directional_rank(current, center, direction).map(|rank| (rank, node.id.clone()))
@@ -262,18 +271,23 @@ impl Scene {
             .min_by(|a, b| a.0.total_cmp(&b.0))
             .map(|(_, id)| id);
         if let Some(next) = next {
-            set_focus(&mut self.root, &next);
-            self.focused = next;
+            set_focus(&mut self.root, Some(&next));
+            self.focused = Some(next);
             true
         } else {
             false
         }
     }
 
-    /// Restores the declared default anchor.
+    /// Restores focus using the scene's deterministic resolution order.
+    ///
+    /// Focus resolves to the declared anchor when it is focusable, then to the first
+    /// focusable node in stable pre-order traversal. If no node is focusable, focus is
+    /// cleared and [`Scene::focused`] reports `None`.
     pub fn reset_focus(&mut self) {
-        set_focus(&mut self.root, &self.default_focus);
-        self.focused = self.default_focus.clone();
+        let focused = resolve_focus(&self.root, &self.default_focus);
+        set_focus(&mut self.root, focused.as_ref());
+        self.focused = focused;
     }
 
     /// Applies semantic state without allowing callers to forge the focus bit.
@@ -282,7 +296,7 @@ impl Scene {
         id: &NodeId,
         transition: StateTransition,
     ) -> Result<(), SceneError> {
-        if id == &self.focused && transition == StateTransition::Disabled(true) {
+        if self.focused.as_ref() == Some(id) && transition == StateTransition::Disabled(true) {
             return Err(SceneError::CannotDisableFocused(id.clone()));
         }
         let node =
@@ -334,8 +348,21 @@ fn find_mut<'a>(node: &'a mut Node, id: &NodeId) -> Option<&'a mut Node> {
         .find_map(|child| find_mut(child, id))
 }
 
-fn set_focus(node: &mut Node, id: &NodeId) {
-    node.state.focused = node.id == *id;
+fn resolve_focus(root: &Node, preferred: &NodeId) -> Option<NodeId> {
+    find(root, preferred)
+        .filter(|node| node.is_focusable())
+        .or_else(|| first_focusable(root))
+        .map(|node| node.id.clone())
+}
+
+fn first_focusable(node: &Node) -> Option<&Node> {
+    node.is_focusable()
+        .then_some(node)
+        .or_else(|| node.children.iter().find_map(first_focusable))
+}
+
+fn set_focus(node: &mut Node, id: Option<&NodeId>) {
+    node.state.focused = id == Some(&node.id);
     for child in &mut node.children {
         set_focus(child, id);
     }
@@ -393,7 +420,7 @@ mod tests {
         for width in 1..=7 {
             for height in 1..=7 {
                 let initial = grid(width, height);
-                let mut seen = HashSet::from([initial.focused().clone()]);
+                let mut seen = HashSet::from([initial.focused().unwrap().clone()]);
                 let mut queue = VecDeque::from([initial]);
                 while let Some(scene) = queue.pop_front() {
                     for direction in [
@@ -404,7 +431,7 @@ mod tests {
                     ] {
                         let mut next = scene.clone();
                         next.move_focus(direction);
-                        if seen.insert(next.focused().clone()) {
+                        if seen.insert(next.focused().unwrap().clone()) {
                             queue.push_back(next);
                         }
                     }
@@ -418,12 +445,12 @@ mod tests {
     fn edges_do_not_wrap_and_focus_is_structural_state() {
         let mut scene = grid(3, 1);
         assert!(!scene.move_focus(AxisMove::Left));
-        assert_eq!(scene.focused().as_str(), "n-0-0");
-        assert!(scene.focused_node().state.focused);
+        assert_eq!(scene.focused().unwrap().as_str(), "n-0-0");
+        assert!(scene.focused_node().unwrap().state.focused);
         assert!(scene.move_focus(AxisMove::Right));
         assert!(scene.move_focus(AxisMove::Right));
         assert!(!scene.move_focus(AxisMove::Right));
-        assert_eq!(scene.focused().as_str(), "n-2-0");
+        assert_eq!(scene.focused().unwrap().as_str(), "n-2-0");
     }
 
     #[test]
@@ -452,8 +479,8 @@ mod tests {
             "root",
         );
         assert_eq!(
-            Scene::new(non_focusable, id("root")).unwrap_err(),
-            SceneError::DefaultFocusNotFocusable(id("root"))
+            Scene::new(non_focusable, id("root")).unwrap().focused(),
+            None
         );
     }
 
@@ -478,5 +505,51 @@ mod tests {
             scene.transition_state(&id("absent"), StateTransition::Selected(true)),
             Err(SceneError::NodeMissing(id("absent")))
         );
+    }
+
+    #[test]
+    fn reset_focus_falls_back_when_the_declared_anchor_is_disabled() {
+        let mut scene = grid(3, 1);
+        assert!(scene.move_focus(AxisMove::Right));
+        scene
+            .transition_state(&id("n-0-0"), StateTransition::Disabled(true))
+            .unwrap();
+
+        scene.reset_focus();
+
+        assert_eq!(scene.focused().unwrap().as_str(), "n-1-0");
+        assert!(scene.focused_node().unwrap().is_focusable());
+    }
+
+    #[test]
+    fn disabled_initial_anchor_falls_back_and_all_disabled_is_unfocused() {
+        let mut disabled_anchor = button("anchor".into(), 0.0, 0.0);
+        disabled_anchor.state.disabled = true;
+        let fallback = button("fallback".into(), 12.0, 0.0);
+        let root = Node::new(
+            id("root"),
+            Role::Group,
+            "root",
+            Bounds::new(0.0, 0.0, 1.0, 1.0),
+            "root",
+        )
+        .with_children(vec![disabled_anchor.clone(), fallback]);
+        let scene = Scene::new(root, id("anchor")).unwrap();
+        assert_eq!(scene.focused().unwrap().as_str(), "fallback");
+
+        let mut disabled_fallback = button("fallback".into(), 12.0, 0.0);
+        disabled_fallback.state.disabled = true;
+        let root = Node::new(
+            id("root"),
+            Role::Group,
+            "root",
+            Bounds::new(0.0, 0.0, 1.0, 1.0),
+            "root",
+        )
+        .with_children(vec![disabled_anchor, disabled_fallback]);
+        let scene = Scene::new(root, id("anchor")).unwrap();
+        assert_eq!(scene.focused(), None);
+        assert_eq!(scene.focused_node(), None);
+        assert!(!scene.root().state.focused);
     }
 }
