@@ -167,6 +167,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "pf-input-map"
+version = "0.0.1"
+dependencies = [
+ "pf-ports",
+ "pf-scene",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "pf-ports"
 version = "0.0.1"
 dependencies = [
