@@ -5,6 +5,11 @@
 //! real shell presentation acknowledged. The core atomically persists the completed receipt
 //! before publishing it. Failure at termination or at any ladder rung atomically records
 //! [`RecoveryRequired`] instead; an unavailable shell is never asked to render its own failure.
+//!
+//! Session history uses user-facing wall-clock time. An NTP step during a session can skew one
+//! entry, so consumers must clamp negative durations to zero. A duration is derivable only when
+//! both timestamps are present: an absent stamp means "unknown", never a zero-length session.
+//! Aggregation is deliberately a consumer concern.
 
 use pf_ports::{
     Clock, LaunchRequest, LaunchResult, MonotonicTime, ObservedSessionState, RecoveryRequired,
@@ -17,7 +22,7 @@ use std::io;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AuthorityError {
@@ -48,11 +53,27 @@ pub enum Receipt {
     Crash { summary: String },
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum EndPrecision {
+    Observed,
+    Approximate,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct EndStamp {
+    pub at: SystemTime,
+    pub precision: EndPrecision,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct HistoryEntry {
     pub session_id: String,
     pub item_id: String,
     pub receipt: Option<Receipt>,
+    #[serde(default)]
+    pub started_at: Option<SystemTime>,
+    #[serde(default)]
+    pub ended_at: Option<EndStamp>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -385,6 +406,9 @@ pub trait AuthorityApi {
     }
     fn acknowledge(&mut self, client_id: &str, sequence: u64) -> Result<(), AuthorityError>;
     fn history(&self) -> Vec<SessionEvent>;
+    fn history_entries(&self) -> Vec<HistoryEntry> {
+        Vec::new()
+    }
 }
 
 /// Versioned session-authority RPC payload carried inside `pf-wire` frames.
@@ -432,7 +456,7 @@ pub enum RpcResponse {
     RejectedBusy,
     ItemUnavailable,
     Events { events: Vec<(u64, RpcEvent)> },
-    History { events: Vec<RpcEvent> },
+    History { entries: Vec<HistoryEntry> },
     Ok,
     Error { message: String },
 }
@@ -519,7 +543,7 @@ fn handle_rpc<S: StateStore, B: SessionSystem, C: Clock>(
             RpcResponse::Ok
         }
         RpcRequest::History => RpcResponse::History {
-            events: authority.history().into_iter().map(Into::into).collect(),
+            entries: authority.history_entries(),
         },
         RpcRequest::Observe { observation } => {
             authority.observe(observation.into())?;
@@ -540,6 +564,7 @@ pub struct Authority<S, B, C> {
     recent_bound: usize,
     grace: Duration,
     graceful_deadline: Option<MonotonicTime>,
+    now_fn: fn() -> SystemTime,
 }
 
 impl<S: StateStore, B: SessionSystem, C: Clock> Authority<S, B, C> {
@@ -550,6 +575,17 @@ impl<S: StateStore, B: SessionSystem, C: Clock> Authority<S, B, C> {
         recent_bound: usize,
         grace: Duration,
     ) -> Result<Self, AuthorityError> {
+        Self::open_with_now_fn(store, system, clock, recent_bound, grace, SystemTime::now)
+    }
+
+    pub fn open_with_now_fn(
+        store: S,
+        system: B,
+        clock: C,
+        recent_bound: usize,
+        grace: Duration,
+        now_fn: fn() -> SystemTime,
+    ) -> Result<Self, AuthorityError> {
         let state = store.load()?.unwrap_or_default();
         Ok(Self {
             store,
@@ -559,6 +595,7 @@ impl<S: StateStore, B: SessionSystem, C: Clock> Authority<S, B, C> {
             recent_bound: recent_bound.max(1),
             grace,
             graceful_deadline: None,
+            now_fn,
         })
     }
     pub fn state(&self) -> &PersistedState {
@@ -703,6 +740,17 @@ impl<S: StateStore, B: SessionSystem, C: Clock> Authority<S, B, C> {
         let session_id = self
             .session_id()
             .ok_or(AuthorityError::InvalidObservation)?;
+        if let Some(entry) = self
+            .state
+            .history
+            .iter_mut()
+            .find(|e| e.session_id == session_id)
+        {
+            entry.ended_at = Some(EndStamp {
+                at: (self.now_fn)(),
+                precision: EndPrecision::Observed,
+            });
+        }
         self.state.phase = Phase::Restoring {
             session_id,
             receipt,
@@ -717,17 +765,36 @@ impl<S: StateStore, B: SessionSystem, C: Clock> Authority<S, B, C> {
         match (&self.state.phase, observation) {
             (Phase::Starting { .. }, Observation::SessionRunning) => {
                 let id = self.session_id().unwrap();
+                if let Some(entry) = self.state.history.iter_mut().find(|e| e.session_id == id) {
+                    entry.started_at = Some((self.now_fn)());
+                }
                 self.state.phase = Phase::Running { session_id: id };
                 self.publish(WireEvent::ObservedRunning);
                 self.persist()
             }
             (Phase::Starting { .. } | Phase::Running { .. }, Observation::SessionExitedCleanly) => {
+                let id = self.session_id().unwrap();
+                if let Some(entry) = self.state.history.iter_mut().find(|e| e.session_id == id) {
+                    entry.ended_at = Some(EndStamp {
+                        at: (self.now_fn)(),
+                        precision: EndPrecision::Observed,
+                    });
+                }
                 self.begin_restoration(Receipt::Returned)
             }
             (
                 Phase::Starting { .. } | Phase::Running { .. },
                 Observation::SessionCrashed { summary },
-            ) => self.begin_restoration(Receipt::Crash { summary }),
+            ) => {
+                let id = self.session_id().unwrap();
+                if let Some(entry) = self.state.history.iter_mut().find(|e| e.session_id == id) {
+                    entry.ended_at = Some(EndStamp {
+                        at: (self.now_fn)(),
+                        precision: EndPrecision::Approximate,
+                    });
+                }
+                self.begin_restoration(Receipt::Crash { summary })
+            }
             (Phase::StoppingGracefully { .. }, Observation::UnitInactive) => {
                 self.unit_inactive(Receipt::Returned)
             }
@@ -845,6 +912,8 @@ impl<S: StateStore, B: SessionSystem, C: Clock> AuthorityApi for Authority<S, B,
             session_id: id.clone(),
             item_id: request.item_id,
             receipt: None,
+            started_at: None,
+            ended_at: None,
         });
         self.state.history.truncate(self.recent_bound);
         self.publish(WireEvent::ObservedStarting);
@@ -888,6 +957,9 @@ impl<S: StateStore, B: SessionSystem, C: Clock> AuthorityApi for Authority<S, B,
                     .map(|r| SessionEvent::Terminal(receipt_to_port(r, &h.session_id)))
             })
             .collect()
+    }
+    fn history_entries(&self) -> Vec<HistoryEntry> {
+        self.state.history.iter().cloned().collect()
     }
 }
 

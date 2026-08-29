@@ -1,6 +1,20 @@
 use super::*;
 use pf_ports::{SessionEvent, TestClock};
+use std::cell::Cell;
 use std::path::PathBuf;
+use std::time::SystemTime;
+
+thread_local! {
+    static WALL_TIME_SECS: Cell<u64> = const { Cell::new(1_234) };
+}
+
+fn fixed_wall_time() -> SystemTime {
+    WALL_TIME_SECS.with(|seconds| SystemTime::UNIX_EPOCH + Duration::from_secs(seconds.get()))
+}
+
+fn set_wall_time(seconds: u64) {
+    WALL_TIME_SECS.with(|wall_time| wall_time.set(seconds));
+}
 
 #[derive(Default)]
 struct FakeSystem {
@@ -39,6 +53,26 @@ fn file_store_reports_corruption_as_typed_recovery_error() {
         FileStore::new(&path).load(),
         Err(AuthorityError::CorruptState { path: got, .. }) if got == path
     ));
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn file_store_loads_pre_timestamp_history_fixture() {
+    let dir = scratch("pre-timestamp");
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("state.json");
+    fs::write(
+        &path,
+        include_bytes!("../tests/fixtures/pre_timestamp_state.json"),
+    )
+    .unwrap();
+
+    let state = FileStore::new(&path).load().unwrap().unwrap();
+    let entry = state.history.front().unwrap();
+    assert_eq!(entry.item_id, "legacy-game");
+    assert_eq!(entry.started_at, None);
+    assert_eq!(entry.ended_at, None);
     fs::remove_dir_all(dir).unwrap();
 }
 
@@ -264,6 +298,91 @@ fn clean_exit_and_crash_are_typed_and_wait_for_presentation() {
             );
         }
     }
+}
+
+#[test]
+fn fixed_wall_clock_stamps_end_observation_not_restoration_completion() {
+    let make = || {
+        set_wall_time(1_234);
+        Authority::open_with_now_fn(
+            MemoryStore::default(),
+            FakeSystem::available(),
+            TestClock::new(),
+            3,
+            Duration::from_millis(10),
+            fixed_wall_time,
+        )
+        .unwrap()
+    };
+
+    let mut returned = make();
+    launch_running(&mut returned);
+    returned.observe(Observation::SessionExitedCleanly).unwrap();
+    set_wall_time(9_999);
+    returned.observe(Observation::UnitInactive).unwrap();
+    restore(&mut returned);
+    let entry = returned.state.history.front().unwrap();
+    assert_eq!(
+        entry.started_at,
+        Some(SystemTime::UNIX_EPOCH + Duration::from_secs(1_234))
+    );
+    assert_eq!(
+        entry.ended_at,
+        Some(EndStamp {
+            at: SystemTime::UNIX_EPOCH + Duration::from_secs(1_234),
+            precision: EndPrecision::Observed,
+        })
+    );
+
+    let mut forced_close = make();
+    launch_running(&mut forced_close);
+    forced_close.intake_safe_return().unwrap();
+    forced_close.tick().unwrap();
+    forced_close.clock.advance(Duration::from_millis(10));
+    forced_close.tick().unwrap();
+    set_wall_time(2_345);
+    forced_close.observe(Observation::UnitInactive).unwrap();
+    set_wall_time(9_999);
+    restore(&mut forced_close);
+    assert_eq!(
+        forced_close.state.history.front().unwrap().ended_at,
+        Some(EndStamp {
+            at: SystemTime::UNIX_EPOCH + Duration::from_secs(2_345),
+            precision: EndPrecision::Observed,
+        })
+    );
+
+    let mut crashed = make();
+    launch_running(&mut crashed);
+    crashed
+        .observe(Observation::SessionCrashed {
+            summary: "fault".into(),
+        })
+        .unwrap();
+    assert_eq!(
+        crashed.state.history.front().unwrap().ended_at,
+        Some(EndStamp {
+            at: fixed_wall_time(),
+            precision: EndPrecision::Approximate,
+        })
+    );
+    crashed.observe(Observation::UnitInactive).unwrap();
+    restore(&mut crashed);
+
+    let mut never_running = make();
+    never_running
+        .launch(LaunchRequest {
+            item_id: "never-running".into(),
+        })
+        .unwrap();
+    never_running
+        .observe(Observation::SessionExitedCleanly)
+        .unwrap();
+    never_running.observe(Observation::UnitInactive).unwrap();
+    restore(&mut never_running);
+    let entry = never_running.state.history.front().unwrap();
+    assert_eq!(entry.started_at, None);
+    assert_eq!(entry.ended_at.unwrap().precision, EndPrecision::Observed);
 }
 
 #[test]

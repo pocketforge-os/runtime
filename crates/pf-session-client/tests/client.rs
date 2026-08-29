@@ -150,7 +150,7 @@ fn socket_transport_orders_receipt_and_resumes_durable_cursor() {
             Duration::from_secs(1),
         )
         .unwrap();
-        for step in 0..9 {
+        for step in 0..10 {
             if step == 2 {
                 authority.observe(Observation::SessionRunning).unwrap();
             }
@@ -211,6 +211,11 @@ fn socket_transport_orders_receipt_and_resumes_durable_cursor() {
         SessionPoll::Event(SessionEvent::Terminal(_))
     ));
     restarted.acknowledge_last().unwrap();
+    let entries = restarted.transport_mut().history_entries().unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].item_id, "game");
+    assert!(entries[0].started_at.is_some());
+    assert!(entries[0].ended_at.is_some());
     thread.join().unwrap();
     std::fs::remove_dir_all(dir).unwrap();
 }
