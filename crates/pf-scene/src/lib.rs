@@ -5,6 +5,7 @@
 
 use std::collections::HashSet;
 use std::fmt;
+use std::sync::Arc;
 
 /// Stable identity for a semantic node across scene revisions.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -72,6 +73,43 @@ pub struct Bounds {
     pub max_height: Option<f32>,
 }
 
+/// Content-addressed encoded image bytes supplied by the scene embedder.
+///
+/// The identifier must identify the bytes immutably. Renderers use it as their
+/// decoded-image cache key and never resolve files or network resources.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ImageSource {
+    pub id: String,
+    pub bytes: Arc<[u8]>,
+}
+
+impl ImageSource {
+    pub fn new(id: impl Into<String>, bytes: impl Into<Arc<[u8]>>) -> Self {
+        Self {
+            id: id.into(),
+            bytes: bytes.into(),
+        }
+    }
+}
+
+/// How an image is scaled while preserving its aspect ratio.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ImageFit {
+    /// Fill the node bounds, cropping equally from the overflowing dimension.
+    Cover,
+    /// Show the entire image, centered inside the node bounds.
+    Contain,
+}
+
+/// Renderer-independent visual content carried by a node.
+#[derive(Clone, Debug, PartialEq)]
+pub enum NodeContent {
+    /// Render the accessible label as text (the legacy/default behavior).
+    Label,
+    /// Render encoded image bytes; the accessible label remains semantic alt text.
+    Image { source: ImageSource, fit: ImageFit },
+}
+
 impl Bounds {
     /// Creates unconstrained logical bounds at the supplied position and size.
     pub fn new(x: f32, y: f32, width: f32, height: f32) -> Self {
@@ -104,6 +142,7 @@ pub struct Node {
     pub style_token: String,
     /// `Some` makes the node focusable and states what activation means.
     pub action: Option<NodeAction>,
+    pub content: NodeContent,
     pub children: Vec<Node>,
 }
 
@@ -123,6 +162,7 @@ impl Node {
             bounds,
             style_token: style_token.into(),
             action: None,
+            content: NodeContent::Label,
             children: Vec::new(),
         }
     }
@@ -134,6 +174,11 @@ impl Node {
 
     pub fn with_children(mut self, children: Vec<Node>) -> Self {
         self.children = children;
+        self
+    }
+
+    pub fn with_image(mut self, source: ImageSource, fit: ImageFit) -> Self {
+        self.content = NodeContent::Image { source, fit };
         self
     }
 
@@ -551,5 +596,28 @@ mod tests {
         assert_eq!(scene.focused(), None);
         assert_eq!(scene.focused_node(), None);
         assert!(!scene.root().state.focused);
+    }
+
+    #[test]
+    fn image_content_retains_encoded_bytes_and_fit() {
+        let bytes: Arc<[u8]> = Arc::from(&b"encoded image"[..]);
+        let node = Node::new(
+            id("art"),
+            Role::ListItem,
+            "Accessible cover description",
+            Bounds::new(1.0, 2.0, 30.0, 40.0),
+            "cover",
+        )
+        .with_image(
+            ImageSource::new("sha256:fixture", bytes.clone()),
+            ImageFit::Cover,
+        );
+        assert_eq!(
+            node.content,
+            NodeContent::Image {
+                source: ImageSource::new("sha256:fixture", bytes),
+                fit: ImageFit::Cover,
+            }
+        );
     }
 }
