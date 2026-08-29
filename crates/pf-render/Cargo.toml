@@ -11,4 +11,5 @@ authors.workspace = true
 [dependencies]
 cosmic-text = { version = "0.12", default-features = false, features = ["std", "swash"] }
 pf-scene = { workspace = true }
+png = "0.17"
 tiny-skia = "0.11"

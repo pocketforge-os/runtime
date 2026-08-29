@@ -1,14 +1,21 @@
 //! Deterministic scene rasterization on the ruled Cosmic Text/Swash/tiny-skia stack.
 
 use cosmic_text::{fontdb, Attrs, Buffer, Color, Family, FontSystem, Metrics, Shaping, SwashCache};
-use pf_scene::{Bounds, Node, Scene, SurfaceMetrics};
-use tiny_skia::{Color as SkColor, Paint, Pixmap, Rect, Transform};
+use pf_scene::{Bounds, ImageFit, ImageSource, Node, NodeContent, Scene, SurfaceMetrics};
+use std::collections::{HashMap, VecDeque};
+use std::io::Cursor;
+use tiny_skia::{
+    Color as SkColor, FilterQuality, Mask, Paint, Pixmap, PixmapPaint, Rect, Transform,
+};
 
 const MANROPE: &[u8] =
     include_bytes!("../../../spikes/render-text/fonts/manrope/Manrope[wght].ttf");
 const FRAUNCES: &[u8] =
     include_bytes!("../../../spikes/render-text/fonts/fraunces/Fraunces[SOFT,WONK,opsz,wght].ttf");
 const CJK: &[u8] = include_bytes!("../fonts/NotoSansCJK-Regular.ttc");
+/// Maximum decoded PNG dimensions accepted by the rasterizer (8 megapixels).
+pub const MAX_IMAGE_PIXELS: u64 = 8_000_000;
+const IMAGE_CACHE_CAPACITY: usize = 16;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DamageRect {
@@ -39,6 +46,22 @@ pub struct RasterFrame {
     pub height: u32,
     pub rgba: Vec<u8>,
     pub damage: Option<DamageRect>,
+    /// Recoverable image failures encountered while producing this frame.
+    pub notes: Vec<RenderNote>,
+}
+
+/// A typed, non-fatal condition for which the embedder may choose a fallback.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RenderNote {
+    ImageDecodeFailed {
+        source_id: String,
+    },
+    ImageTooLarge {
+        source_id: String,
+        width: u32,
+        height: u32,
+        max_pixels: u64,
+    },
 }
 
 /// Long-lived rasterizer. Cosmic Text's shaping state and Swash's glyph images are retained.
@@ -46,6 +69,7 @@ pub struct Rasterizer {
     fonts: FontSystem,
     glyphs: SwashCache,
     previous: Vec<NodeSnapshot>,
+    images: ImageCache,
 }
 
 #[derive(Clone, PartialEq)]
@@ -58,6 +82,19 @@ struct NodeSnapshot {
     focused: bool,
     disabled: bool,
     selected: bool,
+    content: ContentSnapshot,
+}
+
+#[derive(Clone, PartialEq)]
+enum ContentSnapshot {
+    Label,
+    Image { source_id: String, fit: ImageFit },
+}
+
+#[derive(Default)]
+struct ImageCache {
+    decoded: HashMap<String, Pixmap>,
+    insertion_order: VecDeque<String>,
 }
 
 impl Rasterizer {
@@ -71,6 +108,7 @@ impl Rasterizer {
             fonts: FontSystem::new_with_locale_and_db("en-US".into(), db),
             glyphs: SwashCache::new(),
             previous: Vec::new(),
+            images: ImageCache::default(),
         }
     }
 
@@ -83,10 +121,13 @@ impl Rasterizer {
         let height = physical(metrics.logical_height, metrics.scale)?;
         let mut pixmap = Pixmap::new(width, height).ok_or(RenderError::InvalidSurface)?;
         pixmap.fill(SkColor::from_rgba8(13, 17, 23, 255));
+        let mut notes = Vec::new();
         draw_node(
             &mut pixmap,
             &mut self.fonts,
             &mut self.glyphs,
+            &mut self.images,
+            &mut notes,
             scene.root(),
             metrics.scale,
         );
@@ -99,6 +140,7 @@ impl Rasterizer {
             height,
             rgba: pixmap.data().to_vec(),
             damage,
+            notes,
         })
     }
 }
@@ -138,6 +180,13 @@ fn collect(
         focused: node.state.focused,
         disabled: node.state.disabled,
         selected: node.state.selected,
+        content: match &node.content {
+            NodeContent::Label => ContentSnapshot::Label,
+            NodeContent::Image { source, fit } => ContentSnapshot::Image {
+                source_id: source.id.clone(),
+                fit: *fit,
+            },
+        },
     });
     for (index, child) in node.children.iter().enumerate() {
         collect(child, Some(node.id.as_str()), index, out);
@@ -191,6 +240,8 @@ fn draw_node(
     pm: &mut Pixmap,
     fonts: &mut FontSystem,
     glyphs: &mut SwashCache,
+    images: &mut ImageCache,
+    notes: &mut Vec<RenderNote>,
     node: &Node,
     scale: f32,
 ) {
@@ -210,23 +261,152 @@ fn draw_node(
         paint.set_color_rgba8(color.0, color.1, color.2, 255);
         pm.fill_rect(rect, &paint, Transform::identity(), None);
     }
-    draw_text(
-        pm,
-        fonts,
-        glyphs,
-        TextDraw {
-            text: &node.accessible_label,
-            x: (b.x + 6.0) * scale,
-            y: (b.y + 5.0) * scale,
-            width: (b.width - 12.0).max(1.0) * scale,
-            height: (b.height - 5.0).max(0.0) * scale,
-            size: 15.0 * scale,
-            clip: (b.x * scale, b.y * scale, b.width * scale, b.height * scale),
-        },
-    );
-    for child in &node.children {
-        draw_node(pm, fonts, glyphs, child, scale);
+    match &node.content {
+        NodeContent::Label => draw_text(
+            pm,
+            fonts,
+            glyphs,
+            TextDraw {
+                text: &node.accessible_label,
+                x: (b.x + 6.0) * scale,
+                y: (b.y + 5.0) * scale,
+                width: (b.width - 12.0).max(1.0) * scale,
+                height: (b.height - 5.0).max(0.0) * scale,
+                size: 15.0 * scale,
+                clip: (b.x * scale, b.y * scale, b.width * scale, b.height * scale),
+            },
+        ),
+        NodeContent::Image { source, fit } => {
+            if let Err(note) = draw_image(pm, images, source, *fit, b, scale) {
+                notes.push(note);
+            }
+        }
     }
+    for child in &node.children {
+        draw_node(pm, fonts, glyphs, images, notes, child, scale);
+    }
+}
+
+fn draw_image(
+    target: &mut Pixmap,
+    cache: &mut ImageCache,
+    source: &ImageSource,
+    fit: ImageFit,
+    bounds: Bounds,
+    surface_scale: f32,
+) -> Result<(), RenderNote> {
+    let image = cache.get_or_decode(source)?;
+    let target_width = bounds.width * surface_scale;
+    let target_height = bounds.height * surface_scale;
+    if target_width <= 0.0 || target_height <= 0.0 {
+        return Ok(());
+    }
+    let scale_x = target_width / image.width() as f32;
+    let scale_y = target_height / image.height() as f32;
+    let image_scale = match fit {
+        ImageFit::Cover => scale_x.max(scale_y),
+        ImageFit::Contain => scale_x.min(scale_y),
+    };
+    let draw_width = image.width() as f32 * image_scale;
+    let draw_height = image.height() as f32 * image_scale;
+    let x = bounds.x * surface_scale + (target_width - draw_width) / 2.0;
+    let y = bounds.y * surface_scale + (target_height - draw_height) / 2.0;
+
+    let mut mask_data = vec![0; target.width() as usize * target.height() as usize];
+    let left = (bounds.x * surface_scale).floor().max(0.0) as u32;
+    let top = (bounds.y * surface_scale).floor().max(0.0) as u32;
+    let right = ((bounds.x + bounds.width) * surface_scale)
+        .ceil()
+        .clamp(0.0, target.width() as f32) as u32;
+    let bottom = ((bounds.y + bounds.height) * surface_scale)
+        .ceil()
+        .clamp(0.0, target.height() as f32) as u32;
+    for row in top.min(target.height())..bottom {
+        let start = (row * target.width() + left.min(target.width())) as usize;
+        let end = (row * target.width() + right) as usize;
+        mask_data[start..end].fill(255);
+    }
+    let mask_size = tiny_skia::IntSize::from_wh(target.width(), target.height())
+        .expect("pixmap has valid dimensions");
+    let mask = Mask::from_vec(mask_data, mask_size).expect("mask matches target dimensions");
+    let paint = PixmapPaint {
+        quality: FilterQuality::Bilinear,
+        ..PixmapPaint::default()
+    };
+    let transform = Transform::from_scale(image_scale, image_scale).post_translate(x, y);
+    target.draw_pixmap(0, 0, image.as_ref(), &paint, transform, Some(&mask));
+    Ok(())
+}
+
+impl ImageCache {
+    fn get_or_decode(&mut self, source: &ImageSource) -> Result<&Pixmap, RenderNote> {
+        if !self.decoded.contains_key(&source.id) {
+            let pixmap = decode_png(source)?;
+            if self.decoded.len() == IMAGE_CACHE_CAPACITY {
+                if let Some(evicted) = self.insertion_order.pop_front() {
+                    self.decoded.remove(&evicted);
+                }
+            }
+            self.insertion_order.push_back(source.id.clone());
+            self.decoded.insert(source.id.clone(), pixmap);
+        }
+        Ok(self
+            .decoded
+            .get(&source.id)
+            .expect("just inserted or present"))
+    }
+}
+
+fn decode_png(source: &ImageSource) -> Result<Pixmap, RenderNote> {
+    let failed = || RenderNote::ImageDecodeFailed {
+        source_id: source.id.clone(),
+    };
+    let bytes = source.bytes.as_ref();
+    if bytes.len() < 24 || &bytes[..8] != b"\x89PNG\r\n\x1a\n" || &bytes[12..16] != b"IHDR" {
+        return Err(failed());
+    }
+    let width = u32::from_be_bytes(bytes[16..20].try_into().expect("four-byte width"));
+    let height = u32::from_be_bytes(bytes[20..24].try_into().expect("four-byte height"));
+    let pixels = u64::from(width) * u64::from(height);
+    if pixels > MAX_IMAGE_PIXELS {
+        return Err(RenderNote::ImageTooLarge {
+            source_id: source.id.clone(),
+            width,
+            height,
+            max_pixels: MAX_IMAGE_PIXELS,
+        });
+    }
+    let mut decoder = png::Decoder::new(Cursor::new(bytes));
+    decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
+    decoder.set_limits(png::Limits {
+        bytes: MAX_IMAGE_PIXELS as usize * 4,
+    });
+    let mut reader = decoder.read_info().map_err(|_| failed())?;
+    let info = reader.info();
+    debug_assert_eq!((info.width, info.height), (width, height));
+    let mut decoded = vec![0; reader.output_buffer_size()];
+    let output = reader.next_frame(&mut decoded).map_err(|_| failed())?;
+    let bytes = &decoded[..output.buffer_size()];
+    let mut rgba = Vec::with_capacity(pixels as usize * 4);
+    match output.color_type {
+        png::ColorType::Rgba => rgba.extend_from_slice(bytes),
+        png::ColorType::Rgb => bytes
+            .chunks_exact(3)
+            .for_each(|p| rgba.extend_from_slice(&[p[0], p[1], p[2], 255])),
+        png::ColorType::Grayscale => bytes
+            .iter()
+            .for_each(|&v| rgba.extend_from_slice(&[v, v, v, 255])),
+        png::ColorType::GrayscaleAlpha => bytes
+            .chunks_exact(2)
+            .for_each(|p| rgba.extend_from_slice(&[p[0], p[0], p[0], p[1]])),
+        png::ColorType::Indexed => return Err(failed()),
+    }
+    let mut pixmap = Pixmap::new(output.width, output.height).ok_or_else(failed)?;
+    for (source, target) in rgba.chunks_exact(4).zip(pixmap.pixels_mut()) {
+        *target =
+            tiny_skia::ColorU8::from_rgba(source[0], source[1], source[2], source[3]).premultiply();
+    }
+    Ok(pixmap)
 }
 
 struct TextDraw<'a> {
@@ -290,7 +470,11 @@ fn draw_text(pm: &mut Pixmap, fonts: &mut FontSystem, glyphs: &mut SwashCache, d
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pf_scene::{Insets, NodeAction, NodeId, Orientation, Role};
+    use pf_scene::{ImageSource, Insets, NodeAction, NodeId, Orientation, Role};
+    use std::sync::Arc;
+
+    const IMAGE_PNG: &[u8] = include_bytes!("../../../spikes/consent-ui/baseline/s01-initial.png");
+    const CORRUPT_PNG: &[u8] = include_bytes!("../tests/fixtures/corrupt.png");
     fn fixture(label: &str) -> Scene {
         let root = Node::new(
             NodeId::new("root").unwrap(),
@@ -322,6 +506,98 @@ mod tests {
                 .render(&fixture("再開 日本語"), metrics())
                 .unwrap()
                 .rgba
+        );
+    }
+
+    fn image_fixture(bytes: &'static [u8], fit: ImageFit) -> Scene {
+        let root = Node::new(
+            NodeId::new("root").unwrap(),
+            Role::Button,
+            "cover art",
+            Bounds::new(17.0, 11.0, 173.0, 129.0),
+            "art",
+        )
+        .with_action(NodeAction::Activate)
+        .with_image(
+            ImageSource::new("fixture-v1", Arc::<[u8]>::from(bytes)),
+            fit,
+        );
+        Scene::new(root, NodeId::new("root").unwrap()).unwrap()
+    }
+
+    fn frame_hash(bytes: &[u8]) -> u64 {
+        bytes.iter().fold(0xcbf29ce484222325, |hash, byte| {
+            (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+        })
+    }
+
+    #[test]
+    fn image_frame_hash_is_deterministic_across_fresh_runs() {
+        let first = Rasterizer::new()
+            .render(&image_fixture(IMAGE_PNG, ImageFit::Cover), metrics())
+            .unwrap();
+        let second = Rasterizer::new()
+            .render(&image_fixture(IMAGE_PNG, ImageFit::Cover), metrics())
+            .unwrap();
+        assert!(first.notes.is_empty());
+        assert_eq!(frame_hash(&first.rgba), frame_hash(&second.rgba));
+        assert_eq!(frame_hash(&first.rgba), 4_451_243_305_016_117_238);
+    }
+
+    #[test]
+    fn corrupt_image_is_a_typed_note_and_never_draws_debug_text() {
+        let frame = Rasterizer::new()
+            .render(&image_fixture(CORRUPT_PNG, ImageFit::Contain), metrics())
+            .unwrap();
+        assert_eq!(
+            frame.notes,
+            vec![RenderNote::ImageDecodeFailed {
+                source_id: "fixture-v1".into()
+            }]
+        );
+        // The node's themed background remains; its semantic alt text is not painted.
+        assert!(!frame
+            .rgba
+            .chunks_exact(4)
+            .any(|p| p == [244, 234, 220, 255]));
+    }
+
+    #[test]
+    fn oversized_header_is_rejected_before_pixel_allocation() {
+        let mut bytes = vec![0; 24];
+        bytes[..8].copy_from_slice(b"\x89PNG\r\n\x1a\n");
+        bytes[12..16].copy_from_slice(b"IHDR");
+        bytes[16..20].copy_from_slice(&4_000u32.to_be_bytes());
+        bytes[20..24].copy_from_slice(&3_000u32.to_be_bytes());
+        let source = ImageSource::new("oversized", Arc::<[u8]>::from(bytes));
+        assert_eq!(
+            decode_png(&source).unwrap_err(),
+            RenderNote::ImageTooLarge {
+                source_id: "oversized".into(),
+                width: 4_000,
+                height: 3_000,
+                max_pixels: MAX_IMAGE_PIXELS,
+            }
+        );
+    }
+
+    #[test]
+    fn image_content_and_fit_participate_in_damage_tracking() {
+        let mut rasterizer = Rasterizer::new();
+        rasterizer
+            .render(&image_fixture(IMAGE_PNG, ImageFit::Contain), metrics())
+            .unwrap();
+        let frame = rasterizer
+            .render(&image_fixture(IMAGE_PNG, ImageFit::Cover), metrics())
+            .unwrap();
+        assert_eq!(
+            frame.damage,
+            Some(DamageRect {
+                x: 17,
+                y: 11,
+                width: 173,
+                height: 129,
+            })
         );
     }
     #[test]
