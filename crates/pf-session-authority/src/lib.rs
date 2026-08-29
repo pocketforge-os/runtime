@@ -740,6 +740,17 @@ impl<S: StateStore, B: SessionSystem, C: Clock> Authority<S, B, C> {
         let session_id = self
             .session_id()
             .ok_or(AuthorityError::InvalidObservation)?;
+        if let Some(entry) = self
+            .state
+            .history
+            .iter_mut()
+            .find(|e| e.session_id == session_id)
+        {
+            entry.ended_at = Some(EndStamp {
+                at: (self.now_fn)(),
+                precision: EndPrecision::Observed,
+            });
+        }
         self.state.phase = Phase::Restoring {
             session_id,
             receipt,
@@ -762,6 +773,13 @@ impl<S: StateStore, B: SessionSystem, C: Clock> Authority<S, B, C> {
                 self.persist()
             }
             (Phase::Starting { .. } | Phase::Running { .. }, Observation::SessionExitedCleanly) => {
+                let id = self.session_id().unwrap();
+                if let Some(entry) = self.state.history.iter_mut().find(|e| e.session_id == id) {
+                    entry.ended_at = Some(EndStamp {
+                        at: (self.now_fn)(),
+                        precision: EndPrecision::Observed,
+                    });
+                }
                 self.begin_restoration(Receipt::Returned)
             }
             (
@@ -845,12 +863,6 @@ impl<S: StateStore, B: SessionSystem, C: Clock> Authority<S, B, C> {
                 let receipt = receipt.clone();
                 if let Some(entry) = self.state.history.iter_mut().find(|e| e.session_id == id) {
                     entry.receipt = Some(receipt.clone());
-                    if !matches!(receipt, Receipt::Crash { .. }) {
-                        entry.ended_at = Some(EndStamp {
-                            at: (self.now_fn)(),
-                            precision: EndPrecision::Observed,
-                        });
-                    }
                 }
                 self.publish(WireEvent::ObservationComplete);
                 self.publish(WireEvent::Terminal {

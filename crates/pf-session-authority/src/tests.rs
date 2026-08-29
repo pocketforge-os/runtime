@@ -1,10 +1,19 @@
 use super::*;
 use pf_ports::{SessionEvent, TestClock};
+use std::cell::Cell;
 use std::path::PathBuf;
 use std::time::SystemTime;
 
+thread_local! {
+    static WALL_TIME_SECS: Cell<u64> = const { Cell::new(1_234) };
+}
+
 fn fixed_wall_time() -> SystemTime {
-    SystemTime::UNIX_EPOCH + Duration::from_secs(1_234)
+    WALL_TIME_SECS.with(|seconds| SystemTime::UNIX_EPOCH + Duration::from_secs(seconds.get()))
+}
+
+fn set_wall_time(seconds: u64) {
+    WALL_TIME_SECS.with(|wall_time| wall_time.set(seconds));
 }
 
 #[derive(Default)]
@@ -292,8 +301,9 @@ fn clean_exit_and_crash_are_typed_and_wait_for_presentation() {
 }
 
 #[test]
-fn fixed_wall_clock_stamps_returned_crash_and_never_running_honestly() {
+fn fixed_wall_clock_stamps_end_observation_not_restoration_completion() {
     let make = || {
+        set_wall_time(1_234);
         Authority::open_with_now_fn(
             MemoryStore::default(),
             FakeSystem::available(),
@@ -308,14 +318,36 @@ fn fixed_wall_clock_stamps_returned_crash_and_never_running_honestly() {
     let mut returned = make();
     launch_running(&mut returned);
     returned.observe(Observation::SessionExitedCleanly).unwrap();
+    set_wall_time(9_999);
     returned.observe(Observation::UnitInactive).unwrap();
     restore(&mut returned);
     let entry = returned.state.history.front().unwrap();
-    assert_eq!(entry.started_at, Some(fixed_wall_time()));
+    assert_eq!(
+        entry.started_at,
+        Some(SystemTime::UNIX_EPOCH + Duration::from_secs(1_234))
+    );
     assert_eq!(
         entry.ended_at,
         Some(EndStamp {
-            at: fixed_wall_time(),
+            at: SystemTime::UNIX_EPOCH + Duration::from_secs(1_234),
+            precision: EndPrecision::Observed,
+        })
+    );
+
+    let mut forced_close = make();
+    launch_running(&mut forced_close);
+    forced_close.intake_safe_return().unwrap();
+    forced_close.tick().unwrap();
+    forced_close.clock.advance(Duration::from_millis(10));
+    forced_close.tick().unwrap();
+    set_wall_time(2_345);
+    forced_close.observe(Observation::UnitInactive).unwrap();
+    set_wall_time(9_999);
+    restore(&mut forced_close);
+    assert_eq!(
+        forced_close.state.history.front().unwrap().ended_at,
+        Some(EndStamp {
+            at: SystemTime::UNIX_EPOCH + Duration::from_secs(2_345),
             precision: EndPrecision::Observed,
         })
     );
