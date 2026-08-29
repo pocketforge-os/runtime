@@ -358,3 +358,184 @@ fn frame_host_records_every_scene_and_exercises_failures() {
     assert_eq!(host.present(&scene), Ok(PresentAck { sequence: 0 }));
     assert_eq!(host.presented().len(), 4);
 }
+
+#[test]
+fn power_fake_reports_support_refusal_failure_and_applied_policy() {
+    let initial = IdlePolicy {
+        sleep_after: None,
+        power_off_after: Some(Duration::from_secs(300)),
+    };
+    let mut fake = FakePowerPort::new(
+        vec![
+            PowerCapability {
+                action: PowerAction::PowerOff,
+                support: Support::Supported,
+            },
+            PowerCapability {
+                action: PowerAction::Restart,
+                support: Support::Supported,
+            },
+            PowerCapability {
+                action: PowerAction::Sleep,
+                support: Support::Unsupported,
+            },
+        ],
+        initial.clone(),
+    );
+    assert_eq!(fake.idle_policy(), Ok(initial));
+    assert_eq!(
+        fake.request(PowerAction::Sleep),
+        Ok(PowerRequestResult::Unsupported)
+    );
+    fake.script_request(Ok(PowerRequestResult::Refused {
+        reason: "busy".into(),
+    }));
+    assert!(matches!(
+        fake.request(PowerAction::Restart),
+        Ok(PowerRequestResult::Refused { .. })
+    ));
+    fake.script_request(Err(PowerError::BackendUnavailable));
+    assert_eq!(
+        fake.request(PowerAction::PowerOff),
+        Err(PowerError::BackendUnavailable)
+    );
+
+    let requested = IdlePolicy {
+        sleep_after: Some(Duration::from_secs(60)),
+        power_off_after: None,
+    };
+    let applied = IdlePolicy {
+        sleep_after: None,
+        power_off_after: None,
+    };
+    fake.script_policy_write(Ok(AppliedIdlePolicy {
+        requested: requested.clone(),
+        applied: applied.clone(),
+    }));
+    assert_eq!(
+        fake.set_idle_policy(requested),
+        Ok(AppliedIdlePolicy {
+            requested: IdlePolicy {
+                sleep_after: Some(Duration::from_secs(60)),
+                power_off_after: None
+            },
+            applied: applied.clone(),
+        })
+    );
+    assert_eq!(fake.idle_policy(), Ok(applied));
+}
+
+#[test]
+fn time_fake_gates_manual_time_and_preserves_applied_values() {
+    let epoch = SystemTime::UNIX_EPOCH;
+    let state = TimeState {
+        wall_clock: epoch,
+        timezone: "UTC".into(),
+        ntp_state: NtpState::Active,
+    };
+    let mut fake = FakeTimePort::new(
+        TimeCapabilities {
+            manual_set_time: Support::Unsupported,
+        },
+        state,
+    );
+    assert_eq!(
+        fake.set_time(epoch + Duration::from_secs(1)),
+        Err(TimeError::Unsupported)
+    );
+    fake.script_timezone(Ok(AppliedValue {
+        requested: "Mars/Base".into(),
+        applied: "UTC".into(),
+    }));
+    assert_eq!(
+        fake.set_timezone("Mars/Base".into()).unwrap().applied,
+        "UTC"
+    );
+    fake.script_ntp(Err(TimeError::BackendUnavailable));
+    assert_eq!(
+        fake.set_ntp_enabled(false),
+        Err(TimeError::BackendUnavailable)
+    );
+    assert_eq!(fake.read().unwrap().ntp_state, NtpState::Active);
+    assert_eq!(NtpState::Supported, NtpState::Supported);
+    assert_eq!(NtpState::Unsupported, NtpState::Unsupported);
+}
+
+#[test]
+fn network_fake_redacts_credentials_and_scripts_progress_and_degradation() {
+    let credential = WifiCredential::new(b"do-not-echo".to_vec());
+    assert_eq!(credential.expose_secret(), b"do-not-echo");
+    assert!(!format!("{credential:?}").contains("do-not-echo"));
+    let state = NetworkState {
+        interface_present: true,
+        enabled: true,
+        connected_ssid: None,
+        signal: None,
+    };
+    let mut fake = FakeNetworkPort::new(state.clone());
+    fake.script_scan(Ok(vec![WifiNetwork {
+        ssid: "net".into(),
+        security: WifiSecurity::Personal,
+        strength: 72,
+    }]));
+    assert_eq!(fake.scan().unwrap()[0].strength, 72);
+    fake.script_connect(Ok(ConnectResult::Progress(ConnectProgress::Authenticating)));
+    assert_eq!(
+        fake.connect("net", credential.clone()),
+        Ok(ConnectResult::Progress(ConnectProgress::Authenticating))
+    );
+    fake.script_connect(Err(NetworkError::InvalidCredential));
+    assert_eq!(
+        fake.connect("net", credential),
+        Err(NetworkError::InvalidCredential)
+    );
+    let degraded = NetworkState {
+        enabled: false,
+        ..state
+    };
+    fake.script_enabled(Ok(AppliedNetworkEnabled {
+        requested: true,
+        applied: degraded.clone(),
+    }));
+    assert_eq!(fake.set_enabled(true).unwrap().applied, degraded);
+    fake.script_forget(Err(NetworkError::BackendUnavailable));
+    assert_eq!(fake.forget("net"), Err(NetworkError::BackendUnavailable));
+}
+
+#[test]
+fn transfer_fake_keeps_unsupported_visible_and_returns_warning_and_applied_state() {
+    let sftp = TransferServiceState {
+        service: TransferService::Sftp,
+        support: Support::Supported,
+        enabled: false,
+        endpoint_info: Some("device.local:22".into()),
+    };
+    let usb = TransferServiceState {
+        service: TransferService::UsbMassStorage,
+        support: Support::Unsupported,
+        enabled: false,
+        endpoint_info: None,
+    };
+    let mut fake = FakeTransferPort::new(vec![sftp.clone(), usb]);
+    assert_eq!(fake.services().unwrap().len(), 2);
+    assert_eq!(
+        fake.set_enabled(TransferService::UsbMassStorage, true),
+        Err(TransferError::Refused)
+    );
+    fake.script_enabled(Ok(AppliedTransferState {
+        requested: true,
+        applied: sftp.clone(),
+        warning: Some(TransferWarning::ExclusiveStorageAccessRequired),
+    }));
+    let result = fake.set_enabled(TransferService::Sftp, true).unwrap();
+    assert!(matches!(
+        result.warning,
+        Some(TransferWarning::ExclusiveStorageAccessRequired)
+    ));
+    assert!(!result.applied.enabled);
+    fake.script_enabled(Err(TransferError::BackendUnavailable));
+    assert_eq!(
+        fake.set_enabled(TransferService::Sftp, true),
+        Err(TransferError::BackendUnavailable)
+    );
+}

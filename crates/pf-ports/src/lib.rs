@@ -6,7 +6,7 @@
 use pf_scene::{AxisMove, Scene, SurfaceMetrics};
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 /// Monotonic time in nanoseconds from an adapter-defined origin.
 #[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
@@ -315,6 +315,245 @@ pub trait PreferencePort {
     ) -> Result<PreferenceChangeResult, PreferenceError>;
 }
 
+// System-control ports intentionally report the state an adapter actually applied. A
+// successful call is never, by itself, evidence that the requested value became effective.
+
+/// Power control honesty contract.
+///
+/// [`PowerPort::capabilities`] is authoritative for each action. Requests return a typed
+/// acceptance or refusal, and idle-policy writes return both requested and applied state.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum PowerAction {
+    PowerOff,
+    Restart,
+    Sleep,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Support {
+    Supported,
+    Unsupported,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PowerCapability {
+    pub action: PowerAction,
+    pub support: Support,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PowerRequestResult {
+    Accepted,
+    Unsupported,
+    Refused { reason: String },
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct IdlePolicy {
+    pub sleep_after: Option<Duration>,
+    pub power_off_after: Option<Duration>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AppliedIdlePolicy {
+    pub requested: IdlePolicy,
+    pub applied: IdlePolicy,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PowerError {
+    BackendUnavailable,
+    InvalidPolicy,
+}
+
+pub trait PowerPort {
+    fn capabilities(&self) -> Result<Vec<PowerCapability>, PowerError>;
+    fn request(&mut self, action: PowerAction) -> Result<PowerRequestResult, PowerError>;
+    fn idle_policy(&self) -> Result<IdlePolicy, PowerError>;
+    fn set_idle_policy(&mut self, policy: IdlePolicy) -> Result<AppliedIdlePolicy, PowerError>;
+}
+
+/// Wall-clock control honesty contract.
+///
+/// Setters return requested and applied values. Manual time changes are separately gated by
+/// [`TimeCapabilities::manual_set_time`] and unsupported NTP is distinct from inactive NTP.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NtpState {
+    Supported,
+    Active,
+    Inactive,
+    Unsupported,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TimeCapabilities {
+    pub manual_set_time: Support,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TimeState {
+    pub wall_clock: SystemTime,
+    pub timezone: String,
+    pub ntp_state: NtpState,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AppliedValue<T> {
+    pub requested: T,
+    pub applied: T,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TimeError {
+    BackendUnavailable,
+    InvalidTimezone,
+    InvalidTime,
+    Unsupported,
+}
+
+pub trait TimePort {
+    fn capabilities(&self) -> Result<TimeCapabilities, TimeError>;
+    fn read(&self) -> Result<TimeState, TimeError>;
+    fn set_timezone(&mut self, timezone: String) -> Result<AppliedValue<String>, TimeError>;
+    fn set_ntp_enabled(&mut self, enabled: bool) -> Result<AppliedValue<bool>, TimeError>;
+    fn set_time(&mut self, wall_clock: SystemTime) -> Result<AppliedValue<SystemTime>, TimeError>;
+}
+
+/// WiFi control honesty contract.
+///
+/// State and scans are observations, while mutations report typed outcomes. Credentials are
+/// opaque and their debug representation is always redacted. Bluetooth is intentionally not
+/// represented by this WiFi-first boundary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WifiSecurity {
+    Open,
+    Personal,
+    Enterprise,
+    Unknown,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WifiNetwork {
+    pub ssid: String,
+    pub security: WifiSecurity,
+    pub strength: u8,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NetworkState {
+    pub interface_present: bool,
+    pub enabled: bool,
+    pub connected_ssid: Option<String>,
+    pub signal: Option<u8>,
+}
+
+#[derive(Clone, Eq, PartialEq)]
+pub struct WifiCredential(Vec<u8>);
+
+impl WifiCredential {
+    pub fn new(secret: impl Into<Vec<u8>>) -> Self {
+        Self(secret.into())
+    }
+
+    pub fn expose_secret(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl fmt::Debug for WifiCredential {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("WifiCredential([REDACTED])")
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConnectProgress {
+    Authenticating,
+    Associating,
+    ObtainingAddress,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ConnectResult {
+    Progress(ConnectProgress),
+    Connected { ssid: String },
+    Refused,
+    NetworkNotFound,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AppliedNetworkEnabled {
+    pub requested: bool,
+    pub applied: NetworkState,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum NetworkError {
+    BackendUnavailable,
+    InterfaceAbsent,
+    ScanFailed,
+    InvalidCredential,
+}
+
+pub trait NetworkPort {
+    fn state(&self) -> Result<NetworkState, NetworkError>;
+    fn scan(&mut self) -> Result<Vec<WifiNetwork>, NetworkError>;
+    fn connect(
+        &mut self,
+        ssid: &str,
+        credential: WifiCredential,
+    ) -> Result<ConnectResult, NetworkError>;
+    fn forget(&mut self, ssid: &str) -> Result<bool, NetworkError>;
+    fn set_enabled(&mut self, enabled: bool) -> Result<AppliedNetworkEnabled, NetworkError>;
+}
+
+/// File-transfer service honesty contract.
+///
+/// Service inventory includes unsupported services for honest display. Mutations return the
+/// requested value, the applied service state, and any operational warning.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum TransferService {
+    Sftp,
+    UsbMassStorage,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TransferServiceState {
+    pub service: TransferService,
+    pub support: Support,
+    pub enabled: bool,
+    pub endpoint_info: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TransferWarning {
+    ExclusiveStorageAccessRequired,
+    Message(String),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AppliedTransferState {
+    pub requested: bool,
+    pub applied: TransferServiceState,
+    pub warning: Option<TransferWarning>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TransferError {
+    BackendUnavailable,
+    UnknownService,
+    Refused,
+}
+
+pub trait TransferPort {
+    fn services(&self) -> Result<Vec<TransferServiceState>, TransferError>;
+    fn set_enabled(
+        &mut self,
+        service: TransferService,
+        enabled: bool,
+    ) -> Result<AppliedTransferState, TransferError>;
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PresentAck {
     pub sequence: u64,
@@ -552,6 +791,314 @@ impl PreferencePort for FakePreferencePort {
         self.changes
             .push_back(Ok(PreferencePoll::Changed(current.clone())));
         Ok(PreferenceChangeResult::Accepted)
+    }
+}
+
+pub struct FakePowerPort {
+    pub capabilities_result: Result<Vec<PowerCapability>, PowerError>,
+    pub idle_policy_result: Result<IdlePolicy, PowerError>,
+    requests: VecDeque<Result<PowerRequestResult, PowerError>>,
+    policy_writes: VecDeque<Result<AppliedIdlePolicy, PowerError>>,
+}
+
+impl FakePowerPort {
+    pub fn new(capabilities: Vec<PowerCapability>, idle_policy: IdlePolicy) -> Self {
+        Self {
+            capabilities_result: Ok(capabilities),
+            idle_policy_result: Ok(idle_policy),
+            requests: VecDeque::new(),
+            policy_writes: VecDeque::new(),
+        }
+    }
+
+    pub fn script_request(&mut self, result: Result<PowerRequestResult, PowerError>) {
+        self.requests.push_back(result);
+    }
+
+    pub fn script_policy_write(&mut self, result: Result<AppliedIdlePolicy, PowerError>) {
+        self.policy_writes.push_back(result);
+    }
+}
+
+impl PowerPort for FakePowerPort {
+    fn capabilities(&self) -> Result<Vec<PowerCapability>, PowerError> {
+        self.capabilities_result.clone()
+    }
+
+    fn request(&mut self, action: PowerAction) -> Result<PowerRequestResult, PowerError> {
+        self.requests.pop_front().unwrap_or_else(|| {
+            Ok(
+                if self.capabilities_result.as_ref().is_ok_and(|items| {
+                    items
+                        .iter()
+                        .any(|item| item.action == action && item.support == Support::Supported)
+                }) {
+                    PowerRequestResult::Accepted
+                } else {
+                    PowerRequestResult::Unsupported
+                },
+            )
+        })
+    }
+
+    fn idle_policy(&self) -> Result<IdlePolicy, PowerError> {
+        self.idle_policy_result.clone()
+    }
+
+    fn set_idle_policy(&mut self, policy: IdlePolicy) -> Result<AppliedIdlePolicy, PowerError> {
+        let result = self.policy_writes.pop_front().unwrap_or_else(|| {
+            Ok(AppliedIdlePolicy {
+                requested: policy.clone(),
+                applied: policy,
+            })
+        })?;
+        self.idle_policy_result = Ok(result.applied.clone());
+        Ok(result)
+    }
+}
+
+pub struct FakeTimePort {
+    pub capabilities_result: Result<TimeCapabilities, TimeError>,
+    pub state_result: Result<TimeState, TimeError>,
+    timezone_writes: VecDeque<Result<AppliedValue<String>, TimeError>>,
+    ntp_writes: VecDeque<Result<AppliedValue<bool>, TimeError>>,
+    time_writes: VecDeque<Result<AppliedValue<SystemTime>, TimeError>>,
+}
+
+impl FakeTimePort {
+    pub fn new(capabilities: TimeCapabilities, state: TimeState) -> Self {
+        Self {
+            capabilities_result: Ok(capabilities),
+            state_result: Ok(state),
+            timezone_writes: VecDeque::new(),
+            ntp_writes: VecDeque::new(),
+            time_writes: VecDeque::new(),
+        }
+    }
+
+    pub fn script_timezone(&mut self, result: Result<AppliedValue<String>, TimeError>) {
+        self.timezone_writes.push_back(result);
+    }
+
+    pub fn script_ntp(&mut self, result: Result<AppliedValue<bool>, TimeError>) {
+        self.ntp_writes.push_back(result);
+    }
+
+    pub fn script_time(&mut self, result: Result<AppliedValue<SystemTime>, TimeError>) {
+        self.time_writes.push_back(result);
+    }
+}
+
+impl TimePort for FakeTimePort {
+    fn capabilities(&self) -> Result<TimeCapabilities, TimeError> {
+        self.capabilities_result.clone()
+    }
+
+    fn read(&self) -> Result<TimeState, TimeError> {
+        self.state_result.clone()
+    }
+
+    fn set_timezone(&mut self, timezone: String) -> Result<AppliedValue<String>, TimeError> {
+        let result = self.timezone_writes.pop_front().unwrap_or_else(|| {
+            Ok(AppliedValue {
+                requested: timezone.clone(),
+                applied: timezone,
+            })
+        })?;
+        if let Ok(state) = &mut self.state_result {
+            state.timezone = result.applied.clone();
+        }
+        Ok(result)
+    }
+
+    fn set_ntp_enabled(&mut self, enabled: bool) -> Result<AppliedValue<bool>, TimeError> {
+        let result = self.ntp_writes.pop_front().unwrap_or({
+            Ok(AppliedValue {
+                requested: enabled,
+                applied: enabled,
+            })
+        })?;
+        if let Ok(state) = &mut self.state_result {
+            state.ntp_state = if result.applied {
+                NtpState::Active
+            } else {
+                NtpState::Inactive
+            };
+        }
+        Ok(result)
+    }
+
+    fn set_time(&mut self, wall_clock: SystemTime) -> Result<AppliedValue<SystemTime>, TimeError> {
+        if self
+            .capabilities_result
+            .as_ref()
+            .is_ok_and(|capabilities| capabilities.manual_set_time == Support::Unsupported)
+        {
+            return Err(TimeError::Unsupported);
+        }
+        let result = self.time_writes.pop_front().unwrap_or({
+            Ok(AppliedValue {
+                requested: wall_clock,
+                applied: wall_clock,
+            })
+        })?;
+        if let Ok(state) = &mut self.state_result {
+            state.wall_clock = result.applied;
+        }
+        Ok(result)
+    }
+}
+
+pub struct FakeNetworkPort {
+    pub state_result: Result<NetworkState, NetworkError>,
+    scans: VecDeque<Result<Vec<WifiNetwork>, NetworkError>>,
+    connections: VecDeque<Result<ConnectResult, NetworkError>>,
+    forgets: VecDeque<Result<bool, NetworkError>>,
+    enabled_writes: VecDeque<Result<AppliedNetworkEnabled, NetworkError>>,
+}
+
+impl FakeNetworkPort {
+    pub fn new(state: NetworkState) -> Self {
+        Self {
+            state_result: Ok(state),
+            scans: VecDeque::new(),
+            connections: VecDeque::new(),
+            forgets: VecDeque::new(),
+            enabled_writes: VecDeque::new(),
+        }
+    }
+
+    pub fn script_scan(&mut self, result: Result<Vec<WifiNetwork>, NetworkError>) {
+        self.scans.push_back(result);
+    }
+
+    pub fn script_connect(&mut self, result: Result<ConnectResult, NetworkError>) {
+        self.connections.push_back(result);
+    }
+
+    pub fn script_forget(&mut self, result: Result<bool, NetworkError>) {
+        self.forgets.push_back(result);
+    }
+
+    pub fn script_enabled(&mut self, result: Result<AppliedNetworkEnabled, NetworkError>) {
+        self.enabled_writes.push_back(result);
+    }
+}
+
+impl NetworkPort for FakeNetworkPort {
+    fn state(&self) -> Result<NetworkState, NetworkError> {
+        self.state_result.clone()
+    }
+
+    fn scan(&mut self) -> Result<Vec<WifiNetwork>, NetworkError> {
+        self.scans.pop_front().unwrap_or_else(|| Ok(Vec::new()))
+    }
+
+    fn connect(
+        &mut self,
+        ssid: &str,
+        _credential: WifiCredential,
+    ) -> Result<ConnectResult, NetworkError> {
+        let result = self
+            .connections
+            .pop_front()
+            .unwrap_or_else(|| Ok(ConnectResult::Connected { ssid: ssid.into() }))?;
+        if let (ConnectResult::Connected { ssid }, Ok(state)) = (&result, &mut self.state_result) {
+            state.connected_ssid = Some(ssid.clone());
+        }
+        Ok(result)
+    }
+
+    fn forget(&mut self, ssid: &str) -> Result<bool, NetworkError> {
+        let forgotten = self.forgets.pop_front().unwrap_or(Ok(true))?;
+        if forgotten {
+            if let Ok(state) = &mut self.state_result {
+                if state.connected_ssid.as_deref() == Some(ssid) {
+                    state.connected_ssid = None;
+                    state.signal = None;
+                }
+            }
+        }
+        Ok(forgotten)
+    }
+
+    fn set_enabled(&mut self, enabled: bool) -> Result<AppliedNetworkEnabled, NetworkError> {
+        let result = self.enabled_writes.pop_front().unwrap_or_else(|| {
+            let mut applied = self.state_result.clone().unwrap_or(NetworkState {
+                interface_present: true,
+                enabled,
+                connected_ssid: None,
+                signal: None,
+            });
+            applied.enabled = enabled;
+            Ok(AppliedNetworkEnabled {
+                requested: enabled,
+                applied,
+            })
+        })?;
+        self.state_result = Ok(result.applied.clone());
+        Ok(result)
+    }
+}
+
+pub struct FakeTransferPort {
+    pub services_result: Result<Vec<TransferServiceState>, TransferError>,
+    writes: VecDeque<Result<AppliedTransferState, TransferError>>,
+}
+
+impl FakeTransferPort {
+    pub fn new(services: Vec<TransferServiceState>) -> Self {
+        Self {
+            services_result: Ok(services),
+            writes: VecDeque::new(),
+        }
+    }
+
+    pub fn script_enabled(&mut self, result: Result<AppliedTransferState, TransferError>) {
+        self.writes.push_back(result);
+    }
+}
+
+impl TransferPort for FakeTransferPort {
+    fn services(&self) -> Result<Vec<TransferServiceState>, TransferError> {
+        self.services_result.clone()
+    }
+
+    fn set_enabled(
+        &mut self,
+        service: TransferService,
+        enabled: bool,
+    ) -> Result<AppliedTransferState, TransferError> {
+        let result = if let Some(result) = self.writes.pop_front() {
+            result?
+        } else {
+            let states = self
+                .services_result
+                .as_ref()
+                .map_err(|error| error.clone())?;
+            let Some(current) = states.iter().find(|state| state.service == service) else {
+                return Err(TransferError::UnknownService);
+            };
+            if current.support == Support::Unsupported {
+                return Err(TransferError::Refused);
+            }
+            let mut applied = current.clone();
+            applied.enabled = enabled;
+            AppliedTransferState {
+                requested: enabled,
+                applied,
+                warning: None,
+            }
+        };
+        if let Ok(states) = &mut self.services_result {
+            if let Some(state) = states
+                .iter_mut()
+                .find(|state| state.service == result.applied.service)
+            {
+                *state = result.applied.clone();
+            }
+        }
+        Ok(result)
     }
 }
 
