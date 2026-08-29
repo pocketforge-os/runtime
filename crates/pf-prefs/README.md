@@ -32,11 +32,14 @@ E1 capabilities descriptor. pf-prefs never duplicates or forks that descriptor. 
 the *same* silent no-op at the primitive — that unification is `.2`'s job; pf-prefs owns only the
 preference half.
 
-## Schema (v1)
+## Schema (v2)
 
 | key              | type            | default | notes                                                        |
 |------------------|-----------------|---------|--------------------------------------------------------------|
+| `textScale`      | enum steps through `200%` | `100%` | Requested shell text scale. |
+| `highContrast`   | bool            | `false` | Requested high-contrast shell presentation. |
 | `reduceMotion`   | bool            | `false` | Suppress non-essential cosmetic motion.                      |
+| `reduceFlashing` | bool            | `false` | Suppress non-essential flashing effects. |
 | `hapticsEnabled` | bool            | `true`  | Allow haptics; off ⇒ rumble is a silent no-op at the primitive. Matches the merged in-memory default. |
 | `monoAudio`      | bool            | `false` | Down-mix audio to mono.                                      |
 | `brightness`     | scalar `0..=100`| `100`   | **CONTRACT-ONLY in v1** (owner ruling Q3): read + observed, **no sysfs apply leg anywhere in this epic** (a133 has no `/sys/class/backlight`; apply is a hardware-gated follow-on). |
@@ -64,8 +67,9 @@ JSON object, rewritten whole, humanly `cat`-able and hand-editable.
 - **Tolerant load** — missing file ⇒ all defaults; present file ⇒ parsed as a JSON object with
   every known key validated (a type mismatch or out-of-range scalar is a typed `PrefError`, never
   a panic); unknown keys preserved.
-- Only explicitly-set keys are written (a fresh store is `{}`); every other key reads through to
-  its default, and `pf-settings list` shows `default` vs `stored` per key.
+- Current writes carry `schemaVersion: 2`; unversioned v1 stores remain readable. Only explicitly-set
+  preference keys are written; every other key reads through to its default, and `pf-settings list`
+  shows `default` vs `stored` per key.
 
 ## API sketch
 

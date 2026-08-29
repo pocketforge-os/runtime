@@ -1,0 +1,16 @@
+[package]
+name = "pf-prefs-port"
+description = "PreferencePort adapter over the PocketForge preference store"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lib]
+name = "pf_prefs_port"
+
+[dependencies]
+pf-prefs = { workspace = true }
+pf-ports = { workspace = true }

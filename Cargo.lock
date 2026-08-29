@@ -182,6 +182,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "pf-prefs-port"
+version = "0.0.1"
+dependencies = [
+ "pf-ports",
+ "pf-prefs",
+]
+
+[[package]]
 name = "pf-scene"
 version = "0.0.1"
 
@@ -189,7 +197,9 @@ version = "0.0.1"
 name = "pf-settings"
 version = "0.0.1"
 dependencies = [
+ "pf-ports",
  "pf-prefs",
+ "pf-prefs-port",
  "pocketforge",
 ]
 

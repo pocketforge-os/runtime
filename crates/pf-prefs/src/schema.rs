@@ -12,15 +12,15 @@ use crate::error::PrefError;
 
 /// The runtime type of a preference value.
 ///
-/// The v1 schema needs only `Bool` and a bounded `Scalar`; the enum is the extension point —
-/// a future `Enum { variants: &[&str] }` (e.g. a `theme` preference) slots in here and every
-/// consumer that already matches on `PrefKind` keeps compiling with one new arm.
+/// The schema supports booleans, bounded scalars, and closed string enums.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PrefKind {
     /// An on/off preference.
     Bool,
     /// An integer preference constrained to the inclusive range `[min, max]`.
     Scalar { min: i64, max: i64 },
+    /// One of a closed set of stable string values.
+    Enum { variants: &'static [&'static str] },
 }
 
 /// A concrete, validated preference value. Copy-cheap; the store round-trips these to JSON
@@ -32,6 +32,8 @@ pub enum PrefValue {
     /// An integer value (already validated against its key's [`PrefKind::Scalar`] range when it
     /// came through [`validate`]).
     Scalar(i64),
+    /// A validated member of a [`PrefKind::Enum`] variant set.
+    Enum(&'static str),
 }
 
 impl PrefValue {
@@ -40,6 +42,7 @@ impl PrefValue {
         match self {
             PrefValue::Bool(_) => "bool",
             PrefValue::Scalar(_) => "scalar",
+            PrefValue::Enum(_) => "enum",
         }
     }
 }
@@ -49,6 +52,7 @@ impl std::fmt::Display for PrefValue {
         match self {
             PrefValue::Bool(b) => write!(f, "{b}"),
             PrefValue::Scalar(n) => write!(f, "{n}"),
+            PrefValue::Enum(value) => f.write_str(value),
         }
     }
 }
@@ -73,11 +77,26 @@ impl PrefSpec {
             (PrefKind::Bool, PrefValue::Bool(_)) => Ok(value),
             (PrefKind::Scalar { min, max }, PrefValue::Scalar(n)) => {
                 if n < min || n > max {
-                    Err(PrefError::Range { key: self.key.to_string(), value: n, min, max })
+                    Err(PrefError::Range {
+                        key: self.key.to_string(),
+                        value: n,
+                        min,
+                        max,
+                    })
                 } else {
                     Ok(value)
                 }
             }
+            (PrefKind::Enum { variants }, PrefValue::Enum(candidate)) => variants
+                .iter()
+                .copied()
+                .find(|variant| *variant == candidate)
+                .map(PrefValue::Enum)
+                .ok_or_else(|| PrefError::Type {
+                    key: self.key.to_string(),
+                    expected: "enum variant",
+                    got: "unknown enum variant",
+                }),
             // Type mismatch: the stored/attempted value's shape does not match the schema.
             (kind, got) => Err(PrefError::Type {
                 key: self.key.to_string(),
@@ -93,10 +112,15 @@ pub fn kind_name(kind: PrefKind) -> &'static str {
     match kind {
         PrefKind::Bool => "bool",
         PrefKind::Scalar { .. } => "scalar",
+        PrefKind::Enum { .. } => "enum",
     }
 }
 
-/// The v1 preference schema.
+/// Current preference-document schema version. Version 1 was the original unversioned flat
+/// object; version 2 adds the shell accessibility keys and writes `schemaVersion: 2`.
+pub const SCHEMA_VERSION: u64 = 2;
+
+/// The v2 preference schema.
 ///
 /// Defaults are chosen to match the already-merged in-memory seam (`hapticsEnabled` defaults ON,
 /// as `InProcessBackend::rumble_pulse` reads it) and the accessibility-off-by-default norm
@@ -105,6 +129,26 @@ pub fn kind_name(kind: PrefKind) -> &'static str {
 /// reads and the observer fires on, with **no sysfs apply leg anywhere in this epic** (a133 has
 /// no `/sys/class/backlight`; the apply leg is a hardware-gated follow-on).
 pub const SCHEMA: &[PrefSpec] = &[
+    PrefSpec {
+        key: "textScale",
+        kind: PrefKind::Enum {
+            variants: &["100%", "125%", "150%", "175%", "200%"],
+        },
+        default: PrefValue::Enum("100%"),
+        doc: "Scale shell text using a supported step (100%, 125%, 150%, 175%, or 200%).",
+    },
+    PrefSpec {
+        key: "highContrast",
+        kind: PrefKind::Bool,
+        default: PrefValue::Bool(false),
+        doc: "Use the shell's high-contrast presentation.",
+    },
+    PrefSpec {
+        key: "reduceFlashing",
+        kind: PrefKind::Bool,
+        default: PrefValue::Bool(false),
+        doc: "Suppress or replace non-essential flashing effects.",
+    },
     PrefSpec {
         key: "reduceMotion",
         kind: PrefKind::Bool,
@@ -177,6 +221,20 @@ pub fn parse_value(key: &str, raw: &str) -> Result<PrefValue, PrefError> {
                 })
             }
         },
+        PrefKind::Enum { variants } => match variants
+            .iter()
+            .copied()
+            .find(|variant| *variant == raw.trim())
+        {
+            Some(variant) => PrefValue::Enum(variant),
+            None => {
+                return Err(PrefError::Type {
+                    key: key.to_string(),
+                    expected: "enum variant",
+                    got: "unparseable",
+                })
+            }
+        },
     };
     spec.validate(value)
 }
@@ -187,37 +245,88 @@ mod tests {
 
     #[test]
     fn parse_value_bool_forms() {
-        assert_eq!(parse_value("hapticsEnabled", "false").unwrap(), PrefValue::Bool(false));
-        assert_eq!(parse_value("hapticsEnabled", "ON").unwrap(), PrefValue::Bool(true));
-        assert_eq!(parse_value("hapticsEnabled", "0").unwrap(), PrefValue::Bool(false));
+        assert_eq!(
+            parse_value("hapticsEnabled", "false").unwrap(),
+            PrefValue::Bool(false)
+        );
+        assert_eq!(
+            parse_value("hapticsEnabled", "ON").unwrap(),
+            PrefValue::Bool(true)
+        );
+        assert_eq!(
+            parse_value("hapticsEnabled", "0").unwrap(),
+            PrefValue::Bool(false)
+        );
         assert!(parse_value("hapticsEnabled", "maybe").is_err());
     }
 
     #[test]
     fn parse_value_scalar_range() {
-        assert_eq!(parse_value("brightness", "42").unwrap(), PrefValue::Scalar(42));
-        assert!(matches!(parse_value("brightness", "250"), Err(PrefError::Range { .. })));
-        assert!(matches!(parse_value("brightness", "notanum"), Err(PrefError::Type { .. })));
+        assert_eq!(
+            parse_value("brightness", "42").unwrap(),
+            PrefValue::Scalar(42)
+        );
+        assert!(matches!(
+            parse_value("brightness", "250"),
+            Err(PrefError::Range { .. })
+        ));
+        assert!(matches!(
+            parse_value("brightness", "notanum"),
+            Err(PrefError::Type { .. })
+        ));
     }
 
     #[test]
     fn parse_value_unknown_key() {
-        assert!(matches!(parse_value("bogus", "true"), Err(PrefError::UnknownKey(_))));
+        assert!(matches!(
+            parse_value("bogus", "true"),
+            Err(PrefError::UnknownKey(_))
+        ));
     }
 
     #[test]
     fn schema_defaults_match_the_contract() {
-        assert_eq!(spec("reduceMotion").unwrap().default, PrefValue::Bool(false));
-        assert_eq!(spec("hapticsEnabled").unwrap().default, PrefValue::Bool(true));
+        assert_eq!(spec("textScale").unwrap().default, PrefValue::Enum("100%"));
+        assert_eq!(
+            spec("highContrast").unwrap().default,
+            PrefValue::Bool(false)
+        );
+        assert_eq!(
+            spec("reduceMotion").unwrap().default,
+            PrefValue::Bool(false)
+        );
+        assert_eq!(
+            spec("hapticsEnabled").unwrap().default,
+            PrefValue::Bool(true)
+        );
         assert_eq!(spec("monoAudio").unwrap().default, PrefValue::Bool(false));
         assert_eq!(spec("brightness").unwrap().default, PrefValue::Scalar(100));
+        assert_eq!(
+            spec("reduceFlashing").unwrap().default,
+            PrefValue::Bool(false)
+        );
+    }
+
+    #[test]
+    fn text_scale_is_a_closed_enum_including_200_percent() {
+        for step in ["100%", "125%", "150%", "175%", "200%"] {
+            assert_eq!(
+                parse_value("textScale", step).unwrap(),
+                PrefValue::Enum(step)
+            );
+        }
+        assert!(parse_value("textScale", "110%").is_err());
     }
 
     #[test]
     fn every_default_is_self_consistent() {
         // A default value must itself validate against its own spec.
         for s in SCHEMA {
-            assert!(s.validate(s.default).is_ok(), "default for {} is invalid", s.key);
+            assert!(
+                s.validate(s.default).is_ok(),
+                "default for {} is invalid",
+                s.key
+            );
         }
     }
 

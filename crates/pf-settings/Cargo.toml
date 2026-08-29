@@ -21,3 +21,5 @@ pf-prefs = { workspace = true }
 # pf-settings — only pf-settings depends on it, and only for tests.
 [dev-dependencies]
 pocketforge = { workspace = true }
+pf-prefs-port = { path = "../pf-prefs-port", version = "0.0.1" }
+pf-ports = { workspace = true }

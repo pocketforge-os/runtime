@@ -104,12 +104,39 @@ impl Prefs {
         }
     }
 
-    // --- Named typed getters for the v1 schema (the facade's read-API surface) -------------
+    /// Typed closed-enum read. Errors if the key is unknown or is not an enum preference.
+    pub fn get_enum(&self, key: &str) -> Result<&'static str, PrefError> {
+        match self.value(key)? {
+            PrefValue::Enum(value) => Ok(value),
+            other => Err(PrefError::Type {
+                key: key.to_string(),
+                expected: "enum",
+                got: other.kind_name(),
+            }),
+        }
+    }
+
+    // --- Named typed getters for the schema (the facade's read-API surface) ----------------
     // These are infallible: the keys and types are schema constants, so they cannot error.
+
+    /// `textScale` — the shell text scaling step.
+    pub fn text_scale(&self) -> &'static str {
+        self.get_enum("textScale").unwrap_or("100%")
+    }
+
+    /// `highContrast` — use the shell's high-contrast presentation.
+    pub fn high_contrast(&self) -> bool {
+        self.get_bool("highContrast").unwrap_or(false)
+    }
 
     /// `reduceMotion` — suppress non-essential cosmetic motion.
     pub fn reduce_motion(&self) -> bool {
         self.get_bool("reduceMotion").unwrap_or(false)
+    }
+
+    /// `reduceFlashing` — suppress non-essential flashing effects.
+    pub fn reduce_flashing(&self) -> bool {
+        self.get_bool("reduceFlashing").unwrap_or(false)
     }
 
     /// `hapticsEnabled` — allow haptic/rumble actuation (honored at the primitive).
@@ -136,7 +163,11 @@ impl Prefs {
         let old = self.value(key)?; // safe: validate() proved the key is known
         self.stored.insert(key.to_string(), validated);
         Ok(if old != validated {
-            Some(PrefChange { key: key.to_string(), old, new: validated })
+            Some(PrefChange {
+                key: key.to_string(),
+                old,
+                new: validated,
+            })
         } else {
             None
         })
@@ -155,7 +186,10 @@ mod tests {
     #[test]
     fn defaults_read_through_the_schema() {
         let p = Prefs::defaults();
+        assert_eq!(p.text_scale(), "100%");
+        assert!(!p.high_contrast());
         assert!(!p.reduce_motion());
+        assert!(!p.reduce_flashing());
         assert!(p.haptics_enabled());
         assert!(!p.mono_audio());
         assert_eq!(p.brightness(), 100);
@@ -182,15 +216,27 @@ mod tests {
     fn set_to_the_same_effective_value_reports_no_change() {
         let mut p = Prefs::defaults();
         // hapticsEnabled default is true; setting it true is a no-op change (but still stored).
-        assert_eq!(p.set("hapticsEnabled", PrefValue::Bool(true)).unwrap(), None);
+        assert_eq!(
+            p.set("hapticsEnabled", PrefValue::Bool(true)).unwrap(),
+            None
+        );
         assert_eq!(p.source("hapticsEnabled"), Source::Stored);
     }
 
     #[test]
     fn set_validates() {
         let mut p = Prefs::defaults();
-        assert!(matches!(p.set("brightness", PrefValue::Scalar(200)), Err(PrefError::Range { .. })));
-        assert!(matches!(p.set("brightness", PrefValue::Bool(true)), Err(PrefError::Type { .. })));
-        assert!(matches!(p.set("bogus", PrefValue::Bool(true)), Err(PrefError::UnknownKey(_))));
+        assert!(matches!(
+            p.set("brightness", PrefValue::Scalar(200)),
+            Err(PrefError::Range { .. })
+        ));
+        assert!(matches!(
+            p.set("brightness", PrefValue::Bool(true)),
+            Err(PrefError::Type { .. })
+        ));
+        assert!(matches!(
+            p.set("bogus", PrefValue::Bool(true)),
+            Err(PrefError::UnknownKey(_))
+        ));
     }
 }
