@@ -1,0 +1,11 @@
+D1 alpha=0 ms_frame=3.656
+D1 alpha=64 ms_frame=3.494
+D1 alpha=128 ms_frame=3.367
+D1 alpha=192 ms_frame=3.506
+D1 alpha=255 ms_frame=3.368
+D2 band_px=16 accumulated_px_max=32 ms_frame=0.059 fps=16830.9
+D2 band_px=64 accumulated_px_max=128 ms_frame=0.031 fps=32586.5
+D2 band_px=160 accumulated_px_max=320 ms_frame=0.067 fps=14862.2
+D2 band_px=320 accumulated_px_max=640 ms_frame=0.101 fps=9856.6
+D2 band_px=720 accumulated_px_max=720 ms_frame=0.242 fps=4131.0
+RSS VmHWM:	   24484 kB
