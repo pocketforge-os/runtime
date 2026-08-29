@@ -1,0 +1,16 @@
+{
+  "phase": "Idle",
+  "history": [
+    {
+      "session_id": "session-7",
+      "item_id": "legacy-game",
+      "receipt": "Returned"
+    }
+  ],
+  "pending": [],
+  "next_sequence": 8,
+  "next_session": 8,
+  "safe_return_queue": 0,
+  "safe_return_binding_revision": 0,
+  "acknowledged": {}
+}

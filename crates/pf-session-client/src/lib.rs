@@ -3,7 +3,9 @@
 use pf_ports::{
     Deadline, LaunchRequest, LaunchResult, SessionError, SessionEvent, SessionPoll, SessionPort,
 };
-use pf_session_authority::{AuthorityApi, AuthorityError, RpcEvent, RpcRequest, RpcResponse};
+use pf_session_authority::{
+    AuthorityApi, AuthorityError, HistoryEntry, RpcEvent, RpcRequest, RpcResponse,
+};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 
@@ -74,6 +76,16 @@ impl SocketTransport {
     pub fn socket_path(&self) -> &Path {
         &self.socket
     }
+
+    /// Fetch durable session history, including wall-clock playtime stamps.
+    pub fn history_entries(&self) -> Result<Vec<HistoryEntry>, AuthorityError> {
+        match self.call(&RpcRequest::History)? {
+            RpcResponse::History { entries } => Ok(entries),
+            _ => Err(AuthorityError::Backend(
+                "unexpected history response".into(),
+            )),
+        }
+    }
 }
 
 fn backend(error: impl std::fmt::Display) -> AuthorityError {
@@ -116,9 +128,34 @@ impl AuthorityApi for SocketTransport {
         }
     }
     fn history(&self) -> Vec<SessionEvent> {
-        match self.call(&RpcRequest::History) {
-            Ok(RpcResponse::History { events }) => events.into_iter().map(rpc_event).collect(),
-            _ => Vec::new(),
+        self.history_entries()
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|entry| {
+                entry
+                    .receipt
+                    .map(|receipt| receipt_event(entry.session_id, receipt))
+            })
+            .collect()
+    }
+    fn history_entries(&self) -> Vec<HistoryEntry> {
+        SocketTransport::history_entries(self).unwrap_or_default()
+    }
+}
+
+fn receipt_event(session_id: String, receipt: pf_session_authority::Receipt) -> SessionEvent {
+    match receipt {
+        pf_session_authority::Receipt::Returned => {
+            SessionEvent::Terminal(pf_ports::TerminalReceipt::Returned { session_id })
+        }
+        pf_session_authority::Receipt::ForcedClose => {
+            SessionEvent::Terminal(pf_ports::TerminalReceipt::ForcedClose { session_id })
+        }
+        pf_session_authority::Receipt::Crash { summary } => {
+            SessionEvent::Terminal(pf_ports::TerminalReceipt::Crash {
+                session_id,
+                summary,
+            })
         }
     }
 }
