@@ -9,6 +9,7 @@ members = [
     "crates/pf-broker",
     "crates/pf-hw-exerciser",
     "crates/pf-prefs",
+    "crates/pf-prefs-port",
     "crates/pf-settings",
     "crates/pf-input-collect",
     "crates/pf-input-decode",
@@ -31,6 +32,7 @@ pf-wire = { path = "crates/pf-wire", version = "0.0.1" }
 pocketforge = { path = "crates/pocketforge", version = "0.0.1" }
 # E4 preference data layer (tsp-xubv.1) — a NEW leaf crate + its CLI.
 pf-prefs = { path = "crates/pf-prefs", version = "0.0.1" }
+pf-ports = { path = "crates/pf-ports", version = "0.0.1" }
 pf-scene = { path = "crates/pf-scene", version = "0.0.1" }
 serde = { version = "1", features = ["derive"] }
 # serde_json backs the single current-state JSON preference document (owner ruling Q2). Only the

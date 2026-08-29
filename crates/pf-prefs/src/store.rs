@@ -32,10 +32,11 @@ use serde_json::{Map, Value};
 
 use crate::error::PrefError;
 use crate::prefs::{PrefChange, Prefs};
-use crate::schema::{self, PrefKind, PrefValue};
+use crate::schema::{self, PrefKind, PrefValue, SCHEMA_VERSION};
 
 /// The bare document filename inside the resolved directory.
 const PREFS_FILE: &str = "prefs.json";
+const SCHEMA_VERSION_KEY: &str = "schemaVersion";
 
 /// A handle to the on-disk preference document.
 #[derive(Debug, Clone)]
@@ -51,7 +52,9 @@ impl PrefsStore {
 
     /// Open the store under an explicit directory (the document is `<dir>/prefs.json`).
     pub fn at(dir: impl AsRef<Path>) -> PrefsStore {
-        PrefsStore { path: dir.as_ref().join(PREFS_FILE) }
+        PrefsStore {
+            path: dir.as_ref().join(PREFS_FILE),
+        }
     }
 
     /// The full path to the JSON document.
@@ -126,7 +129,10 @@ fn default_prefs_dir() -> PathBuf {
         return PathBuf::from(base).join("pocketforge").join("prefs");
     }
     if let Some(home) = std::env::var_os("HOME") {
-        return PathBuf::from(home).join(".local/state").join("pocketforge").join("prefs");
+        return PathBuf::from(home)
+            .join(".local/state")
+            .join("pocketforge")
+            .join("prefs");
     }
     std::env::temp_dir().join("pocketforge-prefs")
 }
@@ -137,6 +143,10 @@ fn default_prefs_dir() -> PathBuf {
 fn encode(prefs: &Prefs) -> String {
     // BTreeMap iteration is sorted, so the JSON key order is stable/diffable.
     let mut map = Map::new();
+    map.insert(
+        SCHEMA_VERSION_KEY.to_string(),
+        Value::Number(SCHEMA_VERSION.into()),
+    );
     for (k, v) in &prefs.stored {
         map.insert(k.clone(), pref_to_json(*v));
     }
@@ -152,8 +162,23 @@ fn encode(prefs: &Prefs) -> String {
 
 /// Decode a parsed JSON object into a validated document.
 fn decode(obj: &Map<String, Value>) -> Result<Prefs, PrefError> {
+    if let Some(raw) = obj.get(SCHEMA_VERSION_KEY) {
+        let version = raw.as_u64().ok_or_else(|| {
+            PrefError::Parse("schemaVersion must be a non-negative integer".into())
+        })?;
+        if version != SCHEMA_VERSION {
+            return Err(PrefError::UnsupportedVersion {
+                found: version,
+                supported: SCHEMA_VERSION,
+            });
+        }
+    }
+
     let mut prefs = Prefs::defaults();
     for (key, raw) in obj {
+        if key == SCHEMA_VERSION_KEY {
+            continue;
+        }
         match schema::spec(key) {
             Some(spec) => {
                 let value = json_to_pref(key, spec.kind, raw)?;
@@ -175,6 +200,7 @@ fn pref_to_json(v: PrefValue) -> Value {
     match v {
         PrefValue::Bool(b) => Value::Bool(b),
         PrefValue::Scalar(n) => Value::Number(n.into()),
+        PrefValue::Enum(value) => Value::String(value.to_string()),
     }
 }
 
@@ -195,6 +221,23 @@ fn json_to_pref(key: &str, kind: PrefKind, raw: &Value) -> Result<PrefValue, Pre
             _ => Err(PrefError::Type {
                 key: key.to_string(),
                 expected: "scalar",
+                got: json_kind(raw),
+            }),
+        },
+        PrefKind::Enum { variants } => match raw.as_str() {
+            Some(candidate) => variants
+                .iter()
+                .copied()
+                .find(|variant| *variant == candidate)
+                .map(PrefValue::Enum)
+                .ok_or_else(|| PrefError::Type {
+                    key: key.to_string(),
+                    expected: "enum variant",
+                    got: "unknown enum variant",
+                }),
+            None => Err(PrefError::Type {
+                key: key.to_string(),
+                expected: "enum",
                 got: json_kind(raw),
             }),
         },
@@ -219,8 +262,8 @@ mod tests {
 
     /// A scratch store dir unique to this process+tag (no external temp-crate dep).
     fn scratch(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir()
-            .join(format!("pf-prefs-test-{}-{}", std::process::id(), tag));
+        let dir =
+            std::env::temp_dir().join(format!("pf-prefs-test-{}-{}", std::process::id(), tag));
         let _ = std::fs::remove_dir_all(&dir);
         dir
     }
@@ -237,13 +280,26 @@ mod tests {
     fn atomic_write_round_trips() {
         let dir = scratch("roundtrip");
         let store = PrefsStore::at(&dir);
-        store.apply("hapticsEnabled", PrefValue::Bool(false)).unwrap();
+        store
+            .apply("hapticsEnabled", PrefValue::Bool(false))
+            .unwrap();
         store.apply("brightness", PrefValue::Scalar(42)).unwrap();
+        store.apply("textScale", PrefValue::Enum("200%")).unwrap();
+        store.apply("highContrast", PrefValue::Bool(true)).unwrap();
+        store
+            .apply("reduceFlashing", PrefValue::Bool(true))
+            .unwrap();
 
         let reloaded = store.load().unwrap();
         assert!(!reloaded.haptics_enabled());
         assert_eq!(reloaded.brightness(), 42);
-        assert_eq!(reloaded.source("hapticsEnabled"), crate::prefs::Source::Stored);
+        assert_eq!(reloaded.text_scale(), "200%");
+        assert!(reloaded.high_contrast());
+        assert!(reloaded.reduce_flashing());
+        assert_eq!(
+            reloaded.source("hapticsEnabled"),
+            crate::prefs::Source::Stored
+        );
         assert_eq!(reloaded.source("monoAudio"), crate::prefs::Source::Default);
 
         // Only explicitly-set keys are written; a fresh key stays default.
@@ -252,12 +308,40 @@ mod tests {
     }
 
     #[test]
+    fn unversioned_v1_store_remains_readable_and_is_upgraded_on_save() {
+        let dir = scratch("v1-compat");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("prefs.json"),
+            br#"{"reduceMotion":true,"brightness":75}"#,
+        )
+        .unwrap();
+        let store = PrefsStore::at(&dir);
+        let prefs = store.load().unwrap();
+        assert!(prefs.reduce_motion());
+        assert_eq!(prefs.brightness(), 75);
+        assert_eq!(prefs.text_scale(), "100%");
+
+        store.save(&prefs).unwrap();
+        let saved: Value =
+            serde_json::from_str(&std::fs::read_to_string(store.path()).unwrap()).unwrap();
+        assert_eq!(saved[SCHEMA_VERSION_KEY], SCHEMA_VERSION);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn apply_signals_only_on_effective_change() {
         let dir = scratch("signal");
         let store = PrefsStore::at(&dir);
-        assert!(store.apply("hapticsEnabled", PrefValue::Bool(false)).unwrap().is_some());
+        assert!(store
+            .apply("hapticsEnabled", PrefValue::Bool(false))
+            .unwrap()
+            .is_some());
         // Re-setting the same value: no effective change => no signal.
-        assert!(store.apply("hapticsEnabled", PrefValue::Bool(false)).unwrap().is_none());
+        assert!(store
+            .apply("hapticsEnabled", PrefValue::Bool(false))
+            .unwrap()
+            .is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -314,12 +398,47 @@ mod tests {
         let store = PrefsStore::at(&dir);
         let p = store.load().unwrap();
         assert!(!p.haptics_enabled());
-        assert_eq!(p.extra().get("futureKnob").and_then(|v| v.as_str()), Some("v2-only"));
+        assert_eq!(
+            p.extra().get("futureKnob").and_then(|v| v.as_str()),
+            Some("v2-only")
+        );
         // Re-save and confirm the unknown key survived.
         store.save(&p).unwrap();
         let reloaded = store.load().unwrap();
-        assert_eq!(reloaded.extra().get("futureKnob").and_then(|v| v.as_str()), Some("v2-only"));
+        assert_eq!(
+            reloaded.extra().get("futureKnob").and_then(|v| v.as_str()),
+            Some("v2-only")
+        );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn newer_schema_versions_are_typed_errors_and_never_rewritten() {
+        for version in [3_u64, 999] {
+            let dir = scratch(&format!("future-version-{version}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            let original =
+                format!("{{\"schemaVersion\":{version},\"monoAudio\":true,\"futureKnob\":42}}");
+            std::fs::write(dir.join(PREFS_FILE), original.as_bytes()).unwrap();
+            let store = PrefsStore::at(&dir);
+
+            assert!(matches!(
+                store.load(),
+                Err(PrefError::UnsupportedVersion {
+                    found,
+                    supported: SCHEMA_VERSION
+                }) if found == version
+            ));
+            assert!(matches!(
+                store.apply("monoAudio", PrefValue::Bool(false)),
+                Err(PrefError::UnsupportedVersion {
+                    found,
+                    supported: SCHEMA_VERSION
+                }) if found == version
+            ));
+            assert_eq!(std::fs::read_to_string(store.path()).unwrap(), original);
+            let _ = std::fs::remove_dir_all(dir);
+        }
     }
 
     #[test]

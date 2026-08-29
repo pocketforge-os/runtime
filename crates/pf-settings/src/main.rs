@@ -57,7 +57,9 @@ fn main() {
 }
 
 fn run_get(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
-    let key = args.first().ok_or("get requires a <key> (see `pf-settings list`)")?;
+    let key = args
+        .first()
+        .ok_or("get requires a <key> (see `pf-settings list`)")?;
     let prefs = PrefsStore::open_default().load()?;
     let value = prefs.value(key)?;
     println!("{value}");
@@ -78,7 +80,10 @@ fn run_set(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 
 fn run_list(_args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let prefs = PrefsStore::open_default().load()?;
-    println!("{:<16} {:<8} {:<8} {:<8} {:<8}  description", "key", "type", "value", "default", "source");
+    println!(
+        "{:<16} {:<8} {:<8} {:<8} {:<8}  description",
+        "key", "type", "value", "default", "source"
+    );
     for spec in SCHEMA {
         let value = prefs.value(spec.key)?;
         let source = match prefs.source(spec.key) {
@@ -88,6 +93,7 @@ fn run_list(_args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         let ty = match value {
             pf_prefs::PrefValue::Bool(_) => "bool",
             pf_prefs::PrefValue::Scalar(_) => "scalar",
+            pf_prefs::PrefValue::Enum(_) => "enum",
         };
         println!(
             "{:<16} {:<8} {:<8} {:<8} {:<8}  {}",

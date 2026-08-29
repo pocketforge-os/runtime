@@ -20,22 +20,30 @@ reads it, not because a boundary stops the app. This mirrors [`PERMISSION-MODEL.
 **The one enforceable exception is the FF/rumble path (R-B).** Force-feedback / rumble writes route
 through E2's v0 `uinput`+`EVIOCGRAB` input broker, so `hapticsEnabled` is enforceable there even for
 a non-cooperative app — the same single v0-enforceable seam the permission model names for `input`.
-Every other preference (`reduceMotion`, `monoAudio`, `brightness`) is cooperative-only in v0.
+Every other preference is cooperative-only in v0.
 
-## 2. The preferences (v1 schema)
+## 2. The preferences (v2 schema)
 
-The schema is data (`crates/pf-prefs/src/schema.rs`); adding a preference is one row. v1:
+The schema is data (`crates/pf-prefs/src/schema.rs`); adding a preference is one row. v2:
 
 | key | type | default | honored where (v0) | scope note |
 |-----|------|---------|--------------------|------------|
 | `hapticsEnabled` | bool | `true` | **at the primitive** — the rumble path (`enforce.rs::rumble_pulse` + `managers::vibration`); off ⇒ silent no-op | the FF/rumble path is R-B-enforceable |
-| `reduceMotion` | bool | `false` | **readable + observable flag only** — see §4 | v0 ships NO cosmetic-motion machinery to suppress |
+| `textScale` | enum (`100%`, `125%`, `150%`, `175%`, `200%`) | `100%` | **stored + observable through `PreferencePort`** | shell application lands with its consumer; until then the port reports stored-not-applied |
+| `highContrast` | bool | `false` | **stored + observable through `PreferencePort`** | shell application lands with its consumer; until then the port reports stored-not-applied |
+| `reduceMotion` | bool | `false` | **readable + observable flag only** — see §4 | no cosmetic-motion machinery exists; the port reports stored-not-applied |
+| `reduceFlashing` | bool | `false` | **stored + observable through `PreferencePort`** | no flashing-suppression consumer exists yet; the port reports stored-not-applied |
 | `monoAudio` | bool | `false` | **routing layer** — `AudioManager::output_mix()` reports `Mono` | sim-visible semantic; real DSP down-mix is post-v0 (§4) |
 | `brightness` | scalar `0..=100` | `100` | **contract-only** — readable + observer fires; **NO sysfs apply leg** | owner ruling Q3; per-SoC hardware leg is a follow-on bead (§5) |
 
 Defaults match the merged in-memory seam (`hapticsEnabled` ON, as the rumble primitive reads it) and
 the accessibility-off-by-default norm (`reduceMotion`/`monoAudio` opt-in — the accessible affordance
 is never surprising).
+
+Schema v1 stores were unversioned flat JSON objects. Schema v2 writes `schemaVersion: 2`; the loader
+accepts only those two forms. An explicitly versioned document other than v2 returns a typed
+unsupported-version error before any save, so a newer schema can never be misread or downgraded.
+continues to accept an unversioned v1 document and supplies defaults for every additive v2 key.
 
 ## 3. Read-only to apps; observable; honored at the primitive
 
@@ -85,6 +93,21 @@ The epic acceptance is explicit: `PrefsDidChange` fires on **any** write path. T
   when the preference is on — the **sim-visible semantic** a cooperative renderer/mixer reads. The real
   on-device DSP/ALSA channel down-mix is post-v0 and hardware-gated (R-A honesty: v0 proves the
   preference is read at the routing primitive and flips the contract, not that silicon mixes channels).
+
+### 4.1 The `PreferencePort` adapter and applied-vs-stored truth
+
+`crates/pf-prefs-port` adapts the existing `PrefsStore` behind the F01 `PreferencePort`. It snapshots
+the store, reloads it when `next_change` is polled, and therefore observes writes made by the external
+`pf-settings` process without creating a shell-local store. Submissions accept only the adapter's
+configured authority (`user` for the standard constructor); app authority cannot self-promote.
+
+The adapter currently reports every key as stored-not-applied. Although `hapticsEnabled` and
+`monoAudio` have runtime consumers, this store adapter is not connected to the running backend's
+apply cache and therefore cannot observe either consumer's apply/reload acknowledgement. For every
+key, `stored` is the requested value, `effective` remains the schema default, and `applied = false`;
+a write returns `StoredNotApplied`. A future consumer may report application only after its actual
+acknowledgement is wired into this boundary. This distinction prevents persistence or store reload
+alone from being presented as application.
 
 ## 5. `brightness` — contract-only in v1 (owner ruling Q3)
 
@@ -152,5 +175,7 @@ returns the caller's default; `subscribe_preference` returns `None`).
   trivial (no wire/ABI surface changed) and how the post-Phase-2 preference ops land additively.
 - `crates/pf-prefs` — the `.1` data layer (schema + store + validator + read-API + the persist-and-
   signal `apply()` seam this bead's observer keys off).
+- `crates/pf-prefs-port` — the F01 `PreferencePort` adapter, including authority-scoped writes and
+  per-key applied-vs-stored reporting.
 - Briefing `.planning/app-runtime-simulator-research-briefing.md` — R-A (cooperative), R-B (the FF/rumble
   enforceable exception), §A.2.
