@@ -1,0 +1,91 @@
+{
+  "_comment": "Quiet Console — the flagship theme manifest (theme contract §4). This package is DATA: values, declared assets, and declarations the gate can check. It contains no executable content, defines no route, screen, layout, or focus behavior, and binds only the semantic vocabulary in spec/token-vocabulary.json.",
+  "id": "quiet-console",
+  "name": "Quiet Console",
+  "theme_version": "1.0.0",
+  "targets_vocabulary": 1,
+
+  "bases": {
+    "dark": "full",
+    "light": "full",
+    "high-contrast": "full"
+  },
+
+  "fonts": {
+    "ui": "Manrope",
+    "display": "Manrope",
+    "plate": "Fraunces"
+  },
+
+  "motion": {
+    "reduced_motion": "complete-stop",
+    "table": {
+      "focus":   {"duration_ms": 140, "easing": "decel"},
+      "shelf":   {"duration_ms": 240, "easing": "in-out"},
+      "route":   {"duration_ms": 220, "easing": "in-out"},
+      "launch":  {"duration_ms": 420, "easing": "in-out"},
+      "return":  {"duration_ms": 260, "easing": "decel"},
+      "overlay": {"duration_ms": 180, "easing": "decel"},
+      "crash":   {"duration_ms": 320, "easing": "decel"}
+    }
+  },
+
+  "state_cues": {
+    "rest": "none",
+    "focused": "ring-shape+scale",
+    "selected": "pip-or-inset-bar",
+    "pressed": "positional-inset-offset",
+    "disabled": "dashed-border+em-dash",
+    "unavailable": "slash-glyph+reason-text",
+    "destructive": "warn-glyph+confirm-language"
+  },
+
+  "decoration_slots": [
+    {
+      "id": "card-aura",
+      "kind": "per-item-prebaked-gradient",
+      "text_adjacent": false,
+      "opacity_token": "--deco-aura-opacity",
+      "note": "Static per-item backdrop wash pre-baked from cover palette at art ingest (render-capability row 2, CONFIRMED). Absent-safe: high-contrast binds opacity 0 and every screen stays complete."
+    },
+    {
+      "id": "edition-plate",
+      "kind": "deterministic-plate",
+      "text_adjacent": false,
+      "palette_tokens": [
+        "--deco-plate-a-bg", "--deco-plate-a-fg", "--deco-plate-b-bg", "--deco-plate-b-fg",
+        "--deco-plate-c-bg", "--deco-plate-c-fg", "--deco-plate-d-bg", "--deco-plate-d-fg",
+        "--deco-plate-e-bg", "--deco-plate-e-fg", "--deco-plate-f-bg", "--deco-plate-f-fg"
+      ],
+      "monogram_font": "Fraunces",
+      "motifs": ["motifs/steps.svg", "motifs/waves.svg", "motifs/dot-grid.svg",
+                 "motifs/orbit.svg", "motifs/contour.svg", "motifs/rays.svg"],
+      "note": "hash(item id) -> palette (a-f) x motif (1-6): 36 stable editions, offline, no model. The plate's monogram/eyebrow are decorative identity; the structural text label outside the art slot carries identity (§5 req 8), so this slot is not text-adjacent."
+    },
+    {
+      "id": "card-badge",
+      "kind": "status-badge-over-art",
+      "text_adjacent": true,
+      "surface": "--color-surface-scrim",
+      "contents": ["--color-text-secondary"],
+      "note": "The unavailable-reason badge composes over arbitrary cover art; it sits on the declared scrim, so the gate proves the §4.3a worst-case: readable over ANY backing pixels."
+    },
+    {
+      "id": "favorite-pip",
+      "kind": "glyph-over-art",
+      "text_adjacent": true,
+      "surface": "--color-surface-scrim",
+      "contents": ["--state-selected-accent"],
+      "note": "The favorite pip glyph over cover art, on the same declared scrim."
+    }
+  ],
+
+  "assets": [
+    {"path": "motifs/steps.svg",    "type": "image/svg+xml", "sha256": "3639ce6192935d47ca74a8b17be07e4c90a72b1d94b3fd1f2f2b01fea96012e3"},
+    {"path": "motifs/waves.svg",    "type": "image/svg+xml", "sha256": "28255443db59c7bc2e8acbb57dcee08b96db2eb86e8be857e9209191bfcf6ab9"},
+    {"path": "motifs/dot-grid.svg", "type": "image/svg+xml", "sha256": "161c21fb2eb9c6dba0cd6f0dcd7700801bac4728f7ee9de67c9bd446fbf493d2"},
+    {"path": "motifs/orbit.svg",    "type": "image/svg+xml", "sha256": "c9cefbf074b053732789ec4a1bbd0233688d9e197cc76d2de0a562794732f49b"},
+    {"path": "motifs/contour.svg",  "type": "image/svg+xml", "sha256": "f7bfbf15b102baef6625ec42ce1f1e143831588cf539e49690006504d714306c"},
+    {"path": "motifs/rays.svg",     "type": "image/svg+xml", "sha256": "52b04cf57b5452eab9e04ff50b01d983f16127ac3c2f52d0f42898478a334d56"}
+  ]
+}
