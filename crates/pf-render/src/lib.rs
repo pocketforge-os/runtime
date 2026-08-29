@@ -214,36 +214,37 @@ fn draw_node(
         pm,
         fonts,
         glyphs,
-        &node.accessible_label,
-        (b.x + 6.0) * scale,
-        (b.y + 5.0) * scale,
-        (b.width - 12.0).max(1.0) * scale,
-        (b.height - 5.0).max(0.0) * scale,
-        15.0 * scale,
-        (b.x * scale, b.y * scale, b.width * scale, b.height * scale),
+        TextDraw {
+            text: &node.accessible_label,
+            x: (b.x + 6.0) * scale,
+            y: (b.y + 5.0) * scale,
+            width: (b.width - 12.0).max(1.0) * scale,
+            height: (b.height - 5.0).max(0.0) * scale,
+            size: 15.0 * scale,
+            clip: (b.x * scale, b.y * scale, b.width * scale, b.height * scale),
+        },
     );
     for child in &node.children {
         draw_node(pm, fonts, glyphs, child, scale);
     }
 }
 
-fn draw_text(
-    pm: &mut Pixmap,
-    fonts: &mut FontSystem,
-    glyphs: &mut SwashCache,
-    text: &str,
+struct TextDraw<'a> {
+    text: &'a str,
     x: f32,
     y: f32,
     width: f32,
     height: f32,
     size: f32,
     clip: (f32, f32, f32, f32),
-) {
-    let mut buffer = Buffer::new(fonts, Metrics::new(size, size * 1.25));
-    buffer.set_size(fonts, Some(width), Some(height));
+}
+
+fn draw_text(pm: &mut Pixmap, fonts: &mut FontSystem, glyphs: &mut SwashCache, draw: TextDraw<'_>) {
+    let mut buffer = Buffer::new(fonts, Metrics::new(draw.size, draw.size * 1.25));
+    buffer.set_size(fonts, Some(draw.width), Some(draw.height));
     buffer.set_text(
         fonts,
-        text,
+        draw.text,
         Attrs::new().family(Family::Name("Manrope")),
         Shaping::Advanced,
     );
@@ -257,12 +258,12 @@ fn draw_text(
             let pixmap_width = pm.width() as usize;
             for yy in 0..gh as i32 {
                 for xx in 0..gw as i32 {
-                    let px = gx + xx + x as i32;
-                    let py = gy + yy + y as i32;
-                    if px < clip.0.floor() as i32
-                        || py < clip.1.floor() as i32
-                        || px >= (clip.0 + clip.2).ceil() as i32
-                        || py >= (clip.1 + clip.3).ceil() as i32
+                    let px = gx + xx + draw.x as i32;
+                    let py = gy + yy + draw.y as i32;
+                    if px < draw.clip.0.floor() as i32
+                        || py < draw.clip.1.floor() as i32
+                        || px >= (draw.clip.0 + draw.clip.2).ceil() as i32
+                        || py >= (draw.clip.1 + draw.clip.3).ceil() as i32
                         || px < 0
                         || py < 0
                         || px >= pm.width() as i32
@@ -396,7 +397,7 @@ mod tests {
         let frame = Rasterizer::new().render(&scene, metrics()).unwrap();
         for y in 0..frame.height {
             for x in 0..frame.width {
-                if x < 40 || x >= 82 || y < 30 || y >= 54 {
+                if !(40..82).contains(&x) || !(30..54).contains(&y) {
                     let offset = (y * frame.width + x) as usize * 4;
                     assert_eq!(&frame.rgba[offset..offset + 4], &[13, 17, 23, 255]);
                 }
