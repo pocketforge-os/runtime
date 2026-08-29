@@ -1,0 +1,19 @@
+{
+  "schema_version":1,"device_id":"a133","protected_actions":["SafeReturn"],
+  "physical_controls":[
+    {"position":"east","printed_label":"A","fallback_glyph":{"source":"pocketforge","id":"pf-face-east"}},
+    {"position":"south","printed_label":"B","fallback_glyph":{"source":"pocketforge","id":"pf-face-south"}},
+    {"position":"west","printed_label":"Y","fallback_glyph":{"source":"pocketforge","id":"pf-face-west"}},
+    {"position":"north","printed_label":"X","fallback_glyph":{"source":"pocketforge","id":"pf-face-north"}},
+    {"position":"start","fallback_glyph":{"source":"pocketforge","id":"pf-start"}},
+    {"position":"select","fallback_glyph":{"source":"pocketforge","id":"pf-select"}},
+    {"position":"guide","input_code":"BTN_MODE","fallback_glyph":{"source":"pocketforge","id":"pf-guide"}},
+    {"position":"l1","fallback_glyph":{"source":"pocketforge","id":"pf-l1"}},
+    {"position":"r1","fallback_glyph":{"source":"pocketforge","id":"pf-r1"}}
+  ],
+  "effective_map":[
+    {"context":"shell","action":"Activate","binding":{"shape":"single_press","controls":["east"]}},
+    {"context":"shell","action":"Back","binding":{"shape":"single_press","controls":["south"]}},
+    {"context":"global","action":"SafeReturn","binding":{"shape":"single_press","controls":["guide"]}}
+  ]
+}
