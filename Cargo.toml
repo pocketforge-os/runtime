@@ -18,6 +18,8 @@ members = [
     "crates/pf-ports",
     "crates/pf-theme",
     "crates/pf-input-map",
+    "crates/pf-render",
+    "crates/pf-framehost",
 ]
 
 # Shared metadata for every crate in the runtime workspace (tsp-e1b.2 / E2).
@@ -36,7 +38,11 @@ pocketforge = { path = "crates/pocketforge", version = "0.0.1" }
 pf-prefs = { path = "crates/pf-prefs", version = "0.0.1" }
 pf-ports = { path = "crates/pf-ports", version = "0.0.1" }
 pf-scene = { path = "crates/pf-scene", version = "0.0.1" }
+<<<<<<< HEAD
 pf-input-map = { path = "crates/pf-input-map", version = "0.0.1" }
+=======
+pf-render = { path = "crates/pf-render", version = "0.0.1" }
+>>>>>>> bc46bd3 (tsp-op5a.43: Added `pf-render` and `pf-framehost`: deterministic Cosmic Text/)
 serde = { version = "1", features = ["derive"] }
 # serde_json backs the single current-state JSON preference document (owner ruling Q2). Only the
 # NEW pf-prefs leaf crate depends on it; the dependency-light wire/facade crates are untouched.

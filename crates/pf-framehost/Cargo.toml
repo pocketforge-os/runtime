@@ -1,0 +1,19 @@
+[package]
+name = "pf-framehost"
+description = "Offscreen and Linux fbdev FrameHost adapters"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+libc = { workspace = true }
+pf-ports = { workspace = true }
+pf-render = { workspace = true }
+pf-scene = { workspace = true }
+
+[dev-dependencies]
+sha2 = "0.10"
+tempfile = "3"
