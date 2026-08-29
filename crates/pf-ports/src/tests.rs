@@ -462,6 +462,26 @@ fn time_fake_gates_manual_time_and_preserves_applied_values() {
 }
 
 #[test]
+fn time_fake_rejects_unscripted_ntp_write_when_unsupported() {
+    let mut fake = FakeTimePort::new(
+        TimeCapabilities {
+            manual_set_time: Support::Supported,
+        },
+        TimeState {
+            wall_clock: SystemTime::UNIX_EPOCH,
+            timezone: "UTC".into(),
+            ntp_state: NtpState::Unsupported,
+        },
+    );
+
+    assert_eq!(fake.set_ntp_enabled(true), Err(TimeError::Unsupported));
+    assert!(matches!(
+        fake.read().unwrap().ntp_state,
+        NtpState::Unsupported
+    ));
+}
+
+#[test]
 fn network_fake_redacts_credentials_and_scripts_progress_and_degradation() {
     let credential = WifiCredential::new(b"do-not-echo".to_vec());
     assert_eq!(credential.expose_secret(), b"do-not-echo");

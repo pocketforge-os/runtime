@@ -912,12 +912,21 @@ impl TimePort for FakeTimePort {
     }
 
     fn set_ntp_enabled(&mut self, enabled: bool) -> Result<AppliedValue<bool>, TimeError> {
-        let result = self.ntp_writes.pop_front().unwrap_or({
+        let result = if let Some(result) = self.ntp_writes.pop_front() {
+            result
+        } else {
+            if self
+                .state_result
+                .as_ref()
+                .is_ok_and(|state| state.ntp_state == NtpState::Unsupported)
+            {
+                return Err(TimeError::Unsupported);
+            }
             Ok(AppliedValue {
                 requested: enabled,
                 applied: enabled,
             })
-        })?;
+        }?;
         if let Ok(state) = &mut self.state_result {
             state.ntp_state = if result.applied {
                 NtpState::Active
