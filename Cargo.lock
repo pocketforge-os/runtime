@@ -447,6 +447,23 @@ name = "pf-scene"
 version = "0.0.1"
 
 [[package]]
+name = "pf-session-authority"
+version = "0.0.1"
+dependencies = [
+ "pf-ports",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "pf-session-client"
+version = "0.0.1"
+dependencies = [
+ "pf-ports",
+ "pf-session-authority",
+]
+
+[[package]]
 name = "pf-settings"
 version = "0.0.1"
 dependencies = [
