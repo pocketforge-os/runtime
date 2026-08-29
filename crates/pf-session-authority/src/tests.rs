@@ -1,5 +1,6 @@
 use super::*;
 use pf_ports::{SessionEvent, TestClock};
+use std::path::PathBuf;
 
 #[derive(Default)]
 struct FakeSystem {
@@ -9,6 +10,69 @@ struct FakeSystem {
     fail_graceful: bool,
     fail_owner: bool,
     fail_start: bool,
+}
+
+#[derive(Default)]
+struct FakeExecutor {
+    calls: Vec<(String, Vec<String>)>,
+    codes: VecDeque<i32>,
+}
+impl CommandExecutor for FakeExecutor {
+    fn execute(&mut self, program: &str, args: &[String]) -> Result<i32, String> {
+        self.calls.push((program.to_owned(), args.to_vec()));
+        Ok(self.codes.pop_front().unwrap_or(0))
+    }
+}
+
+fn scratch(name: &str) -> PathBuf {
+    std::env::temp_dir().join(format!("pf-authority-{name}-{}", std::process::id()))
+}
+
+#[test]
+fn file_store_reports_corruption_as_typed_recovery_error() {
+    let dir = scratch("corrupt");
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("state.json");
+    fs::write(&path, b"not-json").unwrap();
+    assert!(matches!(
+        FileStore::new(&path).load(),
+        Err(AuthorityError::CorruptState { path: got, .. }) if got == path
+    ));
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn command_system_expands_templates_and_classifies_unavailable() {
+    let executor = FakeExecutor {
+        codes: VecDeque::from([0, 3]),
+        ..FakeExecutor::default()
+    };
+    let templates = CommandTemplates::from_strings(
+        "shim start {item_id} {session_id}",
+        "shim stop {session_id}",
+        "shim kill {session_id}",
+        "shim owner",
+    );
+    let mut system = CommandSystem::with_executor(templates, executor);
+    assert!(system
+        .start_foreground(
+            &LaunchRequest {
+                item_id: "game".into()
+            },
+            "s1"
+        )
+        .unwrap());
+    assert!(!system
+        .start_foreground(
+            &LaunchRequest {
+                item_id: "missing".into()
+            },
+            "s2"
+        )
+        .unwrap());
+    let executor = system.into_executor();
+    assert_eq!(executor.calls[0].1, ["start", "game", "s1"]);
 }
 impl FakeSystem {
     fn available() -> Self {
