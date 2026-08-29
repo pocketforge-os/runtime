@@ -28,6 +28,30 @@ fn copy_tree(src: &Path, dst: &Path) {
         }
     }
 }
+fn rewrite_asset_and_hash(root: &Path, asset_path: &str, source: &str) {
+    let asset = root.join(asset_path);
+    fs::write(&asset, source).unwrap();
+    let hash = std::process::Command::new("sha256sum")
+        .arg(&asset)
+        .output()
+        .unwrap();
+    let hash = String::from_utf8(hash.stdout)
+        .unwrap()
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .to_owned();
+    let manifest = root.join("manifest.json");
+    let mut json: Value = serde_json::from_str(&fs::read_to_string(&manifest).unwrap()).unwrap();
+    let entry = json["assets"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|entry| entry["path"] == asset_path)
+        .unwrap();
+    entry["sha256"] = Value::String(hash);
+    fs::write(&manifest, serde_json::to_vec_pretty(&json).unwrap()).unwrap();
+}
 
 #[test]
 fn flagship_passes_all_load_gates() {
@@ -86,6 +110,32 @@ fn broken_package_reports_a_specific_gate() {
     ));
 }
 
+#[test]
+fn token_css_injection_and_out_of_range_rgba_are_rejected_at_load() {
+    let root = scratch("token-injection");
+    copy_tree(&vendor(), &root);
+    let p = root.join("tokens.json");
+    let mut json: Value = serde_json::from_str(&fs::read_to_string(&p).unwrap()).unwrap();
+    json["theme"]["--type-family-ui"] = Value::String("Manrope; } selector { color: red".into());
+    fs::write(&p, serde_json::to_vec_pretty(&json).unwrap()).unwrap();
+    assert!(matches!(
+        load(&root),
+        Err(LoadError::InvalidTokenValue { .. })
+    ));
+
+    let root = scratch("rgba-range");
+    copy_tree(&vendor(), &root);
+    let p = root.join("tokens.json");
+    let mut json: Value = serde_json::from_str(&fs::read_to_string(&p).unwrap()).unwrap();
+    json["bases"]["dark"]["--color-text-primary"] = Value::String("rgba(999,999,999,1)".into());
+    json["bases"]["dark"]["--color-surface-canvas"] = Value::String("#ffffff".into());
+    fs::write(&p, serde_json::to_vec_pretty(&json).unwrap()).unwrap();
+    assert!(matches!(
+        load(&root),
+        Err(LoadError::InvalidTokenValue { .. })
+    ));
+}
+
 #[cfg(unix)]
 #[test]
 fn malicious_paths_symlinks_and_svg_handlers_are_rejected() {
@@ -109,21 +159,21 @@ fn malicious_paths_symlinks_and_svg_handlers_are_rejected() {
     let source = fs::read_to_string(&asset)
         .unwrap()
         .replace("<svg ", "<svg onclick=\"steal()\" ");
-    fs::write(&asset, &source).unwrap();
-    let hash = std::process::Command::new("sha256sum")
-        .arg(&asset)
-        .output()
-        .unwrap();
-    let hash = String::from_utf8(hash.stdout)
+    rewrite_asset_and_hash(&root, "motifs/steps.svg", &source);
+    assert!(matches!(
+        load(&root),
+        Err(LoadError::UnsafeAssetContent { .. })
+    ));
+
+    let root = scratch("href-whitespace");
+    copy_tree(&vendor(), &root);
+    let source = fs::read_to_string(root.join("motifs/steps.svg"))
         .unwrap()
-        .split_whitespace()
-        .next()
-        .unwrap()
-        .to_owned();
-    let p = root.join("manifest.json");
-    let mut json: Value = serde_json::from_str(&fs::read_to_string(&p).unwrap()).unwrap();
-    json["assets"].as_array_mut().unwrap()[0]["sha256"] = Value::String(hash);
-    fs::write(&p, serde_json::to_vec_pretty(&json).unwrap()).unwrap();
+        .replace(
+            "</svg>",
+            "<image href = \"https://example.com/pixel.png\"/></svg>",
+        );
+    rewrite_asset_and_hash(&root, "motifs/steps.svg", &source);
     assert!(matches!(
         load(&root),
         Err(LoadError::UnsafeAssetContent { .. })

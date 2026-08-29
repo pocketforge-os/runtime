@@ -311,6 +311,10 @@ pub enum LoadError {
         key: String,
     },
     UnknownToken(String),
+    InvalidTokenValue {
+        key: String,
+        value: String,
+    },
     InvalidFont(String),
     MissingStateCue(String),
     InvalidStateCue {
@@ -421,6 +425,83 @@ const STATES: [(&str, &str); 7] = [
 fn known_token(k: &str) -> bool {
     BASE_TOKENS.contains(&k) || THEME_TOKENS.contains(&k)
 }
+fn validate_token_value(key: &str, value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    if value.is_empty()
+        || value.chars().any(char::is_control)
+        || [';', '{', '}', '@'].iter().any(|c| value.contains(*c))
+        || lower.contains("url(")
+    {
+        return false;
+    }
+
+    if key.starts_with("--type-family-") {
+        return value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, ' ' | '-' | '_'));
+    }
+    if key.ends_with("-weight") {
+        return value.parse::<u16>().is_ok_and(|n| (1..=1000).contains(&n))
+            && value.chars().all(|c| c.is_ascii_digit());
+    }
+    if key.ends_with("-duration") {
+        return parse_nonnegative_number(value.strip_suffix("ms").unwrap_or(""));
+    }
+    if key.starts_with("--ease-") {
+        return parse_cubic_bezier(value);
+    }
+    if key == "--deco-aura-opacity" {
+        return parse_unit_interval(value);
+    }
+    if key.starts_with("--elev-") {
+        return value == "none" || parse_shadow(value);
+    }
+    if key.ends_with("-size")
+        || key.ends_with("-tracking")
+        || key.starts_with("--space-")
+        || key.starts_with("--radius-")
+        || key == "--focus-ring-width"
+        || key == "--focus-ring-offset"
+        || key == "--state-pressed-shift"
+    {
+        return ["px", "rem", "em"].iter().any(|unit| {
+            value
+                .strip_suffix(unit)
+                .is_some_and(parse_nonnegative_number)
+        });
+    }
+    parse_color(value).is_some()
+}
+fn parse_nonnegative_number(s: &str) -> bool {
+    !s.is_empty()
+        && s.bytes().filter(|b| *b == b'.').count() <= 1
+        && s.bytes().all(|b| b.is_ascii_digit() || b == b'.')
+        && s.parse::<f64>().is_ok_and(|n| n.is_finite() && n >= 0.0)
+}
+fn parse_unit_interval(s: &str) -> bool {
+    parse_nonnegative_number(s) && s.parse::<f64>().is_ok_and(|n| n <= 1.0)
+}
+fn parse_cubic_bezier(s: &str) -> bool {
+    let Some(body) = s
+        .strip_prefix("cubic-bezier(")
+        .and_then(|s| s.strip_suffix(')'))
+    else {
+        return false;
+    };
+    let parts: Vec<_> = body.split(',').map(str::trim).collect();
+    parts.len() == 4 && parts.into_iter().all(parse_unit_interval)
+}
+fn parse_shadow(s: &str) -> bool {
+    let Some(color_at) = s.find("rgba(") else {
+        return false;
+    };
+    let dimensions: Vec<_> = s[..color_at].split_whitespace().collect();
+    dimensions.len() == 3
+        && dimensions
+            .iter()
+            .all(|v| *v == "0" || v.strip_suffix("px").is_some_and(parse_nonnegative_number))
+        && parse_color(s[color_at..].trim()).is_some()
+}
 fn validate(root: &Path, m: &Manifest, t: &TokenDocument) -> Result<(), LoadError> {
     if m.targets_vocabulary > 1 {
         return Err(LoadError::UnsupportedVocabulary(m.targets_vocabulary));
@@ -432,6 +513,18 @@ fn validate(root: &Path, m: &Manifest, t: &TokenDocument) -> Result<(), LoadErro
     {
         if !known_token(k) {
             return Err(LoadError::UnknownToken(k.clone()));
+        }
+    }
+    for (key, value) in t
+        .theme
+        .iter()
+        .chain(t.bases.values().flat_map(|base| base.iter()))
+    {
+        if !validate_token_value(key, value) {
+            return Err(LoadError::InvalidTokenValue {
+                key: key.clone(),
+                value: value.clone(),
+            });
         }
     }
     for k in THEME_TOKENS {
@@ -702,11 +795,20 @@ fn parse_color(s: &str) -> Option<[f64; 4]> {
     if p.len() != 4 {
         return None;
     }
+    let rgb = [
+        p[0].parse::<u8>().ok()?,
+        p[1].parse::<u8>().ok()?,
+        p[2].parse::<u8>().ok()?,
+    ];
+    let alpha = p[3].parse::<f64>().ok()?;
+    if !alpha.is_finite() || !(0.0..=1.0).contains(&alpha) {
+        return None;
+    }
     Some([
-        p[0].parse::<f64>().ok()? / 255.0,
-        p[1].parse::<f64>().ok()? / 255.0,
-        p[2].parse::<f64>().ok()? / 255.0,
-        p[3].parse().ok()?,
+        rgb[0] as f64 / 255.0,
+        rgb[1] as f64 / 255.0,
+        rgb[2] as f64 / 255.0,
+        alpha,
     ])
 }
 fn lum(c: [f64; 4]) -> f64 {
@@ -827,36 +929,36 @@ fn validate_assets(root: &Path, m: &Manifest) -> Result<(), LoadError> {
 }
 fn validate_svg(path: &str, s: &str) -> Result<(), LoadError> {
     let lower = s.to_ascii_lowercase();
-    if [
-        "<!doctype",
-        "<!entity",
-        "<?",
-        "<script",
-        "javascript:",
-        "xlink:",
-        "href=",
-    ]
-    .iter()
-    .any(|x| lower.contains(x))
+    if ["<!doctype", "<!entity", "<?", "<script", "javascript:"]
+        .iter()
+        .any(|x| lower.contains(x))
     {
         return Err(LoadError::UnsafeAssetContent {
             path: path.into(),
             reason: "active SVG construct".into(),
         });
     }
-    for (start, _) in lower.match_indices(|c: char| c.is_ascii_alphabetic()) {
-        if start > 0 && lower.as_bytes()[start - 1].is_ascii_alphanumeric() {
-            continue;
-        }
-        let tail = &lower[start..];
-        let end = tail
-            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == ':'))
-            .unwrap_or(tail.len());
-        let word = &tail[..end];
-        if word.starts_with("on") && word.len() > 2 && tail[end..].trim_start().starts_with('=') {
+    let document =
+        roxmltree::Document::parse(s).map_err(|error| LoadError::UnsafeAssetContent {
+            path: path.into(),
+            reason: format!("invalid SVG XML: {error}"),
+        })?;
+    for attribute in document
+        .descendants()
+        .filter(|node| node.is_element())
+        .flat_map(|node| node.attributes())
+    {
+        let name = attribute.name();
+        if name.eq_ignore_ascii_case("href") {
             return Err(LoadError::UnsafeAssetContent {
                 path: path.into(),
-                reason: format!("event attribute {word}"),
+                reason: format!("external-reference attribute {name}"),
+            });
+        }
+        if name.len() > 2 && name[..2].eq_ignore_ascii_case("on") {
+            return Err(LoadError::UnsafeAssetContent {
+                path: path.into(),
+                reason: format!("event attribute {name}"),
             });
         }
     }
