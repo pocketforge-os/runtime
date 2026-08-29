@@ -92,33 +92,22 @@ impl PreferencePort for PrefsPreferencePort {
             .apply(&change.key.0, value)
             .map_err(map_backend_error)?;
         self.refresh()?;
-        Ok(if has_apply_leg(&change.key.0) {
-            PreferenceChangeResult::Accepted
-        } else {
-            PreferenceChangeResult::StoredNotApplied
-        })
+        Ok(PreferenceChangeResult::StoredNotApplied)
     }
 }
 
 fn effective(key: &str, stored: PrefValue) -> EffectivePreference {
-    let applied = has_apply_leg(key);
-    let effective = if applied {
-        stored
-    } else {
-        pf_prefs::spec(key).expect("schema key").default
-    };
+    // This adapter observes the store reload, not the running consumer's apply acknowledgement.
+    // Until such an acknowledgement is wired into this boundary, persistence must not be
+    // promoted to application even when another runtime component has an apply leg for the key.
+    let applied = false;
+    let effective = pf_prefs::spec(key).expect("schema key").default;
     EffectivePreference {
         key: PreferenceKey(key.into()),
         effective: to_port_value(effective),
         stored: to_port_value(stored),
         applied,
     }
-}
-
-/// Existing real runtime legs: rumble suppression at the primitive and the audio routing mix.
-/// Other values are stored and observable, but must not claim application before a consumer exists.
-fn has_apply_leg(key: &str) -> bool {
-    matches!(key, "hapticsEnabled" | "monoAudio")
 }
 
 fn to_port_value(value: PrefValue) -> PreferenceValue {
@@ -154,7 +143,9 @@ fn map_backend_error(error: PrefError) -> PreferenceError {
         PrefError::UnknownKey(_) | PrefError::Type { .. } | PrefError::Range { .. } => {
             PreferenceError::InvalidValue
         }
-        PrefError::Io(_) | PrefError::Parse(_) => PreferenceError::BackendUnavailable,
+        PrefError::Io(_) | PrefError::Parse(_) | PrefError::UnsupportedVersion { .. } => {
+            PreferenceError::BackendUnavailable
+        }
     }
 }
 
@@ -176,7 +167,7 @@ mod tests {
     }
 
     #[test]
-    fn reports_applied_and_stored_only_keys_truthfully() {
+    fn reports_store_values_as_not_applied_without_runtime_acknowledgement() {
         let dir = scratch("truthful");
         let store = PrefsStore::at(&dir);
         store.apply("monoAudio", PrefValue::Bool(true)).unwrap();
@@ -187,9 +178,9 @@ mod tests {
             .read(&PreferenceKey("monoAudio".into()))
             .unwrap()
             .unwrap();
-        assert_eq!(mono.effective, PreferenceValue::Bool(true));
+        assert_eq!(mono.effective, PreferenceValue::Bool(false));
         assert_eq!(mono.stored, PreferenceValue::Bool(true));
-        assert!(mono.applied);
+        assert!(!mono.applied);
 
         let motion = port
             .read(&PreferenceKey("reduceMotion".into()))
@@ -199,13 +190,7 @@ mod tests {
         assert_eq!(motion.stored, PreferenceValue::Bool(true));
         assert!(!motion.applied);
 
-        for key in [
-            "textScale",
-            "highContrast",
-            "reduceMotion",
-            "reduceFlashing",
-            "brightness",
-        ] {
+        for key in SCHEMA.iter().map(|spec| spec.key) {
             assert!(
                 !port
                     .read(&PreferenceKey(key.into()))
@@ -215,15 +200,29 @@ mod tests {
                 "{key}"
             );
         }
-        for key in ["hapticsEnabled", "monoAudio"] {
-            assert!(
-                port.read(&PreferenceKey(key.into()))
-                    .unwrap()
-                    .unwrap()
-                    .applied,
-                "{key}"
-            );
-        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn mono_audio_submission_is_stored_not_applied() {
+        let dir = scratch("mono-submit");
+        let mut port = PrefsPreferencePort::for_user(PrefsStore::at(&dir)).unwrap();
+        let result = port
+            .submit_change(PreferenceChange {
+                key: PreferenceKey("monoAudio".into()),
+                value: PreferenceValue::Bool(true),
+                authority: ChangeAuthority(USER_AUTHORITY.into()),
+            })
+            .unwrap();
+
+        assert_eq!(result, PreferenceChangeResult::StoredNotApplied);
+        let mono = port
+            .read(&PreferenceKey("monoAudio".into()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(mono.stored, PreferenceValue::Bool(true));
+        assert_eq!(mono.effective, PreferenceValue::Bool(false));
+        assert!(!mono.applied);
         let _ = std::fs::remove_dir_all(dir);
     }
 

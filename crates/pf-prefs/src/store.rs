@@ -162,14 +162,21 @@ fn encode(prefs: &Prefs) -> String {
 
 /// Decode a parsed JSON object into a validated document.
 fn decode(obj: &Map<String, Value>) -> Result<Prefs, PrefError> {
+    if let Some(raw) = obj.get(SCHEMA_VERSION_KEY) {
+        let version = raw.as_u64().ok_or_else(|| {
+            PrefError::Parse("schemaVersion must be a non-negative integer".into())
+        })?;
+        if version != SCHEMA_VERSION {
+            return Err(PrefError::UnsupportedVersion {
+                found: version,
+                supported: SCHEMA_VERSION,
+            });
+        }
+    }
+
     let mut prefs = Prefs::defaults();
     for (key, raw) in obj {
         if key == SCHEMA_VERSION_KEY {
-            if raw.as_u64().is_none() {
-                return Err(PrefError::Parse(
-                    "schemaVersion must be a non-negative integer".into(),
-                ));
-            }
             continue;
         }
         match schema::spec(key) {
@@ -403,6 +410,35 @@ mod tests {
             Some("v2-only")
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn newer_schema_versions_are_typed_errors_and_never_rewritten() {
+        for version in [3_u64, 999] {
+            let dir = scratch(&format!("future-version-{version}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            let original =
+                format!("{{\"schemaVersion\":{version},\"monoAudio\":true,\"futureKnob\":42}}");
+            std::fs::write(dir.join(PREFS_FILE), original.as_bytes()).unwrap();
+            let store = PrefsStore::at(&dir);
+
+            assert!(matches!(
+                store.load(),
+                Err(PrefError::UnsupportedVersion {
+                    found,
+                    supported: SCHEMA_VERSION
+                }) if found == version
+            ));
+            assert!(matches!(
+                store.apply("monoAudio", PrefValue::Bool(false)),
+                Err(PrefError::UnsupportedVersion {
+                    found,
+                    supported: SCHEMA_VERSION
+                }) if found == version
+            ));
+            assert_eq!(std::fs::read_to_string(store.path()).unwrap(), original);
+            let _ = std::fs::remove_dir_all(dir);
+        }
     }
 
     #[test]

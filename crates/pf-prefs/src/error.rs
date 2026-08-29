@@ -10,26 +10,56 @@ pub enum PrefError {
     Io(std::io::Error),
     /// The store file exists but is not a valid JSON object.
     Parse(String),
+    /// The document declares a schema version this reader does not explicitly support. Refusing
+    /// a newer document prevents an older writer from interpreting it as the current schema and
+    /// then silently downgrading it on save.
+    UnsupportedVersion { found: u64, supported: u64 },
     /// A value was set for a key that is not in the schema (the *explicit set* path rejects
     /// unknown keys; the tolerant-load path preserves them instead — see [`crate::store`]).
     UnknownKey(String),
     /// A stored/attempted value had the wrong type for its key (e.g. a bool for `brightness`).
-    Type { key: String, expected: &'static str, got: &'static str },
+    Type {
+        key: String,
+        expected: &'static str,
+        got: &'static str,
+    },
     /// A scalar value fell outside its schema range.
-    Range { key: String, value: i64, min: i64, max: i64 },
+    Range {
+        key: String,
+        value: i64,
+        min: i64,
+        max: i64,
+    },
 }
 
 impl std::fmt::Display for PrefError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             PrefError::Io(e) => write!(f, "preference store I/O error: {e}"),
-            PrefError::Parse(msg) => write!(f, "preference store is not a valid JSON object: {msg}"),
+            PrefError::Parse(msg) => {
+                write!(f, "preference store is not a valid JSON object: {msg}")
+            }
+            PrefError::UnsupportedVersion { found, supported } => write!(
+                f,
+                "preference schema version {found} is unsupported (latest supported: {supported})"
+            ),
             PrefError::UnknownKey(k) => write!(f, "unknown preference key '{k}'"),
             PrefError::Type { key, expected, got } => {
-                write!(f, "preference '{key}' expects a {expected} value, got a {got}")
+                write!(
+                    f,
+                    "preference '{key}' expects a {expected} value, got a {got}"
+                )
             }
-            PrefError::Range { key, value, min, max } => {
-                write!(f, "preference '{key}' value {value} is out of range {min}..={max}")
+            PrefError::Range {
+                key,
+                value,
+                min,
+                max,
+            } => {
+                write!(
+                    f,
+                    "preference '{key}' value {value} is out of range {min}..={max}"
+                )
             }
         }
     }

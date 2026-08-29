@@ -41,6 +41,8 @@ the accessibility-off-by-default norm (`reduceMotion`/`monoAudio` opt-in — the
 is never surprising).
 
 Schema v1 stores were unversioned flat JSON objects. Schema v2 writes `schemaVersion: 2`; the loader
+accepts only those two forms. An explicitly versioned document other than v2 returns a typed
+unsupported-version error before any save, so a newer schema can never be misread or downgraded.
 continues to accept an unversioned v1 document and supplies defaults for every additive v2 key.
 
 ## 3. Read-only to apps; observable; honored at the primitive
@@ -99,11 +101,12 @@ the store, reloads it when `next_change` is polled, and therefore observes write
 `pf-settings` process without creating a shell-local store. Submissions accept only the adapter's
 configured authority (`user` for the standard constructor); app authority cannot self-promote.
 
-The adapter reports `applied = true` only for keys with an existing real runtime leg:
-`hapticsEnabled` at the rumble primitive and `monoAudio` at the routing layer. For `textScale`,
-`highContrast`, `reduceMotion`, `reduceFlashing`, and `brightness`, `stored` is the requested value,
-`effective` remains the schema default, and `applied = false` until a real consumer exists. A write to
-one of those keys returns `StoredNotApplied`. This distinction prevents persistence or observation
+The adapter currently reports every key as stored-not-applied. Although `hapticsEnabled` and
+`monoAudio` have runtime consumers, this store adapter is not connected to the running backend's
+apply cache and therefore cannot observe either consumer's apply/reload acknowledgement. For every
+key, `stored` is the requested value, `effective` remains the schema default, and `applied = false`;
+a write returns `StoredNotApplied`. A future consumer may report application only after its actual
+acknowledgement is wired into this boundary. This distinction prevents persistence or store reload
 alone from being presented as application.
 
 ## 5. `brightness` — contract-only in v1 (owner ruling Q3)
