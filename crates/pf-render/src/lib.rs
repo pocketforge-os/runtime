@@ -51,6 +51,8 @@ pub struct Rasterizer {
 #[derive(Clone, PartialEq)]
 struct NodeSnapshot {
     id: String,
+    parent_id: Option<String>,
+    sibling_index: usize,
     bounds: Bounds,
     label: String,
     focused: bool,
@@ -89,7 +91,7 @@ impl Rasterizer {
             metrics.scale,
         );
         let mut current = Vec::new();
-        collect(scene.root(), &mut current);
+        collect(scene.root(), None, 0, &mut current);
         let damage = damage(&self.previous, &current, metrics.scale, width, height);
         self.previous = current;
         Ok(RasterFrame {
@@ -121,17 +123,24 @@ fn physical(logical: f32, scale: f32) -> Result<u32, RenderError> {
     }
 }
 
-fn collect(node: &Node, out: &mut Vec<NodeSnapshot>) {
+fn collect(
+    node: &Node,
+    parent_id: Option<&str>,
+    sibling_index: usize,
+    out: &mut Vec<NodeSnapshot>,
+) {
     out.push(NodeSnapshot {
         id: node.id.as_str().into(),
+        parent_id: parent_id.map(str::to_owned),
+        sibling_index,
         bounds: node.bounds,
         label: node.accessible_label.clone(),
         focused: node.state.focused,
         disabled: node.state.disabled,
         selected: node.state.selected,
     });
-    for child in &node.children {
-        collect(child, out);
+    for (index, child) in node.children.iter().enumerate() {
+        collect(child, Some(node.id.as_str()), index, out);
     }
 }
 
@@ -209,7 +218,9 @@ fn draw_node(
         (b.x + 6.0) * scale,
         (b.y + 5.0) * scale,
         (b.width - 12.0).max(1.0) * scale,
+        (b.height - 5.0).max(0.0) * scale,
         15.0 * scale,
+        (b.x * scale, b.y * scale, b.width * scale, b.height * scale),
     );
     for child in &node.children {
         draw_node(pm, fonts, glyphs, child, scale);
@@ -224,10 +235,12 @@ fn draw_text(
     x: f32,
     y: f32,
     width: f32,
+    height: f32,
     size: f32,
+    clip: (f32, f32, f32, f32),
 ) {
     let mut buffer = Buffer::new(fonts, Metrics::new(size, size * 1.25));
-    buffer.set_size(fonts, Some(width), None);
+    buffer.set_size(fonts, Some(width), Some(height));
     buffer.set_text(
         fonts,
         text,
@@ -246,7 +259,15 @@ fn draw_text(
                 for xx in 0..gw as i32 {
                     let px = gx + xx + x as i32;
                     let py = gy + yy + y as i32;
-                    if px < 0 || py < 0 || px >= pm.width() as i32 || py >= pm.height() as i32 {
+                    if px < clip.0.floor() as i32
+                        || py < clip.1.floor() as i32
+                        || px >= (clip.0 + clip.2).ceil() as i32
+                        || py >= (clip.1 + clip.3).ceil() as i32
+                        || px < 0
+                        || py < 0
+                        || px >= pm.width() as i32
+                        || py >= pm.height() as i32
+                    {
                         continue;
                     }
                     let dst = &mut pm.pixels_mut()[py as usize * pixmap_width + px as usize];
@@ -313,5 +334,73 @@ mod tests {
         assert!(first.damage.is_some());
         let second = r.render(&fixture("日本語"), metrics()).unwrap();
         assert_eq!(second.damage, None);
+    }
+
+    fn overlapping_scene(order: [&str; 2]) -> Scene {
+        let children = order.map(|id| {
+            Node::new(
+                NodeId::new(id).unwrap(),
+                Role::Text,
+                id,
+                if id == "front" {
+                    Bounds::new(20.0, 20.0, 80.0, 40.0)
+                } else {
+                    Bounds::new(50.0, 30.0, 80.0, 40.0)
+                },
+                "card",
+            )
+        });
+        let root = Node::new(
+            NodeId::new("root").unwrap(),
+            Role::Button,
+            "",
+            Bounds::new(0.0, 0.0, 150.0, 90.0),
+            "root",
+        )
+        .with_action(NodeAction::Activate)
+        .with_children(children.into());
+        Scene::new(root, NodeId::new("root").unwrap()).unwrap()
+    }
+
+    #[test]
+    fn swapping_overlapping_siblings_damages_their_union() {
+        let mut r = Rasterizer::new();
+        r.render(&overlapping_scene(["front", "back"]), metrics())
+            .unwrap();
+        let frame = r
+            .render(&overlapping_scene(["back", "front"]), metrics())
+            .unwrap();
+        assert_eq!(
+            frame.damage,
+            Some(DamageRect {
+                x: 20,
+                y: 20,
+                width: 110,
+                height: 50,
+            })
+        );
+    }
+
+    #[test]
+    fn wrapping_text_is_clipped_to_node_bounds() {
+        let bounds = Bounds::new(40.0, 30.0, 42.0, 24.0);
+        let node = Node::new(
+            NodeId::new("root").unwrap(),
+            Role::Button,
+            "This label wraps across far more lines than fit",
+            bounds,
+            "card",
+        )
+        .with_action(NodeAction::Activate);
+        let scene = Scene::new(node, NodeId::new("root").unwrap()).unwrap();
+        let frame = Rasterizer::new().render(&scene, metrics()).unwrap();
+        for y in 0..frame.height {
+            for x in 0..frame.width {
+                if x < 40 || x >= 82 || y < 30 || y >= 54 {
+                    let offset = (y * frame.width + x) as usize * 4;
+                    assert_eq!(&frame.rgba[offset..offset + 4], &[13, 17, 23, 255]);
+                }
+            }
+        }
     }
 }

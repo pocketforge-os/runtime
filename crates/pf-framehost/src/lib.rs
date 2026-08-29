@@ -352,6 +352,7 @@ mod tests {
     use super::*;
     use pf_scene::{Bounds, Node, NodeAction, NodeId, Role};
     use sha2::{Digest, Sha256};
+    use std::io::Read;
     use std::sync::{Arc, Mutex};
     fn scene() -> Scene {
         let n = Node::new(
@@ -403,6 +404,63 @@ mod tests {
         )
         .unwrap();
         (host, calls)
+    }
+    fn overlapping_scene(order: [&str; 2]) -> Scene {
+        let children = order.map(|id| {
+            Node::new(
+                NodeId::new(id).unwrap(),
+                Role::Text,
+                id,
+                if id == "front" {
+                    Bounds::new(20.0, 20.0, 80.0, 40.0)
+                } else {
+                    Bounds::new(50.0, 30.0, 80.0, 40.0)
+                },
+                "card",
+            )
+        });
+        let root = Node::new(
+            NodeId::new("root").unwrap(),
+            Role::Button,
+            "",
+            Bounds::new(0.0, 0.0, 150.0, 90.0),
+            "root",
+        )
+        .with_action(NodeAction::Activate)
+        .with_children(children.into());
+        Scene::new(root, NodeId::new("root").unwrap()).unwrap()
+    }
+    fn wrapping_scene(label: &str) -> Scene {
+        let root = Node::new(
+            NodeId::new("root").unwrap(),
+            Role::Button,
+            label,
+            Bounds::new(40.0, 30.0, 42.0, 24.0),
+            "card",
+        )
+        .with_action(NodeAction::Activate);
+        Scene::new(root, NodeId::new("root").unwrap()).unwrap()
+    }
+    fn assert_current_page_matches_frame(host: &mut FbdevHost) {
+        let frame = host.last_frame.as_ref().unwrap();
+        let bpp = bytes_per_pixel(host.info.format);
+        let mut actual = vec![0; host.info.stride as usize * host.info.height as usize];
+        let offset = host.info.stride as u64 * host.info.height as u64 * host.page as u64;
+        host.file.seek(SeekFrom::Start(offset)).unwrap();
+        host.file.read_exact(&mut actual).unwrap();
+        for y in 0..host.info.height as usize {
+            for x in 0..host.info.width as usize {
+                let mut expected = [0; 4];
+                let rgba = &frame.rgba[(y * host.info.width as usize + x) * 4..][..4];
+                pack(host.info.format, rgba, &mut expected[..bpp]);
+                let actual_offset = y * host.info.stride as usize + x * bpp;
+                assert_eq!(
+                    &actual[actual_offset..actual_offset + bpp],
+                    &expected[..bpp],
+                    "pixel mismatch at ({x}, {y})"
+                );
+            }
+        }
     }
     #[test]
     fn offscreen_is_byte_identical_by_sha() {
@@ -465,5 +523,34 @@ mod tests {
         let mut r = [0; 2];
         pack(PixelFormat::Rgb565, &[255, 255, 255, 255], &mut r);
         assert_eq!(r, [0xff, 0xff]);
+    }
+
+    #[test]
+    fn sibling_order_change_repaints_fbdev_pixels() {
+        let (mut host, _) = host(PixelFormat::Xrgb8888, false);
+        let old = overlapping_scene(["front", "back"]);
+        host.present(&old).unwrap();
+        host.present(&old).unwrap();
+        host.present(&overlapping_scene(["back", "front"])).unwrap();
+        assert_eq!(
+            host.frame().unwrap().damage,
+            Some(DamageRect {
+                x: 20,
+                y: 20,
+                width: 110,
+                height: 50,
+            })
+        );
+        assert_current_page_matches_frame(&mut host);
+    }
+
+    #[test]
+    fn changed_wrapping_label_leaves_no_stale_fbdev_glyphs() {
+        let (mut host, _) = host(PixelFormat::Xrgb8888, false);
+        let old = wrapping_scene("This label wraps across far more lines than fit");
+        host.present(&old).unwrap();
+        host.present(&old).unwrap();
+        host.present(&wrapping_scene("Short")).unwrap();
+        assert_current_page_matches_frame(&mut host);
     }
 }
