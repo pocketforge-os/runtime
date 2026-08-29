@@ -1,0 +1,15 @@
+[package]
+name = "pf-ports"
+description = "Typed synchronous shell-boundary port contracts and deterministic fakes"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lib]
+name = "pf_ports"
+
+[dependencies]
+pf-scene = { workspace = true }
