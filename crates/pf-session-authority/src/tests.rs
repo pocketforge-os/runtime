@@ -74,6 +74,34 @@ fn command_system_expands_templates_and_classifies_unavailable() {
     let executor = system.into_executor();
     assert_eq!(executor.calls[0].1, ["start", "game", "s1"]);
 }
+
+#[test]
+fn default_command_templates_use_one_session_keyed_unit_for_the_lifecycle() {
+    let mut system =
+        CommandSystem::with_executor(CommandTemplates::default(), FakeExecutor::default());
+    let request = LaunchRequest {
+        item_id: "game".into(),
+    };
+
+    assert!(system.start_foreground(&request, "session-1").unwrap());
+    system.request_graceful_stop("session-1").unwrap();
+    system.enforce_termination("session-1").unwrap();
+
+    let executor = system.into_executor();
+    let units: Vec<&str> = executor
+        .calls
+        .iter()
+        .map(|(_, args)| args.last().unwrap().as_str())
+        .collect();
+    assert_eq!(
+        units,
+        vec![
+            "pf-foreground@session-1.service",
+            "pf-foreground@session-1.service",
+            "pf-foreground@session-1.service",
+        ]
+    );
+}
 impl FakeSystem {
     fn available() -> Self {
         Self {

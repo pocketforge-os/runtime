@@ -214,3 +214,50 @@ fn socket_transport_orders_receipt_and_resumes_durable_cursor() {
     thread.join().unwrap();
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+fn socket_transport_reports_daemon_down_instead_of_idle() {
+    let dir = std::env::temp_dir().join(format!("pf-session-socket-down-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let socket = dir.join("authority.sock");
+    let mut client = SessionClient::new("launcher", SocketTransport::connect(&socket));
+
+    assert_eq!(
+        client.next_event(Deadline(MonotonicTime::ZERO)),
+        Err(SessionError::BackendUnavailable)
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn socket_transport_reports_mid_stream_drop_on_next_call() {
+    let dir = std::env::temp_dir().join(format!("pf-session-socket-drop-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let socket = dir.join("authority.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let thread = std::thread::spawn(move || {
+        let (mut first, _) = listener.accept().unwrap();
+        let request = pf_wire::read_frame(&mut first).unwrap();
+        let _: pf_session_authority::RpcRequest = serde_json::from_slice(&request).unwrap();
+        let response =
+            serde_json::to_vec(&pf_session_authority::RpcResponse::Events { events: vec![] })
+                .unwrap();
+        pf_wire::write_frame(&mut first, &response).unwrap();
+
+        let (_dropped, _) = listener.accept().unwrap();
+    });
+    let mut client = SessionClient::new("launcher", SocketTransport::connect(&socket));
+    assert_eq!(
+        client.next_event(Deadline(MonotonicTime::ZERO)),
+        Ok(SessionPoll::Idle)
+    );
+    assert_eq!(
+        client.next_event(Deadline(MonotonicTime::ZERO)),
+        Err(SessionError::BackendUnavailable)
+    );
+
+    thread.join().unwrap();
+    std::fs::remove_dir_all(dir).unwrap();
+}

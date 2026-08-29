@@ -92,13 +92,16 @@ impl AuthorityApi for SocketTransport {
         }
     }
     fn events_for(&self, client_id: &str) -> Vec<(u64, SessionEvent)> {
+        self.try_events_for(client_id).unwrap_or_default()
+    }
+    fn try_events_for(&self, client_id: &str) -> Result<Vec<(u64, SessionEvent)>, AuthorityError> {
         match self.call(&RpcRequest::Events {
             client_id: client_id.to_owned(),
-        }) {
-            Ok(RpcResponse::Events { events }) => {
-                events.into_iter().map(|(s, e)| (s, rpc_event(e))).collect()
+        })? {
+            RpcResponse::Events { events } => {
+                Ok(events.into_iter().map(|(s, e)| (s, rpc_event(e))).collect())
             }
-            _ => Vec::new(),
+            _ => Err(AuthorityError::Backend("unexpected events response".into())),
         }
     }
     fn acknowledge(&mut self, client_id: &str, sequence: u64) -> Result<(), AuthorityError> {
@@ -152,7 +155,8 @@ impl<T: AuthorityApi> SessionPort for SessionClient<T> {
     fn next_event(&mut self, _deadline: Deadline) -> Result<SessionPoll, SessionError> {
         let Some((sequence, event)) = self
             .transport
-            .events_for(&self.client_id)
+            .try_events_for(&self.client_id)
+            .map_err(map_error)?
             .into_iter()
             .next()
         else {

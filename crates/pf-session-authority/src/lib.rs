@@ -240,7 +240,7 @@ pub struct CommandTemplates {
 impl Default for CommandTemplates {
     fn default() -> Self {
         Self {
-            start_foreground: words("systemctl start pf-foreground@{item_id}.service"),
+            start_foreground: words("systemctl start pf-foreground@{session_id}.service"),
             request_graceful_stop: words("systemctl stop pf-foreground@{session_id}.service"),
             enforce_termination: words(
                 "systemctl kill --kill-who=all pf-foreground@{session_id}.service",
@@ -380,6 +380,9 @@ pub enum FailureRung {
 pub trait AuthorityApi {
     fn launch(&mut self, request: LaunchRequest) -> Result<LaunchResult, AuthorityError>;
     fn events_for(&self, client_id: &str) -> Vec<(u64, SessionEvent)>;
+    fn try_events_for(&self, client_id: &str) -> Result<Vec<(u64, SessionEvent)>, AuthorityError> {
+        Ok(self.events_for(client_id))
+    }
     fn acknowledge(&mut self, client_id: &str, sequence: u64) -> Result<(), AuthorityError>;
     fn history(&self) -> Vec<SessionEvent>;
 }
