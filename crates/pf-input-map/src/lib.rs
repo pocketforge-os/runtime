@@ -329,7 +329,10 @@ impl RemapStore for JsonRemapStore {
         let doc: PersistedDocument =
             serde_json::from_slice(&bytes).map_err(|e| MapError::Persistence(e.to_string()))?;
         if doc.schema_version != SCHEMA_VERSION {
-            return Err(MapError::Persistence("unsupported schema version".into()));
+            return Err(MapError::UnsupportedVersion {
+                found: doc.schema_version,
+                supported: SCHEMA_VERSION,
+            });
         }
         Ok(doc.devices.get(device_id).cloned())
     }
@@ -343,7 +346,12 @@ impl RemapStore for JsonRemapStore {
                 devices: BTreeMap::new(),
             }
         };
-        doc.schema_version = SCHEMA_VERSION;
+        if doc.schema_version != SCHEMA_VERSION {
+            return Err(MapError::UnsupportedVersion {
+                found: doc.schema_version,
+                supported: SCHEMA_VERSION,
+            });
+        }
         doc.devices.insert(device_id.into(), mappings.to_vec());
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent).map_err(io_error)?;
@@ -450,7 +458,33 @@ impl EffectiveMap {
                 });
             }
         }
-        validate_candidate(&mappings, &controls)?;
+        if let Err(error) = validate_candidate(&mappings, &controls) {
+            if persisted.is_none() {
+                return Err(error);
+            }
+
+            // A persisted candidate is untrusted startup input. If it violates the complete-map
+            // invariants, discard it and re-resolve every changed binding to the shipped map so a
+            // corrupt remap cannot strand input at boot.
+            for mapping in &mappings {
+                if let Some(fallback) = contract
+                    .effective_map
+                    .iter()
+                    .find(|m| m.context == mapping.context && m.action == mapping.action)
+                {
+                    if mapping.binding != fallback.binding {
+                        events.push_back(MapEvent::BindingReResolved {
+                            action: mapping.action.clone(),
+                            stored_device_id: stored_device.into(),
+                            current_device_id: contract.device_id.clone(),
+                            old_binding: mapping.binding.clone(),
+                            effective_binding: fallback.binding.clone(),
+                        });
+                    }
+                }
+            }
+            mappings = contract.effective_map.clone();
+        }
         Ok(Self {
             device_id: contract.device_id,
             controls: contract
@@ -648,14 +682,20 @@ fn validate_candidate(mappings: &[Mapping], controls: &BTreeSet<&str>) -> Result
             return Err(MapError::ProtectedActionUnreachable(action.into()));
         }
     }
-    for safe in mappings.iter().filter(|m| m.action == "SafeReturn") {
-        for face in mappings.iter().filter(|m| {
+    for (index, protected) in mappings
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| PROTECTED.contains(&m.action.as_str()))
+    {
+        for (other_index, face) in mappings.iter().enumerate().filter(|(_, m)| {
             FACE_ACTIONS.contains(&m.action.as_str())
-                && (safe.context == "global" || safe.context == m.context)
+                && (protected.context == m.context
+                    || protected.context == "global"
+                    || m.context == "global")
         }) {
-            if safe.binding.signature() == face.binding.signature() {
+            if index != other_index && protected.binding.signature() == face.binding.signature() {
                 return Err(MapError::Collision {
-                    first: safe.action.clone(),
+                    first: protected.action.clone(),
                     second: face.action.clone(),
                 });
             }
@@ -715,6 +755,7 @@ pub enum MapError {
     UnknownAction { context: String, action: String },
     TransactionActive,
     NoTransaction,
+    UnsupportedVersion { found: u32, supported: u32 },
     Persistence(String),
 }
 impl fmt::Display for MapError {

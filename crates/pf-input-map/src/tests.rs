@@ -176,6 +176,42 @@ fn capture_rejects_reusing_back_for_activate_without_creating_partial_state() {
 }
 
 #[test]
+fn persisted_protected_collision_is_rejected_then_re_resolved_to_shipped_defaults() {
+    let device = contract(A133);
+    let shipped = device.effective_map.clone();
+    let mut persisted = shipped.clone();
+    let activate = persisted
+        .iter_mut()
+        .find(|mapping| mapping.action == "Activate")
+        .unwrap();
+    activate.binding = Binding::single("south");
+
+    let controls = device.controls();
+    assert_eq!(
+        validate_candidate(&persisted, &controls),
+        Err(MapError::Collision {
+            first: "Activate".into(),
+            second: "Back".into(),
+        })
+    );
+
+    let mut effective =
+        EffectiveMap::from_persisted(device, Some(("a133".into(), persisted))).unwrap();
+    assert_eq!(effective.mappings(), shipped);
+    assert!(matches!(
+        effective.next_event(),
+        Some(MapEvent::BindingReResolved {
+            action,
+            old_binding,
+            effective_binding,
+            ..
+        }) if action == "Activate"
+            && old_binding == Binding::single("south")
+            && effective_binding == Binding::single("east")
+    ));
+}
+
+#[test]
 fn rejects_any_candidate_that_strands_a_protected_action() {
     let mut broken = contract(A133);
     broken.effective_map.retain(|m| m.action != "Back");
@@ -248,5 +284,29 @@ fn json_store_is_identity_keyed_and_round_trips() {
     store.save("a523", map(A523).mappings()).unwrap();
     assert_eq!(store.load("a133").unwrap(), Some(mappings));
     assert_ne!(store.load("a133").unwrap(), store.load("a523").unwrap());
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn json_store_save_rejects_future_version_without_touching_file() {
+    let dir = std::env::temp_dir().join(format!(
+        "pf-input-map-future-version-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("remaps.json");
+    let original = br#"{"schema_version":2,"devices":{"future-device":[]}}"#;
+    fs::write(&path, original).unwrap();
+    let mut store = JsonRemapStore::at(&path);
+
+    assert_eq!(
+        store.save("a133", map(A133).mappings()),
+        Err(MapError::UnsupportedVersion {
+            found: 2,
+            supported: SCHEMA_VERSION,
+        })
+    );
+    assert_eq!(fs::read(&path).unwrap(), original);
     let _ = fs::remove_dir_all(dir);
 }
