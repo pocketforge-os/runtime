@@ -7,7 +7,8 @@ runtime workspace or wire a `FrameHost`.
 
 ## Reproduce
 
-From this directory, with Rust 1.77 or newer:
+From this directory, with Rust 1.85 or newer (the minimum required by the committed
+lockfile):
 
 ```sh
 ./run.sh

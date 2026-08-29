@@ -13,9 +13,9 @@ performance claims. A133 measurement is pending.** No device or lab host was acc
 
 | Criterion | Source-owned cosmic-text/swash + tiny-skia | SDL3 + SDL3_ttf bounded toolkit |
 |---|---|---|
-| Deterministic headless output | PASS: two fresh 1280x720 runs have identical SHA-256 `1d0acc…32ac4` | Feasible with software surface, but backend/version inputs add control surface |
-| Image toolchain / Rust 1.77 / build | PASS: pure Rust crate, locked dependencies, release build | C/C++ library and SDL build integration; absent on proof host |
-| Licensed committed fonts, UTF-8 shaping/fallback | PASS with honest limit: OFL Manrope/Fraunces committed; Cosmic advanced shaping; CJK/Hangul tofu because no committed CJK font | HarfBuzz-backed shaping is capable; same committed coverage limitation |
+| Deterministic headless output | PASS: two fresh vendored-only 1280x720 runs have identical SHA-256 `dc753c…ec43c` | Feasible with software surface, but backend/version inputs add control surface |
+| Image toolchain / Rust 1.85 / build | PASS: pure Rust crate; locked release build reproduced with Rust 1.85.0 (the locked graph's true floor) | C/C++ library and SDL build integration; absent on proof host |
+| Licensed committed fonts, UTF-8 shaping/fallback | PASS with honest limit: an empty font database is loaded only with committed OFL Manrope/Fraunces; Cosmic advanced shaping; unsupported scripts/emoji render tofu | HarfBuzz-backed shaping is capable; same committed coverage limitation |
 | 200% reflow + seven states | PASS: committed 200% frame and all seven labelled component states | Technically feasible; would duplicate this scene/layout work in toolkit widgets unless restricted to raster host |
 | Offscreen + arm64 estimates / later instrumentation | PASS: offscreen executable, cross-build recipe; exact A133 plan below | Offscreen feasible; larger native dependency/cross-build surface |
 | Offscreen host | PASS: direct pixmap | PASS: software surface |
@@ -27,33 +27,35 @@ performance claims. A133 measurement is pending.** No device or lab host was acc
 
 | Artifact | SHA-256 |
 |---|---|
-| `evidence/home-1280x720.png` | `1d0acc505369841e20c7041b3e85bb2ff560fa54dc7b5091a7b0c8b525332ac4` |
-| `evidence/home-1024x600.png` | `99ddbe2247ad97cecb9c51e0802caccf3be9ba0300cc83b6f1546ad5e43f1ce0` |
-| `evidence/home-1280x720-200.png` | `4a1dbb9da2b1fd903f1a9eebbd0265a3f4ae7b6cd5a69623e0163517695d4183` |
+| `evidence/home-1280x720.png` | `dc753c6ab60bbad54f9e59318053c6fc85f2287c00fc7ec1db96a1d53f1ec43c` |
+| `evidence/home-1024x600.png` | `12847e7cc28a9df8055d164af767e6efafea8e8ae6400a9d1d76d99f65608b80` |
+| `evidence/home-1280x720-200.png` | `40a4f78cdf9d4ced10492f750aec09ca851d4bdd0abdecc19ca8a1e3c57e6ab1` |
 
 The layout derives all horizontal dimensions from width. At 200%, Cosmic Text wraps
 inside the same constraints; this intentionally exposes clipping pressure rather than
 shrinking text. The mixed fixture includes Latin accents, Arabic, Devanagari, Japanese,
-Hangul, and emoji. CJK fallback is **not claimed**: the flagship set lacks those glyphs.
+Hangul, and emoji. The font database starts empty and loads only the two vendored files,
+so unsupported Arabic/Devanagari/CJK/Hangul/emoji glyphs render tofu rather than leaking
+host fonts. Coverage outside the vendored files is **not claimed**.
 
 ## Resource estimates and D-1 / D-2
 
 Proof host: x86_64 Linux, optimized release build. Ten cold render processes completed
-in 0.32 s total (~32 ms/render including process/font load/PNG encode); maximum RSS was
-20,964 KiB. The isolated benchmark high-water RSS was 24,484 KiB (two source frames,
+in 0.10 s total (~10 ms/render including process/font load/PNG encode); maximum RSS was
+12,672 KiB. The isolated benchmark high-water RSS was 24,376 KiB (two source frames,
 output, shadow, and two page buffers coexist).
 
 **D-1 two-buffer 1280x720 crossfade:** 20 full frames per alpha step: alpha 0/64/128/
-192/255 measured 3.656/3.494/3.367/3.506/3.368 ms per frame respectively. This is a
-memory-resident blend estimate, excluding presentation. Estimated ceiling is ~274–297
+192/255 measured 2.919/2.947/2.958/2.824/2.835 ms per frame respectively. This is a
+memory-resident blend estimate, excluding presentation. Estimated ceiling is ~338–354
 fps on this x86 host; it does not imply the A133 rate.
 
 **D-2 shelf glide:** the retained shadow + alternating two-page accumulated-union copy
-measured 0.059/0.031/0.067/0.101/0.242 ms for current damage bands 16/64/160/320/720 px
+measured 0.050/0.037/0.060/0.089/0.138 ms for current damage bands 16/64/160/320/720 px
 (steady accumulated maxima 32/128/320/640/720 px). Thus the copy-only viewport-width
-damage rate exceeds 4,500 fps even at full height on this host; actual shelf glide is
+damage rate exceeds 7,200 fps even at full height on this host; actual shelf glide is
 paint-bound. The conservative representative full-frame source paint estimate is the
-~32 ms end-to-end render above (~31 fps including font load and PNG encode). These two
+~10 ms end-to-end render above (~100 fps including font load and PNG encode). These two
 numbers bracket sustained shelf glide; F03 should cache shaping/glyphs and measure its
 real scene rather than treating either bound as a product budget. `bench-x86_64.txt`
 contains raw output.

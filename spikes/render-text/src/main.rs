@@ -1,4 +1,4 @@
-use cosmic_text::{Attrs, Buffer, Color, Family, FontSystem, Metrics, Shaping, SwashCache};
+use cosmic_text::{fontdb, Attrs, Buffer, Color, Family, FontSystem, Metrics, Shaping, SwashCache};
 use std::{env, fs, hint::black_box, path::Path, time::Instant};
 use tiny_skia::{Color as SkColor, Paint, Pixmap, Rect, Transform};
 
@@ -71,15 +71,16 @@ fn text(
 }
 
 fn render(path: &Path, w: u32, h: u32, scale: f32) {
-    let mut fonts = FontSystem::new();
+    // Start empty: FontSystem::new() discovers host fonts, which would make both
+    // fallback behavior and the committed PNGs depend on the machine running this.
+    let mut db = fontdb::Database::new();
     for p in [
         "fonts/manrope/Manrope[wght].ttf",
         "fonts/fraunces/Fraunces[SOFT,WONK,opsz,wght].ttf",
     ] {
-        fonts
-            .db_mut()
-            .load_font_data(fs::read(p).expect("vendored font"));
+        db.load_font_data(fs::read(p).expect("vendored font"));
     }
+    let mut fonts = FontSystem::new_with_locale_and_db("en-US".into(), db);
     let mut cache = SwashCache::new();
     let mut pm = Pixmap::new(w, h).unwrap();
     pm.fill(SkColor::from_rgba8(13, 17, 23, 255));
