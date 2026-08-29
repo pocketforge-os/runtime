@@ -7,14 +7,16 @@ use pf_session_authority::{AuthorityApi, AuthorityError};
 
 pub struct SessionClient<T> {
     transport: T,
-    sequence: u64,
+    client_id: String,
+    delivered_sequence: Option<u64>,
     history: Vec<SessionEvent>,
 }
 impl<T> SessionClient<T> {
-    pub fn new(transport: T) -> Self {
+    pub fn new(client_id: impl Into<String>, transport: T) -> Self {
         Self {
             transport,
-            sequence: 0,
+            client_id: client_id.into(),
+            delivered_sequence: None,
             history: Vec::new(),
         }
     }
@@ -23,6 +25,18 @@ impl<T> SessionClient<T> {
     }
     pub fn into_inner(self) -> T {
         self.transport
+    }
+}
+
+impl<T: AuthorityApi> SessionClient<T> {
+    /// Durably acknowledge the last event returned to this client identity.
+    pub fn acknowledge_last(&mut self) -> Result<(), SessionError> {
+        if let Some(sequence) = self.delivered_sequence.take() {
+            self.transport
+                .acknowledge(&self.client_id, sequence)
+                .map_err(map_error)?;
+        }
+        Ok(())
     }
 }
 
@@ -36,13 +50,13 @@ impl<T: AuthorityApi> SessionPort for SessionClient<T> {
     fn next_event(&mut self, _deadline: Deadline) -> Result<SessionPoll, SessionError> {
         let Some((sequence, event)) = self
             .transport
-            .events_after(self.sequence)
+            .events_for(&self.client_id)
             .into_iter()
             .next()
         else {
             return Ok(SessionPoll::Idle);
         };
-        self.sequence = sequence;
+        self.delivered_sequence = Some(sequence);
         self.history.push(event.clone());
         Ok(SessionPoll::Event(event))
     }

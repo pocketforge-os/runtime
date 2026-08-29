@@ -11,7 +11,7 @@ use pf_ports::{
     SessionEvent, TerminalReceipt,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::fs;
 use std::io;
 use std::io::Write;
@@ -44,13 +44,15 @@ pub enum Phase {
     Idle,
     Starting {
         session_id: String,
+        item_id: String,
+        start_invoked: bool,
     },
     Running {
         session_id: String,
     },
     StoppingGracefully {
         session_id: String,
-        deadline_nanos: u64,
+        boot_marker: String,
     },
     ForceStopping {
         session_id: String,
@@ -104,6 +106,7 @@ pub struct PersistedState {
     next_session: u64,
     safe_return_queue: u64,
     pub safe_return_binding_revision: u64,
+    acknowledged: BTreeMap<String, u64>,
 }
 
 impl Default for PersistedState {
@@ -116,6 +119,7 @@ impl Default for PersistedState {
             next_session: 1,
             safe_return_queue: 0,
             safe_return_binding_revision: 0,
+            acknowledged: BTreeMap::new(),
         }
     }
 }
@@ -220,7 +224,8 @@ pub enum FailureRung {
 
 pub trait AuthorityApi {
     fn launch(&mut self, request: LaunchRequest) -> Result<LaunchResult, AuthorityError>;
-    fn events_after(&self, sequence: u64) -> Vec<(u64, SessionEvent)>;
+    fn events_for(&self, client_id: &str) -> Vec<(u64, SessionEvent)>;
+    fn acknowledge(&mut self, client_id: &str, sequence: u64) -> Result<(), AuthorityError>;
     fn history(&self) -> Vec<SessionEvent>;
 }
 
@@ -231,6 +236,7 @@ pub struct Authority<S, B, C> {
     state: PersistedState,
     recent_bound: usize,
     grace: Duration,
+    graceful_deadline: Option<MonotonicTime>,
 }
 
 impl<S: StateStore, B: SessionSystem, C: Clock> Authority<S, B, C> {
@@ -249,6 +255,7 @@ impl<S: StateStore, B: SessionSystem, C: Clock> Authority<S, B, C> {
             state,
             recent_bound: recent_bound.max(1),
             grace,
+            graceful_deadline: None,
         })
     }
     pub fn state(&self) -> &PersistedState {
@@ -263,7 +270,7 @@ impl<S: StateStore, B: SessionSystem, C: Clock> Authority<S, B, C> {
     fn session_id(&self) -> Option<String> {
         match &self.state.phase {
             Phase::Idle => None,
-            Phase::Starting { session_id }
+            Phase::Starting { session_id, .. }
             | Phase::Running { session_id }
             | Phase::StoppingGracefully { session_id, .. }
             | Phase::ForceStopping { session_id }
@@ -277,6 +284,19 @@ impl<S: StateStore, B: SessionSystem, C: Clock> Authority<S, B, C> {
         self.state
             .pending
             .push_back(PublishedEvent { sequence, event });
+    }
+    fn compact_acknowledged(&mut self) {
+        let Some(floor) = self.state.acknowledged.values().copied().min() else {
+            return;
+        };
+        while self
+            .state
+            .pending
+            .front()
+            .is_some_and(|event| event.sequence <= floor)
+        {
+            self.state.pending.pop_front();
+        }
     }
     fn recover(&mut self, reason: String) -> Result<(), AuthorityError> {
         let session_id = self
@@ -302,6 +322,25 @@ impl<S: StateStore, B: SessionSystem, C: Clock> Authority<S, B, C> {
         self.persist()
     }
     pub fn reconcile(&mut self) -> Result<(), AuthorityError> {
+        if matches!(
+            self.state.phase,
+            Phase::Starting {
+                start_invoked: false,
+                ..
+            }
+        ) {
+            return self
+                .recover("interrupted start intent: no foreground unit was observed".into());
+        }
+        if let Phase::StoppingGracefully { session_id, .. } = self.state.phase.clone() {
+            if self.graceful_deadline.is_none() {
+                if let Err(reason) = self.system.enforce_termination(&session_id) {
+                    return self.recover(format!("termination: {reason}"));
+                }
+                self.state.phase = Phase::ForceStopping { session_id };
+                return self.persist();
+            }
+        }
         if self.state.safe_return_queue > 0
             && matches!(
                 self.state.phase,
@@ -310,12 +349,12 @@ impl<S: StateStore, B: SessionSystem, C: Clock> Authority<S, B, C> {
         {
             self.state.safe_return_queue -= 1;
             let id = self.session_id().unwrap();
-            let deadline_nanos = self.clock.deadline_after(self.grace).0.as_nanos();
             match self.system.request_graceful_stop(&id) {
                 Ok(()) => {
+                    self.graceful_deadline = Some(self.clock.deadline_after(self.grace).0);
                     self.state.phase = Phase::StoppingGracefully {
                         session_id: id,
-                        deadline_nanos,
+                        boot_marker: boot_marker(),
                     }
                 }
                 Err(_) => {
@@ -331,16 +370,16 @@ impl<S: StateStore, B: SessionSystem, C: Clock> Authority<S, B, C> {
     }
     pub fn tick(&mut self) -> Result<(), AuthorityError> {
         self.reconcile()?;
-        if let Phase::StoppingGracefully {
-            session_id,
-            deadline_nanos,
-        } = self.state.phase.clone()
-        {
-            if self.clock.now() >= MonotonicTime::from_nanos(deadline_nanos) {
+        if let Phase::StoppingGracefully { session_id, .. } = self.state.phase.clone() {
+            if self
+                .graceful_deadline
+                .is_some_and(|deadline| self.clock.now() >= deadline)
+            {
                 if let Err(reason) = self.system.enforce_termination(&session_id) {
                     return self.recover(format!("termination: {reason}"));
                 }
                 self.state.phase = Phase::ForceStopping { session_id };
+                self.graceful_deadline = None;
                 self.persist()?;
             }
         }
@@ -474,16 +513,30 @@ impl<S: StateStore, B: SessionSystem, C: Clock> AuthorityApi for Authority<S, B,
             return Ok(LaunchResult::RejectedBusy);
         }
         let id = format!("session-{}", self.state.next_session);
+        let before_intent = self.state.clone();
         self.state.next_session += 1;
-        if !self
+        self.state.phase = Phase::Starting {
+            session_id: id.clone(),
+            item_id: request.item_id.clone(),
+            start_invoked: false,
+        };
+        if let Err(error) = self.persist() {
+            self.state = before_intent;
+            return Err(error);
+        }
+        let available = self
             .system
             .start_foreground(&request, &id)
-            .map_err(AuthorityError::Backend)?
-        {
+            .map_err(AuthorityError::Backend)?;
+        if !available {
+            self.state.phase = Phase::Idle;
+            self.persist()?;
             return Ok(LaunchResult::ItemUnavailable);
         }
         self.state.phase = Phase::Starting {
             session_id: id.clone(),
+            item_id: request.item_id.clone(),
+            start_invoked: true,
         };
         self.state.history.push_front(HistoryEntry {
             session_id: id.clone(),
@@ -495,13 +548,32 @@ impl<S: StateStore, B: SessionSystem, C: Clock> AuthorityApi for Authority<S, B,
         self.persist()?;
         Ok(LaunchResult::Accepted { session_id: id })
     }
-    fn events_after(&self, sequence: u64) -> Vec<(u64, SessionEvent)> {
+    fn events_for(&self, client_id: &str) -> Vec<(u64, SessionEvent)> {
+        let sequence = self.state.acknowledged.get(client_id).copied().unwrap_or(0);
         self.state
             .pending
             .iter()
             .filter(|e| e.sequence > sequence)
             .map(|e| (e.sequence, wire_to_port(&e.event)))
             .collect()
+    }
+    fn acknowledge(&mut self, client_id: &str, sequence: u64) -> Result<(), AuthorityError> {
+        if sequence >= self.state.next_sequence {
+            return Err(AuthorityError::InvalidObservation);
+        }
+        let before_acknowledgement = self.state.clone();
+        let cursor = self
+            .state
+            .acknowledged
+            .entry(client_id.to_owned())
+            .or_default();
+        *cursor = (*cursor).max(sequence);
+        self.compact_acknowledged();
+        if let Err(error) = self.persist() {
+            self.state = before_acknowledgement;
+            return Err(error);
+        }
+        Ok(())
     }
     fn history(&self) -> Vec<SessionEvent> {
         self.state
@@ -514,6 +586,12 @@ impl<S: StateStore, B: SessionSystem, C: Clock> AuthorityApi for Authority<S, B,
             })
             .collect()
     }
+}
+
+fn boot_marker() -> String {
+    fs::read_to_string("/proc/sys/kernel/random/boot_id")
+        .map(|value| value.trim().to_owned())
+        .unwrap_or_else(|_| "boot-id-unavailable".to_owned())
 }
 
 fn receipt_to_port(receipt: &Receipt, id: &str) -> TerminalReceipt {
