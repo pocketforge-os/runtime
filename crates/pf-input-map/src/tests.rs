@@ -181,6 +181,35 @@ fn reset_to_shipped_restores_a_pure_swap() {
 }
 
 #[test]
+fn reset_to_shipped_reports_and_restores_an_omitted_mapping() {
+    let mut device = contract(A133);
+    device.effective_map.push(Mapping {
+        context: "shell".into(),
+        action: "Quick".into(),
+        binding: Binding::single("north"),
+    });
+    let mut persisted = device.effective_map.clone();
+    let omitted = persisted
+        .iter()
+        .position(|mapping| mapping.action == "Quick")
+        .unwrap();
+    persisted.remove(omitted);
+    let effective = EffectiveMap::from_persisted(device, Some(("a133".into(), persisted))).unwrap();
+    let mut engine = RemapEngine::new(effective, MemoryStore::default());
+
+    engine.reset_to_shipped().unwrap();
+
+    assert!(matches!(
+        engine.map_mut().next_event(),
+        Some(MapEvent::GlyphsUpdated { actions, .. }) if actions.contains(&"Quick".into())
+    ));
+    assert_eq!(
+        engine.map().binding("shell", "Quick"),
+        engine.map().shipped_binding("shell", "Quick")
+    );
+}
+
+#[test]
 fn reset_to_shipped_failure_leaves_the_in_memory_map_unchanged() {
     let mut effective = map(A133);
     effective.mappings[0].binding = Binding::single("west");

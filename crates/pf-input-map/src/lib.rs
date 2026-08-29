@@ -618,17 +618,27 @@ impl<S: RemapStore> RemapEngine<S> {
         self.pending = None;
 
         let shipped = self.map.shipped.clone();
-        let changed_actions = self
-            .map
-            .mappings
+        let mut changed_actions: Vec<_> = shipped
             .iter()
-            .filter_map(|mapping| {
+            .filter(|mapping| {
                 self.map
-                    .shipped_binding(&mapping.context, &mapping.action)
-                    .filter(|binding| *binding != &mapping.binding)
-                    .map(|_| mapping.action.clone())
+                    .binding(&mapping.context, &mapping.action)
+                    .filter(|binding| *binding == &mapping.binding)
+                    .is_none()
             })
+            .map(|mapping| mapping.action.clone())
             .collect();
+        changed_actions.extend(
+            self.map
+                .mappings
+                .iter()
+                .filter(|mapping| {
+                    self.map
+                        .shipped_binding(&mapping.context, &mapping.action)
+                        .is_none()
+                })
+                .map(|mapping| mapping.action.clone()),
+        );
 
         // Persistence is the commit point: do not expose the shipped map unless the single
         // complete-map save succeeds.
