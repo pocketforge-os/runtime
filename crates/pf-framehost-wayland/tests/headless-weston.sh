@@ -41,3 +41,6 @@ start_weston
 cargo run --quiet --locked -p pf-framehost-wayland --example headless_fixture
 echo "RECONNECT ok"
 
+# Exercise compositor loss and recovery on one live WaylandHost. The fixture
+# owns its compositor so it can kill and restart it without replacing the host.
+cargo run --quiet --locked -p pf-framehost-wayland --example reconnect_fixture
