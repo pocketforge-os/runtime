@@ -486,6 +486,7 @@ name = "pf-session-authority"
 version = "0.0.1"
 dependencies = [
  "pf-ports",
+ "pf-wire",
  "serde",
  "serde_json",
 ]
@@ -496,6 +497,9 @@ version = "0.0.1"
 dependencies = [
  "pf-ports",
  "pf-session-authority",
+ "pf-wire",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
