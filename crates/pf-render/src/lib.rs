@@ -634,9 +634,6 @@ fn draw_node(
                 3.0 * scale,
             )?;
         }
-        if node.state.disabled {
-            stroke_token_rect(pm, context.style, "--state-disabled-border", rect, scale)?;
-        }
     }
     let text_key = if node.state.disabled {
         "--state-disabled-text"
@@ -674,6 +671,14 @@ fn draw_node(
     for child in &node.children {
         draw_node(pm, context, child, scale, transform)?;
     }
+    if node.state.disabled {
+        if let Some(rect) =
+            Rect::from_xywh(b.x * scale, b.y * scale, b.width * scale, b.height * scale)
+        {
+            stroke_token_rect(pm, context.style, "--state-disabled-border", rect, scale)?;
+        }
+        draw_state_glyph(pm, context.style, b, scale, StateGlyph::Disabled)?;
+    }
     if node.state.unavailable {
         fill_token_rect(
             pm,
@@ -708,6 +713,7 @@ fn draw_node(
 
 #[derive(Clone, Copy)]
 enum StateGlyph {
+    Disabled,
     Unavailable,
     Destructive,
 }
@@ -726,6 +732,7 @@ fn draw_state_glyph(
     let top = (b.y + 5.0) * scale;
     let size = size * scale;
     let key = match glyph {
+        StateGlyph::Disabled => "--state-disabled-text",
         StateGlyph::Unavailable => "--state-unavailable-text",
         StateGlyph::Destructive => "--state-destructive-accent",
     };
@@ -738,6 +745,10 @@ fn draw_state_glyph(
     };
     let mut path = PathBuilder::new();
     match glyph {
+        StateGlyph::Disabled => {
+            path.move_to(left + size * 0.12, top + size * 0.5);
+            path.line_to(left + size * 0.88, top + size * 0.5);
+        }
         StateGlyph::Unavailable => {
             path.move_to(left + size * 0.12, top + size * 0.88);
             path.line_to(left + size * 0.88, top + size * 0.12);
@@ -1680,6 +1691,56 @@ mod tests {
             let destructive = render(&state_scene(|n| n.state.destructive = true));
             let warning = token_rgba(base, "--state-destructive-accent");
             assert!((80..95).any(|x| (25..40).any(|y| pixel(&destructive, x, y) == warning)));
+        }
+    }
+
+    #[test]
+    fn disabled_image_only_nodes_keep_renderer_owned_em_dash_ink() {
+        for base in [ThemeBase::Dusk, ThemeBase::HighContrast] {
+            let scene = state_scene(|n| {
+                n.accessible_label.clear();
+                n.state.disabled = true;
+                *n = n.clone().with_image(
+                    ImageSource::new("disabled-image", Arc::<[u8]>::from(IMAGE_PNG)),
+                    ImageFit::Cover,
+                );
+            });
+            let mut rasterizer = Rasterizer::new();
+            rasterizer.set_theme_base(base);
+            let disabled = rasterizer.render(&scene, metrics()).unwrap();
+            let dash = token_rgba(base, "--state-disabled-text");
+
+            assert!(
+                (80..95).any(|x| (25..40).any(|y| pixel(&disabled, x, y) == dash)),
+                "{base:?} disabled image lost its em-dash"
+            );
+        }
+    }
+
+    #[test]
+    fn disabled_labeled_nodes_render_border_dash_and_muted_text() {
+        for base in [ThemeBase::Dusk, ThemeBase::HighContrast] {
+            let mut rasterizer = Rasterizer::new();
+            rasterizer.set_theme_base(base);
+            let disabled = rasterizer
+                .render(&state_scene(|n| n.state.disabled = true), metrics())
+                .unwrap();
+            let surface = token_rgba(base, "--state-rest-surface");
+            let muted = token_rgba(base, "--state-disabled-text");
+
+            assert!(
+                (20..100).any(|x| pixel(&disabled, x, 20) != surface)
+                    && (20..100).any(|x| pixel(&disabled, x, 20) == surface),
+                "{base:?} disabled label lost its dashed border"
+            );
+            assert!(
+                (80..95).any(|x| (25..40).any(|y| pixel(&disabled, x, y) == muted)),
+                "{base:?} disabled label lost its em-dash"
+            );
+            assert!(
+                (26..78).any(|x| (25..65).any(|y| pixel(&disabled, x, y) == muted)),
+                "{base:?} disabled label lost its muted text"
+            );
         }
     }
 
