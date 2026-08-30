@@ -7,7 +7,7 @@
 use pf_ports::{FrameHost, PresentAck, PresentFailure, PresentResult};
 use pf_render::{DamageRect, Rasterizer};
 use pf_scene::{Insets, Orientation, Scene, SurfaceMetrics};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::fs::File;
 use std::io::{Seek, SeekFrom, Write};
 use std::os::fd::{AsFd, AsRawFd};
@@ -44,6 +44,8 @@ pub enum Key {
 /// One keyboard transition. `keysym` is retained for consumers needing more than [`Key`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct KeyEvent {
+    /// Physical evdev keycode, stable across layout and modifier changes.
+    pub code: u32,
     pub keysym: u32,
     pub state: KeyState,
     pub key: Key,
@@ -97,6 +99,7 @@ struct State {
     keyboard: Option<wl_keyboard::WlKeyboard>,
     xkb_context: xkb::Context,
     xkb_state: Option<xkb::State>,
+    pressed_keys: HashMap<u32, (u32, Key)>,
     key_events: VecDeque<KeyEvent>,
     repeat_info: Option<RepeatInfo>,
     surface: Option<wl_surface::WlSurface>,
@@ -120,6 +123,7 @@ impl State {
             keyboard: None,
             xkb_context: xkb::Context::new(xkb::CONTEXT_NO_FLAGS),
             xkb_state: None,
+            pressed_keys: HashMap::new(),
             key_events: VecDeque::new(),
             repeat_info: None,
             surface: None,
@@ -149,6 +153,10 @@ impl State {
         self.surface = Some(surface);
         self.xdg_surface = Some(xdg_surface);
         self.toplevel = Some(toplevel);
+    }
+
+    fn clear_pressed_keys(&mut self) {
+        self.pressed_keys.clear();
     }
 }
 
@@ -184,6 +192,7 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
             if state.seat_name == Some(name) {
                 state.keyboard = None;
                 state.xkb_state = None;
+                state.clear_pressed_keys();
                 state.seat = None;
                 state.seat_name = None;
             }
@@ -207,6 +216,7 @@ impl Dispatch<wl_seat::WlSeat, ()> for State {
                 (false, true) => {
                     state.keyboard = None;
                     state.xkb_state = None;
+                    state.clear_pressed_keys();
                 }
                 _ => {}
             }
@@ -244,6 +254,9 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for State {
                 .map(|keymap| xkb::State::new(&keymap));
             }
             wl_keyboard::Event::Keymap { .. } => state.xkb_state = None,
+            wl_keyboard::Event::Enter { .. } | wl_keyboard::Event::Leave { .. } => {
+                state.clear_pressed_keys();
+            }
             wl_keyboard::Event::Key {
                 key,
                 state: key_state,
@@ -260,9 +273,12 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for State {
                     wl_keyboard::KeyState::Released => KeyState::Released,
                     _ => return,
                 };
-                state
-                    .key_events
-                    .push_back(key_event_from_evdev(xkb_state, key, state_value));
+                state.key_events.push_back(key_event_from_evdev(
+                    xkb_state,
+                    &mut state.pressed_keys,
+                    key,
+                    state_value,
+                ));
             }
             wl_keyboard::Event::Modifiers {
                 mods_depressed,
@@ -286,13 +302,29 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for State {
     }
 }
 
-fn key_event_from_evdev(xkb_state: &xkb::State, key: u32, state: KeyState) -> KeyEvent {
+fn key_event_from_evdev(
+    xkb_state: &xkb::State,
+    pressed_keys: &mut HashMap<u32, (u32, Key)>,
+    code: u32,
+    state: KeyState,
+) -> KeyEvent {
     // wl_keyboard uses evdev codes; XKB retains the historical eight-code offset.
-    let keysym = xkb_state.key_get_one_sym(xkb::Keycode::new(key + 8)).raw();
+    let fresh_keysym = xkb_state.key_get_one_sym(xkb::Keycode::new(code + 8)).raw();
+    let fresh_key = translate_keysym(fresh_keysym);
+    let (keysym, key) = match state {
+        KeyState::Pressed => {
+            pressed_keys.insert(code, (fresh_keysym, fresh_key));
+            (fresh_keysym, fresh_key)
+        }
+        KeyState::Released => pressed_keys
+            .remove(&code)
+            .unwrap_or((fresh_keysym, fresh_key)),
+    };
     KeyEvent {
+        code,
         keysym,
         state,
-        key: translate_keysym(keysym),
+        key,
     }
 }
 
@@ -637,15 +669,71 @@ mod tests {
         )
         .expect("compile test keymap");
         let state = xkb::State::new(&keymap);
+        let mut pressed_keys = HashMap::new();
 
         // KEY_A is evdev 30. This is the same translation path used after keymap receipt.
         assert_eq!(
-            key_event_from_evdev(&state, 30, KeyState::Pressed),
+            key_event_from_evdev(&state, &mut pressed_keys, 30, KeyState::Pressed),
             KeyEvent {
+                code: 30,
                 keysym: u32::from('a'),
                 state: KeyState::Pressed,
                 key: Key::Char('a'),
             }
         );
+    }
+
+    #[test]
+    fn release_uses_press_translation_after_modifiers_change() {
+        let context = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
+        let keymap = xkb::Keymap::new_from_names(
+            &context,
+            "",
+            "",
+            "us",
+            "",
+            None,
+            xkb::KEYMAP_COMPILE_NO_FLAGS,
+        )
+        .expect("compile test keymap");
+        let shift_mask = 1 << keymap.mod_get_index(xkb::MOD_NAME_SHIFT);
+        let mut state = xkb::State::new(&keymap);
+        let mut pressed_keys = HashMap::new();
+
+        state.update_mask(shift_mask, 0, 0, 0, 0, 0);
+        let pressed = key_event_from_evdev(&state, &mut pressed_keys, 30, KeyState::Pressed);
+        state.update_mask(0, 0, 0, 0, 0, 0);
+        let released = key_event_from_evdev(&state, &mut pressed_keys, 30, KeyState::Released);
+
+        assert_eq!(pressed.key, Key::Char('A'));
+        assert_eq!(released.key, pressed.key);
+        assert_eq!(released.keysym, pressed.keysym);
+        assert_eq!(released.code, pressed.code);
+        assert!(pressed_keys.is_empty());
+    }
+
+    #[test]
+    fn keyboard_leave_clears_held_keys() {
+        let context = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
+        let keymap = xkb::Keymap::new_from_names(
+            &context,
+            "",
+            "",
+            "us",
+            "",
+            None,
+            xkb::KEYMAP_COMPILE_NO_FLAGS,
+        )
+        .expect("compile test keymap");
+        let state = xkb::State::new(&keymap);
+        let mut host_state = State::new();
+
+        let pressed =
+            key_event_from_evdev(&state, &mut host_state.pressed_keys, 30, KeyState::Pressed);
+        assert_eq!(pressed.key, Key::Char('a'));
+        assert!(!host_state.pressed_keys.is_empty());
+
+        host_state.clear_pressed_keys();
+        assert!(host_state.pressed_keys.is_empty());
     }
 }
