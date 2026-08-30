@@ -575,6 +575,7 @@ pub type PresentResult = Result<PresentAck, PresentFailure>;
 /// framebuffer details, theme resolution, or ownership of scene mutation.
 pub trait FrameHost {
     fn metrics(&self) -> SurfaceMetrics;
+    fn set_palette(&mut self, _palette: pf_render::Palette) {}
     fn present(&mut self, scene: &Scene) -> PresentResult;
 }
 

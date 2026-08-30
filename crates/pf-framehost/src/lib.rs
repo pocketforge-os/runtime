@@ -1,7 +1,7 @@
 //! Frame hosts own presentation while `pf-render` owns pixels and layout.
 
 use pf_ports::{FrameHost, PresentAck, PresentFailure, PresentResult};
-use pf_render::{DamageRect, RasterFrame, Rasterizer};
+use pf_render::{DamageRect, Palette, RasterFrame, Rasterizer};
 use pf_scene::{Insets, Orientation, Scene, SurfaceMetrics};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Seek, SeekFrom, Write};
@@ -34,6 +34,9 @@ impl OffscreenHost {
 impl FrameHost for OffscreenHost {
     fn metrics(&self) -> SurfaceMetrics {
         self.metrics
+    }
+    fn set_palette(&mut self, palette: Palette) {
+        self.renderer.set_palette(palette);
     }
     fn present(&mut self, scene: &Scene) -> PresentResult {
         self.frame = Some(
@@ -200,6 +203,9 @@ fn union_damage(a: Option<DamageRect>, b: Option<DamageRect>) -> Option<DamageRe
 impl FrameHost for FbdevHost {
     fn metrics(&self) -> SurfaceMetrics {
         self.metrics
+    }
+    fn set_palette(&mut self, palette: Palette) {
+        self.renderer.set_palette(palette);
     }
     fn present(&mut self, scene: &Scene) -> PresentResult {
         let frame = self
@@ -404,6 +410,36 @@ mod tests {
         )
         .unwrap();
         (host, calls)
+    }
+
+    fn assert_high_contrast_frame(frame: &RasterFrame) {
+        assert_eq!(&frame.rgba[..4], &[0, 0, 0, 255]);
+        assert!(frame
+            .rgba
+            .chunks_exact(4)
+            .any(|pixel| pixel == [255, 255, 255, 255]));
+    }
+
+    #[test]
+    fn offscreen_palette_takes_effect_on_next_present() {
+        let mut host = OffscreenHost::new(SurfaceMetrics {
+            logical_width: 319.0,
+            logical_height: 181.0,
+            scale: 1.0,
+            safe_insets: Insets::default(),
+            orientation: Orientation::Landscape,
+        });
+        host.set_palette(Palette::high_contrast());
+        host.present(&scene()).unwrap();
+        assert_high_contrast_frame(host.frame().unwrap());
+    }
+
+    #[test]
+    fn fbdev_palette_takes_effect_on_next_present() {
+        let (mut host, _) = host(PixelFormat::Xrgb8888, false);
+        host.set_palette(Palette::high_contrast());
+        host.present(&scene()).unwrap();
+        assert_high_contrast_frame(host.frame().unwrap());
     }
     fn overlapping_scene(order: [&str; 2]) -> Scene {
         let children = order.map(|id| {

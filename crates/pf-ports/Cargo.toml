@@ -12,4 +12,5 @@ authors.workspace = true
 name = "pf_ports"
 
 [dependencies]
+pf-render = { workspace = true }
 pf-scene = { workspace = true }
