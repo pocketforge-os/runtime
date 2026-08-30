@@ -19,3 +19,5 @@ pf_query
 pf_rumble_pulse
 pf_strerror
 pf_wire_version
+pf_preference_bool
+pf_preference_scalar

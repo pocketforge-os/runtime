@@ -5,13 +5,16 @@
 //! point (see `STABILITY.md`).
 
 use pf_wire::{
-    recv_request, recv_response, send_request, send_response, Op, Permission, Request, Response,
-    RumbleStatus, Status, MAX_FRAME, WIRE_VERSION,
+    recv_request, recv_response, send_request, send_response, Op, Permission, PreferenceKind,
+    Request, Response, RumbleStatus, Status, MAX_FRAME, WIRE_VERSION,
 };
 
 #[test]
 fn wire_version_and_frame_bound_are_frozen() {
-    assert_eq!(WIRE_VERSION, 1, "WIRE_VERSION is part of the frozen contract");
+    assert_eq!(
+        WIRE_VERSION, 1,
+        "WIRE_VERSION is part of the frozen contract"
+    );
     assert_eq!(MAX_FRAME, 64 * 1024, "MAX_FRAME (DoS bound) is frozen");
 }
 
@@ -26,6 +29,7 @@ fn op_discriminants_are_frozen() {
     assert_eq!(Op::RumblePulse as u8, 7);
     assert_eq!(Op::GetPose as u8, 8);
     assert_eq!(Op::SetPose as u8, 9);
+    assert_eq!(Op::GetPreference as u8, 10);
 }
 
 #[test]
@@ -44,6 +48,10 @@ fn status_permission_rumble_discriminants_are_frozen() {
     assert_eq!(RumbleStatus::Fired as u8, 0);
     assert_eq!(RumbleStatus::NoopAbsent as u8, 1);
     assert_eq!(RumbleStatus::NoopSuppressed as u8, 2);
+    assert_eq!(PreferenceKind::NotFound as u8, 0);
+    assert_eq!(PreferenceKind::Bool as u8, 1);
+    assert_eq!(PreferenceKind::Integer as u8, 2);
+    assert_eq!(PreferenceKind::Text as u8, 3);
 }
 
 /// Encode a value via its framed writer to a `Vec<u8>` (len-prefix + body).
@@ -78,7 +86,11 @@ fn canonical_message_encodings_are_frozen() {
         "0000000708041203696d75",
         "frozen Acquire(\"imu\") request encoding"
     );
-    assert_eq!(hex(&resp_bytes), "0000000408001801", "frozen Ok+flag=1 response encoding");
+    assert_eq!(
+        hex(&resp_bytes),
+        "0000000408001801",
+        "frozen Ok+flag=1 response encoding"
+    );
 
     // …and they round-trip through the readers (decode is part of the contract too).
     let mut c = std::io::Cursor::new(&req_bytes);
@@ -89,6 +101,19 @@ fn canonical_message_encodings_are_frozen() {
     let rback = recv_response(&mut c).unwrap();
     assert_eq!(rback.status, Status::Ok);
     assert_eq!(rback.flag, 1);
+
+    let mut pref_req = Request::new(Op::GetPreference, "");
+    pref_req.pref_key = "brightness".into();
+    let pref_resp = Response {
+        preference_kind: PreferenceKind::Integer,
+        preference_integer: 73,
+        ..Response::ok()
+    };
+    assert_eq!(
+        hex(&enc_req(&pref_req)),
+        "0000000e080a2a0a6272696768746e657373"
+    );
+    assert_eq!(hex(&enc_resp(&pref_resp)), "00000006080028023849");
 }
 
 // Written as a fold + `write!` rather than `.map(|x| format!(..)).collect()` so it does not trip
@@ -96,8 +121,9 @@ fn canonical_message_encodings_are_frozen() {
 // the allow-by-default set. It is not part of the frozen contract — just the assertion pretty-printer.
 fn hex(b: &[u8]) -> String {
     use std::fmt::Write as _;
-    b.iter().fold(String::with_capacity(b.len() * 2), |mut out, x| {
-        let _ = write!(out, "{x:02x}");
-        out
-    })
+    b.iter()
+        .fold(String::with_capacity(b.len() * 2), |mut out, x| {
+            let _ = write!(out, "{x:02x}");
+            out
+        })
 }

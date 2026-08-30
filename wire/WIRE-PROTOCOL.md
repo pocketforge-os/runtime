@@ -76,6 +76,7 @@ encode(v): while true { b = v & 0x7f; v >>= 7; if v != 0 { b |= 0x80 }; emit(b);
 | 2       | len       | `name`    | capability name, UTF-8 (e.g. `"vibration"`)         |
 | 3       | len       | `payload` | opaque value (e.g. bytes to `SetCapability`)        |
 | 4       | varint    | `arg`     | scalar arg (e.g. rumble duration in ms)             |
+| 5       | len       | `pref_key`| preference key, UTF-8 (`GetPreference` only)        |
 
 #### `Op` values
 
@@ -90,10 +91,18 @@ encode(v): while true { b = v & 0x7f; v >>= 7; if v != 0 { b |= 0x80 }; emit(b);
 | 7     | `RumblePulse`   | `status=Ok`, `flag` = [`RumbleStatus`]            |
 | 8     | `GetPose`       | `status`, `payload` = pose (9× f64 LE, 72 bytes)  |
 | 9     | `SetPose`       | `payload` = pose; → `status`, `payload` = new pose |
+| 10    | `GetPreference` | typed preference fields; `NotFound` if unavailable |
 
 Pose payload is **9 IEEE-754 `binary64` little-endian** values in order
 `yaw, pitch, roll, x, y, z, wx, wy, wz` (orientation in degrees, angular velocity in deg/s,
 position in metres). `GetPose`/`SetPose` on a device with no IMU return `status=HardwareAbsent`.
+
+`GetPreference` uses `pref_key` (not capability `name`). Its response has `status=Ok` and one
+typed value selected by `preference_kind`: `Bool`, `Integer`, or `Text`. `NotFound` means the key
+was unknown or the preference service was not configured/reachable; callers must use their own
+default. `applied` is always false in PFW1 v1 because no running-consumer apply acknowledgement
+exists. This operation is read-only; preference writes remain control-plane-only. There is no
+subscribe operation in v1, so clients that need freshness should poll on resume.
 
 > **Acquiring INPUT** (added by `.6`): `Acquire` with `name="input"` returns the shared
 > `uinput` device fd out-of-band via `SCM_RIGHTS` on the same socket. The fd, not RPC, is the
@@ -112,6 +121,11 @@ position in metres). `GetPose`/`SetPose` on a device with no IMU return `status=
 | 2       | len       | `payload`    | result bytes (e.g. a `GetCapability` value)      |
 | 3       | varint    | `flag`       | small scalar result (bool, or `RumbleStatus`)    |
 | 4       | varint    | `permission` | [`Permission`](#permission-values) for `Query`   |
+| 5       | varint    | `preference_kind` | 0 NotFound, 1 Bool, 2 Integer, 3 Text       |
+| 6       | varint    | `preference_bool` | boolean preference value                     |
+| 7       | varint    | `preference_integer` | signed i64 as two's-complement varint     |
+| 8       | len       | `preference_text` | UTF-8 enum/text preference value              |
+| 9       | varint    | `applied` | apply acknowledgement; always 0/omitted in v1     |
 
 #### `Status` values — the four-way taxonomy (briefing §A)
 

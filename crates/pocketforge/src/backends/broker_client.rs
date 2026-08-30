@@ -18,7 +18,7 @@ use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::sync::Mutex;
 
-use pf_wire::{recv_response, send_request, Op, Request, Response, RumbleStatus};
+use pf_wire::{recv_response, send_request, Op, PreferenceKind, Request, Response, RumbleStatus};
 
 use crate::backend::{Backend, Pose};
 use crate::backends::scm;
@@ -37,7 +37,9 @@ impl BrokerClientBackend {
 
     /// Wrap an already-connected stream (used by tests + when the supervisor hands the fd in).
     pub fn from_stream(stream: UnixStream) -> BrokerClientBackend {
-        BrokerClientBackend { stream: Mutex::new(stream) }
+        BrokerClientBackend {
+            stream: Mutex::new(stream),
+        }
     }
 
     /// One request/response round-trip. `None` on transport failure (fail-closed at call sites).
@@ -59,11 +61,15 @@ impl BrokerClientBackend {
 
 impl Backend for BrokerClientBackend {
     fn is_present(&self, name: &str) -> bool {
-        self.call(&Request::new(Op::IsPresent, name)).map(|r| r.flag != 0).unwrap_or(false)
+        self.call(&Request::new(Op::IsPresent, name))
+            .map(|r| r.flag != 0)
+            .unwrap_or(false)
     }
 
     fn is_granted(&self, name: &str) -> bool {
-        self.call(&Request::new(Op::IsGranted, name)).map(|r| r.flag != 0).unwrap_or(false)
+        self.call(&Request::new(Op::IsGranted, name))
+            .map(|r| r.flag != 0)
+            .unwrap_or(false)
     }
 
     fn query(&self, name: &str) -> PermissionState {
@@ -93,28 +99,37 @@ impl Backend for BrokerClientBackend {
         // failure returns the conservative taxonomy, never a fabricated fd.
         let s = self.stream.lock().unwrap();
         if let Err(e) = send_request(&mut &*s, &Request::new(Op::Acquire, "input")) {
-            let _ = writeln!(std::io::stderr(), "pocketforge: broker input-fd send failed: {e}");
+            let _ = writeln!(
+                std::io::stderr(),
+                "pocketforge: broker input-fd send failed: {e}"
+            );
             return Err(CapError::PolicyBlocked);
         }
         let mut buf = [0u8; 256];
         let (n, fd) = match scm::recv_fd(s.as_raw_fd(), &mut buf) {
             Ok(v) => v,
             Err(e) => {
-                let _ = writeln!(std::io::stderr(), "pocketforge: broker input-fd recvmsg failed: {e}");
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "pocketforge: broker input-fd recvmsg failed: {e}"
+                );
                 return Err(CapError::PolicyBlocked);
             }
         };
         let resp = match recv_response(&mut std::io::Cursor::new(&buf[..n])) {
             Ok(r) => r,
             Err(e) => {
-                let _ = writeln!(std::io::stderr(), "pocketforge: broker input-fd decode failed: {e}");
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "pocketforge: broker input-fd decode failed: {e}"
+                );
                 return Err(CapError::PolicyBlocked);
             }
         };
         match (CapError::from_status(resp.status), fd) {
-            (None, Some(fd)) => Ok(fd),                    // Ok + fd → the shared re-emit read fd
+            (None, Some(fd)) => Ok(fd), // Ok + fd → the shared re-emit read fd
             (None, None) => Err(CapError::HardwareAbsent), // Ok but no fd (broker has no node)
-            (Some(e), _) => Err(e),                        // typed broker refusal (drops any fd)
+            (Some(e), _) => Err(e),     // typed broker refusal (drops any fd)
         }
     }
 
@@ -171,13 +186,30 @@ impl Backend for BrokerClientBackend {
         }
     }
 
-    fn preference_bool(&self, _name: &str, default: bool) -> bool {
-        // Preferences are not yet a wire op (E4 adds them); v0 returns the caller's default.
-        default
+    fn preference_bool(&self, name: &str, default: bool) -> bool {
+        let mut request = Request::new(Op::GetPreference, "");
+        request.pref_key = name.to_owned();
+        match self.call(&request) {
+            Some(response) if response.preference_kind == PreferenceKind::Bool => {
+                response.preference_bool
+            }
+            _ => default,
+        }
     }
 
     fn set_preference_bool(&self, _name: &str, _value: bool) {
-        // No-op over the wire in v0 (E4 adds a preference op + server-side store).
+        // Intentionally no-op: preference writes are control-plane-only, never a game capability.
+    }
+
+    fn preference_scalar(&self, name: &str, default: i64) -> i64 {
+        let mut request = Request::new(Op::GetPreference, "");
+        request.pref_key = name.to_owned();
+        match self.call(&request) {
+            Some(response) if response.preference_kind == PreferenceKind::Integer => {
+                response.preference_integer
+            }
+            _ => default,
+        }
     }
 }
 
@@ -185,6 +217,44 @@ impl Backend for BrokerClientBackend {
 mod tests {
     use super::*;
     use pf_wire::{recv_request, send_response};
+
+    fn preference_client(response: Response) -> BrokerClientBackend {
+        let (client, server) = UnixStream::pair().unwrap();
+        std::thread::spawn(move || {
+            let mut server = server;
+            let request = recv_request(&mut server).unwrap();
+            assert_eq!(request.op, Op::GetPreference);
+            send_response(&mut server, &response).unwrap();
+        });
+        BrokerClientBackend::from_stream(client)
+    }
+
+    #[test]
+    fn maps_typed_preference_reads_and_defaults_on_not_found_or_wrong_kind() {
+        let boolean = preference_client(Response {
+            preference_kind: PreferenceKind::Bool,
+            preference_bool: true,
+            ..Response::ok()
+        });
+        assert!(boolean.preference_bool("reduceMotion", false));
+
+        let scalar = preference_client(Response {
+            preference_kind: PreferenceKind::Integer,
+            preference_integer: 73,
+            ..Response::ok()
+        });
+        assert_eq!(scalar.preference_scalar("brightness", 50), 73);
+
+        let missing = preference_client(Response::ok());
+        assert!(missing.preference_bool("hapticsEnabled", true));
+
+        let text = preference_client(Response {
+            preference_kind: PreferenceKind::Text,
+            preference_text: "large".into(),
+            ..Response::ok()
+        });
+        assert_eq!(text.preference_scalar("textScale", 100), 100);
+    }
 
     /// Device-free proof of the broker-side `acquire_input_fd` path: a fake broker on a socketpair
     /// receives `Acquire("input")` and replies with a framed `Response::ok()` payload + a real fd
@@ -219,9 +289,18 @@ mod tests {
         let fd = be.acquire_input_fd().expect("client receives the fd");
 
         let mut buf = [0u8; 8];
-        let n = unsafe { libc::read(fd.as_raw_fd(), buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+        let n = unsafe {
+            libc::read(
+                fd.as_raw_fd(),
+                buf.as_mut_ptr() as *mut libc::c_void,
+                buf.len(),
+            )
+        };
         assert_eq!(n, 8, "read the handed fd");
-        assert_eq!(&buf, b"HELLO-FD", "the fd is the exact one the broker handed over");
+        assert_eq!(
+            &buf, b"HELLO-FD",
+            "the fd is the exact one the broker handed over"
+        );
 
         srv.join().unwrap();
     }

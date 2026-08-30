@@ -91,9 +91,13 @@ pub extern "C" fn pf_connect() -> *mut PfSession {
 /// `path` must be a valid NUL-terminated string; the result must be freed with [`pf_free`].
 #[no_mangle]
 pub unsafe extern "C" fn pf_connect_descriptor(path: *const c_char) -> *mut PfSession {
-    let Some(path) = cstr(path) else { return ptr::null_mut() };
+    let Some(path) = cstr(path) else {
+        return ptr::null_mut();
+    };
     match Descriptor::load(path) {
-        Ok(d) => Box::into_raw(Box::new(PfSession { pf: Pf::in_process(d) })),
+        Ok(d) => Box::into_raw(Box::new(PfSession {
+            pf: Pf::in_process(d),
+        })),
         Err(e) => {
             eprintln!("libpocketforge: pf_connect_descriptor failed: {e}");
             ptr::null_mut()
@@ -119,7 +123,10 @@ pub unsafe extern "C" fn pf_free(s: *mut PfSession) {
 #[no_mangle]
 pub unsafe extern "C" fn pf_has_capability(s: *const PfSession, name: *const c_char) -> PfPresence {
     let (Some(sess), Some(name)) = (s.as_ref(), cstr(name)) else {
-        return PfPresence { api: 0, hardware: 0 };
+        return PfPresence {
+            api: 0,
+            hardware: 0,
+        };
     };
     // by-name presence: api=1 if known to the platform, hardware from the backend probe.
     let api = pf::backend::is_known(name) as i32;
@@ -158,7 +165,9 @@ pub unsafe extern "C" fn pf_is_granted(s: *const PfSession, name: *const c_char)
 /// See [`pf_has_capability`].
 #[no_mangle]
 pub unsafe extern "C" fn pf_query(s: *const PfSession, name: *const c_char) -> i32 {
-    let (Some(sess), Some(name)) = (s.as_ref(), cstr(name)) else { return PF_DENIED };
+    let (Some(sess), Some(name)) = (s.as_ref(), cstr(name)) else {
+        return PF_DENIED;
+    };
     match sess.pf.backend().query(name) {
         pf::PermissionState::Granted => PF_GRANTED,
         pf::PermissionState::Denied => PF_DENIED,
@@ -173,7 +182,9 @@ pub unsafe extern "C" fn pf_query(s: *const PfSession, name: *const c_char) -> i
 /// See [`pf_has_capability`].
 #[no_mangle]
 pub unsafe extern "C" fn pf_acquire(s: *const PfSession, name: *const c_char) -> i32 {
-    let (Some(sess), Some(name)) = (s.as_ref(), cstr(name)) else { return PF_UNSUPPORTED };
+    let (Some(sess), Some(name)) = (s.as_ref(), cstr(name)) else {
+        return PF_UNSUPPORTED;
+    };
     match sess.pf.acquire_by_name(name) {
         Ok(()) => PF_OK,
         Err(e) => cap_err_code(e),
@@ -194,10 +205,12 @@ pub unsafe extern "C" fn pf_acquire(s: *const PfSession, name: *const c_char) ->
 /// `s` must be a pointer from `pf_connect*` not already freed.
 #[no_mangle]
 pub unsafe extern "C" fn pf_acquire_input_fd(s: *const PfSession) -> i32 {
-    let Some(sess) = s.as_ref() else { return -PF_UNSUPPORTED };
+    let Some(sess) = s.as_ref() else {
+        return -PF_UNSUPPORTED;
+    };
     match sess.pf.acquire_input_fd() {
-        Ok(fd) => fd.into_raw_fd(),        // ownership transfers to C; C closes it
-        Err(e) => -cap_err_code(e),        // negative PF_* taxonomy code
+        Ok(fd) => fd.into_raw_fd(), // ownership transfers to C; C closes it
+        Err(e) => -cap_err_code(e), // negative PF_* taxonomy code
     }
 }
 
@@ -208,11 +221,48 @@ pub unsafe extern "C" fn pf_acquire_input_fd(s: *const PfSession) -> i32 {
 /// `s` from `pf_connect*`.
 #[no_mangle]
 pub unsafe extern "C" fn pf_rumble_pulse(s: *const PfSession, ms: u32) -> i32 {
-    let Some(sess) = s.as_ref() else { return PF_RUMBLE_NOOP_ABSENT };
+    let Some(sess) = s.as_ref() else {
+        return PF_RUMBLE_NOOP_ABSENT;
+    };
     match sess.pf.backend().rumble_pulse(ms) {
         pf::RumbleStatus::Fired => PF_RUMBLE_FIRED,
         pf::RumbleStatus::NoopAbsent => PF_RUMBLE_NOOP_ABSENT,
         pf::RumbleStatus::NoopSuppressed => PF_RUMBLE_NOOP_SUPPRESSED,
+    }
+}
+
+/// Read a boolean system preference, returning `default_value` for invalid arguments or when the
+/// preference service/key is unavailable. Preference writes remain control-plane-only.
+///
+/// # Safety
+/// `s` from `pf_connect*`; `name` a valid NUL-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn pf_preference_bool(
+    s: *const PfSession,
+    name: *const c_char,
+    default_value: i32,
+) -> i32 {
+    let default_value = default_value != 0;
+    match (s.as_ref(), cstr(name)) {
+        (Some(sess), Some(name)) => sess.pf.backend().preference_bool(name, default_value) as i32,
+        _ => default_value as i32,
+    }
+}
+
+/// Read an integer/scalar system preference, returning `default_value` when unavailable.
+/// Enum preferences (including `textScale`) are intentionally not exposed by the v1 C ABI.
+///
+/// # Safety
+/// `s` from `pf_connect*`; `name` a valid NUL-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn pf_preference_scalar(
+    s: *const PfSession,
+    name: *const c_char,
+    default_value: i64,
+) -> i64 {
+    match (s.as_ref(), cstr(name)) {
+        (Some(sess), Some(name)) => sess.pf.backend().preference_scalar(name, default_value),
+        _ => default_value,
     }
 }
 
