@@ -99,7 +99,12 @@ impl PrefsStore {
             f.sync_all()?;
         }
         match std::fs::rename(&tmp, &self.path) {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                // Persist the directory entry as well as the file contents. Without this
+                // fsync, a power loss after rename may still lose the new name.
+                std::fs::File::open(dir)?.sync_all()?;
+                Ok(())
+            }
             Err(e) => {
                 // Best-effort cleanup so a failed rename does not leave a temp behind.
                 let _ = std::fs::remove_file(&tmp);
