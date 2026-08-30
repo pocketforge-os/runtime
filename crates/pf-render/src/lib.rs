@@ -190,8 +190,10 @@ struct ShadowAsset {
 }
 
 struct RoundedShadowAsset {
-    side: usize,
-    slice_margin: usize,
+    width: usize,
+    height: usize,
+    slice_margin_x: usize,
+    slice_margin_y: usize,
     effect_margin: usize,
     rgba: Vec<u8>,
 }
@@ -203,12 +205,16 @@ const MAX_ROUNDED_SHADOW_RADIUS: u32 = 256;
 
 #[derive(Default)]
 struct RoundedShadowCache {
-    assets: HashMap<(u8, u8, u32, u16), RoundedShadowAsset>,
-    recency: VecDeque<(u8, u8, u32, u16)>,
+    assets: HashMap<(u8, u8, u32, u32, u16), RoundedShadowAsset>,
+    recency: VecDeque<(u8, u8, u32, u32, u16)>,
 }
 
 impl RoundedShadowCache {
-    fn get_or_bake(&mut self, key: (u8, u8, u32, u16), asset: &ShadowAsset) -> &RoundedShadowAsset {
+    fn get_or_bake(
+        &mut self,
+        key: (u8, u8, u32, u32, u16),
+        asset: &ShadowAsset,
+    ) -> &RoundedShadowAsset {
         if let Some(position) = self.recency.iter().position(|candidate| *candidate == key) {
             self.recency.remove(position);
         } else {
@@ -221,7 +227,11 @@ impl RoundedShadowCache {
             }
             self.assets.insert(
                 key,
-                bake_rounded_shadow_physical(asset, key.2 as usize, key.3 as usize),
+                bake_rounded_shadow_physical(
+                    asset,
+                    Radii::new(key.2 as f32, key.3 as f32),
+                    key.4 as usize,
+                ),
             );
         }
         self.recency.push_back(key);
@@ -641,9 +651,14 @@ fn draw_node(
         .pixels;
     let transform = node_transform(node, ancestor_transform, pressed_shift);
     let b = transform.map_bounds(node.bounds);
-    let transformed_radius =
-        node.corner_radius * transform.scale_x.abs().min(transform.scale_y.abs());
-    let radius = clamped_radius(transformed_radius, b) * scale;
+    let radius = clamped_radii(
+        Radii::new(
+            node.corner_radius * transform.scale_x.abs(),
+            node.corner_radius * transform.scale_y.abs(),
+        ),
+        b,
+    )
+    .scaled(scale);
 
     if node.elevation != Elevation::None {
         draw_node_shadow(
@@ -671,7 +686,7 @@ fn draw_node(
     {
         let mut paint = Paint::default();
         paint.set_color_rgba8(color.red, color.green, color.blue, color.alpha);
-        if radius > 0.0 {
+        if radius.is_rounded() {
             pm.fill_path(
                 &rounded_rect_path(rect, radius),
                 &paint,
@@ -844,14 +859,14 @@ fn fill_token_rect_clipped(
     key: &str,
     fill_rect: Rect,
     silhouette: Rect,
-    radius: f32,
+    radius: Radii,
 ) -> Result<(), RenderError> {
     let color = style_color(style, key)?;
     let mut paint = Paint::default();
     paint.set_color_rgba8(color.red, color.green, color.blue, color.alpha);
     let mut mask = Mask::new(pm.width(), pm.height()).expect("pixmap has valid dimensions");
     mask.fill_path(
-        &if radius > 0.0 {
+        &if radius.is_rounded() {
             rounded_rect_path(silhouette, radius)
         } else {
             PathBuilder::from_rect(silhouette)
@@ -870,7 +885,7 @@ fn fill_token_rounded_rect(
     key: &str,
     bounds: Bounds,
     scale: f32,
-    radius: f32,
+    radius: Radii,
 ) -> Result<(), RenderError> {
     let color = style_color(style, key)?;
     if let Some(rect) = Rect::from_xywh(
@@ -881,7 +896,7 @@ fn fill_token_rounded_rect(
     ) {
         let mut paint = Paint::default();
         paint.set_color_rgba8(color.red, color.green, color.blue, color.alpha);
-        if radius > 0.0 {
+        if radius.is_rounded() {
             pm.fill_path(
                 &rounded_rect_path(rect, radius),
                 &paint,
@@ -896,17 +911,44 @@ fn fill_token_rounded_rect(
     Ok(())
 }
 
-fn clamped_radius(radius: f32, bounds: Bounds) -> f32 {
-    if radius.is_finite() && radius > 0.0 {
-        radius.min(bounds.width.min(bounds.height).max(0.0) / 2.0)
-    } else {
-        0.0
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Radii {
+    x: f32,
+    y: f32,
+}
+
+impl Radii {
+    const fn new(x: f32, y: f32) -> Self {
+        Self { x, y }
+    }
+
+    fn scaled(self, scale: f32) -> Self {
+        Self::new(self.x * scale, self.y * scale)
+    }
+
+    fn is_rounded(self) -> bool {
+        self.x > 0.0 && self.y > 0.0
     }
 }
 
-fn rounded_rect_path(rect: Rect, radius: f32) -> tiny_skia::Path {
-    let radius = radius.min(rect.width().min(rect.height()) / 2.0).max(0.0);
-    if radius == 0.0 {
+fn clamped_radii(radius: Radii, bounds: Bounds) -> Radii {
+    let clamp = |value: f32, extent: f32| {
+        if value.is_finite() && value > 0.0 {
+            value.min(extent.max(0.0) / 2.0)
+        } else {
+            0.0
+        }
+    };
+    Radii::new(
+        clamp(radius.x, bounds.width),
+        clamp(radius.y, bounds.height),
+    )
+}
+
+fn rounded_rect_path(rect: Rect, radius: Radii) -> tiny_skia::Path {
+    let rx = radius.x.min(rect.width() / 2.0).max(0.0);
+    let ry = radius.y.min(rect.height() / 2.0).max(0.0);
+    if rx == 0.0 || ry == 0.0 {
         return PathBuilder::from_rect(rect);
     }
     // Standard cubic approximation of a quarter circle.
@@ -915,55 +957,65 @@ fn rounded_rect_path(rect: Rect, radius: f32) -> tiny_skia::Path {
     let top = rect.top();
     let right = rect.right();
     let bottom = rect.bottom();
-    let control = radius * KAPPA;
+    let control_x = rx * KAPPA;
+    let control_y = ry * KAPPA;
     let mut path = PathBuilder::new();
-    path.move_to(left + radius, top);
-    path.line_to(right - radius, top);
+    path.move_to(left + rx, top);
+    path.line_to(right - rx, top);
     path.cubic_to(
-        right - radius + control,
+        right - rx + control_x,
         top,
         right,
-        top + radius - control,
+        top + ry - control_y,
         right,
-        top + radius,
+        top + ry,
     );
-    path.line_to(right, bottom - radius);
+    path.line_to(right, bottom - ry);
     path.cubic_to(
         right,
-        bottom - radius + control,
-        right - radius + control,
+        bottom - ry + control_y,
+        right - rx + control_x,
         bottom,
-        right - radius,
+        right - rx,
         bottom,
     );
-    path.line_to(left + radius, bottom);
+    path.line_to(left + rx, bottom);
     path.cubic_to(
-        left + radius - control,
+        left + rx - control_x,
         bottom,
         left,
-        bottom - radius + control,
+        bottom - ry + control_y,
         left,
-        bottom - radius,
+        bottom - ry,
     );
-    path.line_to(left, top + radius);
+    path.line_to(left, top + ry);
     path.cubic_to(
         left,
-        top + radius - control,
-        left + radius - control,
+        top + ry - control_y,
+        left + rx - control_x,
         top,
-        left + radius,
+        left + rx,
         top,
     );
     path.close();
     path.finish().expect("rounded rectangle path")
 }
 
-fn rounded_coverage(x: f32, y: f32, width: f32, height: f32, radius: f32) -> f32 {
-    let radius = radius.min(width.min(height) / 2.0).max(0.0);
-    let cx = x.clamp(radius, width - radius);
-    let cy = y.clamp(radius, height - radius);
-    let distance = ((x - cx).powi(2) + (y - cy).powi(2)).sqrt();
-    (radius + 0.5 - distance).clamp(0.0, 1.0)
+fn rounded_coverage(x: f32, y: f32, width: f32, height: f32, radius: Radii) -> f32 {
+    let rx = radius.x.min(width / 2.0).max(0.0);
+    let ry = radius.y.min(height / 2.0).max(0.0);
+    if rx == 0.0 || ry == 0.0 {
+        return 1.0;
+    }
+    let cx = x.clamp(rx, width - rx);
+    let cy = y.clamp(ry, height - ry);
+    if rx == ry {
+        let distance = ((x - cx).powi(2) + (y - cy).powi(2)).sqrt();
+        return (rx + 0.5 - distance).clamp(0.0, 1.0);
+    }
+    let distance = (((x - cx) / rx).powi(2) + ((y - cy) / ry).powi(2)).sqrt();
+    let aa = 0.5 / rx.min(ry);
+    ((1.0 + aa - distance) / (aa * 2.0)).clamp(0.0, 1.0)
 }
 
 fn stroke_token_rect(
@@ -972,13 +1024,13 @@ fn stroke_token_rect(
     key: &str,
     rect: Rect,
     scale: f32,
-    radius: f32,
+    radius: Radii,
 ) -> Result<(), RenderError> {
     let color = style_color(style, key)?;
     let mut paint = Paint::default();
     paint.set_color_rgba8(color.red, color.green, color.blue, color.alpha);
     pm.stroke_path(
-        &if radius > 0.0 {
+        &if radius.is_rounded() {
             rounded_rect_path(rect, radius)
         } else {
             PathBuilder::from_rect(rect)
@@ -1000,7 +1052,7 @@ fn draw_focus_ring(
     style: &ResolvedStyleSnapshot,
     b: Bounds,
     scale: f32,
-    radius: f32,
+    radius: Radii,
 ) -> Result<(), RenderError> {
     let width = style
         .length("--focus-ring-width")
@@ -1023,8 +1075,8 @@ fn draw_focus_ring(
         let mut paint = Paint::default();
         paint.set_color_rgba8(ring.red, ring.green, ring.blue, ring.alpha);
         pm.stroke_path(
-            &if radius > 0.0 {
-                rounded_rect_path(rect, radius + outset)
+            &if radius.is_rounded() {
+                rounded_rect_path(rect, Radii::new(radius.x + outset, radius.y + outset))
             } else {
                 PathBuilder::from_rect(rect)
             },
@@ -1046,9 +1098,9 @@ fn draw_node_shadow(
     asset: &ShadowAsset,
     b: Bounds,
     scale: f32,
-    radius: f32,
+    radius: Radii,
 ) {
-    if radius <= 0.0 {
+    if !radius.is_rounded() {
         draw_shadow(
             pm,
             asset.rgba,
@@ -1060,37 +1112,43 @@ fn draw_node_shadow(
         );
         return;
     }
-    let physical_radius = quantized_physical_shadow_radius(b, scale, radius);
+    let physical_radius = quantized_physical_shadow_radii(b, scale, radius);
     let key = (
         theme_base_key(asset.base),
         elevation_key(asset.elevation),
-        physical_radius,
+        physical_radius.0,
+        physical_radius.1,
         ((asset.margin as f32 * scale).round().clamp(1.0, 64.0)) as u16,
     );
     let rounded = cache.get_or_bake(key, asset);
-    let destination_margin = physical_radius + u32::from(key.3);
-    draw_shadow_with_destination_margin(
+    let destination_margin_x = physical_radius.0 + u32::from(key.4);
+    let destination_margin_y = physical_radius.1 + u32::from(key.4);
+    draw_shadow_with_destination_margins(
         pm,
         &rounded.rgba,
-        rounded.side,
-        rounded.slice_margin,
+        rounded.width,
+        rounded.height,
+        rounded.slice_margin_x,
+        rounded.slice_margin_y,
         rounded.effect_margin,
         b,
         scale,
-        destination_margin as i32,
+        destination_margin_x as i32,
+        destination_margin_y as i32,
     );
 }
 
-fn quantized_physical_shadow_radius(b: Bounds, scale: f32, radius: f32) -> u32 {
-    let physical_extent = (b.width * scale)
-        .abs()
-        .min((b.height * scale).abs())
-        .mul_add(0.5, 0.0)
-        .floor()
-        .max(1.0) as u32;
-    radius
-        .round()
-        .clamp(1.0, physical_extent.min(MAX_ROUNDED_SHADOW_RADIUS) as f32) as u32
+fn quantized_physical_shadow_radii(b: Bounds, scale: f32, radius: Radii) -> (u32, u32) {
+    let quantize = |value: f32, extent: f32| {
+        value.round().clamp(
+            1.0,
+            ((extent * scale).abs() * 0.5)
+                .floor()
+                .max(1.0)
+                .min(MAX_ROUNDED_SHADOW_RADIUS as f32),
+        ) as u32
+    };
+    (quantize(radius.x, b.width), quantize(radius.y, b.height))
 }
 
 fn theme_base_key(base: ThemeBase) -> u8 {
@@ -1112,47 +1170,60 @@ fn elevation_key(elevation: Elevation) -> u8 {
 
 #[cfg(test)]
 fn bake_rounded_shadow(asset: &ShadowAsset, radius: usize) -> RoundedShadowAsset {
-    bake_rounded_shadow_physical(asset, radius, asset.margin)
+    bake_rounded_shadow_physical(
+        asset,
+        Radii::new(radius as f32, radius as f32),
+        asset.margin,
+    )
 }
 
 fn bake_rounded_shadow_physical(
     asset: &ShadowAsset,
-    radius: usize,
+    radius: Radii,
     physical_margin: usize,
 ) -> RoundedShadowAsset {
     let effect_scale = physical_margin as f32 / asset.margin as f32;
-    let core = radius * 2 + 3;
-    let side = physical_margin * 2 + core;
-    let mut mask = vec![0.0f32; side * side];
+    let radius_x = radius.x as usize;
+    let radius_y = radius.y as usize;
+    let core_width = radius_x * 2 + 3;
+    let core_height = radius_y * 2 + 3;
+    let width_px = physical_margin * 2 + core_width;
+    let height_px = physical_margin * 2 + core_height;
+    let mut mask = vec![0.0f32; width_px * height_px];
     let grow = (asset.spread * effect_scale).round() as isize;
     let left = physical_margin as isize + (asset.offset_x * effect_scale).round() as isize - grow;
     let top = physical_margin as isize + (asset.offset_y * effect_scale).round() as isize - grow;
-    let width = core as f32 + (grow * 2) as f32;
-    let expanded_radius = (radius as f32 + grow as f32).max(0.0);
-    for y in 0..side {
-        for x in 0..side {
-            mask[y * side + x] = rounded_coverage(
+    let silhouette_width = core_width as f32 + (grow * 2) as f32;
+    let silhouette_height = core_height as f32 + (grow * 2) as f32;
+    let expanded_radius = Radii::new(
+        (radius.x + grow as f32).max(0.0),
+        (radius.y + grow as f32).max(0.0),
+    );
+    for y in 0..height_px {
+        for x in 0..width_px {
+            mask[y * width_px + x] = rounded_coverage(
                 x as f32 + 0.5 - left as f32,
                 y as f32 + 0.5 - top as f32,
-                width,
-                width,
+                silhouette_width,
+                silhouette_height,
                 expanded_radius,
             );
         }
     }
-    blur_mask(&mut mask, side, asset.blur * effect_scale);
+    blur_mask(&mut mask, width_px, height_px, asset.blur * effect_scale);
     // The legacy 3px source establishes the shipped straight-edge penumbra intensity. A larger
     // rounded source has more blur mass, so normalize it to that edge sample while retaining the
     // rounded mask's corner falloff.
     let legacy_edge_alpha =
         f32::from(asset.rgba[(asset.margin * asset.side + asset.side / 2) * 4 + 3]);
-    let rounded_edge_alpha = mask[physical_margin * side + side / 2] * f32::from(asset.color[3]);
+    let rounded_edge_alpha =
+        mask[physical_margin * width_px + width_px / 2] * f32::from(asset.color[3]);
     let normalization = if rounded_edge_alpha > 0.0 {
         legacy_edge_alpha / rounded_edge_alpha
     } else {
         1.0
     };
-    let mut rgba = Vec::with_capacity(side * side * 4);
+    let mut rgba = Vec::with_capacity(width_px * height_px * 4);
     for alpha in mask {
         rgba.extend_from_slice(&[
             asset.color[0],
@@ -1162,15 +1233,17 @@ fn bake_rounded_shadow_physical(
         ]);
     }
     RoundedShadowAsset {
-        side,
-        slice_margin: physical_margin + radius,
+        width: width_px,
+        height: height_px,
+        slice_margin_x: physical_margin + radius_x,
+        slice_margin_y: physical_margin + radius_y,
         // draw_shadow scales this destination-only value; source slicing uses slice_margin above.
         effect_margin: asset.margin,
         rgba,
     }
 }
 
-fn blur_mask(mask: &mut [f32], side: usize, blur: f32) {
+fn blur_mask(mask: &mut [f32], width: usize, height: usize, blur: f32) {
     if blur <= 0.0 {
         return;
     }
@@ -1182,29 +1255,29 @@ fn blur_mask(mask: &mut [f32], side: usize, blur: f32) {
     let sum: f32 = kernel.iter().sum();
     let kernel: Vec<f32> = kernel.into_iter().map(|value| value / sum).collect();
     let mut tmp = vec![0.0; mask.len()];
-    for y in 0..side {
-        for x in 0..side {
-            tmp[y * side + x] = (-radius..=radius)
+    for y in 0..height {
+        for x in 0..width {
+            tmp[y * width + x] = (-radius..=radius)
                 .filter_map(|offset| {
                     usize::try_from(x as isize + offset)
                         .ok()
-                        .filter(|position| *position < side)
+                        .filter(|position| *position < width)
                         .map(|position| {
-                            mask[y * side + position] * kernel[(offset + radius) as usize]
+                            mask[y * width + position] * kernel[(offset + radius) as usize]
                         })
                 })
                 .sum();
         }
     }
-    for y in 0..side {
-        for x in 0..side {
-            mask[y * side + x] = (-radius..=radius)
+    for y in 0..height {
+        for x in 0..width {
+            mask[y * width + x] = (-radius..=radius)
                 .filter_map(|offset| {
                     usize::try_from(y as isize + offset)
                         .ok()
-                        .filter(|position| *position < side)
+                        .filter(|position| *position < height)
                         .map(|position| {
-                            tmp[position * side + x] * kernel[(offset + radius) as usize]
+                            tmp[position * width + x] * kernel[(offset + radius) as usize]
                         })
                 })
                 .sum();
@@ -1245,6 +1318,35 @@ fn draw_shadow_with_destination_margin(
     scale: f32,
     destination_margin: i32,
 ) {
+    draw_shadow_with_destination_margins(
+        pm,
+        rgba,
+        side,
+        side,
+        source_margin,
+        source_margin,
+        effect_margin,
+        b,
+        scale,
+        destination_margin,
+        destination_margin,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_shadow_with_destination_margins(
+    pm: &mut Pixmap,
+    rgba: &[u8],
+    source_width: usize,
+    source_height: usize,
+    source_margin_x: usize,
+    source_margin_y: usize,
+    effect_margin: usize,
+    b: Bounds,
+    scale: f32,
+    destination_margin_x: i32,
+    destination_margin_y: i32,
+) {
     if effect_margin == 0 {
         return;
     }
@@ -1254,15 +1356,27 @@ fn draw_shadow_with_destination_margin(
     let width = (b.width * scale).round().max(1.0) as i32 + margin * 2;
     let height = (b.height * scale).round().max(1.0) as i32 + margin * 2;
     for dy in 0..height {
-        let sy = slice_coordinate(dy, height, side, source_margin, destination_margin);
+        let sy = slice_coordinate(
+            dy,
+            height,
+            source_height,
+            source_margin_y,
+            destination_margin_y,
+        );
         for dx in 0..width {
             let x = left + dx;
             let y = top + dy;
             if x < 0 || y < 0 || x >= pm.width() as i32 || y >= pm.height() as i32 {
                 continue;
             }
-            let sx = slice_coordinate(dx, width, side, source_margin, destination_margin);
-            let index = (sy * side + sx) * 4;
+            let sx = slice_coordinate(
+                dx,
+                width,
+                source_width,
+                source_margin_x,
+                destination_margin_x,
+            );
+            let index = (sy * source_width + sx) * 4;
             let color: [u8; 4] = rgba[index..index + 4].try_into().unwrap();
             blend_pixel(pm, x as u32, y as u32, color);
         }
@@ -1314,7 +1428,7 @@ fn draw_image(
     fit: ImageFit,
     bounds: Bounds,
     surface_scale: f32,
-    radius: f32,
+    radius: Radii,
 ) -> Result<(), RenderNote> {
     let image = cache.get_or_decode(source)?;
     let target_width = bounds.width * surface_scale;
@@ -1342,7 +1456,7 @@ fn draw_image(
     let bottom = ((bounds.y + bounds.height) * surface_scale)
         .ceil()
         .clamp(0.0, target.height() as f32) as u32;
-    if radius > 0.0 {
+    if radius.is_rounded() {
         let rect = Rect::from_xywh(
             bounds.x * surface_scale,
             bounds.y * surface_scale,
@@ -1626,6 +1740,63 @@ mod tests {
             .render(&rounded_fixture(999.0), metrics())
             .unwrap();
         assert_eq!(clamped.rgba, pill.rgba);
+    }
+
+    #[test]
+    fn non_uniform_pressed_rounding_uses_elliptical_fill_and_ring_geometry() {
+        let mut node = Node::new(
+            NodeId::new("ellipse").unwrap(),
+            Role::Group,
+            "",
+            Bounds::new(20.0, 20.0, 100.0, 20.0),
+            "--state-rest-surface",
+        )
+        .with_corner_radius(16.0);
+        node.state.pressed = true;
+        node.state.focused = true;
+        let scene = Scene::new(node, NodeId::new("ellipse").unwrap()).unwrap();
+        let frame = Rasterizer::new().render(&scene, metrics()).unwrap();
+        let canvas = token_rgba(ThemeBase::Dusk, "--color-surface-canvas");
+        let fill = token_rgba(ThemeBase::Dusk, "--state-rest-surface");
+
+        // Press maps the 100x20 node to 98x18: rx=15.68 and ry clamps to 9. The top
+        // edge therefore begins near x=37, not x=30 as the old min-scale circle did.
+        assert_eq!(pixel(&frame, 25, 21), canvas);
+        assert_eq!(pixel(&frame, 38, 21), fill);
+
+        let style = Rasterizer::new().style;
+        let bounds = Bounds::new(21.0, 21.0, 98.0, 18.0);
+        let mut elliptical_ring = Pixmap::new(140, 60).unwrap();
+        draw_focus_ring(
+            &mut elliptical_ring,
+            &style,
+            bounds,
+            1.0,
+            Radii::new(15.68, 9.0),
+        )
+        .unwrap();
+        let mut old_circular_ring = Pixmap::new(140, 60).unwrap();
+        draw_focus_ring(
+            &mut old_circular_ring,
+            &style,
+            bounds,
+            1.0,
+            Radii::new(9.0, 9.0),
+        )
+        .unwrap();
+        assert_ne!(elliptical_ring.data(), old_circular_ring.data());
+    }
+
+    #[test]
+    fn transformed_corner_radii_clamp_each_axis_independently() {
+        assert_eq!(
+            clamped_radii(Radii::new(80.0, 7.0), Bounds::new(0.0, 0.0, 100.0, 20.0)),
+            Radii::new(50.0, 7.0)
+        );
+        assert_eq!(
+            clamped_radii(Radii::new(8.0, 80.0), Bounds::new(0.0, 0.0, 100.0, 20.0)),
+            Radii::new(8.0, 10.0)
+        );
     }
 
     #[test]
@@ -2203,7 +2374,7 @@ mod tests {
                     square.margin + 1,
                 );
                 let rounded_corner =
-                    alpha(&rounded.rgba, rounded.side, square.margin, square.margin);
+                    alpha(&rounded.rgba, rounded.width, square.margin, square.margin);
                 assert!(
                     rounded_corner <= 8 && rounded_corner <= square_corner,
                     "{elevation:?} r={radius}: rounded={rounded_corner}, square={square_corner}"
@@ -2212,14 +2383,47 @@ mod tests {
                 // Far from the corner, the rounded mask is the same half-plane as the square
                 // mask, so its blur must retain the existing straight-edge penumbra profile.
                 let square_edge = alpha(square.rgba, square.side, square.side / 2, square.margin);
-                let rounded_edge =
-                    alpha(&rounded.rgba, rounded.side, rounded.side / 2, square.margin);
+                let rounded_edge = alpha(
+                    &rounded.rgba,
+                    rounded.width,
+                    rounded.width / 2,
+                    square.margin,
+                );
                 assert!(
                     rounded_edge.abs_diff(square_edge) <= 1,
                     "{elevation:?} r={radius}: rounded={rounded_edge}, square={square_edge}"
                 );
             }
         }
+    }
+
+    #[test]
+    fn non_uniform_pressed_shadow_uses_elliptical_silhouette() {
+        let asset = shadow_asset(ThemeBase::Dusk, Elevation::Elev2);
+        let bounds = Bounds::new(21.0, 21.0, 98.0, 18.0);
+        let mut elliptical = Pixmap::new(140, 60).unwrap();
+        draw_node_shadow(
+            &mut elliptical,
+            &mut RoundedShadowCache::default(),
+            asset,
+            bounds,
+            1.0,
+            Radii::new(15.68, 9.0),
+        );
+        let mut old_circle = Pixmap::new(140, 60).unwrap();
+        draw_node_shadow(
+            &mut old_circle,
+            &mut RoundedShadowCache::default(),
+            asset,
+            bounds,
+            1.0,
+            Radii::new(9.0, 9.0),
+        );
+        assert_ne!(elliptical.data(), old_circle.data());
+
+        let baked = bake_rounded_shadow_physical(asset, Radii::new(16.0, 9.0), asset.margin);
+        assert!(baked.width > baked.height);
+        assert!(baked.slice_margin_x > baked.slice_margin_y);
     }
 
     #[test]
@@ -2243,7 +2447,7 @@ mod tests {
             asset,
             bounds,
             1.0,
-            0.0,
+            Radii::new(0.0, 0.0),
         );
         assert_eq!(actual.data(), expected.data());
     }
@@ -2252,19 +2456,20 @@ mod tests {
     fn rounded_shadow_radius_is_bounded_by_physical_extent_and_ceiling() {
         let degenerate = Bounds::new(0.0, 0.0, 100_000.0, 100_000.0);
         assert_eq!(
-            quantized_physical_shadow_radius(degenerate, 0.001, 100.0),
-            50
+            quantized_physical_shadow_radii(degenerate, 0.001, Radii::new(100.0, 100.0)),
+            (50, 50)
         );
         let huge = Bounds::new(0.0, 0.0, 100_000.0, 100_000.0);
         assert_eq!(
-            quantized_physical_shadow_radius(huge, 1.0, 50_000.0),
-            MAX_ROUNDED_SHADOW_RADIUS
+            quantized_physical_shadow_radii(huge, 1.0, Radii::new(50_000.0, 50_000.0)),
+            (MAX_ROUNDED_SHADOW_RADIUS, MAX_ROUNDED_SHADOW_RADIUS)
         );
         let asset = bake_rounded_shadow(
             shadow_asset(ThemeBase::Dusk, Elevation::Elev1),
-            quantized_physical_shadow_radius(degenerate, 0.001, 100.0) as usize,
+            quantized_physical_shadow_radii(degenerate, 0.001, Radii::new(100.0, 100.0)).0 as usize,
         );
-        assert_eq!(asset.side, asset.effect_margin * 2 + 50 * 2 + 3);
+        assert_eq!(asset.width, asset.effect_margin * 2 + 50 * 2 + 3);
+        assert_eq!(asset.height, asset.width);
     }
 
     #[test]
@@ -2272,16 +2477,16 @@ mod tests {
         let asset = shadow_asset(ThemeBase::Dusk, Elevation::Elev1);
         let mut cache = RoundedShadowCache::default();
         for radius in 1..=(ROUNDED_SHADOW_CACHE_CAPACITY as u32 * 4) {
-            cache.get_or_bake((0, 1, radius, asset.margin as u16), asset);
+            cache.get_or_bake((0, 1, radius, radius, asset.margin as u16), asset);
             assert!(cache.assets.len() <= ROUNDED_SHADOW_CACHE_CAPACITY);
         }
         for scale in [1.0, 2.0] {
             for logical_radius in [6.0, 10.0, 16.0] {
                 let physical = (logical_radius * scale) as u32;
                 let margin = (asset.margin as f32 * scale) as u16;
-                cache.get_or_bake((0, 1, physical, margin), asset);
+                cache.get_or_bake((0, 1, physical, physical, margin), asset);
                 let len = cache.assets.len();
-                cache.get_or_bake((0, 1, physical, margin), asset);
+                cache.get_or_bake((0, 1, physical, physical, margin), asset);
                 assert_eq!(cache.assets.len(), len);
             }
         }
@@ -2301,8 +2506,8 @@ mod tests {
                 draw_shadow(
                     &mut round_three,
                     &old.rgba,
-                    old.side,
-                    old.slice_margin,
+                    old.width,
+                    old.slice_margin_x,
                     old.effect_margin,
                     bounds,
                     scale,
@@ -2315,7 +2520,7 @@ mod tests {
                     asset,
                     bounds,
                     scale,
-                    logical_radius as f32 * scale,
+                    Radii::new(logical_radius as f32 * scale, logical_radius as f32 * scale),
                 );
                 for (logical_x, logical_y) in [(72.0, 32.0), (32.0, 72.0), (72.0, 72.0)] {
                     let x = (logical_x * scale) as u32;
