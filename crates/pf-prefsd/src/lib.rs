@@ -10,6 +10,9 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+/// Maximum time a client may block one read or write in the serial v1 server.
+pub const CONNECTION_TIMEOUT: Duration = Duration::from_secs(3);
+
 /// One v1 preference request, carried as JSON in a `pf-wire` frame.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "method", rename_all = "snake_case")]
@@ -78,7 +81,7 @@ pub fn verify_peer_uid(cred: PeerCred, allowed_uid: u32) -> io::Result<()> {
 
 /// Serve exactly one request and response on a connection.
 pub fn serve_connection(store: &PrefsStore, stream: &mut UnixStream) -> io::Result<()> {
-    let body = pf_wire::read_frame(stream).map_err(io::Error::other)?;
+    let body = pf_wire::read_frame(stream).map_err(map_wire_error)?;
     let response = match serde_json::from_slice::<RpcRequest>(&body) {
         Ok(request) => handle_rpc(store, request),
         Err(error) => RpcResponse::Error {
@@ -86,7 +89,23 @@ pub fn serve_connection(store: &PrefsStore, stream: &mut UnixStream) -> io::Resu
         },
     };
     let body = serde_json::to_vec(&response).map_err(io::Error::other)?;
-    pf_wire::write_frame(stream, &body).map_err(io::Error::other)
+    pf_wire::write_frame(stream, &body).map_err(map_wire_error)
+}
+
+fn map_wire_error(error: pf_wire::WireError) -> io::Error {
+    match error {
+        // Preserve timeout kinds so an incomplete length prefix/body or a blocked
+        // response is explicitly handled as a connection I/O failure.
+        pf_wire::WireError::Io(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+            ) =>
+        {
+            error
+        }
+        error => io::Error::other(error),
+    }
 }
 
 /// Serve serial, short-lived connections until `stop` is set.
@@ -95,6 +114,20 @@ pub fn serve_until(
     store: &PrefsStore,
     allowed_uid: u32,
     stop: &AtomicBool,
+) -> io::Result<()> {
+    serve_until_with_timeout(listener, store, allowed_uid, stop, CONNECTION_TIMEOUT)
+}
+
+/// Serve serial connections with an explicit per-I/O timeout.
+///
+/// The separate entry point lets tests use a short bound without weakening the
+/// production deadline.
+pub fn serve_until_with_timeout(
+    listener: UnixListener,
+    store: &PrefsStore,
+    allowed_uid: u32,
+    stop: &AtomicBool,
+    connection_timeout: Duration,
 ) -> io::Result<()> {
     listener.set_nonblocking(true)?;
     while !stop.load(Ordering::Acquire) {
@@ -106,7 +139,14 @@ pub fn serve_until(
                     eprintln!("pf-prefsd: peer refused: {error}");
                     continue;
                 }
-                stream.set_nonblocking(false)?;
+                if let Err(error) = stream
+                    .set_nonblocking(false)
+                    .and_then(|()| stream.set_read_timeout(Some(connection_timeout)))
+                    .and_then(|()| stream.set_write_timeout(Some(connection_timeout)))
+                {
+                    eprintln!("pf-prefsd: connection setup error: {error}");
+                    continue;
+                }
                 if let Err(error) = serve_connection(store, &mut stream) {
                     eprintln!("pf-prefsd: connection error: {error}");
                 }

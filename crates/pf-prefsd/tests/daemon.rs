@@ -1,4 +1,4 @@
-use pf_prefsd::{serve_until, RpcResponse};
+use pf_prefsd::{serve_until_with_timeout, RpcResponse};
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -39,17 +39,22 @@ struct Server {
 
 impl Server {
     fn start(root: &Path) -> Self {
+        Self::start_with_timeout(root, Duration::from_millis(100))
+    }
+
+    fn start_with_timeout(root: &Path, connection_timeout: Duration) -> Self {
         let socket = root.join("prefsd.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let state = root.join("state");
         let stop = Arc::new(AtomicBool::new(false));
         let thread_stop = stop.clone();
         let thread = std::thread::spawn(move || {
-            serve_until(
+            serve_until_with_timeout(
                 listener,
                 &pf_prefs::PrefsStore::at(state),
                 unsafe { libc::geteuid() },
                 &thread_stop,
+                connection_timeout,
             )
             .unwrap();
         });
@@ -61,10 +66,60 @@ impl Server {
     }
 }
 
+#[test]
+fn idle_client_times_out_and_does_not_block_next_client() {
+    let scratch = Scratch::new("idle-timeout");
+    let server = Server::start(&scratch.0);
+    let _stalled = UnixStream::connect(&server.socket).unwrap();
+
+    let started = Instant::now();
+    assert!(matches!(
+        rpc(
+            &server.socket,
+            serde_json::json!({"method":"get", "key":"monoAudio"})
+        ),
+        RpcResponse::Value { .. }
+    ));
+    assert!(started.elapsed() < Duration::from_secs(1));
+}
+
+#[test]
+fn partial_length_prefix_times_out_and_does_not_block_next_client() {
+    let scratch = Scratch::new("partial-timeout");
+    let server = Server::start(&scratch.0);
+    let mut stalled = UnixStream::connect(&server.socket).unwrap();
+    stalled.write_all(&[0, 0]).unwrap();
+
+    let started = Instant::now();
+    assert!(matches!(
+        rpc(
+            &server.socket,
+            serde_json::json!({"method":"get", "key":"monoAudio"})
+        ),
+        RpcResponse::Value { .. }
+    ));
+    assert!(started.elapsed() < Duration::from_secs(1));
+}
+
+#[test]
+fn stop_is_observed_after_stalled_client_times_out() {
+    let scratch = Scratch::new("stalled-stop");
+    let mut server = Server::start(&scratch.0);
+    let _stalled = UnixStream::connect(&server.socket).unwrap();
+    std::thread::sleep(Duration::from_millis(25));
+
+    let started = Instant::now();
+    server.stop.store(true, Ordering::Release);
+    server.thread.take().unwrap().join().unwrap();
+    assert!(started.elapsed() < Duration::from_secs(1));
+}
+
 impl Drop for Server {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
-        self.thread.take().unwrap().join().unwrap();
+        if let Some(thread) = self.thread.take() {
+            thread.join().unwrap();
+        }
     }
 }
 
