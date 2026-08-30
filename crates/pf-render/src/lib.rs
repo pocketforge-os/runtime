@@ -2,9 +2,6 @@
 //!
 //! All paint colors are resolved from the active `pf-theme` base at presentation time.
 
-use cosmic_text::{
-    fontdb, Attrs, Buffer, Color, Family, FontSystem, Metrics, Shaping, SwashCache, Weight,
-};
 use cosmic_text_tracking as tracked_text;
 use pf_scene::{Bounds, ImageFit, ImageSource, Node, NodeContent, Scene, SurfaceMetrics, TypeRole};
 pub use pf_theme::Base as ThemeBase;
@@ -166,10 +163,8 @@ pub enum RenderNote {
 
 /// Long-lived rasterizer. Cosmic Text's shaping state and Swash's glyph images are retained.
 pub struct Rasterizer {
-    fonts: FontSystem,
-    glyphs: SwashCache,
-    tracked_fonts: tracked_text::FontSystem,
-    tracked_glyphs: tracked_text::SwashCache,
+    fonts: tracked_text::FontSystem,
+    glyphs: tracked_text::SwashCache,
     previous: Vec<NodeSnapshot>,
     images: ImageCache,
     theme_base: ThemeBase,
@@ -208,21 +203,14 @@ struct ImageCache {
 
 impl Rasterizer {
     pub fn new() -> Self {
-        let mut db = fontdb::Database::new();
-        let mut tracked_db = tracked_text::fontdb::Database::new();
+        let mut db = tracked_text::fontdb::Database::new();
         // Never call load_system_fonts: output must depend only on repository bytes.
         for data in [MANROPE, FRAUNCES, CJK] {
             db.load_font_data(data.to_vec());
-            tracked_db.load_font_data(data.to_vec());
         }
         Self {
-            fonts: FontSystem::new_with_locale_and_db("en-US".into(), db),
-            glyphs: SwashCache::new(),
-            tracked_fonts: tracked_text::FontSystem::new_with_locale_and_db(
-                "en-US".into(),
-                tracked_db,
-            ),
-            tracked_glyphs: tracked_text::SwashCache::new(),
+            fonts: tracked_text::FontSystem::new_with_locale_and_db("en-US".into(), db),
+            glyphs: tracked_text::SwashCache::new(),
             previous: Vec::new(),
             images: ImageCache::default(),
             theme_base: ThemeBase::Dusk,
@@ -275,8 +263,6 @@ impl Rasterizer {
         let mut context = DrawContext {
             fonts: &mut self.fonts,
             glyphs: &mut self.glyphs,
-            tracked_fonts: &mut self.tracked_fonts,
-            tracked_glyphs: &mut self.tracked_glyphs,
             images: &mut self.images,
             notes: &mut notes,
             style: &self.style,
@@ -415,10 +401,8 @@ fn bounds_rect(b: Bounds, scale: f32, width: u32, height: u32, outset: f32) -> D
 }
 
 struct DrawContext<'a> {
-    fonts: &'a mut FontSystem,
-    glyphs: &'a mut SwashCache,
-    tracked_fonts: &'a mut tracked_text::FontSystem,
-    tracked_glyphs: &'a mut tracked_text::SwashCache,
+    fonts: &'a mut tracked_text::FontSystem,
+    glyphs: &'a mut tracked_text::SwashCache,
     images: &'a mut ImageCache,
     notes: &'a mut Vec<RenderNote>,
     style: &'a ResolvedStyleSnapshot,
@@ -505,11 +489,7 @@ fn draw_node(
                 clip: (b.x * scale, b.y * scale, b.width * scale, b.height * scale),
                 color: text,
             };
-            if draw.style.tracking_em == 0.0 {
-                draw_text(pm, context.fonts, context.glyphs, draw);
-            } else {
-                draw_tracked_text(pm, context.tracked_fonts, context.tracked_glyphs, draw);
-            }
+            draw_text(pm, context.fonts, context.glyphs, draw);
         }
         NodeContent::Image { source, fit } => {
             if let Err(note) = draw_image(pm, context.images, source, *fit, b, scale) {
@@ -659,44 +639,7 @@ struct TextDraw<'a> {
     color: Rgba,
 }
 
-fn draw_text(pm: &mut Pixmap, fonts: &mut FontSystem, glyphs: &mut SwashCache, draw: TextDraw<'_>) {
-    let size = draw.style.size_px * draw.text_scale * draw.surface_scale;
-    let line_height = draw.line_height.map_or(size * 1.25, |value| size * value);
-    let mut buffer = Buffer::new(fonts, Metrics::new(size, line_height));
-    buffer.set_size(fonts, Some(draw.width), Some(draw.height));
-    buffer.set_text(
-        fonts,
-        draw.text,
-        Attrs::new()
-            .family(Family::Name(&draw.style.family))
-            .weight(Weight(draw.style.weight)),
-        Shaping::Advanced,
-    );
-    buffer.shape_until_scroll(fonts, false);
-    let default_color = Color::rgba(
-        draw.color.red,
-        draw.color.green,
-        draw.color.blue,
-        draw.color.alpha,
-    );
-    for run in buffer.layout_runs() {
-        for glyph in run.glyphs {
-            let physical = glyph.physical((0.0, 0.0), 1.0);
-            let color = glyph.color_opt.unwrap_or(default_color);
-            glyphs.with_pixels(fonts, physical.cache_key, color, |x, y, color| {
-                blend_text_pixel(
-                    pm,
-                    &draw,
-                    physical.x + x,
-                    run.line_y as i32 + physical.y + y,
-                    color,
-                );
-            });
-        }
-    }
-}
-
-fn draw_tracked_text(
+fn draw_text(
     pm: &mut Pixmap,
     fonts: &mut tracked_text::FontSystem,
     glyphs: &mut tracked_text::SwashCache,
@@ -739,16 +682,6 @@ fn draw_tracked_text(
             });
         }
     }
-}
-
-fn blend_text_pixel(pm: &mut Pixmap, draw: &TextDraw<'_>, gx: i32, gy: i32, color: Color) {
-    blend_text_pixel_rgba(
-        pm,
-        draw,
-        gx,
-        gy,
-        [color.r(), color.g(), color.b(), color.a()],
-    );
 }
 
 fn blend_text_pixel_rgba(pm: &mut Pixmap, draw: &TextDraw<'_>, gx: i32, gy: i32, color: [u8; 4]) {
@@ -1283,14 +1216,84 @@ mod tests {
     }
 
     #[test]
-    fn untracked_body_raster_matches_round_one_byte_for_byte() {
+    fn unified_body_raster_is_stable() {
         use std::hash::{DefaultHasher, Hash, Hasher};
         let frame = Rasterizer::new()
             .render(&copy_fixture(), metrics())
             .unwrap();
         let mut hasher = DefaultHasher::new();
         frame.rgba.hash(&mut hasher);
-        assert_eq!(hasher.finish(), 0xb5a5_0c58_8bfe_9a94);
+        assert_eq!(hasher.finish(), 0xa401_a750_e354_68a1);
+    }
+
+    fn raster_weight(weight: u16, glyphs: &mut tracked_text::SwashCache) -> (u64, usize) {
+        let mut db = tracked_text::fontdb::Database::new();
+        db.load_font_data(MANROPE.to_vec());
+        let mut fonts = tracked_text::FontSystem::new_with_locale_and_db("en-US".into(), db);
+        let style = ResolvedTypeStyle {
+            family: "Manrope".into(),
+            size_px: 32.0,
+            weight,
+            tracking_em: 0.0,
+        };
+        let mut pixmap = Pixmap::new(300, 60).unwrap();
+        draw_text(
+            &mut pixmap,
+            &mut fonts,
+            glyphs,
+            TextDraw {
+                text: "Variable Weight",
+                x: 0.0,
+                y: 0.0,
+                width: 300.0,
+                height: 60.0,
+                style: &style,
+                text_scale: 1.0,
+                surface_scale: 1.0,
+                line_height: None,
+                clip: (0.0, 0.0, 300.0, 60.0),
+                color: Rgba {
+                    red: 255,
+                    green: 255,
+                    blue: 255,
+                    alpha: 255,
+                },
+            },
+        );
+        let ink_mass = pixmap
+            .pixels()
+            .iter()
+            .map(|pixel| u64::from(pixel.demultiply().red()))
+            .sum();
+        (ink_mass, glyphs.image_cache.len())
+    }
+
+    #[test]
+    fn variable_role_weights_produce_heavier_pixels_at_equal_size() {
+        let body = raster_weight(500, &mut tracked_text::SwashCache::new()).0;
+        let h1 = raster_weight(700, &mut tracked_text::SwashCache::new()).0;
+        let hero = raster_weight(800, &mut tracked_text::SwashCache::new()).0;
+        assert!(h1 > body, "h1(700) ink mass {h1} <= body(500) {body}");
+        assert!(hero > body, "hero(800) ink mass {hero} <= body(500) {body}");
+    }
+
+    #[test]
+    fn glyph_cache_keeps_distinct_entries_for_distinct_weights() {
+        let mut glyphs = tracked_text::SwashCache::new();
+        let (_, body_entries) = raster_weight(500, &mut glyphs);
+        let (_, hero_entries) = raster_weight(800, &mut glyphs);
+        assert!(body_entries > 0);
+        assert!(
+            hero_entries > body_entries,
+            "weight-specific glyphs aliased in the cache: {body_entries} -> {hero_entries}"
+        );
+        let weights: std::collections::HashSet<_> = glyphs
+            .image_cache
+            .keys()
+            .map(|key| key.font_weight.0)
+            .collect();
+        assert!(weights.contains(&500));
+        assert!(weights.contains(&800));
     }
 
     fn tracked_layout(text: &str, width: f32, spacing: f32) -> Vec<(f32, Vec<f32>)> {
