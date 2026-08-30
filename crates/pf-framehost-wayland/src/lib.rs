@@ -184,8 +184,22 @@ impl State {
     }
 
     #[cfg(feature = "keyboard")]
-    fn clear_pressed_keys(&mut self) {
-        self.pressed_keys.clear();
+    fn release_pressed_keys(&mut self) {
+        self.key_events.extend(
+            self.pressed_keys
+                .drain()
+                .map(|(code, (keysym, key))| KeyEvent {
+                    code,
+                    keysym,
+                    state: KeyState::Released,
+                    key,
+                }),
+        );
+    }
+
+    #[cfg(feature = "keyboard")]
+    fn poll_key_event(&mut self) -> Option<KeyEvent> {
+        self.key_events.pop_front()
     }
 }
 
@@ -224,7 +238,7 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
             if state.seat_name == Some(name) {
                 state.keyboard = None;
                 state.xkb_state = None;
-                state.clear_pressed_keys();
+                state.release_pressed_keys();
                 state.seat = None;
                 state.seat_name = None;
             }
@@ -249,7 +263,7 @@ impl Dispatch<wl_seat::WlSeat, ()> for State {
                 (false, true) => {
                     state.keyboard = None;
                     state.xkb_state = None;
-                    state.clear_pressed_keys();
+                    state.release_pressed_keys();
                 }
                 _ => {}
             }
@@ -289,7 +303,7 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for State {
             }
             wl_keyboard::Event::Keymap { .. } => state.xkb_state = None,
             wl_keyboard::Event::Enter { .. } | wl_keyboard::Event::Leave { .. } => {
-                state.clear_pressed_keys();
+                state.release_pressed_keys();
             }
             wl_keyboard::Event::Key {
                 key,
@@ -379,6 +393,12 @@ fn translate_keysym(keysym: u32) -> Key {
     }
 }
 
+#[cfg(feature = "keyboard")]
+fn transfer_pressed_key_releases(old: &mut State, replacement: &mut State) {
+    old.release_pressed_keys();
+    replacement.key_events.append(&mut old.key_events);
+}
+
 impl Dispatch<xdg_wm_base::XdgWmBase, ()> for State {
     fn event(
         _: &mut Self,
@@ -403,13 +423,17 @@ impl Dispatch<xdg_toplevel::XdgToplevel, ()> for State {
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
-        match event {
-            xdg_toplevel::Event::Configure { width, height, .. } if width > 0 && height > 0 => {
-                state.pending_size = Some((width as u32, height as u32));
-            }
-            xdg_toplevel::Event::Close => state.closed = true,
-            _ => {}
+        handle_toplevel_event(state, event);
+    }
+}
+
+fn handle_toplevel_event(state: &mut State, event: xdg_toplevel::Event) {
+    match event {
+        xdg_toplevel::Event::Configure { width, height, .. } if width > 0 && height > 0 => {
+            state.pending_size = Some((width as u32, height as u32));
         }
+        xdg_toplevel::Event::Close => state.closed = true,
+        _ => {}
     }
 }
 
@@ -505,17 +529,33 @@ impl WaylandHost {
 
     /// Rebuild every protocol object after compositor loss.
     pub fn reconnect(&mut self) -> Result<(), WaylandHostError> {
-        *self = Self::connect()?;
+        let replacement = Self::connect()?;
+        #[cfg(feature = "keyboard")]
+        {
+            let mut replacement = replacement;
+            transfer_pressed_key_releases(&mut self.state, &mut replacement.state);
+            *self = replacement;
+        }
+        #[cfg(not(feature = "keyboard"))]
+        {
+            *self = replacement;
+        }
         Ok(())
+    }
+
+    /// Return whether the compositor has requested that this toplevel close.
+    pub fn is_closed(&self) -> bool {
+        self.state.closed
     }
 
     /// Return the next queued keyboard transition without waiting for the compositor.
     ///
     /// A compositor without a seat/keyboard (or a disconnected compositor) simply yields `None`.
+    /// A keyboard leave/disconnect delivers synthetic releases for all held keys.
     #[cfg(feature = "keyboard")]
     pub fn poll_key_event(&mut self) -> Option<KeyEvent> {
         self.pump_events_nonblocking();
-        self.state.key_events.pop_front()
+        self.state.poll_key_event()
     }
 
     /// Return the most recently advertised compositor repeat settings.
@@ -756,7 +796,7 @@ mod tests {
 
     #[cfg(feature = "keyboard")]
     #[test]
-    fn keyboard_leave_clears_held_keys() {
+    fn keyboard_leave_releases_held_keys() {
         let context = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
         let keymap = xkb::Keymap::new_from_names(
             &context,
@@ -771,12 +811,61 @@ mod tests {
         let state = xkb::State::new(&keymap);
         let mut host_state = State::new();
 
-        let pressed =
-            key_event_from_evdev(&state, &mut host_state.pressed_keys, 30, KeyState::Pressed);
-        assert_eq!(pressed.key, Key::Char('a'));
-        assert!(!host_state.pressed_keys.is_empty());
+        let presses = [30, 105].map(|code| {
+            key_event_from_evdev(
+                &state,
+                &mut host_state.pressed_keys,
+                code,
+                KeyState::Pressed,
+            )
+        });
+        assert_eq!(presses.map(|event| event.key), [Key::Char('a'), Key::Left]);
 
-        host_state.clear_pressed_keys();
+        host_state.release_pressed_keys();
         assert!(host_state.pressed_keys.is_empty());
+        let mut releases = Vec::new();
+        while let Some(event) = host_state.poll_key_event() {
+            releases.push(event);
+        }
+        releases.sort_by_key(|event| event.code);
+        let mut expected = presses.map(|event| KeyEvent {
+            state: KeyState::Released,
+            ..event
+        });
+        expected.sort_by_key(|event| event.code);
+        assert_eq!(releases, expected);
+    }
+
+    #[cfg(feature = "keyboard")]
+    #[test]
+    fn reconnect_releases_held_keys_before_replacing_state() {
+        let mut old_state = State::new();
+        old_state
+            .pressed_keys
+            .insert(30, (u32::from('a'), Key::Char('a')));
+        let mut replacement_state = State::new();
+
+        transfer_pressed_key_releases(&mut old_state, &mut replacement_state);
+
+        assert!(old_state.pressed_keys.is_empty());
+        assert_eq!(
+            replacement_state.poll_key_event(),
+            Some(KeyEvent {
+                code: 30,
+                keysym: u32::from('a'),
+                state: KeyState::Released,
+                key: Key::Char('a'),
+            })
+        );
+    }
+
+    #[test]
+    fn fabricated_toplevel_close_sets_closed_state() {
+        let mut state = State::new();
+        assert!(!state.closed);
+
+        handle_toplevel_event(&mut state, xdg_toplevel::Event::Close);
+
+        assert!(state.closed);
     }
 }
