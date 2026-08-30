@@ -14,7 +14,9 @@ name = "pocketforge"
 [dependencies]
 pf-wire = { workspace = true }
 pf-prefs = { workspace = true }
+pf-prefsd = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 toml = { workspace = true }
 # libc: the input fd-handoff path (tsp-e1b.10) needs raw syscalls — open() the platform-provided
 # evdev node (in-process backend) and recvmsg() the SCM_RIGHTS fd off the acquire socket (broker

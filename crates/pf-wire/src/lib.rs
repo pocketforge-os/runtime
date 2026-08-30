@@ -115,6 +115,8 @@ pub enum Op {
     GetPose = 8,
     /// Set the IMU pose absolutely (`payload` = 9× f64 LE). -> `status` + `payload` (new pose).
     SetPose = 9,
+    /// Read one system preference by `pref_key`. -> typed preference fields.
+    GetPreference = 10,
 }
 
 impl Op {
@@ -129,7 +131,41 @@ impl Op {
             7 => Op::RumblePulse,
             8 => Op::GetPose,
             9 => Op::SetPose,
-            _ => return Err(WireError::BadEnum { field: "op", value: v }),
+            10 => Op::GetPreference,
+            _ => {
+                return Err(WireError::BadEnum {
+                    field: "op",
+                    value: v,
+                })
+            }
+        })
+    }
+}
+
+/// Type of the preference value carried by a [`Response`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum PreferenceKind {
+    /// The preference was not found (including a degraded/unavailable preference service).
+    NotFound = 0,
+    Bool = 1,
+    Integer = 2,
+    Text = 3,
+}
+
+impl PreferenceKind {
+    fn from_u64(v: u64) -> Result<Self> {
+        Ok(match v {
+            0 => Self::NotFound,
+            1 => Self::Bool,
+            2 => Self::Integer,
+            3 => Self::Text,
+            _ => {
+                return Err(WireError::BadEnum {
+                    field: "preference_kind",
+                    value: v,
+                })
+            }
         })
     }
 }
@@ -159,7 +195,12 @@ impl Status {
             2 => Status::PolicyBlocked,
             3 => Status::ConsentDenied,
             4 => Status::HardwareAbsent,
-            _ => return Err(WireError::BadEnum { field: "status", value: v }),
+            _ => {
+                return Err(WireError::BadEnum {
+                    field: "status",
+                    value: v,
+                })
+            }
         })
     }
 }
@@ -179,7 +220,12 @@ impl Permission {
             0 => Permission::Granted,
             1 => Permission::Denied,
             2 => Permission::Prompt,
-            _ => return Err(WireError::BadEnum { field: "permission", value: v }),
+            _ => {
+                return Err(WireError::BadEnum {
+                    field: "permission",
+                    value: v,
+                })
+            }
         })
     }
 }
@@ -203,7 +249,12 @@ impl RumbleStatus {
             0 => RumbleStatus::Fired,
             1 => RumbleStatus::NoopAbsent,
             2 => RumbleStatus::NoopSuppressed,
-            _ => return Err(WireError::BadEnum { field: "rumble_status", value: v }),
+            _ => {
+                return Err(WireError::BadEnum {
+                    field: "rumble_status",
+                    value: v,
+                })
+            }
         })
     }
 }
@@ -215,7 +266,7 @@ impl RumbleStatus {
 /// A request from `libpocketforge` to the broker.
 ///
 /// Field numbers (see the spec): 1=op (varint), 2=name (len-delim utf8),
-/// 3=payload (len-delim bytes), 4=arg (varint).
+/// 3=payload (len-delim bytes), 4=arg (varint), 5=pref_key (len-delim utf8).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Request {
     pub op: Op,
@@ -225,12 +276,20 @@ pub struct Request {
     pub payload: Vec<u8>,
     /// Optional scalar argument (e.g. rumble duration in ms).
     pub arg: u64,
+    /// System-preference key for [`Op::GetPreference`].
+    pub pref_key: String,
 }
 
 impl Request {
     /// Construct a request carrying only an op + capability name.
     pub fn new(op: Op, name: impl Into<String>) -> Request {
-        Request { op, name: name.into(), payload: Vec::new(), arg: 0 }
+        Request {
+            op,
+            name: name.into(),
+            payload: Vec::new(),
+            arg: 0,
+            pref_key: String::new(),
+        }
     }
 
     /// Encode to the PFW1 body (no length prefix; see [`write_frame`]).
@@ -246,6 +305,9 @@ impl Request {
         if self.arg != 0 {
             put_varint_field(&mut b, 4, self.arg);
         }
+        if !self.pref_key.is_empty() {
+            put_len_field(&mut b, 5, self.pref_key.as_bytes());
+        }
         b
     }
 
@@ -255,34 +317,54 @@ impl Request {
         let mut name = String::new();
         let mut payload = Vec::new();
         let mut arg = 0u64;
+        let mut pref_key = String::new();
         for field in FieldIter::new(buf) {
             let (num, val) = field?;
             match (num, val) {
                 (1, FieldVal::Varint(v)) => op = Some(Op::from_u64(v)?),
                 (2, FieldVal::Len(b)) => {
-                    name = std::str::from_utf8(b).map_err(|_| WireError::BadUtf8)?.to_string()
+                    name = std::str::from_utf8(b)
+                        .map_err(|_| WireError::BadUtf8)?
+                        .to_string()
                 }
                 (3, FieldVal::Len(b)) => payload = b.to_vec(),
                 (4, FieldVal::Varint(v)) => arg = v,
+                (5, FieldVal::Len(b)) => {
+                    pref_key = std::str::from_utf8(b)
+                        .map_err(|_| WireError::BadUtf8)?
+                        .to_string()
+                }
                 // Strict wire-type checks for known fields; unknown fields skipped by the iter.
                 (1 | 4, FieldVal::Len(_)) => {
-                    return Err(WireError::BadWireType { field: num, got: WT_LEN })
+                    return Err(WireError::BadWireType {
+                        field: num,
+                        got: WT_LEN,
+                    })
                 }
-                (2 | 3, FieldVal::Varint(_)) => {
-                    return Err(WireError::BadWireType { field: num, got: WT_VARINT })
+                (2 | 3 | 5, FieldVal::Varint(_)) => {
+                    return Err(WireError::BadWireType {
+                        field: num,
+                        got: WT_VARINT,
+                    })
                 }
                 _ => {}
             }
         }
         let op = op.ok_or(WireError::Truncated)?;
-        Ok(Request { op, name, payload, arg })
+        Ok(Request {
+            op,
+            name,
+            payload,
+            arg,
+            pref_key,
+        })
     }
 }
 
 /// A reply from the broker to `libpocketforge`.
 ///
 /// Field numbers: 1=status (varint), 2=payload (len-delim), 3=flag (varint),
-/// 4=permission (varint).
+/// 4=permission, 5=preference kind, 6=bool, 7=i64, 8=string, 9=applied.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Response {
     pub status: Status,
@@ -292,6 +374,12 @@ pub struct Response {
     pub flag: u64,
     /// The permission state for a `Query`.
     pub permission: Permission,
+    pub preference_kind: PreferenceKind,
+    pub preference_bool: bool,
+    pub preference_integer: i64,
+    pub preference_text: String,
+    /// Whether the running consumer acknowledged applying the stored value (always false in v1).
+    pub applied: bool,
 }
 
 impl Response {
@@ -302,17 +390,28 @@ impl Response {
             payload: Vec::new(),
             flag: 0,
             permission: Permission::Granted,
+            preference_kind: PreferenceKind::NotFound,
+            preference_bool: false,
+            preference_integer: 0,
+            preference_text: String::new(),
+            applied: false,
         }
     }
 
     /// An error response carrying one of the four taxonomy statuses.
     pub fn err(status: Status) -> Response {
-        Response { status, ..Response::ok() }
+        Response {
+            status,
+            ..Response::ok()
+        }
     }
 
     /// An `Ok` response whose `flag` is a boolean (presence/grant checks).
     pub fn boolean(v: bool) -> Response {
-        Response { flag: v as u64, ..Response::ok() }
+        Response {
+            flag: v as u64,
+            ..Response::ok()
+        }
     }
 
     /// Encode to the PFW1 body.
@@ -328,6 +427,21 @@ impl Response {
         if self.permission != Permission::Granted {
             put_varint_field(&mut b, 4, self.permission as u64);
         }
+        if self.preference_kind != PreferenceKind::NotFound {
+            put_varint_field(&mut b, 5, self.preference_kind as u64);
+        }
+        if self.preference_bool {
+            put_varint_field(&mut b, 6, 1);
+        }
+        if self.preference_integer != 0 {
+            put_varint_field(&mut b, 7, self.preference_integer as u64);
+        }
+        if !self.preference_text.is_empty() {
+            put_len_field(&mut b, 8, self.preference_text.as_bytes());
+        }
+        if self.applied {
+            put_varint_field(&mut b, 9, 1);
+        }
         b
     }
 
@@ -337,6 +451,11 @@ impl Response {
         let mut payload = Vec::new();
         let mut flag = 0u64;
         let mut permission = Permission::Granted;
+        let mut preference_kind = PreferenceKind::NotFound;
+        let mut preference_bool = false;
+        let mut preference_integer = 0;
+        let mut preference_text = String::new();
+        let mut applied = false;
         for field in FieldIter::new(buf) {
             let (num, val) = field?;
             match (num, val) {
@@ -344,17 +463,42 @@ impl Response {
                 (2, FieldVal::Len(b)) => payload = b.to_vec(),
                 (3, FieldVal::Varint(v)) => flag = v,
                 (4, FieldVal::Varint(v)) => permission = Permission::from_u64(v)?,
-                (1 | 3 | 4, FieldVal::Len(_)) => {
-                    return Err(WireError::BadWireType { field: num, got: WT_LEN })
+                (5, FieldVal::Varint(v)) => preference_kind = PreferenceKind::from_u64(v)?,
+                (6, FieldVal::Varint(v)) => preference_bool = v != 0,
+                (7, FieldVal::Varint(v)) => preference_integer = v as i64,
+                (8, FieldVal::Len(b)) => {
+                    preference_text = std::str::from_utf8(b)
+                        .map_err(|_| WireError::BadUtf8)?
+                        .to_string()
                 }
-                (2, FieldVal::Varint(_)) => {
-                    return Err(WireError::BadWireType { field: num, got: WT_VARINT })
+                (9, FieldVal::Varint(v)) => applied = v != 0,
+                (1 | 3 | 4 | 5 | 6 | 7 | 9, FieldVal::Len(_)) => {
+                    return Err(WireError::BadWireType {
+                        field: num,
+                        got: WT_LEN,
+                    })
+                }
+                (2 | 8, FieldVal::Varint(_)) => {
+                    return Err(WireError::BadWireType {
+                        field: num,
+                        got: WT_VARINT,
+                    })
                 }
                 _ => {}
             }
         }
         let status = status.ok_or(WireError::Truncated)?;
-        Ok(Response { status, payload, flag, permission })
+        Ok(Response {
+            status,
+            payload,
+            flag,
+            permission,
+            preference_kind,
+            preference_bool,
+            preference_integer,
+            preference_text,
+            applied,
+        })
     }
 }
 
@@ -451,7 +595,11 @@ struct FieldIter<'a> {
 
 impl<'a> FieldIter<'a> {
     fn new(buf: &'a [u8]) -> Self {
-        FieldIter { buf, pos: 0, done: false }
+        FieldIter {
+            buf,
+            pos: 0,
+            done: false,
+        }
     }
 
     fn read_varint(&mut self) -> Result<u64> {
@@ -529,7 +677,17 @@ mod tests {
 
     #[test]
     fn varint_roundtrip() {
-        for v in [0u64, 1, 127, 128, 300, 16_383, 16_384, u32::MAX as u64, u64::MAX] {
+        for v in [
+            0u64,
+            1,
+            127,
+            128,
+            300,
+            16_383,
+            16_384,
+            u32::MAX as u64,
+            u64::MAX,
+        ] {
             let mut b = Vec::new();
             put_varint(&mut b, v);
             let mut it = FieldIter::new(&b);
@@ -546,6 +704,7 @@ mod tests {
             name: "location".into(),
             payload: vec![1, 2, 3, 4, 0, 255],
             arg: 40,
+            pref_key: String::new(),
         };
         let bytes = req.encode();
         assert_eq!(Request::decode(&bytes).unwrap(), req);
@@ -566,7 +725,13 @@ mod tests {
             Status::ConsentDenied,
             Status::HardwareAbsent,
         ] {
-            let resp = Response { status: st, payload: vec![9, 9], flag: 7, permission: Permission::Prompt };
+            let resp = Response {
+                status: st,
+                payload: vec![9, 9],
+                flag: 7,
+                permission: Permission::Prompt,
+                ..Response::ok()
+            };
             assert_eq!(Response::decode(&resp.encode()).unwrap(), resp);
         }
     }
@@ -592,7 +757,10 @@ mod tests {
     fn frame_too_large_rejected() {
         let big = vec![0u8; MAX_FRAME + 1];
         let mut out = Vec::new();
-        assert!(matches!(write_frame(&mut out, &big), Err(WireError::FrameTooLarge(_))));
+        assert!(matches!(
+            write_frame(&mut out, &big),
+            Err(WireError::FrameTooLarge(_))
+        ));
     }
 
     #[test]
@@ -601,7 +769,10 @@ mod tests {
         let mut bytes = ((MAX_FRAME as u32) + 1).to_be_bytes().to_vec();
         bytes.push(0);
         let mut cursor = std::io::Cursor::new(bytes);
-        assert!(matches!(read_frame(&mut cursor), Err(WireError::FrameTooLarge(_))));
+        assert!(matches!(
+            read_frame(&mut cursor),
+            Err(WireError::FrameTooLarge(_))
+        ));
     }
 
     #[test]
@@ -619,6 +790,9 @@ mod tests {
         // field 1 (op) as a length-delimited value must error.
         let mut bytes = Vec::new();
         put_len_field(&mut bytes, 1, b"oops");
-        assert!(matches!(Request::decode(&bytes), Err(WireError::BadWireType { field: 1, .. })));
+        assert!(matches!(
+            Request::decode(&bytes),
+            Err(WireError::BadWireType { field: 1, .. })
+        ));
     }
 }

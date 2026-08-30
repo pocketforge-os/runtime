@@ -569,8 +569,10 @@ version = "0.0.1"
 dependencies = [
  "libc",
  "pf-prefs",
+ "pf-prefsd",
  "pf-wire",
  "serde",
+ "serde_json",
  "toml",
 ]
 

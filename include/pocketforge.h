@@ -68,6 +68,14 @@ int  pf_acquire_input_fd(PfSession *s);
 int  pf_rumble_pulse(const PfSession *s, uint32_t ms);       /* -> PF_RUMBLE_* (never fails) */
 int  pf_entropy_fill(const PfSession *s, uint8_t *buf, size_t len); /* 0 ok, -1 error */
 
+/*
+ * Read system preferences; unavailable keys/services return the caller-supplied default.
+ * The v1 C surface covers bool and scalar keys only. Enum keys such as textScale are not
+ * exposed through these symbols. Writes are control-plane-only; games receive no write API.
+ */
+int     pf_preference_bool(const PfSession *s, const char *name, int default_value);
+int64_t pf_preference_scalar(const PfSession *s, const char *name, int64_t default_value);
+
 /* Misc. */
 uint32_t    pf_wire_version(void);
 const char *pf_strerror(int status);                         /* static; do not free */

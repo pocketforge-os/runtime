@@ -22,14 +22,15 @@ surfaces). Frozen values:
 - **Permission / `pf_query`:** `Granted=0`, `Denied=1`, `Prompt=2`.
 - **RumbleStatus / `pf_rumble_pulse`:** `Fired=0`, `NoopAbsent=1`, `NoopSuppressed=2`.
 - **`Op`:** `IsPresent=1`, `IsGranted=2`, `Query=3`, `Acquire=4`, `GetCapability=5`,
-  `SetCapability=6`, `RumblePulse=7`, `GetPose=8`, `SetPose=9`.
+  `SetCapability=6`, `RumblePulse=7`, `GetPose=8`, `SetPose=9`, `GetPreference=10`.
 - **Framing:** big-endian `u32` length prefix; `MAX_FRAME = 65536`. Body is protobuf-wire
   (varint + len-delimited), unknown fields skipped.
 - **Pose payload:** exactly 9× IEEE-754 `binary64` little-endian = 72 bytes, order
   `yaw,pitch,roll,x,y,z,wx,wy,wz`.
-- **C symbols (13):** `pf_connect`, `pf_connect_descriptor`, `pf_free`, `pf_has_capability`,
+- **C symbols (15):** `pf_connect`, `pf_connect_descriptor`, `pf_free`, `pf_has_capability`,
   `pf_is_present`, `pf_is_granted`, `pf_query`, `pf_acquire`, `pf_acquire_input_fd`,
-  `pf_rumble_pulse`, `pf_entropy_fill`, `pf_wire_version`, `pf_strerror` (full list:
+  `pf_rumble_pulse`, `pf_entropy_fill`, `pf_wire_version`, `pf_strerror`,
+  `pf_preference_bool`, `pf_preference_scalar` (full authoritative list in
   `abi/libpocketforge.v1.abi`). `pf_acquire_input_fd` was ADDED additively (`tsp-e1b.10`, the
   input event fd handoff) — a new symbol, so soname + `WIRE_VERSION` are UNCHANGED and no `Op`
   was added (the broker path reuses `Acquire("input")` + `SCM_RIGHTS`, wire §4.1).
