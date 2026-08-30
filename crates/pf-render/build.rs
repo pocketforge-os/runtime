@@ -26,7 +26,7 @@ fn main() {
             };
             let side = margin * 2 + 3;
             let bytes = bake(side, margin, offset_x, offset_y, blur, spread, color);
-            code.push_str(&format!("ShadowAsset {{ base: ThemeBase::{variant}, elevation: Elevation::{elevation}, side: {side}, margin: {margin}, rgba: &{:?} }},\n", bytes));
+            code.push_str(&format!("ShadowAsset {{ base: ThemeBase::{variant}, elevation: Elevation::{elevation}, side: {side}, margin: {margin}, offset_x: {offset_x:?}, offset_y: {offset_y:?}, blur: {blur:?}, spread: {spread:?}, color: {color:?}, rgba: &{:?} }},\n", bytes));
         }
     }
     code.push(']');
