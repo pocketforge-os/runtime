@@ -10,6 +10,11 @@
 //! entry, so consumers must clamp negative durations to zero. A duration is derivable only when
 //! both timestamps are present: an absent stamp means "unknown", never a zero-length session.
 //! Aggregation is deliberately a consumer concern.
+//!
+//! `pf-session-authorityd` uses device systemd command templates by default. Desktop and
+//! simulator runs can select its `desktop-sim` command preset, which represents running
+//! sessions with marker files under the daemon state directory while exercising the same
+//! [`CommandTemplates`] substitution and execution path as the device commands.
 
 use pf_ports::{
     Clock, LaunchRequest, LaunchResult, MonotonicTime, ObservedSessionState, RecoveryRequired,
@@ -284,6 +289,44 @@ impl CommandTemplates {
             activate_selected_owner: words(activate),
         }
     }
+
+    /// Builds the dependency-free shell templates used by the daemon's `desktop-sim` preset.
+    ///
+    /// Starting a session creates `sessions/{session_id}.running`, graceful and forced stops
+    /// remove it idempotently, and activating the selected owner creates `shell-selected`.
+    pub fn desktop_sim(state_dir: &Path) -> Self {
+        let state_dir = state_dir.as_os_str().to_string_lossy().into_owned();
+        Self {
+            start_foreground: vec![
+                "sh".into(),
+                "-c".into(),
+                "mkdir -p \"$1/sessions\" && touch \"$1/sessions/$2.running\"".into(),
+                "pf-session-authorityd".into(),
+                state_dir.clone(),
+                "{session_id}".into(),
+            ],
+            request_graceful_stop: desktop_sim_remove_template(&state_dir),
+            enforce_termination: desktop_sim_remove_template(&state_dir),
+            activate_selected_owner: vec![
+                "sh".into(),
+                "-c".into(),
+                "touch \"$1/shell-selected\"".into(),
+                "pf-session-authorityd".into(),
+                state_dir,
+            ],
+        }
+    }
+}
+
+fn desktop_sim_remove_template(state_dir: &str) -> Vec<String> {
+    vec![
+        "sh".into(),
+        "-c".into(),
+        "rm -f \"$1/sessions/$2.running\"".into(),
+        "pf-session-authorityd".into(),
+        state_dir.into(),
+        "{session_id}".into(),
+    ]
 }
 
 pub struct CommandSystem<E = ProcessExecutor> {

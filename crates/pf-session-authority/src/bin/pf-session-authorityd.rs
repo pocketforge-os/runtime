@@ -24,7 +24,12 @@ struct Args {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let args = parse_args(env::args().skip(1))?;
+    let raw_args: Vec<_> = env::args().skip(1).collect();
+    if raw_args.iter().any(|arg| arg == "--help" || arg == "-h") {
+        println!("{HELP}");
+        return Ok(());
+    }
+    let args = parse_args(raw_args.into_iter())?;
     fs::create_dir_all(&args.state_dir)?;
     prepare_socket(&args.socket)?;
     let listener = UnixListener::bind(&args.socket)?;
@@ -78,14 +83,26 @@ impl Drop for SocketGuard {
     }
 }
 
+const HELP: &str = r#"Usage: pf-session-authorityd --state-dir PATH --socket PATH [OPTIONS]
+
+Options:
+  --command-preset PRESET          Command templates to use: device (default), desktop-sim
+                                   desktop-sim maintains sessions/{session_id}.running and
+                                   shell-selected markers below --state-dir
+  --start-command COMMAND          Override the preset's launch command
+  --graceful-stop-command COMMAND  Override the preset's graceful-stop command
+  --terminate-command COMMAND      Override the preset's forced-termination command
+  --activate-owner-command COMMAND Override the preset's selected-owner command
+  -h, --help                       Print help"#;
+
 fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
-    let mut state_dir = None;
-    let mut socket = None;
-    let defaults = CommandTemplates::default();
-    let mut start = defaults.start_foreground.join(" ");
-    let mut graceful = defaults.request_graceful_stop.join(" ");
-    let mut terminate = defaults.enforce_termination.join(" ");
-    let mut activate = defaults.activate_selected_owner.join(" ");
+    let mut state_dir: Option<PathBuf> = None;
+    let mut socket: Option<PathBuf> = None;
+    let mut preset = "device".to_owned();
+    let mut start = None;
+    let mut graceful = None;
+    let mut terminate = None;
+    let mut activate = None;
     while let Some(flag) = args.next() {
         let value = args
             .next()
@@ -93,16 +110,63 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
         match flag.as_str() {
             "--state-dir" => state_dir = Some(value.into()),
             "--socket" => socket = Some(value.into()),
-            "--start-command" => start = value,
-            "--graceful-stop-command" => graceful = value,
-            "--terminate-command" => terminate = value,
-            "--activate-owner-command" => activate = value,
+            "--command-preset" => preset = value,
+            "--start-command" => start = Some(value),
+            "--graceful-stop-command" => graceful = Some(value),
+            "--terminate-command" => terminate = Some(value),
+            "--activate-owner-command" => activate = Some(value),
             _ => return Err(format!("unknown argument: {flag}")),
         }
     }
+    let state_dir = state_dir.ok_or("--state-dir is required")?;
+    let mut templates = match preset.as_str() {
+        "device" => CommandTemplates::default(),
+        "desktop-sim" => CommandTemplates::desktop_sim(&state_dir),
+        _ => return Err(format!("unknown command preset: {preset}")),
+    };
+    if let Some(command) = start {
+        templates.start_foreground = command.split_whitespace().map(str::to_owned).collect();
+    }
+    if let Some(command) = graceful {
+        templates.request_graceful_stop = command.split_whitespace().map(str::to_owned).collect();
+    }
+    if let Some(command) = terminate {
+        templates.enforce_termination = command.split_whitespace().map(str::to_owned).collect();
+    }
+    if let Some(command) = activate {
+        templates.activate_selected_owner = command.split_whitespace().map(str::to_owned).collect();
+    }
     Ok(Args {
-        state_dir: state_dir.ok_or("--state-dir is required")?,
+        state_dir,
         socket: socket.ok_or("--socket is required")?,
-        templates: CommandTemplates::from_strings(&start, &graceful, &terminate, &activate),
+        templates,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn desktop_sim_preset_parses_and_explicit_commands_override_it() {
+        let args = parse_args(
+            [
+                "--start-command",
+                "custom {session_id}",
+                "--command-preset",
+                "desktop-sim",
+                "--state-dir",
+                "/tmp/pf state",
+                "--socket",
+                "/tmp/pf.sock",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        )
+        .unwrap();
+
+        assert_eq!(args.templates.start_foreground, ["custom", "{session_id}"]);
+        assert_eq!(args.templates.request_graceful_stop[0], "sh");
+        assert_eq!(args.templates.request_graceful_stop[4], "/tmp/pf state");
+    }
 }
