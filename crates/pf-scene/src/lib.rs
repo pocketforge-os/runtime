@@ -110,6 +110,21 @@ pub enum NodeContent {
     Image { source: ImageSource, fit: ImageFit },
 }
 
+/// Product typography roles resolved by the renderer at presentation time.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+pub enum TypeRole {
+    Hero,
+    Title,
+    H1,
+    #[default]
+    Body,
+    Label,
+    Caption,
+    Eyebrow,
+    /// Decorative edition-plate or monogram text; the only Fraunces binding.
+    Plate,
+}
+
 impl Bounds {
     /// Creates unconstrained logical bounds at the supplied position and size.
     pub fn new(x: f32, y: f32, width: f32, height: f32) -> Self {
@@ -143,6 +158,10 @@ pub struct Node {
     /// `Some` makes the node focusable and states what activation means.
     pub action: Option<NodeAction>,
     pub content: NodeContent,
+    /// Theme typography key. It is resolved to concrete metrics only while rendering.
+    pub type_role: TypeRole,
+    /// Component-owned line-height multiplier. `None` uses the font's normal line box.
+    pub line_height: Option<f32>,
     pub children: Vec<Node>,
 }
 
@@ -163,6 +182,8 @@ impl Node {
             style_token: style_token.into(),
             action: None,
             content: NodeContent::Label,
+            type_role: TypeRole::Body,
+            line_height: None,
             children: Vec::new(),
         }
     }
@@ -179,6 +200,20 @@ impl Node {
 
     pub fn with_image(mut self, source: ImageSource, fit: ImageFit) -> Self {
         self.content = NodeContent::Image { source, fit };
+        self
+    }
+
+    pub fn with_type_role(mut self, role: TypeRole) -> Self {
+        self.type_role = role;
+        self
+    }
+
+    /// Supplies component structure's line-height (for example 1.04 hero or 1.5 copy).
+    pub fn with_line_height(mut self, multiplier: f32) -> Self {
+        self.line_height = multiplier
+            .is_finite()
+            .then_some(multiplier)
+            .filter(|v| *v > 0.0);
         self
     }
 
