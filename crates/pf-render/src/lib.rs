@@ -2,8 +2,10 @@
 //!
 //! All paint colors are resolved from the active `pf-theme` base at presentation time.
 
-use cosmic_text::{fontdb, Attrs, Buffer, Color, Family, FontSystem, Metrics, Shaping, SwashCache};
-use pf_scene::{Bounds, ImageFit, ImageSource, Node, NodeContent, Scene, SurfaceMetrics};
+use cosmic_text::{
+    fontdb, Attrs, Buffer, Color, Family, FontSystem, Metrics, Shaping, SwashCache, Weight,
+};
+use pf_scene::{Bounds, ImageFit, ImageSource, Node, NodeContent, Scene, SurfaceMetrics, TypeRole};
 pub use pf_theme::Base as ThemeBase;
 use pf_theme::{ResolvedStyleSnapshot, Rgba};
 use std::collections::{HashMap, VecDeque};
@@ -21,6 +23,98 @@ const CJK: &[u8] = include_bytes!("../fonts/NotoSansCJK-Regular.ttc");
 /// Maximum decoded PNG dimensions accepted by the rasterizer (8 megapixels).
 pub const MAX_IMAGE_PIXELS: u64 = 8_000_000;
 const IMAGE_CACHE_CAPACITY: usize = 16;
+const ROOT_FONT_SIZE: f32 = 16.0;
+const TYPE_TOKENS: &str = include_str!("../../pf-theme/vendor/package/tokens.json");
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ResolvedTypeStyle {
+    pub family: String,
+    pub size_px: f32,
+    pub weight: u16,
+    pub tracking_em: f32,
+}
+
+#[derive(Clone, Debug)]
+struct TypographySnapshot {
+    roles: HashMap<TypeRole, ResolvedTypeStyle>,
+}
+
+impl TypographySnapshot {
+    fn flagship() -> Self {
+        let roles = [
+            TypeRole::Hero,
+            TypeRole::Title,
+            TypeRole::H1,
+            TypeRole::Body,
+            TypeRole::Label,
+            TypeRole::Caption,
+            TypeRole::Eyebrow,
+            TypeRole::Plate,
+        ]
+        .into_iter()
+        .map(|role| (role, parse_type_role(role)))
+        .collect();
+        Self { roles }
+    }
+
+    fn resolve(&self, role: TypeRole) -> &ResolvedTypeStyle {
+        &self.roles[&role]
+    }
+}
+
+fn parse_type_role(role: TypeRole) -> ResolvedTypeStyle {
+    let theme = serde_json::from_str::<serde_json::Value>(TYPE_TOKENS)
+        .expect("embedded flagship type tokens are valid JSON");
+    let values = theme["theme"].as_object().expect("theme token object");
+    if role == TypeRole::Plate {
+        return ResolvedTypeStyle {
+            family: token(values, "--type-family-plate").into(),
+            size_px: ROOT_FONT_SIZE,
+            weight: 500,
+            tracking_em: 0.0,
+        };
+    }
+    let key = match role {
+        TypeRole::Hero => "hero",
+        TypeRole::Title => "title",
+        TypeRole::H1 => "h1",
+        TypeRole::Body => "body",
+        TypeRole::Label => "label",
+        TypeRole::Caption => "caption",
+        TypeRole::Eyebrow => "eyebrow",
+        TypeRole::Plate => unreachable!(),
+    };
+    let family_key = if matches!(role, TypeRole::Hero | TypeRole::Title) {
+        "--type-family-display"
+    } else {
+        "--type-family-ui"
+    };
+    let size = token(values, &format!("--type-{key}-size"));
+    let weight = token(values, &format!("--type-{key}-weight"));
+    ResolvedTypeStyle {
+        family: token(values, family_key).into(),
+        size_px: size
+            .strip_suffix("rem")
+            .expect("type size is rem")
+            .parse::<f32>()
+            .expect("numeric type size")
+            * ROOT_FONT_SIZE,
+        weight: weight.parse().expect("numeric type weight"),
+        tracking_em: if role == TypeRole::Eyebrow {
+            token(values, "--type-eyebrow-tracking")
+                .strip_suffix("em")
+                .expect("tracking is em")
+                .parse()
+                .expect("numeric tracking")
+        } else {
+            0.0
+        },
+    }
+}
+
+fn token<'a>(values: &'a serde_json::Map<String, serde_json::Value>, key: &str) -> &'a str {
+    values[key].as_str().expect("string type token")
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DamageRect {
@@ -77,6 +171,8 @@ pub struct Rasterizer {
     images: ImageCache,
     theme_base: ThemeBase,
     style: ResolvedStyleSnapshot,
+    typography: TypographySnapshot,
+    text_scale: f32,
 }
 
 #[derive(Clone, PartialEq)]
@@ -87,6 +183,8 @@ struct NodeSnapshot {
     bounds: Bounds,
     label: String,
     style_token: String,
+    type_role: TypeRole,
+    line_height: Option<f32>,
     focused: bool,
     disabled: bool,
     selected: bool,
@@ -121,7 +219,21 @@ impl Rasterizer {
             style: pf_theme::flagship()
                 .resolved_style(ThemeBase::Dusk)
                 .expect("embedded dusk style snapshot"),
+            typography: TypographySnapshot::flagship(),
+            text_scale: 1.0,
         }
+    }
+
+    /// Sets accessibility text scale. Text is reshaped and reflowed at this size.
+    pub fn set_text_scale(&mut self, factor: f32) -> Result<(), RenderError> {
+        if !factor.is_finite() || factor <= 0.0 {
+            return Err(RenderError::InvalidTextScale);
+        }
+        if self.text_scale != factor {
+            self.text_scale = factor;
+            self.previous.clear();
+        }
+        Ok(())
     }
 
     pub fn set_theme_base(&mut self, base: ThemeBase) {
@@ -156,6 +268,8 @@ impl Rasterizer {
             images: &mut self.images,
             notes: &mut notes,
             style: &self.style,
+            typography: &self.typography,
+            text_scale: self.text_scale,
         };
         draw_node(&mut pixmap, &mut context, scene.root(), metrics.scale)?;
         let mut current = Vec::new();
@@ -200,6 +314,7 @@ impl Default for Rasterizer {
 pub enum RenderError {
     InvalidSurface,
     UnknownStyleKey(String),
+    InvalidTextScale,
 }
 
 fn physical(logical: f32, scale: f32) -> Result<u32, RenderError> {
@@ -224,6 +339,8 @@ fn collect(
         bounds: node.bounds,
         label: node.accessible_label.clone(),
         style_token: node.style_token.clone(),
+        type_role: node.type_role,
+        line_height: node.line_height,
         focused: node.state.focused,
         disabled: node.state.disabled,
         selected: node.state.selected,
@@ -291,6 +408,8 @@ struct DrawContext<'a> {
     images: &'a mut ImageCache,
     notes: &'a mut Vec<RenderNote>,
     style: &'a ResolvedStyleSnapshot,
+    typography: &'a TypographySnapshot,
+    text_scale: f32,
 }
 
 fn style_color(style: &ResolvedStyleSnapshot, key: &str) -> Result<Rgba, RenderError> {
@@ -368,7 +487,10 @@ fn draw_node(
                 y: (b.y + 5.0) * scale,
                 width: (b.width - 12.0).max(1.0) * scale,
                 height: (b.height - 5.0).max(0.0) * scale,
-                size: 15.0 * scale,
+                style: context.typography.resolve(node.type_role),
+                text_scale: context.text_scale,
+                surface_scale: scale,
+                line_height: node.line_height,
                 clip: (b.x * scale, b.y * scale, b.width * scale, b.height * scale),
                 color: text,
             },
@@ -513,62 +635,80 @@ struct TextDraw<'a> {
     y: f32,
     width: f32,
     height: f32,
-    size: f32,
+    style: &'a ResolvedTypeStyle,
+    text_scale: f32,
+    surface_scale: f32,
+    line_height: Option<f32>,
     clip: (f32, f32, f32, f32),
     color: Rgba,
 }
 
 fn draw_text(pm: &mut Pixmap, fonts: &mut FontSystem, glyphs: &mut SwashCache, draw: TextDraw<'_>) {
-    let mut buffer = Buffer::new(fonts, Metrics::new(draw.size, draw.size * 1.25));
+    let size = draw.style.size_px * draw.text_scale * draw.surface_scale;
+    let line_height = draw.line_height.map_or(size * 1.25, |value| size * value);
+    let mut buffer = Buffer::new(fonts, Metrics::new(size, line_height));
     buffer.set_size(fonts, Some(draw.width), Some(draw.height));
     buffer.set_text(
         fonts,
         draw.text,
-        Attrs::new().family(Family::Name("Manrope")),
+        Attrs::new()
+            .family(Family::Name(&draw.style.family))
+            .weight(Weight(draw.style.weight)),
         Shaping::Advanced,
     );
     buffer.shape_until_scroll(fonts, false);
-    buffer.draw(
-        fonts,
-        glyphs,
-        Color::rgba(
-            draw.color.red,
-            draw.color.green,
-            draw.color.blue,
-            draw.color.alpha,
-        ),
-        |gx, gy, gw, gh, color| {
-            let alpha = color.a() as u32;
-            let pixmap_width = pm.width() as usize;
-            for yy in 0..gh as i32 {
-                for xx in 0..gw as i32 {
-                    let px = gx + xx + draw.x as i32;
-                    let py = gy + yy + draw.y as i32;
-                    if px < draw.clip.0.floor() as i32
-                        || py < draw.clip.1.floor() as i32
-                        || px >= (draw.clip.0 + draw.clip.2).ceil() as i32
-                        || py >= (draw.clip.1 + draw.clip.3).ceil() as i32
-                        || px < 0
-                        || py < 0
-                        || px >= pm.width() as i32
-                        || py >= pm.height() as i32
-                    {
-                        continue;
-                    }
-                    let dst = &mut pm.pixels_mut()[py as usize * pixmap_width + px as usize];
-                    let old = dst.demultiply();
-                    let inv = 255 - alpha;
-                    *dst = tiny_skia::PremultipliedColorU8::from_rgba(
-                        ((color.r() as u32 * alpha + old.red() as u32 * inv) / 255) as u8,
-                        ((color.g() as u32 * alpha + old.green() as u32 * inv) / 255) as u8,
-                        ((color.b() as u32 * alpha + old.blue() as u32 * inv) / 255) as u8,
-                        255,
-                    )
-                    .unwrap();
-                }
-            }
-        },
+    let default_color = Color::rgba(
+        draw.color.red,
+        draw.color.green,
+        draw.color.blue,
+        draw.color.alpha,
     );
+    let tracking = draw.style.tracking_em * size;
+    for run in buffer.layout_runs() {
+        for (index, glyph) in run.glyphs.iter().enumerate() {
+            // Tracking is component typography, applied after shaping so ligatures, clusters,
+            // variable axes, and CJK fallback all remain Cosmic Text's responsibility.
+            let physical = glyph.physical((index as f32 * tracking, 0.0), 1.0);
+            let color = glyph.color_opt.unwrap_or(default_color);
+            glyphs.with_pixels(fonts, physical.cache_key, color, |x, y, color| {
+                blend_text_pixel(
+                    pm,
+                    &draw,
+                    physical.x + x,
+                    run.line_y as i32 + physical.y + y,
+                    color,
+                );
+            });
+        }
+    }
+}
+
+fn blend_text_pixel(pm: &mut Pixmap, draw: &TextDraw<'_>, gx: i32, gy: i32, color: Color) {
+    let px = gx + draw.x as i32;
+    let py = gy + draw.y as i32;
+    if px < draw.clip.0.floor() as i32
+        || py < draw.clip.1.floor() as i32
+        || px >= (draw.clip.0 + draw.clip.2).ceil() as i32
+        || py >= (draw.clip.1 + draw.clip.3).ceil() as i32
+        || px < 0
+        || py < 0
+        || px >= pm.width() as i32
+        || py >= pm.height() as i32
+    {
+        return;
+    }
+    let alpha = color.a() as u32;
+    let pixmap_width = pm.width() as usize;
+    let dst = &mut pm.pixels_mut()[py as usize * pixmap_width + px as usize];
+    let old = dst.demultiply();
+    let inv = 255 - alpha;
+    *dst = tiny_skia::PremultipliedColorU8::from_rgba(
+        ((color.r() as u32 * alpha + old.red() as u32 * inv) / 255) as u8,
+        ((color.g() as u32 * alpha + old.green() as u32 * inv) / 255) as u8,
+        ((color.b() as u32 * alpha + old.blue() as u32 * inv) / 255) as u8,
+        255,
+    )
+    .expect("opaque text blend is valid");
 }
 
 #[cfg(test)]
@@ -982,5 +1122,95 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn role_metrics_are_resolved_exactly_from_the_vendored_tokens() {
+        let typography = TypographySnapshot::flagship();
+        let expected = [
+            (TypeRole::Hero, 52.0, 800, 0.0),
+            (TypeRole::Title, 34.0, 800, 0.0),
+            (TypeRole::H1, 22.0, 700, 0.0),
+            (TypeRole::Body, 15.0, 500, 0.0),
+            (TypeRole::Label, 14.0, 600, 0.0),
+            (TypeRole::Caption, 12.5, 600, 0.0),
+            (TypeRole::Eyebrow, 11.5, 700, 0.14),
+        ];
+        for (role, size_px, weight, tracking_em) in expected {
+            let style = typography.resolve(role);
+            assert_eq!(style.family, "Manrope", "{role:?}");
+            assert_eq!(style.size_px, size_px, "{role:?}");
+            assert_eq!(style.weight, weight, "{role:?}");
+            assert_eq!(style.tracking_em, tracking_em, "{role:?}");
+        }
+    }
+
+    #[test]
+    fn fraunces_is_exclusively_bound_to_plate_text() {
+        let typography = TypographySnapshot::flagship();
+        for role in [
+            TypeRole::Hero,
+            TypeRole::Title,
+            TypeRole::H1,
+            TypeRole::Body,
+            TypeRole::Label,
+            TypeRole::Caption,
+            TypeRole::Eyebrow,
+        ] {
+            assert_ne!(typography.resolve(role).family, "Fraunces", "{role:?}");
+        }
+        assert_eq!(typography.resolve(TypeRole::Plate).family, "Fraunces");
+    }
+
+    fn copy_fixture() -> Scene {
+        let root = Node::new(
+            NodeId::new("copy").unwrap(),
+            Role::Text,
+            "Measured body text wraps into additional lines as its accessible text scale grows",
+            Bounds::new(8.0, 8.0, 150.0, 230.0),
+            "--state-rest-surface",
+        )
+        .with_type_role(TypeRole::Body)
+        .with_line_height(1.5);
+        Scene::new(root, NodeId::new("copy").unwrap()).unwrap()
+    }
+
+    fn text_ink(frame: &RasterFrame) -> Vec<(u32, u32)> {
+        let text = [244, 239, 230, 255];
+        (0..frame.height)
+            .flat_map(|y| (0..frame.width).map(move |x| (x, y)))
+            .filter(|&(x, y)| pixel(frame, x, y) == text)
+            .collect()
+    }
+
+    #[test]
+    fn text_scale_reshapes_and_reflows_body_copy_instead_of_scaling_a_framebuffer() {
+        let scene = copy_fixture();
+        let mut normal = Rasterizer::new();
+        let one = normal.render(&scene, metrics()).unwrap();
+        let mut large = Rasterizer::new();
+        large.set_text_scale(2.0).unwrap();
+        let two = large.render(&scene, metrics()).unwrap();
+        assert_eq!((one.width, one.height), (two.width, two.height));
+        let one_ink = text_ink(&one);
+        let two_ink = text_ink(&two);
+        assert!(two_ink.len() > one_ink.len());
+        let one_bottom = one_ink.iter().map(|p| p.1).max().unwrap();
+        let two_bottom = two_ink.iter().map(|p| p.1).max().unwrap();
+        assert!(
+            two_bottom > one_bottom * 3 / 2,
+            "{one_bottom} -> {two_bottom}"
+        );
+    }
+
+    #[test]
+    fn cached_glyph_raster_is_deterministic_for_same_text_role_and_scale() {
+        let scene = copy_fixture();
+        let mut rasterizer = Rasterizer::new();
+        rasterizer.set_text_scale(2.0).unwrap();
+        let cold = rasterizer.render(&scene, metrics()).unwrap();
+        let cached = rasterizer.render(&scene, metrics()).unwrap();
+        assert_eq!(cold.rgba, cached.rgba);
+        assert_eq!(cached.damage, None);
     }
 }
