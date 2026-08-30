@@ -54,10 +54,25 @@ pub enum NodeAction {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct NodeState {
     pub focused: bool,
+    pub pressed: bool,
     pub disabled: bool,
     pub selected: bool,
+    pub unavailable: bool,
+    pub destructive: bool,
+    /// Draw the theme scrim over this node's content (overlay-wave primitive).
+    pub scrimmed: bool,
     pub checked: bool,
     pub expanded: bool,
+}
+
+/// Theme-owned depth treatment. Renderers resolve these to pre-baked assets.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum Elevation {
+    #[default]
+    None,
+    Elev1,
+    Elev2,
+    Focus,
 }
 
 /// Logical bounds constraints, independent of surface scale.
@@ -162,6 +177,7 @@ pub struct Node {
     pub type_role: TypeRole,
     /// Component-owned line-height multiplier. `None` uses the font's normal line box.
     pub line_height: Option<f32>,
+    pub elevation: Elevation,
     pub children: Vec<Node>,
 }
 
@@ -184,6 +200,7 @@ impl Node {
             content: NodeContent::Label,
             type_role: TypeRole::Body,
             line_height: None,
+            elevation: Elevation::None,
             children: Vec::new(),
         }
     }
@@ -217,8 +234,21 @@ impl Node {
         self
     }
 
+    pub fn with_elevation(mut self, elevation: Elevation) -> Self {
+        self.elevation = elevation;
+        self
+    }
+
     pub fn is_focusable(&self) -> bool {
-        self.action.is_some() && !self.state.disabled
+        self.action.is_some()
+            && !self.state.disabled
+            && !(self.state.unavailable && self.role.is_control())
+    }
+}
+
+impl Role {
+    fn is_control(self) -> bool {
+        matches!(self, Self::Button | Self::Toggle | Self::Slider)
     }
 }
 
@@ -260,8 +290,12 @@ pub enum AxisMove {
 /// A controlled structural-state transition. Focus itself is owned by [`Scene`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StateTransition {
+    Pressed(bool),
     Disabled(bool),
     Selected(bool),
+    Unavailable(bool),
+    Destructive(bool),
+    Scrimmed(bool),
     Checked(bool),
     Expanded(bool),
 }
@@ -379,13 +413,24 @@ impl Scene {
         if self.focused.as_ref() == Some(id) && transition == StateTransition::Disabled(true) {
             return Err(SceneError::CannotDisableFocused(id.clone()));
         }
-        let node =
-            find_mut(&mut self.root, id).ok_or_else(|| SceneError::NodeMissing(id.clone()))?;
-        match transition {
-            StateTransition::Disabled(value) => node.state.disabled = value,
-            StateTransition::Selected(value) => node.state.selected = value,
-            StateTransition::Checked(value) => node.state.checked = value,
-            StateTransition::Expanded(value) => node.state.expanded = value,
+        {
+            let node =
+                find_mut(&mut self.root, id).ok_or_else(|| SceneError::NodeMissing(id.clone()))?;
+            match transition {
+                StateTransition::Pressed(value) => node.state.pressed = value,
+                StateTransition::Disabled(value) => node.state.disabled = value,
+                StateTransition::Selected(value) => node.state.selected = value,
+                StateTransition::Unavailable(value) => node.state.unavailable = value,
+                StateTransition::Destructive(value) => node.state.destructive = value,
+                StateTransition::Scrimmed(value) => node.state.scrimmed = value,
+                StateTransition::Checked(value) => node.state.checked = value,
+                StateTransition::Expanded(value) => node.state.expanded = value,
+            }
+        }
+        if self.focused.as_ref() == Some(id)
+            && find(&self.root, id).is_some_and(|node| !node.is_focusable())
+        {
+            self.reset_focus();
         }
         Ok(())
     }
@@ -631,6 +676,71 @@ mod tests {
         assert_eq!(scene.focused(), None);
         assert_eq!(scene.focused_node(), None);
         assert!(!scene.root().state.focused);
+    }
+
+    #[test]
+    fn unavailable_item_card_stays_focusable_and_reachable() {
+        let first = button("first".into(), 0.0, 0.0);
+        let mut card = Node::new(
+            id("card"),
+            Role::ListItem,
+            "Unavailable item details",
+            Bounds::new(12.0, 0.0, 8.0, 8.0),
+            "card",
+        )
+        .with_action(NodeAction::Activate);
+        card.state.unavailable = true;
+        assert!(
+            card.is_focusable(),
+            "unavailable item cards expose their details"
+        );
+
+        let root = Node::new(
+            id("root"),
+            Role::Group,
+            "root",
+            Bounds::new(0.0, 0.0, 1.0, 1.0),
+            "root",
+        )
+        .with_children(vec![first, card]);
+        let mut scene = Scene::new(root, id("first")).unwrap();
+        assert!(scene.move_focus(AxisMove::Right));
+        assert_eq!(scene.focused().unwrap().as_str(), "card");
+    }
+
+    #[test]
+    fn unavailable_controls_are_skipped_for_initial_focus_and_traversal() {
+        let first = button("first".into(), 0.0, 0.0);
+        let mut unavailable = button("unavailable".into(), 12.0, 0.0);
+        unavailable.state.unavailable = true;
+        let last = button("last".into(), 24.0, 0.0);
+        let root = Node::new(
+            id("root"),
+            Role::Group,
+            "root",
+            Bounds::new(0.0, 0.0, 1.0, 1.0),
+            "root",
+        )
+        .with_children(vec![first, unavailable, last]);
+
+        let initial = Scene::new(root.clone(), id("unavailable")).unwrap();
+        assert_eq!(initial.focused().unwrap().as_str(), "first");
+
+        let mut traversed = Scene::new(root, id("first")).unwrap();
+        assert!(traversed.move_focus(AxisMove::Right));
+        assert_eq!(traversed.focused().unwrap().as_str(), "last");
+    }
+
+    #[test]
+    fn focused_control_refocuses_when_it_becomes_unavailable() {
+        let mut scene = grid(2, 1);
+        scene
+            .transition_state(&id("n-0-0"), StateTransition::Unavailable(true))
+            .unwrap();
+
+        assert_eq!(scene.focused().unwrap().as_str(), "n-1-0");
+        assert!(scene.focused_node().unwrap().state.focused);
+        assert!(!find(scene.root(), &id("n-0-0")).unwrap().state.focused);
     }
 
     #[test]

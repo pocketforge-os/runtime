@@ -3,14 +3,16 @@
 //! All paint colors are resolved from the active `pf-theme` base at presentation time.
 
 use cosmic_text_tracking as tracked_text;
-use pf_scene::{Bounds, ImageFit, ImageSource, Node, NodeContent, Scene, SurfaceMetrics, TypeRole};
+use pf_scene::{
+    Bounds, Elevation, ImageFit, ImageSource, Node, NodeContent, Scene, SurfaceMetrics, TypeRole,
+};
 pub use pf_theme::Base as ThemeBase;
 use pf_theme::{ResolvedStyleSnapshot, Rgba};
 use std::collections::{HashMap, VecDeque};
 use std::io::Cursor;
 use tiny_skia::{
     Color as SkColor, FilterQuality, Mask, Paint, PathBuilder, Pixmap, PixmapPaint, Rect, Stroke,
-    Transform,
+    StrokeDash, Transform,
 };
 
 const MANROPE: &[u8] =
@@ -173,6 +175,16 @@ pub struct Rasterizer {
     text_scale: f32,
 }
 
+struct ShadowAsset {
+    base: ThemeBase,
+    elevation: Elevation,
+    side: usize,
+    margin: usize,
+    rgba: &'static [u8],
+}
+
+const SHADOW_ASSETS: &[ShadowAsset] = include!(concat!(env!("OUT_DIR"), "/shadow_assets.rs"));
+
 #[derive(Clone, PartialEq)]
 struct NodeSnapshot {
     id: String,
@@ -184,8 +196,13 @@ struct NodeSnapshot {
     type_role: TypeRole,
     line_height: Option<f32>,
     focused: bool,
+    pressed: bool,
     disabled: bool,
     selected: bool,
+    unavailable: bool,
+    destructive: bool,
+    scrimmed: bool,
+    elevation: Elevation,
     content: ContentSnapshot,
 }
 
@@ -269,9 +286,27 @@ impl Rasterizer {
             typography: &self.typography,
             text_scale: self.text_scale,
         };
-        draw_node(&mut pixmap, &mut context, scene.root(), metrics.scale)?;
+        draw_node(
+            &mut pixmap,
+            &mut context,
+            scene.root(),
+            metrics.scale,
+            LogicalTransform::IDENTITY,
+        )?;
         let mut current = Vec::new();
-        collect(scene.root(), None, 0, &mut current);
+        let pressed_shift = self
+            .style
+            .length("--state-pressed-shift")
+            .expect("typed pressed shift")
+            .pixels;
+        collect(
+            scene.root(),
+            None,
+            0,
+            &mut current,
+            LogicalTransform::IDENTITY,
+            pressed_shift,
+        );
         let focus_damage_outset = (self
             .style
             .length("--focus-ring-offset")
@@ -290,6 +325,7 @@ impl Rasterizer {
             width,
             height,
             focus_damage_outset,
+            self.theme_base,
         );
         self.previous = current;
         Ok(RasterFrame {
@@ -329,19 +365,27 @@ fn collect(
     parent_id: Option<&str>,
     sibling_index: usize,
     out: &mut Vec<NodeSnapshot>,
+    ancestor_transform: LogicalTransform,
+    pressed_shift: f32,
 ) {
+    let transform = node_transform(node, ancestor_transform, pressed_shift);
     out.push(NodeSnapshot {
         id: node.id.as_str().into(),
         parent_id: parent_id.map(str::to_owned),
         sibling_index,
-        bounds: node.bounds,
+        bounds: transform.map_bounds(node.bounds),
         label: node.accessible_label.clone(),
         style_token: node.style_token.clone(),
         type_role: node.type_role,
         line_height: node.line_height,
         focused: node.state.focused,
+        pressed: node.state.pressed,
         disabled: node.state.disabled,
         selected: node.state.selected,
+        unavailable: node.state.unavailable,
+        destructive: node.state.destructive,
+        scrimmed: node.state.scrimmed,
+        elevation: node.elevation,
         content: match &node.content {
             NodeContent::Label => ContentSnapshot::Label,
             NodeContent::Image { source, fit } => ContentSnapshot::Image {
@@ -351,8 +395,85 @@ fn collect(
         },
     });
     for (index, child) in node.children.iter().enumerate() {
-        collect(child, Some(node.id.as_str()), index, out);
+        collect(
+            child,
+            Some(node.id.as_str()),
+            index,
+            out,
+            transform,
+            pressed_shift,
+        );
     }
+}
+
+/// Axis-aligned logical-space transform carried by the paint walk. Pressed geometry only
+/// scales and translates, so retaining this narrower representation avoids introducing
+/// rotation/skew rounding into text layout and clipping.
+#[derive(Clone, Copy)]
+struct LogicalTransform {
+    scale_x: f32,
+    scale_y: f32,
+    translate_x: f32,
+    translate_y: f32,
+}
+
+impl LogicalTransform {
+    const IDENTITY: Self = Self {
+        scale_x: 1.0,
+        scale_y: 1.0,
+        translate_x: 0.0,
+        translate_y: 0.0,
+    };
+
+    fn then(self, local: Self) -> Self {
+        Self {
+            scale_x: self.scale_x * local.scale_x,
+            scale_y: self.scale_y * local.scale_y,
+            translate_x: self.scale_x * local.translate_x + self.translate_x,
+            translate_y: self.scale_y * local.translate_y + self.translate_y,
+        }
+    }
+
+    fn map_bounds(self, bounds: Bounds) -> Bounds {
+        Bounds::new(
+            bounds.x * self.scale_x + self.translate_x,
+            bounds.y * self.scale_y + self.translate_y,
+            bounds.width * self.scale_x,
+            bounds.height * self.scale_y,
+        )
+    }
+
+    fn is_finite(self) -> bool {
+        self.scale_x.is_finite()
+            && self.scale_y.is_finite()
+            && self.translate_x.is_finite()
+            && self.translate_y.is_finite()
+    }
+}
+
+fn node_transform(node: &Node, ancestor: LogicalTransform, pressed_shift: f32) -> LogicalTransform {
+    if !node.state.pressed {
+        return ancestor;
+    }
+
+    let pressed_axis = |origin: f32, size: f32| {
+        if size == 0.0 {
+            (1.0, 0.0)
+        } else {
+            let scale = (size - pressed_shift * 2.0).max(1.0) / size;
+            (scale, origin + pressed_shift - origin * scale)
+        }
+    };
+    let (scale_x, translate_x) = pressed_axis(node.bounds.x, node.bounds.width);
+    let (scale_y, translate_y) = pressed_axis(node.bounds.y, node.bounds.height);
+    let composed = ancestor.then(LogicalTransform {
+        scale_x,
+        scale_y,
+        translate_x,
+        translate_y,
+    });
+    debug_assert!(composed.is_finite(), "pressed transform must remain finite");
+    composed
 }
 
 fn damage(
@@ -362,6 +483,7 @@ fn damage(
     width: u32,
     height: u32,
     focus_outset: f32,
+    base: ThemeBase,
 ) -> Option<DamageRect> {
     if old.is_empty() {
         return Some(DamageRect {
@@ -379,12 +501,47 @@ fn damage(
             old.iter().find(|v| v.id == node.id)
         };
         if peer != Some(node) {
-            let outset = if node.focused { focus_outset } else { 0.0 };
+            let elevation_outset = effect_outset(base, node.elevation) * scale;
+            let aura_outset = if node.focused {
+                effect_outset(base, Elevation::Focus) * scale
+            } else {
+                0.0
+            };
+            let outset = elevation_outset.max(aura_outset).max(if node.focused {
+                focus_outset
+            } else {
+                0.0
+            });
             let r = bounds_rect(node.bounds, scale, width, height, outset);
             result = Some(result.map_or(r, |d: DamageRect| d.union(r)));
         }
     }
     result
+}
+
+fn shadow_asset(base: ThemeBase, elevation: Elevation) -> &'static ShadowAsset {
+    SHADOW_ASSETS
+        .iter()
+        .find(|asset| asset.base == base && asset.elevation == elevation)
+        .expect("build script emits every base/elevation asset")
+}
+
+/// Returns the deterministic build-generated RGBA 9-slice source for an elevation.
+/// The bytes are immutable and may be used by conformance tests or alternate frame hosts.
+pub fn prebaked_elevation_bytes(base: ThemeBase, elevation: Elevation) -> &'static [u8] {
+    if elevation == Elevation::None {
+        &[]
+    } else {
+        shadow_asset(base, elevation).rgba
+    }
+}
+
+fn effect_outset(base: ThemeBase, elevation: Elevation) -> f32 {
+    if elevation == Elevation::None {
+        0.0
+    } else {
+        shadow_asset(base, elevation).margin as f32
+    }
 }
 
 fn bounds_rect(b: Bounds, scale: f32, width: u32, height: u32, outset: f32) -> DamageRect {
@@ -422,52 +579,66 @@ fn draw_node(
     context: &mut DrawContext<'_>,
     node: &Node,
     scale: f32,
+    ancestor_transform: LogicalTransform,
 ) -> Result<(), RenderError> {
-    let b = node.bounds;
-    let surface_key = if node.state.selected {
-        "--state-selected-accent"
-    } else {
-        &node.style_token
-    };
-    let color = style_color(context.style, surface_key)?;
+    let pressed_shift = context
+        .style
+        .length("--state-pressed-shift")
+        .expect("typed pressed shift")
+        .pixels;
+    let transform = node_transform(node, ancestor_transform, pressed_shift);
+    let b = transform.map_bounds(node.bounds);
+
+    if node.elevation != Elevation::None {
+        draw_shadow(
+            pm,
+            shadow_asset(context.style.base(), node.elevation),
+            b,
+            scale,
+        );
+    }
+    if node.state.focused && node.elevation != Elevation::Focus {
+        draw_shadow(
+            pm,
+            shadow_asset(context.style.base(), Elevation::Focus),
+            b,
+            scale,
+        );
+    }
+
+    let color = style_color(context.style, &node.style_token)?;
     if let Some(rect) = Rect::from_xywh(b.x * scale, b.y * scale, b.width * scale, b.height * scale)
     {
         let mut paint = Paint::default();
         paint.set_color_rgba8(color.red, color.green, color.blue, color.alpha);
         pm.fill_rect(rect, &paint, Transform::identity(), None);
-        if node.state.focused {
-            let ring = style_color(context.style, "--state-focused-ring")?;
-            paint.set_color_rgba8(ring.red, ring.green, ring.blue, ring.alpha);
-            let width = context
-                .style
-                .length("--focus-ring-width")
-                .expect("typed focus width")
-                .pixels
-                * scale;
-            let offset = context
-                .style
-                .length("--focus-ring-offset")
-                .expect("typed focus offset")
-                .pixels
-                * scale;
-            let stroke = Stroke {
-                width,
-                ..Stroke::default()
-            };
-            let outset = offset + width / 2.0;
-            if let Some(ring_rect) = Rect::from_xywh(
-                rect.x() - outset,
-                rect.y() - outset,
-                rect.width() + outset * 2.0,
-                rect.height() + outset * 2.0,
-            ) {
-                let path = PathBuilder::from_rect(ring_rect);
-                pm.stroke_path(&path, &paint, &stroke, Transform::identity(), None);
-            }
+        if node.state.selected {
+            fill_token_rect(
+                pm,
+                context.style,
+                "--state-selected-accent",
+                rect.x(),
+                rect.y(),
+                3.0 * scale,
+                rect.height(),
+            )?;
+        }
+        if node.state.destructive {
+            fill_token_rect(
+                pm,
+                context.style,
+                "--state-destructive-accent",
+                rect.x(),
+                rect.y(),
+                rect.width(),
+                3.0 * scale,
+            )?;
         }
     }
     let text_key = if node.state.disabled {
         "--state-disabled-text"
+    } else if node.state.unavailable {
+        "--state-unavailable-text"
     } else if node.state.focused {
         "--state-focused-text"
     } else {
@@ -498,9 +669,254 @@ fn draw_node(
         }
     }
     for child in &node.children {
-        draw_node(pm, context, child, scale)?;
+        draw_node(pm, context, child, scale, transform)?;
+    }
+    if node.state.disabled {
+        if let Some(rect) =
+            Rect::from_xywh(b.x * scale, b.y * scale, b.width * scale, b.height * scale)
+        {
+            stroke_token_rect(pm, context.style, "--state-disabled-border", rect, scale)?;
+        }
+        draw_state_glyph(pm, context.style, b, scale, StateGlyph::Disabled)?;
+    }
+    if node.state.unavailable {
+        fill_token_rect(
+            pm,
+            context.style,
+            "--state-unavailable-veil",
+            b.x * scale,
+            b.y * scale,
+            b.width * scale,
+            b.height * scale,
+        )?;
+        draw_state_glyph(pm, context.style, b, scale, StateGlyph::Unavailable)?;
+    }
+    if node.state.destructive {
+        draw_state_glyph(pm, context.style, b, scale, StateGlyph::Destructive)?;
+    }
+    if node.state.scrimmed {
+        fill_token_rect(
+            pm,
+            context.style,
+            "--color-surface-scrim",
+            b.x * scale,
+            b.y * scale,
+            b.width * scale,
+            b.height * scale,
+        )?;
+    }
+    if node.state.focused {
+        draw_focus_ring(pm, context.style, b, scale)?;
     }
     Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum StateGlyph {
+    Disabled,
+    Unavailable,
+    Destructive,
+}
+
+/// Draws the renderer-owned, non-color half of the state cue grammar. Keeping these
+/// marks outside node content prevents a component from accidentally omitting them.
+fn draw_state_glyph(
+    pm: &mut Pixmap,
+    style: &ResolvedStyleSnapshot,
+    b: Bounds,
+    scale: f32,
+    glyph: StateGlyph,
+) -> Result<(), RenderError> {
+    let size = b.width.min(b.height).min(14.0);
+    let left = (b.x + b.width - size - 5.0) * scale;
+    let top = (b.y + 5.0) * scale;
+    let size = size * scale;
+    let key = match glyph {
+        StateGlyph::Disabled => "--state-disabled-text",
+        StateGlyph::Unavailable => "--state-unavailable-text",
+        StateGlyph::Destructive => "--state-destructive-accent",
+    };
+    let color = style_color(style, key)?;
+    let mut paint = Paint::default();
+    paint.set_color_rgba8(color.red, color.green, color.blue, color.alpha);
+    let stroke = Stroke {
+        width: (2.0 * scale).max(1.0),
+        ..Stroke::default()
+    };
+    let mut path = PathBuilder::new();
+    match glyph {
+        StateGlyph::Disabled => {
+            path.move_to(left + size * 0.12, top + size * 0.5);
+            path.line_to(left + size * 0.88, top + size * 0.5);
+        }
+        StateGlyph::Unavailable => {
+            path.move_to(left + size * 0.12, top + size * 0.88);
+            path.line_to(left + size * 0.88, top + size * 0.12);
+        }
+        StateGlyph::Destructive => {
+            path.move_to(left + size * 0.5, top + size * 0.08);
+            path.line_to(left + size * 0.94, top + size * 0.9);
+            path.line_to(left + size * 0.06, top + size * 0.9);
+            path.close();
+            path.move_to(left + size * 0.5, top + size * 0.3);
+            path.line_to(left + size * 0.5, top + size * 0.62);
+            path.move_to(left + size * 0.5, top + size * 0.76);
+            path.line_to(left + size * 0.5, top + size * 0.78);
+        }
+    }
+    if let Some(path) = path.finish() {
+        pm.stroke_path(&path, &paint, &stroke, Transform::identity(), None);
+    }
+    Ok(())
+}
+
+fn fill_token_rect(
+    pm: &mut Pixmap,
+    style: &ResolvedStyleSnapshot,
+    key: &str,
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+) -> Result<(), RenderError> {
+    let color = style_color(style, key)?;
+    if let Some(rect) = Rect::from_xywh(x, y, width, height) {
+        let mut paint = Paint::default();
+        paint.set_color_rgba8(color.red, color.green, color.blue, color.alpha);
+        pm.fill_rect(rect, &paint, Transform::identity(), None);
+    }
+    Ok(())
+}
+
+fn stroke_token_rect(
+    pm: &mut Pixmap,
+    style: &ResolvedStyleSnapshot,
+    key: &str,
+    rect: Rect,
+    scale: f32,
+) -> Result<(), RenderError> {
+    let color = style_color(style, key)?;
+    let mut paint = Paint::default();
+    paint.set_color_rgba8(color.red, color.green, color.blue, color.alpha);
+    pm.stroke_path(
+        &PathBuilder::from_rect(rect),
+        &paint,
+        &Stroke {
+            width: scale,
+            dash: StrokeDash::new(vec![4.0 * scale, 3.0 * scale], 0.0),
+            ..Stroke::default()
+        },
+        Transform::identity(),
+        None,
+    );
+    Ok(())
+}
+
+fn draw_focus_ring(
+    pm: &mut Pixmap,
+    style: &ResolvedStyleSnapshot,
+    b: Bounds,
+    scale: f32,
+) -> Result<(), RenderError> {
+    let width = style
+        .length("--focus-ring-width")
+        .expect("typed focus width")
+        .pixels
+        * scale;
+    let offset = style
+        .length("--focus-ring-offset")
+        .expect("typed focus offset")
+        .pixels
+        * scale;
+    let outset = offset + width / 2.0;
+    if let Some(rect) = Rect::from_xywh(
+        b.x * scale - outset,
+        b.y * scale - outset,
+        b.width * scale + outset * 2.0,
+        b.height * scale + outset * 2.0,
+    ) {
+        let ring = style_color(style, "--state-focused-ring")?;
+        let mut paint = Paint::default();
+        paint.set_color_rgba8(ring.red, ring.green, ring.blue, ring.alpha);
+        pm.stroke_path(
+            &PathBuilder::from_rect(rect),
+            &paint,
+            &Stroke {
+                width,
+                ..Stroke::default()
+            },
+            Transform::identity(),
+            None,
+        );
+    }
+    Ok(())
+}
+
+fn draw_shadow(pm: &mut Pixmap, asset: &ShadowAsset, b: Bounds, scale: f32) {
+    if asset.margin == 0 {
+        return;
+    }
+    let margin = (asset.margin as f32 * scale).round().max(1.0) as i32;
+    let left = (b.x * scale).round() as i32 - margin;
+    let top = (b.y * scale).round() as i32 - margin;
+    let width = (b.width * scale).round().max(1.0) as i32 + margin * 2;
+    let height = (b.height * scale).round().max(1.0) as i32 + margin * 2;
+    for dy in 0..height {
+        let sy = slice_coordinate(dy, height, asset.side, asset.margin, margin);
+        for dx in 0..width {
+            let x = left + dx;
+            let y = top + dy;
+            if x < 0 || y < 0 || x >= pm.width() as i32 || y >= pm.height() as i32 {
+                continue;
+            }
+            let sx = slice_coordinate(dx, width, asset.side, asset.margin, margin);
+            let index = (sy * asset.side + sx) * 4;
+            blend_pixel(
+                pm,
+                x as u32,
+                y as u32,
+                asset.rgba[index..index + 4].try_into().unwrap(),
+            );
+        }
+    }
+}
+
+fn slice_coordinate(
+    position: i32,
+    destination: i32,
+    side: usize,
+    source_margin: usize,
+    destination_margin: i32,
+) -> usize {
+    if position < destination_margin {
+        (position.max(0) as usize * source_margin / destination_margin as usize)
+            .min(source_margin.saturating_sub(1))
+    } else if position >= destination - destination_margin {
+        let distance = (destination - 1 - position).max(0) as usize;
+        side - 1
+            - (distance * source_margin / destination_margin as usize)
+                .min(source_margin.saturating_sub(1))
+    } else {
+        source_margin + 1
+    }
+}
+
+fn blend_pixel(pm: &mut Pixmap, x: u32, y: u32, color: [u8; 4]) {
+    let alpha = u32::from(color[3]);
+    if alpha == 0 {
+        return;
+    }
+    let width = pm.width() as usize;
+    let dst = &mut pm.pixels_mut()[y as usize * width + x as usize];
+    let old = dst.demultiply();
+    let inv = 255 - alpha;
+    *dst = tiny_skia::PremultipliedColorU8::from_rgba(
+        ((u32::from(color[0]) * alpha + u32::from(old.red()) * inv) / 255) as u8,
+        ((u32::from(color[1]) * alpha + u32::from(old.green()) * inv) / 255) as u8,
+        ((u32::from(color[2]) * alpha + u32::from(old.blue()) * inv) / 255) as u8,
+        255,
+    )
+    .expect("opaque blend");
 }
 
 fn draw_image(
@@ -920,20 +1336,412 @@ mod tests {
         assert_eq!(pixel(&focused, 15, 35), [243, 223, 174, 255]);
 
         let unfocused = rasterizer.render(&focus_scene(false), metrics()).unwrap();
-        assert_eq!(
-            unfocused.damage,
-            Some(DamageRect {
-                x: 15,
-                y: 15,
-                width: 50,
-                height: 40,
-            })
-        );
+        let damage = unfocused.damage.expect("focus loss is damaged");
+        assert_eq!(damage.x, 0);
+        assert_eq!(damage.y, 0);
+        assert!(damage.width >= 92 && damage.height >= 82, "{damage:?}");
         assert_eq!(pixel(&unfocused, 15, 35), [23, 21, 18, 255]);
 
         let focused_again = rasterizer.render(&focus_scene(true), metrics()).unwrap();
         assert_eq!(focused_again.damage, unfocused.damage);
         assert_eq!(pixel(&focused_again, 15, 35), [243, 223, 174, 255]);
+    }
+
+    fn state_scene(configure: impl FnOnce(&mut Node)) -> Scene {
+        let mut root = Node::new(
+            NodeId::new("state").unwrap(),
+            Role::Text,
+            "MMMM",
+            Bounds::new(20.0, 20.0, 80.0, 50.0),
+            "--state-rest-surface",
+        );
+        configure(&mut root);
+        Scene::new(root, NodeId::new("state").unwrap()).unwrap()
+    }
+
+    fn token_rgba(base: ThemeBase, key: &str) -> [u8; 4] {
+        let style = pf_theme::flagship().resolved_style(base).unwrap();
+        let color = style.color(key).unwrap();
+        [color.red, color.green, color.blue, color.alpha]
+    }
+
+    #[test]
+    fn all_state_and_scrim_primitives_resolve_per_base() {
+        for base in [ThemeBase::Dusk, ThemeBase::Day, ThemeBase::HighContrast] {
+            let render = |scene: &Scene| {
+                let mut rasterizer = Rasterizer::new();
+                rasterizer.set_theme_base(base);
+                rasterizer.render(scene, metrics()).unwrap()
+            };
+
+            let selected = render(&state_scene(|n| n.state.selected = true));
+            assert_eq!(
+                pixel(&selected, 20, 45),
+                token_rgba(base, "--state-selected-accent")
+            );
+
+            let destructive = render(&state_scene(|n| n.state.destructive = true));
+            assert_eq!(
+                pixel(&destructive, 50, 20),
+                token_rgba(base, "--state-destructive-accent")
+            );
+
+            let disabled = render(&state_scene(|n| n.state.disabled = true));
+            let disabled_text = token_rgba(base, "--state-disabled-text");
+            assert!(disabled.rgba.chunks_exact(4).any(|p| p == disabled_text));
+            assert_ne!(
+                pixel(&disabled, 20, 45),
+                token_rgba(base, "--state-rest-surface")
+            );
+
+            let unavailable = render(&state_scene(|n| n.state.unavailable = true));
+            let surface = token_rgba(base, "--state-rest-surface");
+            let veil = token_rgba(base, "--state-unavailable-veil");
+            let expected = [
+                ((u32::from(veil[0]) * u32::from(veil[3])
+                    + u32::from(surface[0]) * (255 - u32::from(veil[3])))
+                    / 255) as u8,
+                ((u32::from(veil[1]) * u32::from(veil[3])
+                    + u32::from(surface[1]) * (255 - u32::from(veil[3])))
+                    / 255) as u8,
+                ((u32::from(veil[2]) * u32::from(veil[3])
+                    + u32::from(surface[2]) * (255 - u32::from(veil[3])))
+                    / 255) as u8,
+                255,
+            ];
+            assert!(
+                pixel(&unavailable, 90, 60)
+                    .iter()
+                    .zip(expected)
+                    .all(|(actual, expected)| actual.abs_diff(expected) <= 2),
+                "{base:?}: actual={:?}, expected={expected:?}",
+                pixel(&unavailable, 90, 60)
+            );
+
+            let scrimmed = render(&state_scene(|n| {
+                n.style_token = "--color-status-ready".into();
+                n.state.scrimmed = true;
+            }));
+            assert_ne!(
+                pixel(&scrimmed, 90, 60),
+                token_rgba(base, "--color-status-ready")
+            );
+
+            let pressed = render(&state_scene(|n| n.state.pressed = true));
+            assert_eq!(
+                pixel(&pressed, 20, 20),
+                token_rgba(base, "--color-surface-canvas")
+            );
+            assert_eq!(pixel(&pressed, 21, 21), surface);
+        }
+    }
+
+    fn pressed_composite(parent_pressed: bool, child_pressed: bool) -> Scene {
+        let mut child = Node::new(
+            NodeId::new("child").unwrap(),
+            Role::Text,
+            "MMMM",
+            Bounds::new(40.0, 24.0, 20.0, 20.0),
+            "--color-status-ready",
+        );
+        child.state.pressed = child_pressed;
+        let mut root = Node::new(
+            NodeId::new("root").unwrap(),
+            Role::Button,
+            "",
+            Bounds::new(20.0, 20.0, 40.0, 30.0),
+            "--state-rest-surface",
+        )
+        .with_action(NodeAction::Activate)
+        .with_children(vec![child]);
+        root.state.pressed = parent_pressed;
+        Scene::new(root, NodeId::new("root").unwrap()).unwrap()
+    }
+
+    #[test]
+    fn pressed_geometry_transforms_composite_subtree_and_release_restores_raster() {
+        let mut rasterizer = Rasterizer::new();
+        let rest = rasterizer
+            .render(&pressed_composite(false, false), metrics())
+            .unwrap();
+        let pressed = rasterizer
+            .render(&pressed_composite(true, false), metrics())
+            .unwrap();
+        let canvas = token_rgba(ThemeBase::Dusk, "--color-surface-canvas");
+        let child_surface = token_rgba(ThemeBase::Dusk, "--color-status-ready");
+        let child_text = token_rgba(ThemeBase::Dusk, "--state-rest-text");
+
+        // The pressed parent occupies x=[21, 59). Its right-edge child and text must move
+        // with that parent: no child ink remains at the rest-position edge x=59.
+        assert_eq!(pixel(&pressed, 59, 30), canvas);
+        assert!(
+            (21..59).any(|x| pixel(&pressed, x, 30) == child_surface),
+            "child surface did not render inside transformed parent"
+        );
+        assert!(
+            (21..59).any(|x| (21..49).any(|y| pixel(&pressed, x, y) == child_text)),
+            "child text did not render inside transformed parent"
+        );
+        let press_damage = pressed
+            .damage
+            .expect("press must damage transformed extents");
+        assert!(press_damage.x <= 20 && press_damage.x + press_damage.width >= 60);
+        assert!(press_damage.y <= 20 && press_damage.y + press_damage.height >= 50);
+
+        let released = rasterizer
+            .render(&pressed_composite(false, false), metrics())
+            .unwrap();
+        assert_eq!(
+            released.rgba, rest.rgba,
+            "release must restore the exact rest raster"
+        );
+        let release_damage = released
+            .damage
+            .expect("release must damage both pressed and rest extents");
+        assert!(release_damage.x <= 20 && release_damage.x + release_damage.width >= 60);
+        assert!(release_damage.y <= 20 && release_damage.y + release_damage.height >= 50);
+    }
+
+    #[test]
+    fn nested_pressed_transforms_compose_in_the_paint_walk() {
+        let shift = pf_theme::flagship()
+            .resolved_style(ThemeBase::Dusk)
+            .unwrap()
+            .length("--state-pressed-shift")
+            .unwrap()
+            .pixels;
+        let scene = pressed_composite(true, true);
+        let root = scene.root();
+        let parent = node_transform(root, LogicalTransform::IDENTITY, shift);
+        let child = &root.children[0];
+        let nested = node_transform(child, parent, shift);
+        let parent_only = parent.map_bounds(child.bounds);
+        let composed = nested.map_bounds(child.bounds);
+
+        assert!(composed.x > parent_only.x);
+        assert!(composed.y > parent_only.y);
+        assert!(composed.width < parent_only.width);
+        assert!(composed.height < parent_only.height);
+
+        let parent_frame = Rasterizer::new()
+            .render(&pressed_composite(true, false), metrics())
+            .unwrap();
+        let nested_frame = Rasterizer::new().render(&scene, metrics()).unwrap();
+        assert_ne!(nested_frame.rgba, parent_frame.rgba);
+    }
+
+    fn degenerate_pressed_composite(width: f32, height: f32, pressed: bool) -> Scene {
+        let child = Node::new(
+            NodeId::new("child").unwrap(),
+            Role::Text,
+            "child",
+            Bounds::new(40.0, 30.0, 20.0, 12.0),
+            "--color-status-ready",
+        );
+        let mut root = Node::new(
+            NodeId::new("root").unwrap(),
+            Role::Button,
+            "",
+            Bounds::new(20.0, 20.0, width, height),
+            "--state-rest-surface",
+        )
+        .with_action(NodeAction::Activate)
+        .with_children(vec![child]);
+        root.state.pressed = pressed;
+        Scene::new(root, NodeId::new("root").unwrap()).unwrap()
+    }
+
+    #[test]
+    fn degenerate_pressed_axes_keep_descendant_transforms_finite_and_at_rest() {
+        let shift = pf_theme::flagship()
+            .resolved_style(ThemeBase::Dusk)
+            .unwrap()
+            .length("--state-pressed-shift")
+            .unwrap()
+            .pixels;
+
+        for (width, height) in [(0.0, 30.0), (40.0, 0.0)] {
+            let scene = degenerate_pressed_composite(width, height, true);
+            let root = scene.root();
+            let transform = node_transform(root, LogicalTransform::IDENTITY, shift);
+            let child = root.children[0].bounds;
+            let mapped = transform.map_bounds(child);
+
+            assert!(transform.is_finite());
+            assert!([mapped.x, mapped.y, mapped.width, mapped.height]
+                .into_iter()
+                .all(f32::is_finite));
+            if width == 0.0 {
+                assert_eq!((mapped.x, mapped.width), (child.x, child.width));
+            }
+            if height == 0.0 {
+                assert_eq!((mapped.y, mapped.height), (child.y, child.height));
+            }
+        }
+    }
+
+    #[test]
+    fn degenerate_pressed_nodes_keep_descendants_visible_and_damage_bounded() {
+        let child_surface = token_rgba(ThemeBase::Dusk, "--color-status-ready");
+        for (width, height) in [(0.0, 30.0), (40.0, 0.0)] {
+            let mut rasterizer = Rasterizer::new();
+            rasterizer
+                .render(
+                    &degenerate_pressed_composite(width, height, false),
+                    metrics(),
+                )
+                .unwrap();
+            let pressed = rasterizer
+                .render(
+                    &degenerate_pressed_composite(width, height, true),
+                    metrics(),
+                )
+                .unwrap();
+
+            assert!(
+                pressed
+                    .rgba
+                    .chunks_exact(4)
+                    .any(|pixel| pixel == child_surface),
+                "descendant disappeared for {width}x{height} pressed parent"
+            );
+            let damage = pressed.damage.expect("press must produce finite damage");
+            assert!(damage.x <= pressed.width && damage.y <= pressed.height);
+            assert!(damage.x + damage.width <= pressed.width);
+            assert!(damage.y + damage.height <= pressed.height);
+        }
+    }
+
+    #[test]
+    fn prebaked_nine_slices_are_stable_and_high_contrast_depth_is_absent() {
+        for base in [ThemeBase::Dusk, ThemeBase::Day, ThemeBase::HighContrast] {
+            for elevation in [Elevation::Elev1, Elevation::Elev2, Elevation::Focus] {
+                let first = prebaked_elevation_bytes(base, elevation);
+                let second = prebaked_elevation_bytes(base, elevation);
+                assert_eq!(first, second);
+                assert_eq!(first.len() % 4, 0);
+                if base == ThemeBase::HighContrast {
+                    assert!(first.iter().all(|byte| *byte == 0));
+                } else {
+                    assert!(first.iter().any(|byte| *byte != 0));
+                }
+            }
+        }
+
+        let plain = state_scene(|_| {});
+        let elevated = state_scene(|n| n.elevation = Elevation::Elev2);
+        let mut rasterizer = Rasterizer::new();
+        rasterizer.set_theme_base(ThemeBase::HighContrast);
+        let plain = rasterizer.render(&plain, metrics()).unwrap().rgba;
+        let elevated = rasterizer.render(&elevated, metrics()).unwrap().rgba;
+        assert_eq!(plain, elevated);
+    }
+
+    #[test]
+    fn nine_slice_edge_texels_keep_scaled_source_provenance() {
+        let side = 7usize;
+        let margin = 2usize;
+        let mut rgba = Vec::with_capacity(side * side * 4);
+        for _y in 0..side {
+            for x in 0..side {
+                rgba.extend_from_slice(&[(x * 30) as u8, 0, 0, 255]);
+            }
+        }
+        let asset = ShadowAsset {
+            base: ThemeBase::Dusk,
+            elevation: Elevation::Elev1,
+            side,
+            margin,
+            rgba: Box::leak(rgba.into_boxed_slice()),
+        };
+
+        let raster = |scale: f32| {
+            let mut pm = Pixmap::new(64, 32).unwrap();
+            draw_shadow(&mut pm, &asset, Bounds::new(10.0, 10.0, 12.0, 8.0), scale);
+            pm
+        };
+        let half = raster(0.5);
+        let one = raster(1.0);
+        let two = raster(2.0);
+
+        // At 0.5x the single destination edge pixel reaches the first source edge.
+        assert_eq!(half.pixel(4, 7).unwrap().demultiply().red(), 0);
+        // At 1x source edge texels 0 and 1 are preserved one-for-one.
+        assert_eq!(one.pixel(8, 14).unwrap().demultiply().red(), 0);
+        assert_eq!(one.pixel(9, 14).unwrap().demultiply().red(), 30);
+        // At 2x each source edge texel occupies two pixels; none comes from center x=3.
+        assert_eq!(two.pixel(16, 28).unwrap().demultiply().red(), 0);
+        assert_eq!(two.pixel(17, 28).unwrap().demultiply().red(), 0);
+        assert_eq!(two.pixel(18, 28).unwrap().demultiply().red(), 30);
+        assert_eq!(two.pixel(19, 28).unwrap().demultiply().red(), 30);
+    }
+
+    #[test]
+    fn non_color_state_glyphs_render_in_dusk_and_high_contrast() {
+        for base in [ThemeBase::Dusk, ThemeBase::HighContrast] {
+            let render = |scene: &Scene| {
+                let mut rasterizer = Rasterizer::new();
+                rasterizer.set_theme_base(base);
+                rasterizer.render(scene, metrics()).unwrap()
+            };
+            let unavailable = render(&state_scene(|n| n.state.unavailable = true));
+            let slash = token_rgba(base, "--state-unavailable-text");
+            assert!((80..95).any(|x| (25..40).any(|y| pixel(&unavailable, x, y) == slash)));
+
+            let destructive = render(&state_scene(|n| n.state.destructive = true));
+            let warning = token_rgba(base, "--state-destructive-accent");
+            assert!((80..95).any(|x| (25..40).any(|y| pixel(&destructive, x, y) == warning)));
+        }
+    }
+
+    #[test]
+    fn disabled_image_only_nodes_keep_renderer_owned_em_dash_ink() {
+        for base in [ThemeBase::Dusk, ThemeBase::HighContrast] {
+            let scene = state_scene(|n| {
+                n.accessible_label.clear();
+                n.state.disabled = true;
+                *n = n.clone().with_image(
+                    ImageSource::new("disabled-image", Arc::<[u8]>::from(IMAGE_PNG)),
+                    ImageFit::Cover,
+                );
+            });
+            let mut rasterizer = Rasterizer::new();
+            rasterizer.set_theme_base(base);
+            let disabled = rasterizer.render(&scene, metrics()).unwrap();
+            let dash = token_rgba(base, "--state-disabled-text");
+
+            assert!(
+                (80..95).any(|x| (25..40).any(|y| pixel(&disabled, x, y) == dash)),
+                "{base:?} disabled image lost its em-dash"
+            );
+        }
+    }
+
+    #[test]
+    fn disabled_labeled_nodes_render_border_dash_and_muted_text() {
+        for base in [ThemeBase::Dusk, ThemeBase::HighContrast] {
+            let mut rasterizer = Rasterizer::new();
+            rasterizer.set_theme_base(base);
+            let disabled = rasterizer
+                .render(&state_scene(|n| n.state.disabled = true), metrics())
+                .unwrap();
+            let surface = token_rgba(base, "--state-rest-surface");
+            let muted = token_rgba(base, "--state-disabled-text");
+
+            assert!(
+                (20..100).any(|x| pixel(&disabled, x, 20) != surface)
+                    && (20..100).any(|x| pixel(&disabled, x, 20) == surface),
+                "{base:?} disabled label lost its dashed border"
+            );
+            assert!(
+                (80..95).any(|x| (25..40).any(|y| pixel(&disabled, x, y) == muted)),
+                "{base:?} disabled label lost its em-dash"
+            );
+            assert!(
+                (26..78).any(|x| (25..65).any(|y| pixel(&disabled, x, y) == muted)),
+                "{base:?} disabled label lost its muted text"
+            );
+        }
     }
 
     #[cfg(debug_assertions)]
@@ -1036,15 +1844,9 @@ mod tests {
         let frame = rasterizer
             .render(&image_fixture(IMAGE_PNG, ImageFit::Cover), metrics())
             .unwrap();
-        assert_eq!(
-            frame.damage,
-            Some(DamageRect {
-                x: 12,
-                y: 6,
-                width: 183,
-                height: 139,
-            })
-        );
+        let damage = frame.damage.expect("fit change is damaged");
+        assert_eq!((damage.x, damage.y), (0, 0));
+        assert!(damage.width >= 222 && damage.height >= 172, "{damage:?}");
     }
     #[test]
     fn cjk_fixture_produces_ink_and_damage_accumulates() {
