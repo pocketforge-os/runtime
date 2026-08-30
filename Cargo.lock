@@ -394,12 +394,14 @@ dependencies = [
 name = "pf-framehost-wayland"
 version = "0.0.1"
 dependencies = [
+ "libc",
  "pf-ports",
  "pf-render",
  "pf-scene",
  "tempfile",
  "wayland-client",
  "wayland-protocols",
+ "xkbcommon",
 ]
 
 [[package]]
@@ -1068,6 +1070,23 @@ checksum = "df79d97927682d2fd8adb29682d1140b343be4ac0f08fd68b7765d9c059d3945"
 dependencies = [
  "memchr",
 ]
+
+[[package]]
+name = "xkbcommon"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8d66ca9352cbd4eecbbc40871d8a11b4ac8107cfc528a6e14d7c19c69d0e1ac9"
+dependencies = [
+ "libc",
+ "memmap2",
+ "xkeysym",
+]
+
+[[package]]
+name = "xkeysym"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b9cc00251562a284751c9973bace760d86c0276c471b4be569fe6b068ee97a56"
 
 [[package]]
 name = "yazi"

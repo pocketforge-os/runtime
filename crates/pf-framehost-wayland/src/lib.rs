@@ -7,17 +7,68 @@
 use pf_ports::{FrameHost, PresentAck, PresentFailure, PresentResult};
 use pf_render::{DamageRect, Rasterizer};
 use pf_scene::{Insets, Orientation, Scene, SurfaceMetrics};
+#[cfg(feature = "keyboard")]
+use std::collections::{HashMap, VecDeque};
 use std::fs::File;
 use std::io::{Seek, SeekFrom, Write};
 use std::os::fd::AsFd;
+#[cfg(feature = "keyboard")]
+use std::os::fd::AsRawFd;
 use wayland_client::protocol::{
     wl_buffer, wl_compositor, wl_registry, wl_shm, wl_shm_pool, wl_surface,
 };
+#[cfg(feature = "keyboard")]
+use wayland_client::protocol::{wl_keyboard, wl_seat};
+#[cfg(feature = "keyboard")]
+use wayland_client::WEnum;
 use wayland_client::{delegate_noop, Connection, Dispatch, EventQueue, QueueHandle};
 use wayland_protocols::xdg::shell::client::{xdg_surface, xdg_toplevel, xdg_wm_base};
+#[cfg(feature = "keyboard")]
+use xkbcommon::xkb;
 
 const DEFAULT_WIDTH: u32 = 640;
 const DEFAULT_HEIGHT: u32 = 480;
+
+/// Press/release state reported by the compositor.
+#[cfg(feature = "keyboard")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum KeyState {
+    Pressed,
+    Released,
+}
+
+/// Layout-aware key meaning used by the PocketForge shell.
+#[cfg(feature = "keyboard")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Key {
+    Up,
+    Down,
+    Left,
+    Right,
+    Enter,
+    Escape,
+    Char(char),
+    Other(u32),
+}
+
+/// One keyboard transition. `keysym` is retained for consumers needing more than [`Key`].
+#[cfg(feature = "keyboard")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct KeyEvent {
+    /// Physical evdev keycode, stable across layout and modifier changes.
+    pub code: u32,
+    pub keysym: u32,
+    pub state: KeyState,
+    pub key: Key,
+}
+
+/// Compositor-provided repeat settings. This crate deliberately does not synthesize repeats.
+#[cfg(feature = "keyboard")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RepeatInfo {
+    pub rate: i32,
+    pub delay_ms: i32,
+}
 
 /// Connection/setup failures retain enough type information for reconnect policy.
 #[derive(Debug)]
@@ -55,6 +106,22 @@ struct State {
     compositor: Option<wl_compositor::WlCompositor>,
     shm: Option<wl_shm::WlShm>,
     wm_base: Option<xdg_wm_base::XdgWmBase>,
+    #[cfg(feature = "keyboard")]
+    seat: Option<wl_seat::WlSeat>,
+    #[cfg(feature = "keyboard")]
+    seat_name: Option<u32>,
+    #[cfg(feature = "keyboard")]
+    keyboard: Option<wl_keyboard::WlKeyboard>,
+    #[cfg(feature = "keyboard")]
+    xkb_context: xkb::Context,
+    #[cfg(feature = "keyboard")]
+    xkb_state: Option<xkb::State>,
+    #[cfg(feature = "keyboard")]
+    pressed_keys: HashMap<u32, (u32, Key)>,
+    #[cfg(feature = "keyboard")]
+    key_events: VecDeque<KeyEvent>,
+    #[cfg(feature = "keyboard")]
+    repeat_info: Option<RepeatInfo>,
     surface: Option<wl_surface::WlSurface>,
     xdg_surface: Option<xdg_surface::XdgSurface>,
     toplevel: Option<xdg_toplevel::XdgToplevel>,
@@ -71,6 +138,22 @@ impl State {
             compositor: None,
             shm: None,
             wm_base: None,
+            #[cfg(feature = "keyboard")]
+            seat: None,
+            #[cfg(feature = "keyboard")]
+            seat_name: None,
+            #[cfg(feature = "keyboard")]
+            keyboard: None,
+            #[cfg(feature = "keyboard")]
+            xkb_context: xkb::Context::new(xkb::CONTEXT_NO_FLAGS),
+            #[cfg(feature = "keyboard")]
+            xkb_state: None,
+            #[cfg(feature = "keyboard")]
+            pressed_keys: HashMap::new(),
+            #[cfg(feature = "keyboard")]
+            key_events: VecDeque::new(),
+            #[cfg(feature = "keyboard")]
+            repeat_info: None,
             surface: None,
             xdg_surface: None,
             toplevel: None,
@@ -99,6 +182,11 @@ impl State {
         self.xdg_surface = Some(xdg_surface);
         self.toplevel = Some(toplevel);
     }
+
+    #[cfg(feature = "keyboard")]
+    fn clear_pressed_keys(&mut self) {
+        self.pressed_keys.clear();
+    }
 }
 
 impl Dispatch<wl_registry::WlRegistry, ()> for State {
@@ -112,7 +200,7 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
     ) {
         if let wl_registry::Event::Global {
             name,
-            interface,
+            ref interface,
             version,
         } = event
         {
@@ -122,10 +210,172 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
                 }
                 "wl_shm" => state.shm = Some(registry.bind(name, 1, qh, ())),
                 "xdg_wm_base" => state.wm_base = Some(registry.bind(name, 1, qh, ())),
+                #[cfg(feature = "keyboard")]
+                "wl_seat" if state.seat.is_none() => {
+                    state.seat = Some(registry.bind(name, version.min(7), qh, ()));
+                    state.seat_name = Some(name);
+                }
                 _ => return,
             }
             state.init_xdg(qh);
         }
+        #[cfg(feature = "keyboard")]
+        if let wl_registry::Event::GlobalRemove { name } = event {
+            if state.seat_name == Some(name) {
+                state.keyboard = None;
+                state.xkb_state = None;
+                state.clear_pressed_keys();
+                state.seat = None;
+                state.seat_name = None;
+            }
+        }
+    }
+}
+
+#[cfg(feature = "keyboard")]
+impl Dispatch<wl_seat::WlSeat, ()> for State {
+    fn event(
+        state: &mut Self,
+        seat: &wl_seat::WlSeat,
+        event: wl_seat::Event,
+        _: &(),
+        _: &Connection,
+        qh: &QueueHandle<Self>,
+    ) {
+        if let wl_seat::Event::Capabilities { capabilities } = event {
+            let has_keyboard = matches!(capabilities, WEnum::Value(value) if value.contains(wl_seat::Capability::Keyboard));
+            match (has_keyboard, state.keyboard.is_some()) {
+                (true, false) => state.keyboard = Some(seat.get_keyboard(qh, ())),
+                (false, true) => {
+                    state.keyboard = None;
+                    state.xkb_state = None;
+                    state.clear_pressed_keys();
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+#[cfg(feature = "keyboard")]
+impl Dispatch<wl_keyboard::WlKeyboard, ()> for State {
+    fn event(
+        state: &mut Self,
+        _: &wl_keyboard::WlKeyboard,
+        event: wl_keyboard::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        match event {
+            wl_keyboard::Event::Keymap {
+                format: WEnum::Value(wl_keyboard::KeymapFormat::XkbV1),
+                fd,
+                size,
+            } => {
+                // SAFETY: Wayland transfers an owned, valid keymap fd and supplies its mapping size.
+                state.xkb_state = unsafe {
+                    xkb::Keymap::new_from_fd(
+                        &state.xkb_context,
+                        fd,
+                        size as usize,
+                        xkb::KEYMAP_FORMAT_TEXT_V1,
+                        xkb::KEYMAP_COMPILE_NO_FLAGS,
+                    )
+                }
+                .ok()
+                .flatten()
+                .map(|keymap| xkb::State::new(&keymap));
+            }
+            wl_keyboard::Event::Keymap { .. } => state.xkb_state = None,
+            wl_keyboard::Event::Enter { .. } | wl_keyboard::Event::Leave { .. } => {
+                state.clear_pressed_keys();
+            }
+            wl_keyboard::Event::Key {
+                key,
+                state: key_state,
+                ..
+            } => {
+                let Some(xkb_state) = &state.xkb_state else {
+                    return;
+                };
+                let Some(key_state) = key_state.into_result().ok() else {
+                    return;
+                };
+                let state_value = match key_state {
+                    wl_keyboard::KeyState::Pressed => KeyState::Pressed,
+                    wl_keyboard::KeyState::Released => KeyState::Released,
+                    _ => return,
+                };
+                state.key_events.push_back(key_event_from_evdev(
+                    xkb_state,
+                    &mut state.pressed_keys,
+                    key,
+                    state_value,
+                ));
+            }
+            wl_keyboard::Event::Modifiers {
+                mods_depressed,
+                mods_latched,
+                mods_locked,
+                group,
+                ..
+            } => {
+                if let Some(xkb_state) = &mut state.xkb_state {
+                    xkb_state.update_mask(mods_depressed, mods_latched, mods_locked, 0, 0, group);
+                }
+            }
+            wl_keyboard::Event::RepeatInfo { rate, delay } => {
+                state.repeat_info = Some(RepeatInfo {
+                    rate,
+                    delay_ms: delay,
+                });
+            }
+            _ => {}
+        }
+    }
+}
+
+#[cfg(feature = "keyboard")]
+fn key_event_from_evdev(
+    xkb_state: &xkb::State,
+    pressed_keys: &mut HashMap<u32, (u32, Key)>,
+    code: u32,
+    state: KeyState,
+) -> KeyEvent {
+    // wl_keyboard uses evdev codes; XKB retains the historical eight-code offset.
+    let fresh_keysym = xkb_state.key_get_one_sym(xkb::Keycode::new(code + 8)).raw();
+    let fresh_key = translate_keysym(fresh_keysym);
+    let (keysym, key) = match state {
+        KeyState::Pressed => {
+            pressed_keys.insert(code, (fresh_keysym, fresh_key));
+            (fresh_keysym, fresh_key)
+        }
+        KeyState::Released => pressed_keys
+            .remove(&code)
+            .unwrap_or((fresh_keysym, fresh_key)),
+    };
+    KeyEvent {
+        code,
+        keysym,
+        state,
+        key,
+    }
+}
+
+#[cfg(feature = "keyboard")]
+fn translate_keysym(keysym: u32) -> Key {
+    match keysym {
+        0xff52 => Key::Up,
+        0xff54 => Key::Down,
+        0xff51 => Key::Left,
+        0xff53 => Key::Right,
+        0xff0d | 0xff8d => Key::Enter,
+        0xff1b => Key::Escape,
+        value => char::from_u32(xkb::keysym_to_utf32(xkb::Keysym::new(value)))
+            .filter(|character| !character.is_control())
+            .map(Key::Char)
+            .unwrap_or(Key::Other(value)),
     }
 }
 
@@ -257,6 +507,43 @@ impl WaylandHost {
     pub fn reconnect(&mut self) -> Result<(), WaylandHostError> {
         *self = Self::connect()?;
         Ok(())
+    }
+
+    /// Return the next queued keyboard transition without waiting for the compositor.
+    ///
+    /// A compositor without a seat/keyboard (or a disconnected compositor) simply yields `None`.
+    #[cfg(feature = "keyboard")]
+    pub fn poll_key_event(&mut self) -> Option<KeyEvent> {
+        self.pump_events_nonblocking();
+        self.state.key_events.pop_front()
+    }
+
+    /// Return the most recently advertised compositor repeat settings.
+    #[cfg(feature = "keyboard")]
+    pub fn repeat_info(&self) -> Option<RepeatInfo> {
+        self.state.repeat_info
+    }
+
+    #[cfg(feature = "keyboard")]
+    fn pump_events_nonblocking(&mut self) {
+        if self.queue.dispatch_pending(&mut self.state).is_err() {
+            return;
+        }
+        let Some(guard) = self.connection.prepare_read() else {
+            let _ = self.queue.dispatch_pending(&mut self.state);
+            return;
+        };
+        let backend = self.connection.backend();
+        let mut poll_fd = libc::pollfd {
+            fd: backend.poll_fd().as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: poll_fd points to one initialized pollfd for the duration of this call.
+        let ready = unsafe { libc::poll(&mut poll_fd, 1, 0) } > 0;
+        if ready && guard.read().is_ok() {
+            let _ = self.queue.dispatch_pending(&mut self.state);
+        }
     }
 
     /// Synchronize with the compositor, applying configure/close/buffer-release events.
@@ -392,5 +679,104 @@ mod tests {
         assert!(WaylandHostError::MissingGlobal("wl_shm")
             .to_string()
             .contains("wl_shm"));
+    }
+
+    #[cfg(feature = "keyboard")]
+    #[test]
+    fn shell_keysyms_have_stable_meanings() {
+        assert_eq!(translate_keysym(0xff52), Key::Up);
+        assert_eq!(translate_keysym(0xff54), Key::Down);
+        assert_eq!(translate_keysym(0xff51), Key::Left);
+        assert_eq!(translate_keysym(0xff53), Key::Right);
+        assert_eq!(translate_keysym(0xff0d), Key::Enter);
+        assert_eq!(translate_keysym(0xff1b), Key::Escape);
+        assert_eq!(translate_keysym(u32::from('é')), Key::Char('é'));
+        assert_eq!(translate_keysym(0x0100_03bb), Key::Char('λ'));
+        assert_eq!(translate_keysym(0x100_0000), Key::Other(0x100_0000));
+    }
+
+    #[cfg(feature = "keyboard")]
+    #[test]
+    fn fabricated_evdev_event_uses_received_xkb_layout() {
+        let context = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
+        let keymap = xkb::Keymap::new_from_names(
+            &context,
+            "",
+            "",
+            "us",
+            "",
+            None,
+            xkb::KEYMAP_COMPILE_NO_FLAGS,
+        )
+        .expect("compile test keymap");
+        let state = xkb::State::new(&keymap);
+        let mut pressed_keys = HashMap::new();
+
+        // KEY_A is evdev 30. This is the same translation path used after keymap receipt.
+        assert_eq!(
+            key_event_from_evdev(&state, &mut pressed_keys, 30, KeyState::Pressed),
+            KeyEvent {
+                code: 30,
+                keysym: u32::from('a'),
+                state: KeyState::Pressed,
+                key: Key::Char('a'),
+            }
+        );
+    }
+
+    #[cfg(feature = "keyboard")]
+    #[test]
+    fn release_uses_press_translation_after_modifiers_change() {
+        let context = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
+        let keymap = xkb::Keymap::new_from_names(
+            &context,
+            "",
+            "",
+            "us",
+            "",
+            None,
+            xkb::KEYMAP_COMPILE_NO_FLAGS,
+        )
+        .expect("compile test keymap");
+        let shift_mask = 1 << keymap.mod_get_index(xkb::MOD_NAME_SHIFT);
+        let mut state = xkb::State::new(&keymap);
+        let mut pressed_keys = HashMap::new();
+
+        state.update_mask(shift_mask, 0, 0, 0, 0, 0);
+        let pressed = key_event_from_evdev(&state, &mut pressed_keys, 30, KeyState::Pressed);
+        state.update_mask(0, 0, 0, 0, 0, 0);
+        let released = key_event_from_evdev(&state, &mut pressed_keys, 30, KeyState::Released);
+
+        assert_eq!(pressed.key, Key::Char('A'));
+        assert_eq!(released.key, pressed.key);
+        assert_eq!(released.keysym, pressed.keysym);
+        assert_eq!(released.code, pressed.code);
+        assert!(pressed_keys.is_empty());
+    }
+
+    #[cfg(feature = "keyboard")]
+    #[test]
+    fn keyboard_leave_clears_held_keys() {
+        let context = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
+        let keymap = xkb::Keymap::new_from_names(
+            &context,
+            "",
+            "",
+            "us",
+            "",
+            None,
+            xkb::KEYMAP_COMPILE_NO_FLAGS,
+        )
+        .expect("compile test keymap");
+        let state = xkb::State::new(&keymap);
+        let mut host_state = State::new();
+
+        let pressed =
+            key_event_from_evdev(&state, &mut host_state.pressed_keys, 30, KeyState::Pressed);
+        assert_eq!(pressed.key, Key::Char('a'));
+        assert!(!host_state.pressed_keys.is_empty());
+
+        host_state.clear_pressed_keys();
+        assert!(host_state.pressed_keys.is_empty());
     }
 }

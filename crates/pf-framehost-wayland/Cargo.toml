@@ -8,6 +8,10 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 
+[features]
+default = []
+keyboard = ["dep:xkbcommon"]
+
 [dependencies]
 pf-ports = { workspace = true }
 pf-render = { workspace = true }
@@ -15,6 +19,8 @@ pf-scene = { workspace = true }
 tempfile = "3"
 wayland-client = "=0.31.11"
 wayland-protocols = { version = "=0.32.9", features = ["client"] }
+libc = "=0.2.186"
+xkbcommon = { version = "=0.8.0", features = ["wayland"], optional = true }
 
 [[example]]
 name = "headless_fixture"

@@ -28,6 +28,17 @@ configure, `wl_shm` present, compositor process death, typed
 `PresentFailure::SurfaceLost`, `WaylandHost::reconnect`, a second configure, and a
 second present on the same `WaylandHost`. The scene is the same Japanese-label,
 non-round-number geometry fixture used by `pf-framehost`'s offscreen/fbdev parity tests.
+
+Weston's headless backend advertises a seat and sends the XKB keymap, but it has no
+physical or virtual input backend through which this fixture can inject a genuine key
+without adding a separate privileged input-emulation dependency. The key-event leg is
+therefore covered by the crate test `fabricated_evdev_event_uses_received_xkb_layout`:
+it compiles a real XKB layout and fabricates the raw evdev `KEY_A` payload delivered by
+`wl_keyboard`, then verifies the public keysym/state/stable-key event. Live desktop
+verification is: run `headless_fixture` under a normal Weston session, focus the
+PocketForge window, press arrows/Enter/Escape/a, and drain `poll_key_event()`; verify
+the corresponding press and release events and inspect `repeat_info()` against the
+compositor configuration.
 The expected panic text from the separate fresh-process connection-failure probe is
 omitted above; the harness converts its non-zero exit into `DISCONNECT typed connection
 failure`.
