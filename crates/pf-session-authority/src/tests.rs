@@ -267,6 +267,51 @@ fn graceful_safe_return_observes_every_rung_before_returned() {
 }
 
 #[test]
+fn rpc_safe_return_while_running_starts_graceful_stop_and_consumes_queue() {
+    let mut a = authority();
+    launch_running(&mut a);
+
+    assert!(matches!(
+        handle_rpc(&mut a, RpcRequest::SafeReturn).unwrap(),
+        RpcResponse::Ok
+    ));
+
+    assert!(matches!(a.state.phase, Phase::StoppingGracefully { .. }));
+    assert_eq!(a.state.safe_return_queue, 0);
+    assert_eq!(
+        a.system
+            .calls
+            .iter()
+            .filter(|call| *call == "graceful")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn rpc_safe_return_while_idle_does_not_affect_subsequent_launch() {
+    let mut a = authority();
+
+    assert!(matches!(
+        handle_rpc(&mut a, RpcRequest::SafeReturn).unwrap(),
+        RpcResponse::Ok
+    ));
+    assert!(matches!(a.state.phase, Phase::Idle));
+    assert_eq!(a.state.safe_return_queue, 0);
+
+    assert!(matches!(
+        a.launch(LaunchRequest {
+            item_id: "game".into(),
+        })
+        .unwrap(),
+        LaunchResult::Accepted { .. }
+    ));
+    assert!(matches!(a.state.phase, Phase::Starting { .. }));
+    assert_eq!(a.state.safe_return_queue, 0);
+    assert_eq!(a.system.calls, ["start"]);
+}
+
+#[test]
 fn grace_deadline_enforces_termination_and_publishes_forced_close() {
     let mut a = authority();
     let id = launch_running(&mut a);
