@@ -286,9 +286,27 @@ impl Rasterizer {
             typography: &self.typography,
             text_scale: self.text_scale,
         };
-        draw_node(&mut pixmap, &mut context, scene.root(), metrics.scale)?;
+        draw_node(
+            &mut pixmap,
+            &mut context,
+            scene.root(),
+            metrics.scale,
+            LogicalTransform::IDENTITY,
+        )?;
         let mut current = Vec::new();
-        collect(scene.root(), None, 0, &mut current);
+        let pressed_shift = self
+            .style
+            .length("--state-pressed-shift")
+            .expect("typed pressed shift")
+            .pixels;
+        collect(
+            scene.root(),
+            None,
+            0,
+            &mut current,
+            LogicalTransform::IDENTITY,
+            pressed_shift,
+        );
         let focus_damage_outset = (self
             .style
             .length("--focus-ring-offset")
@@ -347,12 +365,15 @@ fn collect(
     parent_id: Option<&str>,
     sibling_index: usize,
     out: &mut Vec<NodeSnapshot>,
+    ancestor_transform: LogicalTransform,
+    pressed_shift: f32,
 ) {
+    let transform = node_transform(node, ancestor_transform, pressed_shift);
     out.push(NodeSnapshot {
         id: node.id.as_str().into(),
         parent_id: parent_id.map(str::to_owned),
         sibling_index,
-        bounds: node.bounds,
+        bounds: transform.map_bounds(node.bounds),
         label: node.accessible_label.clone(),
         style_token: node.style_token.clone(),
         type_role: node.type_role,
@@ -374,8 +395,69 @@ fn collect(
         },
     });
     for (index, child) in node.children.iter().enumerate() {
-        collect(child, Some(node.id.as_str()), index, out);
+        collect(
+            child,
+            Some(node.id.as_str()),
+            index,
+            out,
+            transform,
+            pressed_shift,
+        );
     }
+}
+
+/// Axis-aligned logical-space transform carried by the paint walk. Pressed geometry only
+/// scales and translates, so retaining this narrower representation avoids introducing
+/// rotation/skew rounding into text layout and clipping.
+#[derive(Clone, Copy)]
+struct LogicalTransform {
+    scale_x: f32,
+    scale_y: f32,
+    translate_x: f32,
+    translate_y: f32,
+}
+
+impl LogicalTransform {
+    const IDENTITY: Self = Self {
+        scale_x: 1.0,
+        scale_y: 1.0,
+        translate_x: 0.0,
+        translate_y: 0.0,
+    };
+
+    fn then(self, local: Self) -> Self {
+        Self {
+            scale_x: self.scale_x * local.scale_x,
+            scale_y: self.scale_y * local.scale_y,
+            translate_x: self.scale_x * local.translate_x + self.translate_x,
+            translate_y: self.scale_y * local.translate_y + self.translate_y,
+        }
+    }
+
+    fn map_bounds(self, bounds: Bounds) -> Bounds {
+        Bounds::new(
+            bounds.x * self.scale_x + self.translate_x,
+            bounds.y * self.scale_y + self.translate_y,
+            bounds.width * self.scale_x,
+            bounds.height * self.scale_y,
+        )
+    }
+}
+
+fn node_transform(node: &Node, ancestor: LogicalTransform, pressed_shift: f32) -> LogicalTransform {
+    if !node.state.pressed {
+        return ancestor;
+    }
+    let target_width = (node.bounds.width - pressed_shift * 2.0).max(1.0);
+    let target_height = (node.bounds.height - pressed_shift * 2.0).max(1.0);
+    let scale_x = target_width / node.bounds.width;
+    let scale_y = target_height / node.bounds.height;
+    ancestor.then(LogicalTransform {
+        scale_x,
+        scale_y,
+        translate_x: node.bounds.x + pressed_shift - node.bounds.x * scale_x,
+        translate_y: node.bounds.y + pressed_shift - node.bounds.y * scale_y,
+    })
 }
 
 fn damage(
@@ -481,21 +563,15 @@ fn draw_node(
     context: &mut DrawContext<'_>,
     node: &Node,
     scale: f32,
+    ancestor_transform: LogicalTransform,
 ) -> Result<(), RenderError> {
-    let shift = if node.state.pressed {
-        context
-            .style
-            .length("--state-pressed-shift")
-            .expect("typed pressed shift")
-            .pixels
-    } else {
-        0.0
-    };
-    let mut b = node.bounds;
-    b.x += shift;
-    b.y += shift;
-    b.width = (b.width - shift * 2.0).max(1.0);
-    b.height = (b.height - shift * 2.0).max(1.0);
+    let pressed_shift = context
+        .style
+        .length("--state-pressed-shift")
+        .expect("typed pressed shift")
+        .pixels;
+    let transform = node_transform(node, ancestor_transform, pressed_shift);
+    let b = transform.map_bounds(node.bounds);
 
     if node.elevation != Elevation::None {
         draw_shadow(
@@ -580,7 +656,7 @@ fn draw_node(
         }
     }
     for child in &node.children {
-        draw_node(pm, context, child, scale)?;
+        draw_node(pm, context, child, scale, transform)?;
     }
     if node.state.unavailable {
         fill_token_rect(
@@ -1331,6 +1407,100 @@ mod tests {
             );
             assert_eq!(pixel(&pressed, 21, 21), surface);
         }
+    }
+
+    fn pressed_composite(parent_pressed: bool, child_pressed: bool) -> Scene {
+        let mut child = Node::new(
+            NodeId::new("child").unwrap(),
+            Role::Text,
+            "MMMM",
+            Bounds::new(40.0, 24.0, 20.0, 20.0),
+            "--color-status-ready",
+        );
+        child.state.pressed = child_pressed;
+        let mut root = Node::new(
+            NodeId::new("root").unwrap(),
+            Role::Button,
+            "",
+            Bounds::new(20.0, 20.0, 40.0, 30.0),
+            "--state-rest-surface",
+        )
+        .with_action(NodeAction::Activate)
+        .with_children(vec![child]);
+        root.state.pressed = parent_pressed;
+        Scene::new(root, NodeId::new("root").unwrap()).unwrap()
+    }
+
+    #[test]
+    fn pressed_geometry_transforms_composite_subtree_and_release_restores_raster() {
+        let mut rasterizer = Rasterizer::new();
+        let rest = rasterizer
+            .render(&pressed_composite(false, false), metrics())
+            .unwrap();
+        let pressed = rasterizer
+            .render(&pressed_composite(true, false), metrics())
+            .unwrap();
+        let canvas = token_rgba(ThemeBase::Dusk, "--color-surface-canvas");
+        let child_surface = token_rgba(ThemeBase::Dusk, "--color-status-ready");
+        let child_text = token_rgba(ThemeBase::Dusk, "--state-rest-text");
+
+        // The pressed parent occupies x=[21, 59). Its right-edge child and text must move
+        // with that parent: no child ink remains at the rest-position edge x=59.
+        assert_eq!(pixel(&pressed, 59, 30), canvas);
+        assert!(
+            (21..59).any(|x| pixel(&pressed, x, 30) == child_surface),
+            "child surface did not render inside transformed parent"
+        );
+        assert!(
+            (21..59).any(|x| (21..49).any(|y| pixel(&pressed, x, y) == child_text)),
+            "child text did not render inside transformed parent"
+        );
+        let press_damage = pressed
+            .damage
+            .expect("press must damage transformed extents");
+        assert!(press_damage.x <= 20 && press_damage.x + press_damage.width >= 60);
+        assert!(press_damage.y <= 20 && press_damage.y + press_damage.height >= 50);
+
+        let released = rasterizer
+            .render(&pressed_composite(false, false), metrics())
+            .unwrap();
+        assert_eq!(
+            released.rgba, rest.rgba,
+            "release must restore the exact rest raster"
+        );
+        let release_damage = released
+            .damage
+            .expect("release must damage both pressed and rest extents");
+        assert!(release_damage.x <= 20 && release_damage.x + release_damage.width >= 60);
+        assert!(release_damage.y <= 20 && release_damage.y + release_damage.height >= 50);
+    }
+
+    #[test]
+    fn nested_pressed_transforms_compose_in_the_paint_walk() {
+        let shift = pf_theme::flagship()
+            .resolved_style(ThemeBase::Dusk)
+            .unwrap()
+            .length("--state-pressed-shift")
+            .unwrap()
+            .pixels;
+        let scene = pressed_composite(true, true);
+        let root = scene.root();
+        let parent = node_transform(root, LogicalTransform::IDENTITY, shift);
+        let child = &root.children[0];
+        let nested = node_transform(child, parent, shift);
+        let parent_only = parent.map_bounds(child.bounds);
+        let composed = nested.map_bounds(child.bounds);
+
+        assert!(composed.x > parent_only.x);
+        assert!(composed.y > parent_only.y);
+        assert!(composed.width < parent_only.width);
+        assert!(composed.height < parent_only.height);
+
+        let parent_frame = Rasterizer::new()
+            .render(&pressed_composite(true, false), metrics())
+            .unwrap();
+        let nested_frame = Rasterizer::new().render(&scene, metrics()).unwrap();
+        assert_ne!(nested_frame.rgba, parent_frame.rgba);
     }
 
     #[test]
