@@ -36,6 +36,12 @@ fn per_device_shipped_defaults_cover_all_device_classes() {
         map(BUTTONLESS).binding("global", "SafeReturn"),
         Some(&chord("select", "start"))
     );
+    for fixture in [A523, A133, BUTTONLESS] {
+        assert_eq!(
+            map(fixture).binding("global", "Start"),
+            Some(&Binding::single("start"))
+        );
+    }
 }
 
 #[test]
@@ -244,6 +250,18 @@ fn rejects_safe_return_collision_across_contexts() {
         engine.begin("global", "SafeReturn", Binding::single("east")),
         Err(MapError::Collision {
             first: "SafeReturn".into(),
+            second: "Activate".into()
+        })
+    );
+}
+
+#[test]
+fn rejects_start_collision_across_contexts() {
+    let mut engine = RemapEngine::new(map(A133), MemoryStore::default());
+    assert_eq!(
+        engine.begin("global", "Start", Binding::single("east")),
+        Err(MapError::Collision {
+            first: "Start".into(),
             second: "Activate".into()
         })
     );
