@@ -442,22 +442,38 @@ impl LogicalTransform {
             bounds.height * self.scale_y,
         )
     }
+
+    fn is_finite(self) -> bool {
+        self.scale_x.is_finite()
+            && self.scale_y.is_finite()
+            && self.translate_x.is_finite()
+            && self.translate_y.is_finite()
+    }
 }
 
 fn node_transform(node: &Node, ancestor: LogicalTransform, pressed_shift: f32) -> LogicalTransform {
     if !node.state.pressed {
         return ancestor;
     }
-    let target_width = (node.bounds.width - pressed_shift * 2.0).max(1.0);
-    let target_height = (node.bounds.height - pressed_shift * 2.0).max(1.0);
-    let scale_x = target_width / node.bounds.width;
-    let scale_y = target_height / node.bounds.height;
-    ancestor.then(LogicalTransform {
+
+    let pressed_axis = |origin: f32, size: f32| {
+        if size == 0.0 {
+            (1.0, 0.0)
+        } else {
+            let scale = (size - pressed_shift * 2.0).max(1.0) / size;
+            (scale, origin + pressed_shift - origin * scale)
+        }
+    };
+    let (scale_x, translate_x) = pressed_axis(node.bounds.x, node.bounds.width);
+    let (scale_y, translate_y) = pressed_axis(node.bounds.y, node.bounds.height);
+    let composed = ancestor.then(LogicalTransform {
         scale_x,
         scale_y,
-        translate_x: node.bounds.x + pressed_shift - node.bounds.x * scale_x,
-        translate_y: node.bounds.y + pressed_shift - node.bounds.y * scale_y,
-    })
+        translate_x,
+        translate_y,
+    });
+    debug_assert!(composed.is_finite(), "pressed transform must remain finite");
+    composed
 }
 
 fn damage(
@@ -1501,6 +1517,88 @@ mod tests {
             .unwrap();
         let nested_frame = Rasterizer::new().render(&scene, metrics()).unwrap();
         assert_ne!(nested_frame.rgba, parent_frame.rgba);
+    }
+
+    fn degenerate_pressed_composite(width: f32, height: f32, pressed: bool) -> Scene {
+        let child = Node::new(
+            NodeId::new("child").unwrap(),
+            Role::Text,
+            "child",
+            Bounds::new(40.0, 30.0, 20.0, 12.0),
+            "--color-status-ready",
+        );
+        let mut root = Node::new(
+            NodeId::new("root").unwrap(),
+            Role::Button,
+            "",
+            Bounds::new(20.0, 20.0, width, height),
+            "--state-rest-surface",
+        )
+        .with_action(NodeAction::Activate)
+        .with_children(vec![child]);
+        root.state.pressed = pressed;
+        Scene::new(root, NodeId::new("root").unwrap()).unwrap()
+    }
+
+    #[test]
+    fn degenerate_pressed_axes_keep_descendant_transforms_finite_and_at_rest() {
+        let shift = pf_theme::flagship()
+            .resolved_style(ThemeBase::Dusk)
+            .unwrap()
+            .length("--state-pressed-shift")
+            .unwrap()
+            .pixels;
+
+        for (width, height) in [(0.0, 30.0), (40.0, 0.0)] {
+            let scene = degenerate_pressed_composite(width, height, true);
+            let root = scene.root();
+            let transform = node_transform(root, LogicalTransform::IDENTITY, shift);
+            let child = root.children[0].bounds;
+            let mapped = transform.map_bounds(child);
+
+            assert!(transform.is_finite());
+            assert!([mapped.x, mapped.y, mapped.width, mapped.height]
+                .into_iter()
+                .all(f32::is_finite));
+            if width == 0.0 {
+                assert_eq!((mapped.x, mapped.width), (child.x, child.width));
+            }
+            if height == 0.0 {
+                assert_eq!((mapped.y, mapped.height), (child.y, child.height));
+            }
+        }
+    }
+
+    #[test]
+    fn degenerate_pressed_nodes_keep_descendants_visible_and_damage_bounded() {
+        let child_surface = token_rgba(ThemeBase::Dusk, "--color-status-ready");
+        for (width, height) in [(0.0, 30.0), (40.0, 0.0)] {
+            let mut rasterizer = Rasterizer::new();
+            rasterizer
+                .render(
+                    &degenerate_pressed_composite(width, height, false),
+                    metrics(),
+                )
+                .unwrap();
+            let pressed = rasterizer
+                .render(
+                    &degenerate_pressed_composite(width, height, true),
+                    metrics(),
+                )
+                .unwrap();
+
+            assert!(
+                pressed
+                    .rgba
+                    .chunks_exact(4)
+                    .any(|pixel| pixel == child_surface),
+                "descendant disappeared for {width}x{height} pressed parent"
+            );
+            let damage = pressed.damage.expect("press must produce finite damage");
+            assert!(damage.x <= pressed.width && damage.y <= pressed.height);
+            assert!(damage.x + damage.width <= pressed.width);
+            assert!(damage.y + damage.height <= pressed.height);
+        }
     }
 
     #[test]
