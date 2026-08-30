@@ -158,7 +158,10 @@ impl Rasterizer {
     }
 
     pub fn set_palette(&mut self, palette: Palette) {
-        self.palette = palette;
+        if self.palette != palette {
+            self.palette = palette;
+            self.previous.clear();
+        }
     }
 
     pub fn render(
@@ -584,6 +587,35 @@ mod tests {
             .rgba
             .chunks_exact(4)
             .any(|pixel| pixel == [255, 255, 255, 255]));
+    }
+
+    #[test]
+    fn palette_change_invalidates_damage_once_but_identical_set_does_not() {
+        let scene = fixture("Palette");
+        let surface = metrics();
+        let full_surface = Some(DamageRect {
+            x: 0,
+            y: 0,
+            width: surface.logical_width as u32,
+            height: surface.logical_height as u32,
+        });
+        let mut rasterizer = Rasterizer::new();
+
+        let standard = rasterizer.render(&scene, surface).unwrap();
+        assert_eq!(&standard.rgba[..4], &[13, 17, 23, 255]);
+
+        rasterizer.set_palette(Palette::high_contrast());
+        let changed = rasterizer.render(&scene, surface).unwrap();
+        assert_eq!(changed.damage, full_surface);
+        assert_eq!(&changed.rgba[..4], &[0, 0, 0, 255]);
+        assert!(changed
+            .rgba
+            .chunks_exact(4)
+            .any(|pixel| pixel == [255, 255, 255, 255]));
+
+        assert_eq!(rasterizer.render(&scene, surface).unwrap().damage, None);
+        rasterizer.set_palette(Palette::high_contrast());
+        assert_eq!(rasterizer.render(&scene, surface).unwrap().damage, None);
     }
 
     fn image_fixture(bytes: &'static [u8], fit: ImageFit) -> Scene {
