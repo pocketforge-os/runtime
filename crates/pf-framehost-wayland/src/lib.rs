@@ -76,6 +76,7 @@ pub enum WaylandHostError {
     CompositorUnavailable(String),
     Protocol(String),
     MissingGlobal(&'static str),
+    InvalidSize { width: u32, height: u32 },
     InvalidConfigure { width: i32, height: i32 },
     Io(std::io::Error),
 }
@@ -86,11 +87,51 @@ impl std::fmt::Display for WaylandHostError {
             Self::CompositorUnavailable(e) => write!(f, "compositor unavailable: {e}"),
             Self::Protocol(e) => write!(f, "Wayland protocol failure: {e}"),
             Self::MissingGlobal(g) => write!(f, "required Wayland global missing: {g}"),
+            Self::InvalidSize { width, height } => {
+                write!(f, "invalid Wayland host size: {width}x{height}")
+            }
             Self::InvalidConfigure { width, height } => {
                 write!(f, "invalid compositor configure: {width}x{height}")
             }
             Self::Io(e) => write!(f, "wl_shm backing store: {e}"),
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ValidatedSize {
+    width: u32,
+    height: u32,
+    width_i32: i32,
+    height_i32: i32,
+    stride_i32: i32,
+    pool_bytes_i32: i32,
+}
+
+impl ValidatedSize {
+    fn new(width: u32, height: u32) -> Result<Self, WaylandHostError> {
+        let invalid = || WaylandHostError::InvalidSize { width, height };
+        if width == 0 || height == 0 {
+            return Err(invalid());
+        }
+        let width_i32 = i32::try_from(width).map_err(|_| invalid())?;
+        let height_i32 = i32::try_from(height).map_err(|_| invalid())?;
+        let stride = width.checked_mul(4).ok_or_else(&invalid)?;
+        let stride_i32 = i32::try_from(stride).map_err(|_| invalid())?;
+        let pool_bytes = stride.checked_mul(height).ok_or_else(&invalid)?;
+        let pool_bytes_i32 = i32::try_from(pool_bytes).map_err(|_| invalid())?;
+        Ok(Self {
+            width,
+            height,
+            width_i32,
+            height_i32,
+            stride_i32,
+            pool_bytes_i32,
+        })
+    }
+
+    fn dimensions(self) -> (u32, u32) {
+        (self.width, self.height)
     }
 }
 
@@ -126,13 +167,13 @@ struct State {
     xdg_surface: Option<xdg_surface::XdgSurface>,
     toplevel: Option<xdg_toplevel::XdgToplevel>,
     configured: bool,
-    size: (u32, u32),
+    size: ValidatedSize,
     closed: bool,
     released_buffers: Vec<u64>,
 }
 
 impl State {
-    fn new(width: u32, height: u32) -> Self {
+    fn new(size: ValidatedSize) -> Self {
         Self {
             compositor: None,
             shm: None,
@@ -157,7 +198,7 @@ impl State {
             xdg_surface: None,
             toplevel: None,
             configured: false,
-            size: (width, height),
+            size,
             closed: false,
             released_buffers: Vec::new(),
         }
@@ -175,9 +216,8 @@ impl State {
         let toplevel = xdg_surface.get_toplevel(qh, ());
         toplevel.set_title("PocketForge".into());
         toplevel.set_app_id("org.pocketforge.shell".into());
-        let (width, height) = self.size;
-        toplevel.set_min_size(width as i32, height as i32);
-        toplevel.set_max_size(width as i32, height as i32);
+        toplevel.set_min_size(self.size.width_i32, self.size.height_i32);
+        toplevel.set_max_size(self.size.width_i32, self.size.height_i32);
         surface.commit();
         self.surface = Some(surface);
         self.xdg_surface = Some(xdg_surface);
@@ -496,12 +536,14 @@ impl WaylandHost {
     /// The size is device-faithful by design: compositor configure events never trigger
     /// adaptive sizing or UI reflow.
     pub fn connect_with_size(width: u32, height: u32) -> Result<Self, WaylandHostError> {
+        // Validate before connecting so invalid input cannot emit any protocol request.
+        let size = ValidatedSize::new(width, height)?;
         let connection = Connection::connect_to_env()
             .map_err(|e| WaylandHostError::CompositorUnavailable(e.to_string()))?;
         let mut queue = connection.new_event_queue();
         let qh = queue.handle();
         connection.display().get_registry(&qh, ());
-        let mut state = State::new(width, height);
+        let mut state = State::new(size);
         queue
             .roundtrip(&mut state)
             .map_err(|e| WaylandHostError::Protocol(e.to_string()))?;
@@ -532,7 +574,7 @@ impl WaylandHost {
 
     /// Rebuild every protocol object after compositor loss.
     pub fn reconnect(&mut self) -> Result<(), WaylandHostError> {
-        let (width, height) = self.state.size;
+        let (width, height) = self.state.size.dimensions();
         let replacement = Self::connect_with_size(width, height)?;
         #[cfg(feature = "keyboard")]
         {
@@ -613,18 +655,14 @@ impl WaylandHost {
             .renderer
             .render(scene, self.metrics())
             .map_err(|e| WaylandHostError::Protocol(format!("render: {e:?}")))?;
-        let size = frame
-            .width
-            .checked_mul(frame.height)
-            .and_then(|v| v.checked_mul(4))
-            .ok_or(WaylandHostError::InvalidConfigure {
-                width: frame.width as i32,
-                height: frame.height as i32,
-            })?;
+        let size = self.state.size;
+        debug_assert_eq!((frame.width, frame.height), size.dimensions());
         let mut file = tempfile::tempfile()?;
-        file.set_len(size as u64)?;
+        file.set_len(u64::try_from(size.pool_bytes_i32).expect("validated positive size"))?;
         file.seek(SeekFrom::Start(0))?;
-        let mut xrgb = Vec::with_capacity(size as usize);
+        let mut xrgb = Vec::with_capacity(
+            usize::try_from(size.pool_bytes_i32).expect("validated positive size"),
+        );
         for rgba in frame.rgba.chunks_exact(4) {
             xrgb.extend_from_slice(&[rgba[2], rgba[1], rgba[0], 0xff]);
         }
@@ -637,14 +675,14 @@ impl WaylandHost {
             .shm
             .as_ref()
             .expect("validated global")
-            .create_pool(file.as_fd(), size as i32, &qh, ());
+            .create_pool(file.as_fd(), size.pool_bytes_i32, &qh, ());
         let buffer_id = self.next_buffer_id;
         self.next_buffer_id += 1;
         let buffer = pool.create_buffer(
             0,
-            frame.width as i32,
-            frame.height as i32,
-            (frame.width * 4) as i32,
+            size.width_i32,
+            size.height_i32,
+            size.stride_i32,
             wl_shm::Format::Xrgb8888,
             &qh,
             BufferId(buffer_id),
@@ -652,7 +690,7 @@ impl WaylandHost {
         pool.destroy();
         let surface = self.state.surface.as_ref().expect("configured surface");
         surface.attach(Some(&buffer), 0, 0);
-        submit_damage(surface, frame.damage, frame.width, frame.height);
+        submit_damage(surface, frame.damage, size);
         surface.commit();
         self.connection
             .flush()
@@ -665,23 +703,23 @@ impl WaylandHost {
     }
 }
 
-fn submit_damage(
-    surface: &wl_surface::WlSurface,
-    damage: Option<DamageRect>,
-    width: u32,
-    height: u32,
-) {
+fn submit_damage(surface: &wl_surface::WlSurface, damage: Option<DamageRect>, size: ValidatedSize) {
     if let Some(d) = damage {
-        surface.damage_buffer(d.x as i32, d.y as i32, d.width as i32, d.height as i32);
+        surface.damage_buffer(
+            i32::try_from(d.x).expect("damage x is within validated surface"),
+            i32::try_from(d.y).expect("damage y is within validated surface"),
+            i32::try_from(d.width).expect("damage width is within validated surface"),
+            i32::try_from(d.height).expect("damage height is within validated surface"),
+        );
     } else {
         // Attaching a newly allocated buffer still needs damage before it is visible.
-        surface.damage_buffer(0, 0, width as i32, height as i32);
+        surface.damage_buffer(0, 0, size.width_i32, size.height_i32);
     }
 }
 
 impl FrameHost for WaylandHost {
     fn metrics(&self) -> SurfaceMetrics {
-        let (width, height) = self.state.size;
+        let (width, height) = self.state.size.dimensions();
         SurfaceMetrics {
             logical_width: width as f32,
             logical_height: height as f32,
@@ -700,7 +738,9 @@ impl FrameHost for WaylandHost {
             WaylandHostError::CompositorUnavailable(_) | WaylandHostError::Protocol(_) => {
                 PresentFailure::SurfaceLost
             }
-            WaylandHostError::InvalidConfigure { .. } => PresentFailure::Rejected,
+            WaylandHostError::InvalidSize { .. } | WaylandHostError::InvalidConfigure { .. } => {
+                PresentFailure::Rejected
+            }
             WaylandHostError::MissingGlobal(_) | WaylandHostError::Io(_) => {
                 PresentFailure::Backend(error.to_string())
             }
@@ -712,15 +752,62 @@ impl FrameHost for WaylandHost {
 mod tests {
     use super::*;
 
+    fn valid_size(width: u32, height: u32) -> ValidatedSize {
+        ValidatedSize::new(width, height).expect("valid test size")
+    }
+
+    #[test]
+    fn zero_width_is_rejected_before_connecting() {
+        assert!(matches!(
+            WaylandHost::connect_with_size(0, 720),
+            Err(WaylandHostError::InvalidSize {
+                width: 0,
+                height: 720
+            })
+        ));
+    }
+
+    #[test]
+    fn zero_height_is_rejected_before_connecting() {
+        assert!(matches!(
+            WaylandHost::connect_with_size(1280, 0),
+            Err(WaylandHostError::InvalidSize {
+                width: 1280,
+                height: 0
+            })
+        ));
+    }
+
+    #[test]
+    fn pool_size_above_protocol_limit_is_rejected() {
+        let error = ValidatedSize::new(32_768, 16_384).unwrap_err();
+        assert!(matches!(
+            error,
+            WaylandHostError::InvalidSize {
+                width: 32_768,
+                height: 16_384
+            }
+        ));
+        assert!(error.to_string().contains("32768x16384"));
+    }
+
+    #[test]
+    fn common_panel_size_is_accepted() {
+        let size = ValidatedSize::new(1280, 720).expect("1280x720 must be valid");
+        assert_eq!(size.dimensions(), (1280, 720));
+        assert_eq!(size.stride_i32, 5120);
+        assert_eq!(size.pool_bytes_i32, 3_686_400);
+    }
+
     #[test]
     fn damage_is_not_fixed_to_a_product_resolution() {
-        let metrics = State::new(DEFAULT_WIDTH, DEFAULT_HEIGHT).size;
-        assert_eq!(metrics, (DEFAULT_WIDTH, DEFAULT_HEIGHT));
+        let metrics = State::new(valid_size(DEFAULT_WIDTH, DEFAULT_HEIGHT)).size;
+        assert_eq!(metrics.dimensions(), (DEFAULT_WIDTH, DEFAULT_HEIGHT));
     }
 
     #[test]
     fn zero_size_configure_keeps_pinned_metrics() {
-        let mut state = State::new(1280, 720);
+        let mut state = State::new(valid_size(1280, 720));
         handle_toplevel_event(
             &mut state,
             xdg_toplevel::Event::Configure {
@@ -729,12 +816,12 @@ mod tests {
                 states: Vec::new(),
             },
         );
-        assert_eq!(state.size, (1280, 720));
+        assert_eq!(state.size.dimensions(), (1280, 720));
     }
 
     #[test]
     fn nonzero_configure_keeps_pinned_metrics() {
-        let mut state = State::new(1280, 720);
+        let mut state = State::new(valid_size(1280, 720));
         handle_toplevel_event(
             &mut state,
             xdg_toplevel::Event::Configure {
@@ -743,7 +830,7 @@ mod tests {
                 states: Vec::new(),
             },
         );
-        assert_eq!(state.size, (1280, 720));
+        assert_eq!(state.size.dimensions(), (1280, 720));
     }
 
     #[test]
@@ -841,7 +928,7 @@ mod tests {
         )
         .expect("compile test keymap");
         let state = xkb::State::new(&keymap);
-        let mut host_state = State::new(DEFAULT_WIDTH, DEFAULT_HEIGHT);
+        let mut host_state = State::new(valid_size(DEFAULT_WIDTH, DEFAULT_HEIGHT));
 
         let presses = [30, 105].map(|code| {
             key_event_from_evdev(
@@ -871,11 +958,11 @@ mod tests {
     #[cfg(feature = "keyboard")]
     #[test]
     fn reconnect_releases_held_keys_before_replacing_state() {
-        let mut old_state = State::new(DEFAULT_WIDTH, DEFAULT_HEIGHT);
+        let mut old_state = State::new(valid_size(DEFAULT_WIDTH, DEFAULT_HEIGHT));
         old_state
             .pressed_keys
             .insert(30, (u32::from('a'), Key::Char('a')));
-        let mut replacement_state = State::new(DEFAULT_WIDTH, DEFAULT_HEIGHT);
+        let mut replacement_state = State::new(valid_size(DEFAULT_WIDTH, DEFAULT_HEIGHT));
         replacement_state.key_events.push_back(KeyEvent {
             code: 30,
             keysym: u32::from('a'),
@@ -909,7 +996,7 @@ mod tests {
 
     #[test]
     fn fabricated_toplevel_close_sets_closed_state() {
-        let mut state = State::new(DEFAULT_WIDTH, DEFAULT_HEIGHT);
+        let mut state = State::new(valid_size(DEFAULT_WIDTH, DEFAULT_HEIGHT));
         assert!(!state.closed);
 
         handle_toplevel_event(&mut state, xdg_toplevel::Event::Close);
