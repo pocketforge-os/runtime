@@ -1,7 +1,7 @@
 //! Frame hosts own presentation while `pf-render` owns pixels and layout.
 
 use pf_ports::{FrameHost, PresentAck, PresentFailure, PresentResult};
-use pf_render::{DamageRect, RasterFrame, Rasterizer, ThemeBase};
+use pf_render::{DamageRect, RasterFrame, Rasterizer, RenderError, ThemeBase};
 use pf_scene::{Insets, Orientation, Scene, SurfaceMetrics};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Seek, SeekFrom, Write};
@@ -28,6 +28,10 @@ impl OffscreenHost {
     }
     pub fn bytes(&self) -> Option<&[u8]> {
         self.frame.as_ref().map(|f| f.rgba.as_slice())
+    }
+
+    pub fn set_text_scale(&mut self, factor: f32) -> Result<(), RenderError> {
+        self.renderer.set_text_scale(factor)
     }
 }
 
@@ -144,6 +148,10 @@ impl FbdevHost {
 
     pub fn frame(&self) -> Option<&RasterFrame> {
         self.last_frame.as_ref()
+    }
+
+    pub fn set_text_scale(&mut self, factor: f32) -> Result<(), RenderError> {
+        self.renderer.set_text_scale(factor)
     }
 
     fn write_frame(&mut self, frame: &RasterFrame) -> io::Result<()> {
@@ -440,6 +448,43 @@ mod tests {
         host.set_theme_base(ThemeBase::HighContrast);
         host.present(&scene()).unwrap();
         assert_high_contrast_frame(host.frame().unwrap());
+    }
+
+    #[test]
+    fn offscreen_text_scale_is_forwarded_and_validated() {
+        let metrics = SurfaceMetrics {
+            logical_width: 319.0,
+            logical_height: 181.0,
+            scale: 1.0,
+            safe_insets: Insets::default(),
+            orientation: Orientation::Landscape,
+        };
+        let mut normal = OffscreenHost::new(metrics);
+        normal.present(&scene()).unwrap();
+        let mut large = OffscreenHost::new(metrics);
+        large.set_text_scale(2.0).unwrap();
+        large.present(&scene()).unwrap();
+
+        assert_ne!(normal.bytes(), large.bytes());
+        assert!(matches!(
+            large.set_text_scale(f32::NAN),
+            Err(RenderError::InvalidTextScale)
+        ));
+    }
+
+    #[test]
+    fn fbdev_text_scale_is_forwarded_and_validated() {
+        let (mut normal, _) = host(PixelFormat::Xrgb8888, false);
+        normal.present(&scene()).unwrap();
+        let (mut large, _) = host(PixelFormat::Xrgb8888, false);
+        large.set_text_scale(2.0).unwrap();
+        large.present(&scene()).unwrap();
+
+        assert_ne!(normal.frame().unwrap().rgba, large.frame().unwrap().rgba);
+        assert!(matches!(
+            large.set_text_scale(0.0),
+            Err(RenderError::InvalidTextScale)
+        ));
     }
     fn overlapping_scene(order: [&str; 2]) -> Scene {
         let children = order.map(|id| {

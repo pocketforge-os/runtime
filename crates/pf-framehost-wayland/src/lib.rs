@@ -5,7 +5,7 @@
 //! the rasterizer's damage rectangle.
 
 use pf_ports::{FrameHost, PresentAck, PresentFailure, PresentResult};
-use pf_render::{DamageRect, Rasterizer, ThemeBase};
+use pf_render::{DamageRect, Rasterizer, RenderError, ThemeBase};
 use pf_scene::{Insets, Orientation, Scene, SurfaceMetrics};
 #[cfg(feature = "keyboard")]
 use std::collections::{HashMap, VecDeque};
@@ -519,6 +519,7 @@ pub struct WaylandHost {
     queue: EventQueue<State>,
     state: State,
     renderer: Rasterizer,
+    text_scale: f32,
     sequence: u64,
     // A fresh immutable buffer is used for every present. Keeping the proxy and file alive
     // avoids recycling storage while the compositor may still read it.
@@ -566,6 +567,7 @@ impl WaylandHost {
             queue,
             state,
             renderer: Rasterizer::new(),
+            text_scale: 1.0,
             sequence: 0,
             buffers: Vec::new(),
             next_buffer_id: 1,
@@ -575,10 +577,12 @@ impl WaylandHost {
     /// Rebuild every protocol object after compositor loss.
     pub fn reconnect(&mut self) -> Result<(), WaylandHostError> {
         let (width, height) = self.state.size.dimensions();
-        let replacement = Self::connect_with_size(width, height)?;
+        let mut replacement = Self::connect_with_size(width, height)?;
+        replacement
+            .set_text_scale(self.text_scale)
+            .expect("the stored text scale was previously validated");
         #[cfg(feature = "keyboard")]
         {
-            let mut replacement = replacement;
             transfer_pressed_key_releases(&mut self.state, &mut replacement.state);
             *self = replacement;
         }
@@ -586,6 +590,15 @@ impl WaylandHost {
         {
             *self = replacement;
         }
+        Ok(())
+    }
+
+    /// Set accessibility text scale for subsequent frames.
+    ///
+    /// Validation is owned by `Rasterizer`; only an accepted factor is retained for reconnects.
+    pub fn set_text_scale(&mut self, factor: f32) -> Result<(), RenderError> {
+        set_renderer_text_scale(&mut self.renderer, factor)?;
+        self.text_scale = factor;
         Ok(())
     }
 
@@ -756,6 +769,10 @@ fn set_renderer_theme_base(renderer: &mut Rasterizer, base: ThemeBase) {
     renderer.set_theme_base(base);
 }
 
+fn set_renderer_text_scale(renderer: &mut Rasterizer, factor: f32) -> Result<(), RenderError> {
+    renderer.set_text_scale(factor)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -794,6 +811,36 @@ mod tests {
             .rgba
             .chunks_exact(4)
             .any(|pixel| pixel == [255, 255, 255, 255]));
+    }
+
+    #[test]
+    fn text_scale_forwarding_changes_raster_ink_and_rejects_invalid_factors() {
+        let node = Node::new(
+            NodeId::new("root").unwrap(),
+            Role::Text,
+            "Accessible text wraps across several lines",
+            Bounds::new(3.0, 4.0, 100.0, 100.0),
+            "--state-rest-surface",
+        );
+        let scene = Scene::new(node, NodeId::new("root").unwrap()).unwrap();
+        let metrics = SurfaceMetrics {
+            logical_width: 120.0,
+            logical_height: 120.0,
+            scale: 1.0,
+            safe_insets: Insets::default(),
+            orientation: Orientation::Landscape,
+        };
+        let mut normal = Rasterizer::new();
+        let normal = normal.render(&scene, metrics).unwrap();
+        let mut large = Rasterizer::new();
+        set_renderer_text_scale(&mut large, 2.0).unwrap();
+        let large = large.render(&scene, metrics).unwrap();
+
+        assert_ne!(normal.rgba, large.rgba);
+        assert!(matches!(
+            set_renderer_text_scale(&mut Rasterizer::new(), f32::INFINITY),
+            Err(RenderError::InvalidTextScale)
+        ));
     }
 
     #[test]
