@@ -439,7 +439,7 @@ fn collect(
         style_token: node.style_token.clone(),
         type_role: node.type_role,
         line_height: node.line_height,
-        corner_radius: node.corner_radius,
+        corner_radius: normalized_corner_radius(node.corner_radius),
         focused: node.state.focused,
         pressed: node.state.pressed,
         disabled: node.state.disabled,
@@ -651,10 +651,11 @@ fn draw_node(
         .pixels;
     let transform = node_transform(node, ancestor_transform, pressed_shift);
     let b = transform.map_bounds(node.bounds);
+    let corner_radius = normalized_corner_radius(node.corner_radius);
     let radius = clamped_radii(
         Radii::new(
-            node.corner_radius * transform.scale_x.abs(),
-            node.corner_radius * transform.scale_y.abs(),
+            corner_radius * transform.scale_x.abs(),
+            corner_radius * transform.scale_y.abs(),
         ),
         b,
     )
@@ -945,6 +946,14 @@ fn clamped_radii(radius: Radii, bounds: Bounds) -> Radii {
     )
 }
 
+fn normalized_corner_radius(radius: f32) -> f32 {
+    if radius.is_finite() && radius > 0.0 {
+        radius
+    } else {
+        0.0
+    }
+}
+
 fn rounded_rect_path(rect: Rect, radius: Radii) -> tiny_skia::Path {
     let rx = radius.x.min(rect.width() / 2.0).max(0.0);
     let ry = radius.y.min(rect.height() / 2.0).max(0.0);
@@ -1100,6 +1109,9 @@ fn draw_node_shadow(
     scale: f32,
     radius: Radii,
 ) {
+    if asset.margin == 0 || asset.color[3] == 0 {
+        return;
+    }
     if !radius.is_rounded() {
         draw_shadow(
             pm,
@@ -1822,6 +1834,30 @@ mod tests {
     }
 
     #[test]
+    fn non_finite_corner_radius_has_stable_damage_and_paints_sharp() {
+        let mut node = Node::new(
+            NodeId::new("root").unwrap(),
+            Role::Group,
+            "",
+            Bounds::new(20.0, 20.0, 40.0, 40.0),
+            "--state-rest-surface",
+        );
+        node.corner_radius = f32::NAN;
+        let scene = Scene::new(node, NodeId::new("root").unwrap()).unwrap();
+
+        let mut rasterizer = Rasterizer::new();
+        let first = rasterizer.render(&scene, metrics()).unwrap();
+        let second = rasterizer.render(&scene, metrics()).unwrap();
+        let sharp = Rasterizer::new()
+            .render(&rounded_fixture(0.0), metrics())
+            .unwrap();
+
+        assert_eq!(second.damage, None);
+        assert_eq!(first.rgba, sharp.rgba);
+        assert_eq!(second.rgba, sharp.rgba);
+    }
+
+    #[test]
     fn rounded_image_content_is_clipped_to_node_silhouette() {
         let root = Node::new(
             NodeId::new("art").unwrap(),
@@ -2354,6 +2390,28 @@ mod tests {
         let plain = rasterizer.render(&plain, metrics()).unwrap().rgba;
         let elevated = rasterizer.render(&elevated, metrics()).unwrap().rgba;
         assert_eq!(plain, elevated);
+    }
+
+    #[test]
+    fn high_contrast_rounded_elevation_skips_shadow_cache() {
+        let mut node = Node::new(
+            NodeId::new("rounded").unwrap(),
+            Role::Group,
+            "",
+            Bounds::new(20.0, 20.0, 40.0, 40.0),
+            "--state-rest-surface",
+        )
+        .with_corner_radius(16.0)
+        .with_elevation(Elevation::Elev2);
+        node.state.focused = true;
+        let scene = Scene::new(node, NodeId::new("rounded").unwrap()).unwrap();
+        let mut rasterizer = Rasterizer::new();
+        rasterizer.set_theme_base(ThemeBase::HighContrast);
+
+        rasterizer.render(&scene, metrics()).unwrap();
+
+        assert!(rasterizer.rounded_shadows.assets.is_empty());
+        assert!(rasterizer.rounded_shadows.recency.is_empty());
     }
 
     #[test]
