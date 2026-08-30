@@ -396,7 +396,8 @@ fn translate_keysym(keysym: u32) -> Key {
 #[cfg(feature = "keyboard")]
 fn transfer_pressed_key_releases(old: &mut State, replacement: &mut State) {
     old.release_pressed_keys();
-    replacement.key_events.append(&mut old.key_events);
+    old.key_events.append(&mut replacement.key_events);
+    std::mem::swap(&mut old.key_events, &mut replacement.key_events);
 }
 
 impl Dispatch<xdg_wm_base::XdgWmBase, ()> for State {
@@ -844,6 +845,12 @@ mod tests {
             .pressed_keys
             .insert(30, (u32::from('a'), Key::Char('a')));
         let mut replacement_state = State::new();
+        replacement_state.key_events.push_back(KeyEvent {
+            code: 30,
+            keysym: u32::from('a'),
+            state: KeyState::Pressed,
+            key: Key::Char('a'),
+        });
 
         transfer_pressed_key_releases(&mut old_state, &mut replacement_state);
 
@@ -857,6 +864,16 @@ mod tests {
                 key: Key::Char('a'),
             })
         );
+        assert_eq!(
+            replacement_state.poll_key_event(),
+            Some(KeyEvent {
+                code: 30,
+                keysym: u32::from('a'),
+                state: KeyState::Pressed,
+                key: Key::Char('a'),
+            })
+        );
+        assert_eq!(replacement_state.poll_key_event(), None);
     }
 
     #[test]
