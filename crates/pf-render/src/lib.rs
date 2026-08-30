@@ -169,7 +169,7 @@ pub struct Rasterizer {
     glyphs: tracked_text::SwashCache,
     previous: Vec<NodeSnapshot>,
     images: ImageCache,
-    rounded_shadows: HashMap<(u8, u8, u32), RoundedShadowAsset>,
+    rounded_shadows: RoundedShadowCache,
     theme_base: ThemeBase,
     style: ResolvedStyleSnapshot,
     typography: TypographySnapshot,
@@ -194,6 +194,41 @@ struct RoundedShadowAsset {
     slice_margin: usize,
     effect_margin: usize,
     rgba: Vec<u8>,
+}
+
+const ROUNDED_SHADOW_CACHE_CAPACITY: usize = 32;
+// Large enough for handheld UI pills, while keeping one RGBA bake below 2 MiB and the full cache
+// below 64 MiB even when hostile content churns through maximum-sized radii and effect margins.
+const MAX_ROUNDED_SHADOW_RADIUS: u32 = 256;
+
+#[derive(Default)]
+struct RoundedShadowCache {
+    assets: HashMap<(u8, u8, u32, u16), RoundedShadowAsset>,
+    recency: VecDeque<(u8, u8, u32, u16)>,
+}
+
+impl RoundedShadowCache {
+    fn get_or_bake(&mut self, key: (u8, u8, u32, u16), asset: &ShadowAsset) -> &RoundedShadowAsset {
+        if let Some(position) = self.recency.iter().position(|candidate| *candidate == key) {
+            self.recency.remove(position);
+        } else {
+            if self.assets.len() == ROUNDED_SHADOW_CACHE_CAPACITY {
+                let oldest = self
+                    .recency
+                    .pop_front()
+                    .expect("a full shadow cache has an oldest entry");
+                self.assets.remove(&oldest);
+            }
+            self.assets.insert(
+                key,
+                bake_rounded_shadow_physical(asset, key.2 as usize, key.3 as usize),
+            );
+        }
+        self.recency.push_back(key);
+        self.assets
+            .get(&key)
+            .expect("requested shadow is present after cache update")
+    }
 }
 
 const SHADOW_ASSETS: &[ShadowAsset] = include!(concat!(env!("OUT_DIR"), "/shadow_assets.rs"));
@@ -244,7 +279,7 @@ impl Rasterizer {
             glyphs: tracked_text::SwashCache::new(),
             previous: Vec::new(),
             images: ImageCache::default(),
-            rounded_shadows: HashMap::new(),
+            rounded_shadows: RoundedShadowCache::default(),
             theme_base: ThemeBase::Dusk,
             style: pf_theme::flagship()
                 .resolved_style(ThemeBase::Dusk)
@@ -578,7 +613,7 @@ struct DrawContext<'a> {
     fonts: &'a mut tracked_text::FontSystem,
     glyphs: &'a mut tracked_text::SwashCache,
     images: &'a mut ImageCache,
-    rounded_shadows: &'a mut HashMap<(u8, u8, u32), RoundedShadowAsset>,
+    rounded_shadows: &'a mut RoundedShadowCache,
     notes: &'a mut Vec<RenderNote>,
     style: &'a ResolvedStyleSnapshot,
     typography: &'a TypographySnapshot,
@@ -1007,7 +1042,7 @@ fn draw_focus_ring(
 
 fn draw_node_shadow(
     pm: &mut Pixmap,
-    cache: &mut HashMap<(u8, u8, u32), RoundedShadowAsset>,
+    cache: &mut RoundedShadowCache,
     asset: &ShadowAsset,
     b: Bounds,
     scale: f32,
@@ -1025,16 +1060,16 @@ fn draw_node_shadow(
         );
         return;
     }
-    let logical_radius = (radius / scale).round().max(1.0) as u32;
+    let physical_radius = quantized_physical_shadow_radius(b, scale, radius);
     let key = (
         theme_base_key(asset.base),
         elevation_key(asset.elevation),
-        logical_radius,
+        physical_radius,
+        ((asset.margin as f32 * scale).round().clamp(1.0, 64.0)) as u16,
     );
-    let rounded = cache
-        .entry(key)
-        .or_insert_with(|| bake_rounded_shadow(asset, logical_radius as usize));
-    draw_shadow(
+    let rounded = cache.get_or_bake(key, asset);
+    let destination_margin = physical_radius + u32::from(key.3);
+    draw_shadow_with_destination_margin(
         pm,
         &rounded.rgba,
         rounded.side,
@@ -1042,7 +1077,20 @@ fn draw_node_shadow(
         rounded.effect_margin,
         b,
         scale,
+        destination_margin as i32,
     );
+}
+
+fn quantized_physical_shadow_radius(b: Bounds, scale: f32, radius: f32) -> u32 {
+    let physical_extent = (b.width * scale)
+        .abs()
+        .min((b.height * scale).abs())
+        .mul_add(0.5, 0.0)
+        .floor()
+        .max(1.0) as u32;
+    radius
+        .round()
+        .clamp(1.0, physical_extent.min(MAX_ROUNDED_SHADOW_RADIUS) as f32) as u32
 }
 
 fn theme_base_key(base: ThemeBase) -> u8 {
@@ -1062,13 +1110,23 @@ fn elevation_key(elevation: Elevation) -> u8 {
     }
 }
 
+#[cfg(test)]
 fn bake_rounded_shadow(asset: &ShadowAsset, radius: usize) -> RoundedShadowAsset {
+    bake_rounded_shadow_physical(asset, radius, asset.margin)
+}
+
+fn bake_rounded_shadow_physical(
+    asset: &ShadowAsset,
+    radius: usize,
+    physical_margin: usize,
+) -> RoundedShadowAsset {
+    let effect_scale = physical_margin as f32 / asset.margin as f32;
     let core = radius * 2 + 3;
-    let side = asset.margin * 2 + core;
+    let side = physical_margin * 2 + core;
     let mut mask = vec![0.0f32; side * side];
-    let grow = asset.spread.round() as isize;
-    let left = asset.margin as isize + asset.offset_x.round() as isize - grow;
-    let top = asset.margin as isize + asset.offset_y.round() as isize - grow;
+    let grow = (asset.spread * effect_scale).round() as isize;
+    let left = physical_margin as isize + (asset.offset_x * effect_scale).round() as isize - grow;
+    let top = physical_margin as isize + (asset.offset_y * effect_scale).round() as isize - grow;
     let width = core as f32 + (grow * 2) as f32;
     let expanded_radius = (radius as f32 + grow as f32).max(0.0);
     for y in 0..side {
@@ -1082,13 +1140,13 @@ fn bake_rounded_shadow(asset: &ShadowAsset, radius: usize) -> RoundedShadowAsset
             );
         }
     }
-    blur_mask(&mut mask, side, asset.blur);
+    blur_mask(&mut mask, side, asset.blur * effect_scale);
     // The legacy 3px source establishes the shipped straight-edge penumbra intensity. A larger
     // rounded source has more blur mass, so normalize it to that edge sample while retaining the
     // rounded mask's corner falloff.
     let legacy_edge_alpha =
         f32::from(asset.rgba[(asset.margin * asset.side + asset.side / 2) * 4 + 3]);
-    let rounded_edge_alpha = mask[asset.margin * side + side / 2] * f32::from(asset.color[3]);
+    let rounded_edge_alpha = mask[physical_margin * side + side / 2] * f32::from(asset.color[3]);
     let normalization = if rounded_edge_alpha > 0.0 {
         legacy_edge_alpha / rounded_edge_alpha
     } else {
@@ -1105,7 +1163,8 @@ fn bake_rounded_shadow(asset: &ShadowAsset, radius: usize) -> RoundedShadowAsset
     }
     RoundedShadowAsset {
         side,
-        slice_margin: asset.margin + radius,
+        slice_margin: physical_margin + radius,
+        // draw_shadow scales this destination-only value; source slicing uses slice_margin above.
         effect_margin: asset.margin,
         rgba,
     }
@@ -1162,11 +1221,34 @@ fn draw_shadow(
     b: Bounds,
     scale: f32,
 ) {
+    let destination_margin = (source_margin as f32 * scale).round().max(1.0) as i32;
+    draw_shadow_with_destination_margin(
+        pm,
+        rgba,
+        side,
+        source_margin,
+        effect_margin,
+        b,
+        scale,
+        destination_margin,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_shadow_with_destination_margin(
+    pm: &mut Pixmap,
+    rgba: &[u8],
+    side: usize,
+    source_margin: usize,
+    effect_margin: usize,
+    b: Bounds,
+    scale: f32,
+    destination_margin: i32,
+) {
     if effect_margin == 0 {
         return;
     }
     let margin = (effect_margin as f32 * scale).round().max(1.0) as i32;
-    let destination_margin = (source_margin as f32 * scale).round().max(1.0) as i32;
     let left = (b.x * scale).round() as i32 - margin;
     let top = (b.y * scale).round() as i32 - margin;
     let width = (b.width * scale).round().max(1.0) as i32 + margin * 2;
@@ -2155,8 +2237,97 @@ mod tests {
             1.0,
         );
         let mut actual = Pixmap::new(112, 112).unwrap();
-        draw_node_shadow(&mut actual, &mut HashMap::new(), asset, bounds, 1.0, 0.0);
+        draw_node_shadow(
+            &mut actual,
+            &mut RoundedShadowCache::default(),
+            asset,
+            bounds,
+            1.0,
+            0.0,
+        );
         assert_eq!(actual.data(), expected.data());
+    }
+
+    #[test]
+    fn rounded_shadow_radius_is_bounded_by_physical_extent_and_ceiling() {
+        let degenerate = Bounds::new(0.0, 0.0, 100_000.0, 100_000.0);
+        assert_eq!(
+            quantized_physical_shadow_radius(degenerate, 0.001, 100.0),
+            50
+        );
+        let huge = Bounds::new(0.0, 0.0, 100_000.0, 100_000.0);
+        assert_eq!(
+            quantized_physical_shadow_radius(huge, 1.0, 50_000.0),
+            MAX_ROUNDED_SHADOW_RADIUS
+        );
+        let asset = bake_rounded_shadow(
+            shadow_asset(ThemeBase::Dusk, Elevation::Elev1),
+            quantized_physical_shadow_radius(degenerate, 0.001, 100.0) as usize,
+        );
+        assert_eq!(asset.side, asset.effect_margin * 2 + 50 * 2 + 3);
+    }
+
+    #[test]
+    fn rounded_shadow_cache_evicts_under_radius_churn_and_reuses_tokens() {
+        let asset = shadow_asset(ThemeBase::Dusk, Elevation::Elev1);
+        let mut cache = RoundedShadowCache::default();
+        for radius in 1..=(ROUNDED_SHADOW_CACHE_CAPACITY as u32 * 4) {
+            cache.get_or_bake((0, 1, radius, asset.margin as u16), asset);
+            assert!(cache.assets.len() <= ROUNDED_SHADOW_CACHE_CAPACITY);
+        }
+        for scale in [1.0, 2.0] {
+            for logical_radius in [6.0, 10.0, 16.0] {
+                let physical = (logical_radius * scale) as u32;
+                let margin = (asset.margin as f32 * scale) as u16;
+                cache.get_or_bake((0, 1, physical, margin), asset);
+                let len = cache.assets.len();
+                cache.get_or_bake((0, 1, physical, margin), asset);
+                assert_eq!(cache.assets.len(), len);
+            }
+        }
+        assert_eq!(cache.assets.len(), ROUNDED_SHADOW_CACHE_CAPACITY);
+        assert_eq!(cache.assets.len(), cache.recency.len());
+    }
+
+    #[test]
+    fn token_radius_shadow_samples_match_round_three_at_common_scales() {
+        let asset = shadow_asset(ThemeBase::Dusk, Elevation::Elev2);
+        let bounds = Bounds::new(32.0, 32.0, 80.0, 80.0);
+        for scale in [1.0, 2.0] {
+            for logical_radius in [6usize, 10, 16, 40] {
+                let side = (128.0 * scale) as u32;
+                let mut round_three = Pixmap::new(side, side).unwrap();
+                let old = bake_rounded_shadow(asset, logical_radius);
+                draw_shadow(
+                    &mut round_three,
+                    &old.rgba,
+                    old.side,
+                    old.slice_margin,
+                    old.effect_margin,
+                    bounds,
+                    scale,
+                );
+
+                let mut current = Pixmap::new(side, side).unwrap();
+                draw_node_shadow(
+                    &mut current,
+                    &mut RoundedShadowCache::default(),
+                    asset,
+                    bounds,
+                    scale,
+                    logical_radius as f32 * scale,
+                );
+                for (logical_x, logical_y) in [(72.0, 32.0), (32.0, 72.0), (72.0, 72.0)] {
+                    let x = (logical_x * scale) as u32;
+                    let y = (logical_y * scale) as u32;
+                    assert_eq!(
+                        current.pixel(x, y),
+                        round_three.pixel(x, y),
+                        "scale={scale} radius={logical_radius} sample=({x},{y})"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
