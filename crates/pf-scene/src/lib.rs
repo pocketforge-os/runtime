@@ -54,10 +54,25 @@ pub enum NodeAction {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct NodeState {
     pub focused: bool,
+    pub pressed: bool,
     pub disabled: bool,
     pub selected: bool,
+    pub unavailable: bool,
+    pub destructive: bool,
+    /// Draw the theme scrim over this node's content (overlay-wave primitive).
+    pub scrimmed: bool,
     pub checked: bool,
     pub expanded: bool,
+}
+
+/// Theme-owned depth treatment. Renderers resolve these to pre-baked assets.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum Elevation {
+    #[default]
+    None,
+    Elev1,
+    Elev2,
+    Focus,
 }
 
 /// Logical bounds constraints, independent of surface scale.
@@ -162,6 +177,7 @@ pub struct Node {
     pub type_role: TypeRole,
     /// Component-owned line-height multiplier. `None` uses the font's normal line box.
     pub line_height: Option<f32>,
+    pub elevation: Elevation,
     pub children: Vec<Node>,
 }
 
@@ -184,6 +200,7 @@ impl Node {
             content: NodeContent::Label,
             type_role: TypeRole::Body,
             line_height: None,
+            elevation: Elevation::None,
             children: Vec::new(),
         }
     }
@@ -214,6 +231,11 @@ impl Node {
             .is_finite()
             .then_some(multiplier)
             .filter(|v| *v > 0.0);
+        self
+    }
+
+    pub fn with_elevation(mut self, elevation: Elevation) -> Self {
+        self.elevation = elevation;
         self
     }
 
@@ -260,8 +282,12 @@ pub enum AxisMove {
 /// A controlled structural-state transition. Focus itself is owned by [`Scene`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StateTransition {
+    Pressed(bool),
     Disabled(bool),
     Selected(bool),
+    Unavailable(bool),
+    Destructive(bool),
+    Scrimmed(bool),
     Checked(bool),
     Expanded(bool),
 }
@@ -382,8 +408,12 @@ impl Scene {
         let node =
             find_mut(&mut self.root, id).ok_or_else(|| SceneError::NodeMissing(id.clone()))?;
         match transition {
+            StateTransition::Pressed(value) => node.state.pressed = value,
             StateTransition::Disabled(value) => node.state.disabled = value,
             StateTransition::Selected(value) => node.state.selected = value,
+            StateTransition::Unavailable(value) => node.state.unavailable = value,
+            StateTransition::Destructive(value) => node.state.destructive = value,
+            StateTransition::Scrimmed(value) => node.state.scrimmed = value,
             StateTransition::Checked(value) => node.state.checked = value,
             StateTransition::Expanded(value) => node.state.expanded = value,
         }
