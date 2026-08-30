@@ -470,6 +470,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "pf-prefsd"
+version = "0.0.1"
+dependencies = [
+ "libc",
+ "pf-prefs",
+ "pf-wire",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "pf-render"
 version = "0.0.1"
 dependencies = [
