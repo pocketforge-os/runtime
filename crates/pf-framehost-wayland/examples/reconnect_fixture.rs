@@ -54,6 +54,8 @@ fn main() {
 
     let mut compositor = start(runtime.path(), socket);
     let mut host = WaylandHost::connect().expect("initial connect/configure");
+    host.set_text_scale(2.0).expect("set text scale");
+    assert!(host.set_text_scale(0.0).is_err());
     println!("CONNECT ok");
     println!("CONFIGURE {:?}", host.metrics());
     println!(
@@ -68,7 +70,7 @@ fn main() {
 
     let mut compositor = start(runtime.path(), socket);
     host.reconnect().expect("reconnect/configure");
-    println!("RECONNECT ok");
+    println!("RECONNECT ok (text scale retained)");
     println!(
         "PRESENT {:?}",
         host.present(&scene).expect("present after reconnect")
