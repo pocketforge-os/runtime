@@ -459,6 +459,7 @@ pub trait AuthorityApi {
 #[serde(tag = "method", rename_all = "snake_case")]
 pub enum RpcRequest {
     Launch { item_id: String },
+    SafeReturn,
     Events { client_id: String },
     Acknowledge { client_id: String, sequence: u64 },
     History,
@@ -571,6 +572,16 @@ fn handle_rpc<S: StateStore, B: SessionSystem, C: Clock>(
             LaunchResult::RejectedBusy => RpcResponse::RejectedBusy,
             LaunchResult::ItemUnavailable => RpcResponse::ItemUnavailable,
         },
+        RpcRequest::SafeReturn => {
+            if matches!(
+                authority.state.phase,
+                Phase::Starting { .. } | Phase::Running { .. }
+            ) {
+                authority.intake_safe_return()?;
+                authority.reconcile()?;
+            }
+            RpcResponse::Ok
+        }
         RpcRequest::Events { client_id } => RpcResponse::Events {
             events: authority
                 .events_for(&client_id)

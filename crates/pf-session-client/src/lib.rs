@@ -44,6 +44,13 @@ impl<T: AuthorityApi> SessionClient<T> {
     }
 }
 
+impl SessionClient<SocketTransport> {
+    /// Request an immediate, graceful return from the active session.
+    pub fn safe_return(&self) -> Result<(), AuthorityError> {
+        self.transport.safe_return()
+    }
+}
+
 fn map_error(_: AuthorityError) -> SessionError {
     SessionError::BackendUnavailable
 }
@@ -75,6 +82,16 @@ impl SocketTransport {
 
     pub fn socket_path(&self) -> &Path {
         &self.socket
+    }
+
+    /// Request an immediate, graceful return from the active session.
+    pub fn safe_return(&self) -> Result<(), AuthorityError> {
+        match self.call(&RpcRequest::SafeReturn)? {
+            RpcResponse::Ok => Ok(()),
+            _ => Err(AuthorityError::Backend(
+                "unexpected safe return response".into(),
+            )),
+        }
     }
 
     /// Fetch durable session history, including wall-clock playtime stamps.
