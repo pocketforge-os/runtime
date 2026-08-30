@@ -592,6 +592,10 @@ fn draw_node(
             b.width * scale,
             b.height * scale,
         )?;
+        draw_state_glyph(pm, context.style, b, scale, StateGlyph::Unavailable)?;
+    }
+    if node.state.destructive {
+        draw_state_glyph(pm, context.style, b, scale, StateGlyph::Destructive)?;
     }
     if node.state.scrimmed {
         fill_token_rect(
@@ -606,6 +610,59 @@ fn draw_node(
     }
     if node.state.focused {
         draw_focus_ring(pm, context.style, b, scale)?;
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum StateGlyph {
+    Unavailable,
+    Destructive,
+}
+
+/// Draws the renderer-owned, non-color half of the state cue grammar. Keeping these
+/// marks outside node content prevents a component from accidentally omitting them.
+fn draw_state_glyph(
+    pm: &mut Pixmap,
+    style: &ResolvedStyleSnapshot,
+    b: Bounds,
+    scale: f32,
+    glyph: StateGlyph,
+) -> Result<(), RenderError> {
+    let size = b.width.min(b.height).min(14.0);
+    let left = (b.x + b.width - size - 5.0) * scale;
+    let top = (b.y + 5.0) * scale;
+    let size = size * scale;
+    let key = match glyph {
+        StateGlyph::Unavailable => "--state-unavailable-text",
+        StateGlyph::Destructive => "--state-destructive-accent",
+    };
+    let color = style_color(style, key)?;
+    let mut paint = Paint::default();
+    paint.set_color_rgba8(color.red, color.green, color.blue, color.alpha);
+    let stroke = Stroke {
+        width: (2.0 * scale).max(1.0),
+        ..Stroke::default()
+    };
+    let mut path = PathBuilder::new();
+    match glyph {
+        StateGlyph::Unavailable => {
+            path.move_to(left + size * 0.12, top + size * 0.88);
+            path.line_to(left + size * 0.88, top + size * 0.12);
+        }
+        StateGlyph::Destructive => {
+            path.move_to(left + size * 0.5, top + size * 0.08);
+            path.line_to(left + size * 0.94, top + size * 0.9);
+            path.line_to(left + size * 0.06, top + size * 0.9);
+            path.close();
+            path.move_to(left + size * 0.5, top + size * 0.3);
+            path.line_to(left + size * 0.5, top + size * 0.62);
+            path.move_to(left + size * 0.5, top + size * 0.76);
+            path.line_to(left + size * 0.5, top + size * 0.78);
+        }
+    }
+    if let Some(path) = path.finish() {
+        pm.stroke_path(&path, &paint, &stroke, Transform::identity(), None);
     }
     Ok(())
 }
@@ -696,20 +753,20 @@ fn draw_shadow(pm: &mut Pixmap, asset: &ShadowAsset, b: Bounds, scale: f32) {
     if asset.margin == 0 {
         return;
     }
-    let margin = (asset.margin as f32 * scale).round() as i32;
+    let margin = (asset.margin as f32 * scale).round().max(1.0) as i32;
     let left = (b.x * scale).round() as i32 - margin;
     let top = (b.y * scale).round() as i32 - margin;
     let width = (b.width * scale).round().max(1.0) as i32 + margin * 2;
     let height = (b.height * scale).round().max(1.0) as i32 + margin * 2;
     for dy in 0..height {
-        let sy = slice_coordinate(dy, height, asset.side, asset.margin);
+        let sy = slice_coordinate(dy, height, asset.side, asset.margin, margin);
         for dx in 0..width {
             let x = left + dx;
             let y = top + dy;
             if x < 0 || y < 0 || x >= pm.width() as i32 || y >= pm.height() as i32 {
                 continue;
             }
-            let sx = slice_coordinate(dx, width, asset.side, asset.margin);
+            let sx = slice_coordinate(dx, width, asset.side, asset.margin, margin);
             let index = (sy * asset.side + sx) * 4;
             blend_pixel(
                 pm,
@@ -721,14 +778,23 @@ fn draw_shadow(pm: &mut Pixmap, asset: &ShadowAsset, b: Bounds, scale: f32) {
     }
 }
 
-fn slice_coordinate(position: i32, destination: i32, side: usize, margin: usize) -> usize {
-    let margin_i32 = margin as i32;
-    if position < margin_i32 {
-        position.max(0) as usize
-    } else if position >= destination - margin_i32 {
-        (side as i32 - (destination - position)).max(0) as usize
+fn slice_coordinate(
+    position: i32,
+    destination: i32,
+    side: usize,
+    source_margin: usize,
+    destination_margin: i32,
+) -> usize {
+    if position < destination_margin {
+        (position.max(0) as usize * source_margin / destination_margin as usize)
+            .min(source_margin.saturating_sub(1))
+    } else if position >= destination - destination_margin {
+        let distance = (destination - 1 - position).max(0) as usize;
+        side - 1
+            - (distance * source_margin / destination_margin as usize)
+                .min(source_margin.saturating_sub(1))
     } else {
-        margin + 1
+        source_margin + 1
     }
 }
 
@@ -1290,6 +1356,63 @@ mod tests {
         let plain = rasterizer.render(&plain, metrics()).unwrap().rgba;
         let elevated = rasterizer.render(&elevated, metrics()).unwrap().rgba;
         assert_eq!(plain, elevated);
+    }
+
+    #[test]
+    fn nine_slice_edge_texels_keep_scaled_source_provenance() {
+        let side = 7usize;
+        let margin = 2usize;
+        let mut rgba = Vec::with_capacity(side * side * 4);
+        for _y in 0..side {
+            for x in 0..side {
+                rgba.extend_from_slice(&[(x * 30) as u8, 0, 0, 255]);
+            }
+        }
+        let asset = ShadowAsset {
+            base: ThemeBase::Dusk,
+            elevation: Elevation::Elev1,
+            side,
+            margin,
+            rgba: Box::leak(rgba.into_boxed_slice()),
+        };
+
+        let raster = |scale: f32| {
+            let mut pm = Pixmap::new(64, 32).unwrap();
+            draw_shadow(&mut pm, &asset, Bounds::new(10.0, 10.0, 12.0, 8.0), scale);
+            pm
+        };
+        let half = raster(0.5);
+        let one = raster(1.0);
+        let two = raster(2.0);
+
+        // At 0.5x the single destination edge pixel reaches the first source edge.
+        assert_eq!(half.pixel(4, 7).unwrap().demultiply().red(), 0);
+        // At 1x source edge texels 0 and 1 are preserved one-for-one.
+        assert_eq!(one.pixel(8, 14).unwrap().demultiply().red(), 0);
+        assert_eq!(one.pixel(9, 14).unwrap().demultiply().red(), 30);
+        // At 2x each source edge texel occupies two pixels; none comes from center x=3.
+        assert_eq!(two.pixel(16, 28).unwrap().demultiply().red(), 0);
+        assert_eq!(two.pixel(17, 28).unwrap().demultiply().red(), 0);
+        assert_eq!(two.pixel(18, 28).unwrap().demultiply().red(), 30);
+        assert_eq!(two.pixel(19, 28).unwrap().demultiply().red(), 30);
+    }
+
+    #[test]
+    fn non_color_state_glyphs_render_in_dusk_and_high_contrast() {
+        for base in [ThemeBase::Dusk, ThemeBase::HighContrast] {
+            let render = |scene: &Scene| {
+                let mut rasterizer = Rasterizer::new();
+                rasterizer.set_theme_base(base);
+                rasterizer.render(scene, metrics()).unwrap()
+            };
+            let unavailable = render(&state_scene(|n| n.state.unavailable = true));
+            let slash = token_rgba(base, "--state-unavailable-text");
+            assert!((80..95).any(|x| (25..40).any(|y| pixel(&unavailable, x, y) == slash)));
+
+            let destructive = render(&state_scene(|n| n.state.destructive = true));
+            let warning = token_rgba(base, "--state-destructive-accent");
+            assert!((80..95).any(|x| (25..40).any(|y| pixel(&destructive, x, y) == warning)));
+        }
     }
 
     #[cfg(debug_assertions)]
