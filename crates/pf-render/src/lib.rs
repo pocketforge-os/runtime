@@ -1,4 +1,7 @@
 //! Deterministic scene rasterization on the ruled Cosmic Text/Swash/tiny-skia stack.
+//!
+//! This crate exposes only the minimal raster palette seam. Unifying these colors with
+//! the full `pf-theme` token set is intentionally left to a follow-on change.
 
 use cosmic_text::{fontdb, Attrs, Buffer, Color, Family, FontSystem, Metrics, Shaping, SwashCache};
 use pf_scene::{Bounds, ImageFit, ImageSource, Node, NodeContent, Scene, SurfaceMetrics};
@@ -16,6 +19,46 @@ const CJK: &[u8] = include_bytes!("../fonts/NotoSansCJK-Regular.ttc");
 /// Maximum decoded PNG dimensions accepted by the rasterizer (8 megapixels).
 pub const MAX_IMAGE_PIXELS: u64 = 8_000_000;
 const IMAGE_CACHE_CAPACITY: usize = 16;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Palette {
+    pub background: (u8, u8, u8),
+    pub text: (u8, u8, u8),
+    pub node_default: (u8, u8, u8),
+    pub node_focused: (u8, u8, u8),
+    pub node_selected: (u8, u8, u8),
+    pub node_disabled: (u8, u8, u8),
+}
+
+impl Palette {
+    pub const fn standard() -> Self {
+        Self {
+            background: (13, 17, 23),
+            text: (244, 234, 220),
+            node_default: (26, 36, 48),
+            node_focused: (36, 65, 95),
+            node_selected: (44, 58, 72),
+            node_disabled: (32, 36, 42),
+        }
+    }
+
+    pub const fn high_contrast() -> Self {
+        Self {
+            background: (0, 0, 0),
+            text: (255, 255, 255),
+            node_default: (0, 0, 0),
+            node_focused: (0, 102, 204),
+            node_selected: (80, 80, 80),
+            node_disabled: (20, 20, 20),
+        }
+    }
+}
+
+impl Default for Palette {
+    fn default() -> Self {
+        Self::standard()
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DamageRect {
@@ -70,6 +113,7 @@ pub struct Rasterizer {
     glyphs: SwashCache,
     previous: Vec<NodeSnapshot>,
     images: ImageCache,
+    palette: Palette,
 }
 
 #[derive(Clone, PartialEq)]
@@ -109,6 +153,14 @@ impl Rasterizer {
             glyphs: SwashCache::new(),
             previous: Vec::new(),
             images: ImageCache::default(),
+            palette: Palette::standard(),
+        }
+    }
+
+    pub fn set_palette(&mut self, palette: Palette) {
+        if self.palette != palette {
+            self.palette = palette;
+            self.previous.clear();
         }
     }
 
@@ -120,17 +172,22 @@ impl Rasterizer {
         let width = physical(metrics.logical_width, metrics.scale)?;
         let height = physical(metrics.logical_height, metrics.scale)?;
         let mut pixmap = Pixmap::new(width, height).ok_or(RenderError::InvalidSurface)?;
-        pixmap.fill(SkColor::from_rgba8(13, 17, 23, 255));
+        let background = self.palette.background;
+        pixmap.fill(SkColor::from_rgba8(
+            background.0,
+            background.1,
+            background.2,
+            255,
+        ));
         let mut notes = Vec::new();
-        draw_node(
-            &mut pixmap,
-            &mut self.fonts,
-            &mut self.glyphs,
-            &mut self.images,
-            &mut notes,
-            scene.root(),
-            metrics.scale,
-        );
+        let mut context = DrawContext {
+            fonts: &mut self.fonts,
+            glyphs: &mut self.glyphs,
+            images: &mut self.images,
+            notes: &mut notes,
+            palette: self.palette,
+        };
+        draw_node(&mut pixmap, &mut context, scene.root(), metrics.scale);
         let mut current = Vec::new();
         collect(scene.root(), None, 0, &mut current);
         let damage = damage(&self.previous, &current, metrics.scale, width, height);
@@ -236,24 +293,24 @@ fn bounds_rect(b: Bounds, scale: f32, width: u32, height: u32) -> DamageRect {
     }
 }
 
-fn draw_node(
-    pm: &mut Pixmap,
-    fonts: &mut FontSystem,
-    glyphs: &mut SwashCache,
-    images: &mut ImageCache,
-    notes: &mut Vec<RenderNote>,
-    node: &Node,
-    scale: f32,
-) {
+struct DrawContext<'a> {
+    fonts: &'a mut FontSystem,
+    glyphs: &'a mut SwashCache,
+    images: &'a mut ImageCache,
+    notes: &'a mut Vec<RenderNote>,
+    palette: Palette,
+}
+
+fn draw_node(pm: &mut Pixmap, context: &mut DrawContext<'_>, node: &Node, scale: f32) {
     let b = node.bounds;
     let color = if node.state.focused {
-        (36, 65, 95)
+        context.palette.node_focused
     } else if node.state.disabled {
-        (32, 36, 42)
+        context.palette.node_disabled
     } else if node.state.selected {
-        (44, 58, 72)
+        context.palette.node_selected
     } else {
-        (26, 36, 48)
+        context.palette.node_default
     };
     if let Some(rect) = Rect::from_xywh(b.x * scale, b.y * scale, b.width * scale, b.height * scale)
     {
@@ -264,8 +321,8 @@ fn draw_node(
     match &node.content {
         NodeContent::Label => draw_text(
             pm,
-            fonts,
-            glyphs,
+            context.fonts,
+            context.glyphs,
             TextDraw {
                 text: &node.accessible_label,
                 x: (b.x + 6.0) * scale,
@@ -274,16 +331,17 @@ fn draw_node(
                 height: (b.height - 5.0).max(0.0) * scale,
                 size: 15.0 * scale,
                 clip: (b.x * scale, b.y * scale, b.width * scale, b.height * scale),
+                color: context.palette.text,
             },
         ),
         NodeContent::Image { source, fit } => {
-            if let Err(note) = draw_image(pm, images, source, *fit, b, scale) {
-                notes.push(note);
+            if let Err(note) = draw_image(pm, context.images, source, *fit, b, scale) {
+                context.notes.push(note);
             }
         }
     }
     for child in &node.children {
-        draw_node(pm, fonts, glyphs, images, notes, child, scale);
+        draw_node(pm, context, child, scale);
     }
 }
 
@@ -417,6 +475,7 @@ struct TextDraw<'a> {
     height: f32,
     size: f32,
     clip: (f32, f32, f32, f32),
+    color: (u8, u8, u8),
 }
 
 fn draw_text(pm: &mut Pixmap, fonts: &mut FontSystem, glyphs: &mut SwashCache, draw: TextDraw<'_>) {
@@ -432,7 +491,7 @@ fn draw_text(pm: &mut Pixmap, fonts: &mut FontSystem, glyphs: &mut SwashCache, d
     buffer.draw(
         fonts,
         glyphs,
-        Color::rgb(244, 234, 220),
+        Color::rgb(draw.color.0, draw.color.1, draw.color.2),
         |gx, gy, gw, gh, color| {
             let alpha = color.a() as u32;
             let pixmap_width = pm.width() as usize;
@@ -507,6 +566,56 @@ mod tests {
                 .unwrap()
                 .rgba
         );
+    }
+
+    #[test]
+    fn standard_palette_is_the_default_and_high_contrast_changes_pixels() {
+        let scene = fixture("Palette");
+        let default = Rasterizer::new().render(&scene, metrics()).unwrap();
+        let mut explicit_standard = Rasterizer::new();
+        explicit_standard.set_palette(Palette::standard());
+        assert_eq!(
+            default.rgba,
+            explicit_standard.render(&scene, metrics()).unwrap().rgba
+        );
+
+        let mut high_contrast = Rasterizer::new();
+        high_contrast.set_palette(Palette::high_contrast());
+        let frame = high_contrast.render(&scene, metrics()).unwrap();
+        assert_eq!(&frame.rgba[..4], &[0, 0, 0, 255]);
+        assert!(frame
+            .rgba
+            .chunks_exact(4)
+            .any(|pixel| pixel == [255, 255, 255, 255]));
+    }
+
+    #[test]
+    fn palette_change_invalidates_damage_once_but_identical_set_does_not() {
+        let scene = fixture("Palette");
+        let surface = metrics();
+        let full_surface = Some(DamageRect {
+            x: 0,
+            y: 0,
+            width: surface.logical_width as u32,
+            height: surface.logical_height as u32,
+        });
+        let mut rasterizer = Rasterizer::new();
+
+        let standard = rasterizer.render(&scene, surface).unwrap();
+        assert_eq!(&standard.rgba[..4], &[13, 17, 23, 255]);
+
+        rasterizer.set_palette(Palette::high_contrast());
+        let changed = rasterizer.render(&scene, surface).unwrap();
+        assert_eq!(changed.damage, full_surface);
+        assert_eq!(&changed.rgba[..4], &[0, 0, 0, 255]);
+        assert!(changed
+            .rgba
+            .chunks_exact(4)
+            .any(|pixel| pixel == [255, 255, 255, 255]));
+
+        assert_eq!(rasterizer.render(&scene, surface).unwrap().damage, None);
+        rasterizer.set_palette(Palette::high_contrast());
+        assert_eq!(rasterizer.render(&scene, surface).unwrap().damage, None);
     }
 
     fn image_fixture(bytes: &'static [u8], fit: ImageFit) -> Scene {

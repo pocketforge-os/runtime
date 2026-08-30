@@ -5,7 +5,7 @@
 //! the rasterizer's damage rectangle.
 
 use pf_ports::{FrameHost, PresentAck, PresentFailure, PresentResult};
-use pf_render::{DamageRect, Rasterizer};
+use pf_render::{DamageRect, Palette, Rasterizer};
 use pf_scene::{Insets, Orientation, Scene, SurfaceMetrics};
 #[cfg(feature = "keyboard")]
 use std::collections::{HashMap, VecDeque};
@@ -733,6 +733,10 @@ impl FrameHost for WaylandHost {
         }
     }
 
+    fn set_palette(&mut self, palette: Palette) {
+        set_renderer_palette(&mut self.renderer, palette);
+    }
+
     fn present(&mut self, scene: &Scene) -> PresentResult {
         self.present_inner(scene).map_err(|error| match error {
             WaylandHostError::CompositorUnavailable(_) | WaylandHostError::Protocol(_) => {
@@ -748,12 +752,48 @@ impl FrameHost for WaylandHost {
     }
 }
 
+fn set_renderer_palette(renderer: &mut Rasterizer, palette: Palette) {
+    renderer.set_palette(palette);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pf_scene::{Bounds, Node, NodeId, Role};
 
     fn valid_size(width: u32, height: u32) -> ValidatedSize {
         ValidatedSize::new(width, height).expect("valid test size")
+    }
+
+    #[test]
+    fn host_palette_forwarder_changes_the_next_render() {
+        let node = Node::new(
+            NodeId::new("root").unwrap(),
+            Role::Text,
+            "Palette",
+            Bounds::new(3.0, 4.0, 100.0, 40.0),
+            "card",
+        );
+        let scene = Scene::new(node, NodeId::new("root").unwrap()).unwrap();
+        let mut renderer = Rasterizer::new();
+        set_renderer_palette(&mut renderer, Palette::high_contrast());
+        let frame = renderer
+            .render(
+                &scene,
+                SurfaceMetrics {
+                    logical_width: 120.0,
+                    logical_height: 60.0,
+                    scale: 1.0,
+                    safe_insets: Insets::default(),
+                    orientation: Orientation::Landscape,
+                },
+            )
+            .unwrap();
+        assert_eq!(&frame.rgba[..4], &[0, 0, 0, 255]);
+        assert!(frame
+            .rgba
+            .chunks_exact(4)
+            .any(|pixel| pixel == [255, 255, 255, 255]));
     }
 
     #[test]
