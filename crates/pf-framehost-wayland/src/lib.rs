@@ -126,14 +126,13 @@ struct State {
     xdg_surface: Option<xdg_surface::XdgSurface>,
     toplevel: Option<xdg_toplevel::XdgToplevel>,
     configured: bool,
-    pending_size: Option<(u32, u32)>,
     size: (u32, u32),
     closed: bool,
     released_buffers: Vec<u64>,
 }
 
 impl State {
-    fn new() -> Self {
+    fn new(width: u32, height: u32) -> Self {
         Self {
             compositor: None,
             shm: None,
@@ -158,8 +157,7 @@ impl State {
             xdg_surface: None,
             toplevel: None,
             configured: false,
-            pending_size: None,
-            size: (DEFAULT_WIDTH, DEFAULT_HEIGHT),
+            size: (width, height),
             closed: false,
             released_buffers: Vec::new(),
         }
@@ -177,6 +175,9 @@ impl State {
         let toplevel = xdg_surface.get_toplevel(qh, ());
         toplevel.set_title("PocketForge".into());
         toplevel.set_app_id("org.pocketforge.shell".into());
+        let (width, height) = self.size;
+        toplevel.set_min_size(width as i32, height as i32);
+        toplevel.set_max_size(width as i32, height as i32);
         surface.commit();
         self.surface = Some(surface);
         self.xdg_surface = Some(xdg_surface);
@@ -429,12 +430,8 @@ impl Dispatch<xdg_toplevel::XdgToplevel, ()> for State {
 }
 
 fn handle_toplevel_event(state: &mut State, event: xdg_toplevel::Event) {
-    match event {
-        xdg_toplevel::Event::Configure { width, height, .. } if width > 0 && height > 0 => {
-            state.pending_size = Some((width as u32, height as u32));
-        }
-        xdg_toplevel::Event::Close => state.closed = true,
-        _ => {}
+    if let xdg_toplevel::Event::Close = event {
+        state.closed = true;
     }
 }
 
@@ -449,9 +446,6 @@ impl Dispatch<xdg_surface::XdgSurface, ()> for State {
     ) {
         if let xdg_surface::Event::Configure { serial } = event {
             surface.ack_configure(serial);
-            if let Some(size) = state.pending_size.take() {
-                state.size = size;
-            }
             state.configured = true;
         }
     }
@@ -494,12 +488,20 @@ pub struct WaylandHost {
 
 impl WaylandHost {
     pub fn connect() -> Result<Self, WaylandHostError> {
+        Self::connect_with_size(DEFAULT_WIDTH, DEFAULT_HEIGHT)
+    }
+
+    /// Connect with a fixed logical size matching the simulated device panel.
+    ///
+    /// The size is device-faithful by design: compositor configure events never trigger
+    /// adaptive sizing or UI reflow.
+    pub fn connect_with_size(width: u32, height: u32) -> Result<Self, WaylandHostError> {
         let connection = Connection::connect_to_env()
             .map_err(|e| WaylandHostError::CompositorUnavailable(e.to_string()))?;
         let mut queue = connection.new_event_queue();
         let qh = queue.handle();
         connection.display().get_registry(&qh, ());
-        let mut state = State::new();
+        let mut state = State::new(width, height);
         queue
             .roundtrip(&mut state)
             .map_err(|e| WaylandHostError::Protocol(e.to_string()))?;
@@ -530,7 +532,8 @@ impl WaylandHost {
 
     /// Rebuild every protocol object after compositor loss.
     pub fn reconnect(&mut self) -> Result<(), WaylandHostError> {
-        let replacement = Self::connect()?;
+        let (width, height) = self.state.size;
+        let replacement = Self::connect_with_size(width, height)?;
         #[cfg(feature = "keyboard")]
         {
             let mut replacement = replacement;
@@ -711,8 +714,36 @@ mod tests {
 
     #[test]
     fn damage_is_not_fixed_to_a_product_resolution() {
-        let metrics = State::new().size;
+        let metrics = State::new(DEFAULT_WIDTH, DEFAULT_HEIGHT).size;
         assert_eq!(metrics, (DEFAULT_WIDTH, DEFAULT_HEIGHT));
+    }
+
+    #[test]
+    fn zero_size_configure_keeps_pinned_metrics() {
+        let mut state = State::new(1280, 720);
+        handle_toplevel_event(
+            &mut state,
+            xdg_toplevel::Event::Configure {
+                width: 0,
+                height: 0,
+                states: Vec::new(),
+            },
+        );
+        assert_eq!(state.size, (1280, 720));
+    }
+
+    #[test]
+    fn nonzero_configure_keeps_pinned_metrics() {
+        let mut state = State::new(1280, 720);
+        handle_toplevel_event(
+            &mut state,
+            xdg_toplevel::Event::Configure {
+                width: 640,
+                height: 480,
+                states: Vec::new(),
+            },
+        );
+        assert_eq!(state.size, (1280, 720));
     }
 
     #[test]
@@ -810,7 +841,7 @@ mod tests {
         )
         .expect("compile test keymap");
         let state = xkb::State::new(&keymap);
-        let mut host_state = State::new();
+        let mut host_state = State::new(DEFAULT_WIDTH, DEFAULT_HEIGHT);
 
         let presses = [30, 105].map(|code| {
             key_event_from_evdev(
@@ -840,11 +871,11 @@ mod tests {
     #[cfg(feature = "keyboard")]
     #[test]
     fn reconnect_releases_held_keys_before_replacing_state() {
-        let mut old_state = State::new();
+        let mut old_state = State::new(DEFAULT_WIDTH, DEFAULT_HEIGHT);
         old_state
             .pressed_keys
             .insert(30, (u32::from('a'), Key::Char('a')));
-        let mut replacement_state = State::new();
+        let mut replacement_state = State::new(DEFAULT_WIDTH, DEFAULT_HEIGHT);
         replacement_state.key_events.push_back(KeyEvent {
             code: 30,
             keysym: u32::from('a'),
@@ -878,7 +909,7 @@ mod tests {
 
     #[test]
     fn fabricated_toplevel_close_sets_closed_state() {
-        let mut state = State::new();
+        let mut state = State::new(DEFAULT_WIDTH, DEFAULT_HEIGHT);
         assert!(!state.closed);
 
         handle_toplevel_event(&mut state, xdg_toplevel::Event::Close);
