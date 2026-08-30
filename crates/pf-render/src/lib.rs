@@ -160,7 +160,25 @@ impl Rasterizer {
         draw_node(&mut pixmap, &mut context, scene.root(), metrics.scale)?;
         let mut current = Vec::new();
         collect(scene.root(), None, 0, &mut current);
-        let damage = damage(&self.previous, &current, metrics.scale, width, height);
+        let focus_damage_outset = (self
+            .style
+            .length("--focus-ring-offset")
+            .expect("typed focus offset")
+            .pixels
+            + self
+                .style
+                .length("--focus-ring-width")
+                .expect("typed focus width")
+                .pixels)
+            * metrics.scale;
+        let damage = damage(
+            &self.previous,
+            &current,
+            metrics.scale,
+            width,
+            height,
+            focus_damage_outset,
+        );
         self.previous = current;
         Ok(RasterFrame {
             width,
@@ -228,6 +246,7 @@ fn damage(
     scale: f32,
     width: u32,
     height: u32,
+    focus_outset: f32,
 ) -> Option<DamageRect> {
     if old.is_empty() {
         return Some(DamageRect {
@@ -245,18 +264,19 @@ fn damage(
             old.iter().find(|v| v.id == node.id)
         };
         if peer != Some(node) {
-            let r = bounds_rect(node.bounds, scale, width, height);
+            let outset = if node.focused { focus_outset } else { 0.0 };
+            let r = bounds_rect(node.bounds, scale, width, height, outset);
             result = Some(result.map_or(r, |d: DamageRect| d.union(r)));
         }
     }
     result
 }
 
-fn bounds_rect(b: Bounds, scale: f32, width: u32, height: u32) -> DamageRect {
-    let x = (b.x * scale).floor().max(0.0) as u32;
-    let y = (b.y * scale).floor().max(0.0) as u32;
-    let right = ((b.x + b.width) * scale).ceil().max(0.0) as u32;
-    let bottom = ((b.y + b.height) * scale).ceil().max(0.0) as u32;
+fn bounds_rect(b: Bounds, scale: f32, width: u32, height: u32, outset: f32) -> DamageRect {
+    let x = (b.x * scale - outset).floor().max(0.0) as u32;
+    let y = (b.y * scale - outset).floor().max(0.0) as u32;
+    let right = ((b.x + b.width) * scale + outset).ceil().max(0.0) as u32;
+    let bottom = ((b.y + b.height) * scale + outset).ceil().max(0.0) as u32;
     DamageRect {
         x: x.min(width),
         y: y.min(height),
@@ -307,16 +327,22 @@ fn draw_node(
                 .expect("typed focus width")
                 .pixels
                 * scale;
+            let offset = context
+                .style
+                .length("--focus-ring-offset")
+                .expect("typed focus offset")
+                .pixels
+                * scale;
             let stroke = Stroke {
                 width,
                 ..Stroke::default()
             };
-            let inset = width / 2.0;
+            let outset = offset + width / 2.0;
             if let Some(ring_rect) = Rect::from_xywh(
-                rect.x() + inset,
-                rect.y() + inset,
-                rect.width() - width,
-                rect.height() - width,
+                rect.x() - outset,
+                rect.y() - outset,
+                rect.width() + outset * 2.0,
+                rect.height() + outset * 2.0,
             ) {
                 let path = PathBuilder::from_rect(ring_rect);
                 pm.stroke_path(&path, &paint, &stroke, Transform::identity(), None);
@@ -601,7 +627,7 @@ mod tests {
         let mut high_contrast = Rasterizer::new();
         high_contrast.set_theme_base(ThemeBase::HighContrast);
         let frame = high_contrast.render(&scene, metrics()).unwrap();
-        assert_eq!(&frame.rgba[..4], &[0, 0, 0, 255]);
+        assert_eq!(pixel(&frame, 430, 276), [0, 0, 0, 255]);
         assert!(frame
             .rgba
             .chunks_exact(4)
@@ -610,8 +636,8 @@ mod tests {
         let mut day = Rasterizer::new();
         day.set_theme_base(ThemeBase::Day);
         assert_eq!(
-            &day.render(&scene, metrics()).unwrap().rgba[..4],
-            &[242, 238, 228, 255]
+            pixel(&day.render(&scene, metrics()).unwrap(), 430, 276),
+            [242, 238, 228, 255]
         );
     }
 
@@ -628,12 +654,12 @@ mod tests {
         let mut rasterizer = Rasterizer::new();
 
         let dusk = rasterizer.render(&scene, surface).unwrap();
-        assert_eq!(&dusk.rgba[..4], &[23, 21, 18, 255]);
+        assert_eq!(pixel(&dusk, 430, 276), [23, 21, 18, 255]);
 
         rasterizer.set_theme_base(ThemeBase::HighContrast);
         let changed = rasterizer.render(&scene, surface).unwrap();
         assert_eq!(changed.damage, full_surface);
-        assert_eq!(&changed.rgba[..4], &[0, 0, 0, 255]);
+        assert_eq!(pixel(&changed, 430, 276), [0, 0, 0, 255]);
         assert!(changed
             .rgba
             .chunks_exact(4)
@@ -657,7 +683,7 @@ mod tests {
         root.state.focused = true;
         let scene = Scene::new(root, NodeId::new("focused").unwrap()).unwrap();
         let dusk = Rasterizer::new().render(&scene, metrics()).unwrap();
-        assert_eq!(&dusk.rgba[..4], &[23, 21, 18, 255]);
+        assert_eq!(pixel(&dusk, 430, 276), [23, 21, 18, 255]);
         assert!(dusk
             .rgba
             .chunks_exact(4)
@@ -666,11 +692,104 @@ mod tests {
         let mut contrast = Rasterizer::new();
         contrast.set_theme_base(ThemeBase::HighContrast);
         let contrast = contrast.render(&scene, metrics()).unwrap();
-        assert_eq!(&contrast.rgba[..4], &[0, 0, 0, 255]);
+        assert_eq!(pixel(&contrast, 430, 276), [0, 0, 0, 255]);
         assert!(contrast
             .rgba
             .chunks_exact(4)
             .any(|pixel| pixel == [255, 216, 61, 255]));
+    }
+
+    fn focus_scene(focused: bool) -> Scene {
+        let root = Node::new(
+            NodeId::new("focused").unwrap(),
+            Role::Button,
+            "",
+            Bounds::new(20.0, 20.0, 40.0, 30.0),
+            "--state-rest-surface",
+        );
+        let root = if focused {
+            root.with_action(NodeAction::Activate)
+        } else {
+            root
+        };
+        Scene::new(root, NodeId::new("focused").unwrap()).unwrap()
+    }
+
+    fn pixel(frame: &RasterFrame, x: u32, y: u32) -> &[u8] {
+        let start = ((y * frame.width + x) * 4) as usize;
+        &frame.rgba[start..start + 4]
+    }
+
+    #[test]
+    fn focus_ring_uses_outline_offset_geometry_in_dusk_and_high_contrast() {
+        let cases = [
+            (
+                ThemeBase::Dusk,
+                [23, 21, 18, 255],
+                [243, 223, 174, 255],
+                15,
+                65,
+            ),
+            (
+                ThemeBase::HighContrast,
+                [0, 0, 0, 255],
+                [255, 216, 61, 255],
+                14,
+                66,
+            ),
+        ];
+
+        for (base, canvas, ring, outer_left, outer_right) in cases {
+            let mut rasterizer = Rasterizer::new();
+            rasterizer.set_theme_base(base);
+            let frame = rasterizer.render(&focus_scene(true), metrics()).unwrap();
+
+            // The outer edge is offset + width from the node's x range [20, 60).
+            assert_eq!(pixel(&frame, outer_left, 35), ring, "{base:?} left edge");
+            assert_eq!(
+                pixel(&frame, outer_right - 1, 35),
+                ring,
+                "{base:?} right edge"
+            );
+            assert_eq!(
+                pixel(&frame, outer_left - 1, 35),
+                canvas,
+                "{base:?} outside left edge"
+            );
+            assert_eq!(
+                pixel(&frame, outer_right, 35),
+                canvas,
+                "{base:?} outside right edge"
+            );
+
+            // The three-pixel outline offset remains untouched canvas.
+            for x in 17..20 {
+                assert_eq!(pixel(&frame, x, 35), canvas, "{base:?} gap at x={x}");
+            }
+        }
+    }
+
+    #[test]
+    fn focus_loss_damage_covers_ring_and_redraw_clears_it() {
+        let mut rasterizer = Rasterizer::new();
+        let focused = rasterizer.render(&focus_scene(true), metrics()).unwrap();
+        assert_eq!(pixel(&focused, 15, 35), [243, 223, 174, 255]);
+
+        let unfocused = rasterizer.render(&focus_scene(false), metrics()).unwrap();
+        assert_eq!(
+            unfocused.damage,
+            Some(DamageRect {
+                x: 15,
+                y: 15,
+                width: 50,
+                height: 40,
+            })
+        );
+        assert_eq!(pixel(&unfocused, 15, 35), [23, 21, 18, 255]);
+
+        let focused_again = rasterizer.render(&focus_scene(true), metrics()).unwrap();
+        assert_eq!(focused_again.damage, unfocused.damage);
+        assert_eq!(pixel(&focused_again, 15, 35), [243, 223, 174, 255]);
     }
 
     #[cfg(debug_assertions)]
@@ -724,7 +843,7 @@ mod tests {
             .unwrap();
         assert!(first.notes.is_empty());
         assert_eq!(frame_hash(&first.rgba), frame_hash(&second.rgba));
-        assert_eq!(frame_hash(&first.rgba), 10_636_224_959_707_624_994);
+        assert_eq!(frame_hash(&first.rgba), 4_902_161_646_795_392_738);
     }
 
     #[test]
@@ -776,10 +895,10 @@ mod tests {
         assert_eq!(
             frame.damage,
             Some(DamageRect {
-                x: 17,
-                y: 11,
-                width: 173,
-                height: 129,
+                x: 12,
+                y: 6,
+                width: 183,
+                height: 139,
             })
         );
     }
@@ -856,7 +975,8 @@ mod tests {
         let frame = Rasterizer::new().render(&scene, metrics()).unwrap();
         for y in 0..frame.height {
             for x in 0..frame.width {
-                if !(40..82).contains(&x) || !(30..54).contains(&y) {
+                // Focus paint extends five pixels beyond the node; text must not.
+                if !(35..87).contains(&x) || !(25..59).contains(&y) {
                     let offset = (y * frame.width + x) as usize * 4;
                     assert_eq!(&frame.rgba[offset..offset + 4], &[23, 21, 18, 255]);
                 }
