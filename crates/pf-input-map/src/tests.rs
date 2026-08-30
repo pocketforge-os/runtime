@@ -321,6 +321,32 @@ fn persisted_protected_collision_is_rejected_then_re_resolved_to_shipped_default
 }
 
 #[test]
+fn legacy_persisted_map_keeps_user_remaps_and_adds_new_shipped_protected_actions() {
+    let device = contract(A133);
+    let shipped_start = device
+        .effective_map
+        .iter()
+        .find(|mapping| mapping.action == "Start")
+        .unwrap()
+        .clone();
+    let mut persisted = device.effective_map.clone();
+    persisted.retain(|mapping| mapping.action != "Start");
+    persisted
+        .iter_mut()
+        .find(|mapping| mapping.action == "Activate")
+        .unwrap()
+        .binding = Binding::single("west");
+
+    let effective = EffectiveMap::from_persisted(device, Some(("a133".into(), persisted))).unwrap();
+
+    assert_eq!(
+        effective.binding("shell", "Activate"),
+        Some(&Binding::single("west"))
+    );
+    assert!(effective.mappings().contains(&shipped_start));
+}
+
+#[test]
 fn rejects_any_candidate_that_strands_a_protected_action() {
     let mut broken = contract(A133);
     broken.effective_map.retain(|m| m.action != "Back");

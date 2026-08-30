@@ -429,6 +429,19 @@ impl EffectiveMap {
             .as_ref()
             .map(|(_, m)| m.clone())
             .unwrap_or_else(|| contract.effective_map.clone());
+        if persisted.is_some() {
+            for action in PROTECTED {
+                if !mappings.iter().any(|mapping| mapping.action == action) {
+                    mappings.extend(
+                        contract
+                            .effective_map
+                            .iter()
+                            .filter(|mapping| mapping.action == action)
+                            .cloned(),
+                    );
+                }
+            }
+        }
         let mut events = VecDeque::new();
         let stored_device = persisted
             .as_ref()
