@@ -4,23 +4,29 @@
 //! observable without inventing a second preference store. It also keeps the port truthful:
 //! only preferences with an existing runtime apply/observe leg are reported as applied.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 
 use pf_ports::{
     ChangeAuthority, Deadline, EffectivePreference, PreferenceChange, PreferenceChangeResult,
     PreferenceError, PreferenceKey, PreferencePoll, PreferencePort, PreferenceValue,
 };
-use pf_prefs::{PrefError, PrefValue, Prefs, PrefsStore, SCHEMA};
+use pf_prefs::{PrefError, PrefValue, PrefsStore, SCHEMA};
+use pf_prefsd::{Client, ClientError, ErrorKind};
 
 /// The authority name used by the standard settings control plane.
 pub const USER_AUTHORITY: &str = "user";
 
 /// Store-backed implementation of the shell's preference boundary.
 pub struct PrefsPreferencePort {
-    store: PrefsStore,
+    backend: Backend,
     allowed_authority: ChangeAuthority,
-    snapshot: Prefs,
+    snapshot: BTreeMap<String, PrefValue>,
     pending: VecDeque<EffectivePreference>,
+}
+
+enum Backend {
+    Store(PrefsStore),
+    Daemon(Client),
 }
 
 impl PrefsPreferencePort {
@@ -29,9 +35,13 @@ impl PrefsPreferencePort {
         store: PrefsStore,
         allowed_authority: ChangeAuthority,
     ) -> Result<Self, PreferenceError> {
-        let snapshot = store.load().map_err(map_backend_error)?;
+        let backend = match std::env::var_os("PF_PREFSD_SOCK") {
+            Some(socket) => Backend::Daemon(Client::new(socket)),
+            None => Backend::Store(store),
+        };
+        let snapshot = load_all(&backend)?;
         Ok(Self {
-            store,
+            backend,
             allowed_authority,
             snapshot,
             pending: VecDeque::new(),
@@ -44,10 +54,17 @@ impl PrefsPreferencePort {
     }
 
     fn refresh(&mut self) -> Result<(), PreferenceError> {
-        let fresh = self.store.load().map_err(map_backend_error)?;
+        let fresh = load_all(&self.backend)?;
         for spec in SCHEMA {
-            let old = self.snapshot.value(spec.key).map_err(map_backend_error)?;
-            let new = fresh.value(spec.key).map_err(map_backend_error)?;
+            let old = self
+                .snapshot
+                .get(spec.key)
+                .copied()
+                .ok_or(PreferenceError::BackendUnavailable)?;
+            let new = fresh
+                .get(spec.key)
+                .copied()
+                .ok_or(PreferenceError::BackendUnavailable)?;
             if old != new {
                 self.pending.push_back(effective(spec.key, new));
             }
@@ -62,7 +79,14 @@ impl PreferencePort for PrefsPreferencePort {
         let Some(spec) = pf_prefs::spec(&key.0) else {
             return Ok(None);
         };
-        let stored = self.snapshot.value(spec.key).map_err(map_backend_error)?;
+        let stored = match &self.backend {
+            Backend::Store(_) => self.snapshot.get(spec.key).copied(),
+            Backend::Daemon(client) => Some(json_to_pref(
+                spec.key,
+                client.get(spec.key).map_err(map_client_error)?,
+            )?),
+        }
+        .ok_or(PreferenceError::BackendUnavailable)?;
         Ok(Some(effective(spec.key, stored)))
     }
 
@@ -88,11 +112,73 @@ impl PreferencePort for PrefsPreferencePort {
             return Ok(PreferenceChangeResult::UnsupportedKey);
         }
         let value = from_port_value(&change.key.0, change.value)?;
-        self.store
-            .apply(&change.key.0, value)
-            .map_err(map_backend_error)?;
+        match &self.backend {
+            Backend::Store(store) => {
+                store
+                    .apply(&change.key.0, value)
+                    .map_err(map_backend_error)?;
+            }
+            Backend::Daemon(client) => {
+                client
+                    .set(&change.key.0, pref_to_json(value))
+                    .map_err(map_client_set_error)?;
+            }
+        }
         self.refresh()?;
         Ok(PreferenceChangeResult::StoredNotApplied)
+    }
+}
+
+fn load_all(backend: &Backend) -> Result<BTreeMap<String, PrefValue>, PreferenceError> {
+    match backend {
+        Backend::Store(store) => {
+            let prefs = store.load().map_err(map_backend_error)?;
+            SCHEMA
+                .iter()
+                .map(|spec| prefs.value(spec.key).map(|value| (spec.key.into(), value)))
+                .collect::<Result<_, _>>()
+                .map_err(map_backend_error)
+        }
+        Backend::Daemon(client) => client
+            .get_all()
+            .map_err(map_client_error)?
+            .into_iter()
+            .map(|(key, value)| json_to_pref(&key, value).map(|value| (key, value)))
+            .collect(),
+    }
+}
+
+fn pref_to_json(value: PrefValue) -> serde_json::Value {
+    match value {
+        PrefValue::Bool(value) => value.into(),
+        PrefValue::Scalar(value) => value.into(),
+        PrefValue::Enum(value) => value.into(),
+    }
+}
+
+fn json_to_pref(key: &str, value: serde_json::Value) -> Result<PrefValue, PreferenceError> {
+    let port_value = match value {
+        serde_json::Value::Bool(value) => PreferenceValue::Bool(value),
+        serde_json::Value::Number(value) => {
+            PreferenceValue::Integer(value.as_i64().ok_or(PreferenceError::BackendUnavailable)?)
+        }
+        serde_json::Value::String(value) => PreferenceValue::Text(value),
+        _ => return Err(PreferenceError::BackendUnavailable),
+    };
+    from_port_value(key, port_value).map_err(|_| PreferenceError::BackendUnavailable)
+}
+
+fn map_client_error(_error: ClientError) -> PreferenceError {
+    PreferenceError::BackendUnavailable
+}
+
+fn map_client_set_error(error: ClientError) -> PreferenceError {
+    match error {
+        ClientError::Remote {
+            kind: Some(ErrorKind::InvalidValue),
+            ..
+        } => PreferenceError::InvalidValue,
+        error => map_client_error(error),
     }
 }
 
@@ -152,6 +238,31 @@ fn map_backend_error(error: PrefError) -> PreferenceError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn daemon_error_kinds_fail_toward_infrastructure() {
+        assert_eq!(
+            map_client_set_error(ClientError::Remote {
+                message: "schema skew".into(),
+                kind: Some(ErrorKind::InvalidValue),
+            }),
+            PreferenceError::InvalidValue
+        );
+        for kind in [
+            Some(ErrorKind::Store),
+            Some(ErrorKind::Internal),
+            Some(ErrorKind::Unknown),
+            None,
+        ] {
+            assert_eq!(
+                map_client_set_error(ClientError::Remote {
+                    message: "daemon failure".into(),
+                    kind,
+                }),
+                PreferenceError::BackendUnavailable
+            );
+        }
+    }
     use pf_ports::{MonotonicTime, PreferencePort};
     use std::path::PathBuf;
 

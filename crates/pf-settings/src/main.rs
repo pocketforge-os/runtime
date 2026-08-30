@@ -3,9 +3,9 @@
 //!
 //! Modeled on `pf-permissions` (the AppOps inspect/revoke CLI): a small standalone tool a
 //! settings screen — or an operator on a serial console — uses to read and change preferences.
-//! Every write goes through the single [`pf_prefs::PrefsStore`] persist-and-signal seam, the same
-//! path the on-panel settings UI (`.3`) and the supervisor will use later. Apps never link this;
-//! they read the store through the capability facade and are read-only on it by contract.
+//! When `$PF_PREFSD_SOCK` is set, reads and writes go through that daemon; otherwise the CLI uses
+//! the existing [`pf_prefs::PrefsStore`] path. Apps never link this; they read preferences through
+//! the capability facade and are read-only on them by contract.
 //!
 //! The store root is discovered from `$PF_PREFS_DIR` (else `$XDG_STATE_HOME/pocketforge/prefs`,
 //! else `$HOME/.local/state/pocketforge/prefs`) — see [`pf_prefs::PrefsStore`].
@@ -16,6 +16,7 @@
 //!   pf-settings list
 
 use pf_prefs::{parse_value, PrefsStore, Source, SCHEMA};
+use pf_prefsd::Client;
 
 const USAGE: &str = "\
 pf-settings — read/change PocketForge user & accessibility preferences
@@ -25,7 +26,8 @@ USAGE:
     pf-settings set  <key> <value>  Set a preference (validated, atomically persisted)
     pf-settings list                Show every preference: type, value, default, source
 
-Store: $PF_PREFS_DIR/prefs.json (else $XDG_STATE_HOME/.../prefs, else ~/.local/state/.../prefs)
+Backend: $PF_PREFSD_SOCK when set; otherwise $PF_PREFS_DIR/prefs.json
+(else $XDG_STATE_HOME/.../prefs, else ~/.local/state/.../prefs)
 Preferences are READ-ONLY TO APPS by contract; this is the authority-side writer.";
 
 fn main() {
@@ -60,9 +62,12 @@ fn run_get(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let key = args
         .first()
         .ok_or("get requires a <key> (see `pf-settings list`)")?;
-    let prefs = PrefsStore::open_default().load()?;
-    let value = prefs.value(key)?;
-    println!("{value}");
+    if let Some(client) = daemon_client() {
+        println!("{}", display_json(client.get(key)?));
+    } else {
+        let prefs = PrefsStore::open_default().load()?;
+        println!("{}", prefs.value(key)?);
+    }
     Ok(())
 }
 
@@ -70,6 +75,16 @@ fn run_set(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let key = args.first().ok_or("set requires a <key> and <value>")?;
     let raw = args.get(1).ok_or("set requires a <value>")?;
     let value = parse_value(key, raw)?;
+    if let Some(client) = daemon_client() {
+        let old = client.get(key)?;
+        let new = client.set(key, pref_to_json(value))?;
+        if old == new {
+            println!("{key}: {} (unchanged)", display_json(new));
+        } else {
+            println!("{key}: {} -> {}", display_json(old), display_json(new));
+        }
+        return Ok(());
+    }
     let store = PrefsStore::open_default();
     match store.apply(key, value)? {
         Some(change) => println!("{}: {} -> {}", change.key, change.old, change.new),
@@ -79,31 +94,70 @@ fn run_set(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn run_list(_args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
-    let prefs = PrefsStore::open_default().load()?;
+    let daemon_values = daemon_client().map(|client| client.get_all()).transpose()?;
+    let prefs = if daemon_values.is_none() {
+        Some(PrefsStore::open_default().load()?)
+    } else {
+        None
+    };
     println!(
         "{:<16} {:<8} {:<8} {:<8} {:<8}  description",
         "key", "type", "value", "default", "source"
     );
     for spec in SCHEMA {
-        let value = prefs.value(spec.key)?;
-        let source = match prefs.source(spec.key) {
-            Source::Default => "default",
-            Source::Stored => "stored",
+        let value = match &daemon_values {
+            Some(values) => display_json(
+                values
+                    .get(spec.key)
+                    .ok_or_else(|| format!("daemon omitted preference '{}'", spec.key))?
+                    .clone(),
+            ),
+            None => prefs
+                .as_ref()
+                .expect("local prefs")
+                .value(spec.key)?
+                .to_string(),
         };
-        let ty = match value {
-            pf_prefs::PrefValue::Bool(_) => "bool",
-            pf_prefs::PrefValue::Scalar(_) => "scalar",
-            pf_prefs::PrefValue::Enum(_) => "enum",
+        let source = match &daemon_values {
+            Some(_) => "daemon",
+            None => match prefs.as_ref().expect("local prefs").source(spec.key) {
+                Source::Default => "default",
+                Source::Stored => "stored",
+            },
+        };
+        let ty = match spec.kind {
+            pf_prefs::PrefKind::Bool => "bool",
+            pf_prefs::PrefKind::Scalar { .. } => "scalar",
+            pf_prefs::PrefKind::Enum { .. } => "enum",
         };
         println!(
             "{:<16} {:<8} {:<8} {:<8} {:<8}  {}",
             spec.key,
             ty,
-            value.to_string(),
+            value,
             spec.default.to_string(),
             source,
             spec.doc,
         );
     }
     Ok(())
+}
+
+fn daemon_client() -> Option<Client> {
+    std::env::var_os("PF_PREFSD_SOCK").map(Client::new)
+}
+
+fn pref_to_json(value: pf_prefs::PrefValue) -> serde_json::Value {
+    match value {
+        pf_prefs::PrefValue::Bool(value) => value.into(),
+        pf_prefs::PrefValue::Scalar(value) => value.into(),
+        pf_prefs::PrefValue::Enum(value) => value.into(),
+    }
+}
+
+fn display_json(value: serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(value) => value,
+        value => value.to_string(),
+    }
 }

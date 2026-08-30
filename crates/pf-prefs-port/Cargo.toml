@@ -13,4 +13,6 @@ name = "pf_prefs_port"
 
 [dependencies]
 pf-prefs = { workspace = true }
+pf-prefsd = { workspace = true }
 pf-ports = { workspace = true }
+serde_json = { workspace = true }

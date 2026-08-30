@@ -467,6 +467,8 @@ version = "0.0.1"
 dependencies = [
  "pf-ports",
  "pf-prefs",
+ "pf-prefsd",
+ "serde_json",
 ]
 
 [[package]]
@@ -519,10 +521,13 @@ dependencies = [
 name = "pf-settings"
 version = "0.0.1"
 dependencies = [
+ "libc",
  "pf-ports",
  "pf-prefs",
  "pf-prefs-port",
+ "pf-prefsd",
  "pocketforge",
+ "serde_json",
 ]
 
 [[package]]
