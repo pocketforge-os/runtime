@@ -656,7 +656,10 @@ fn draw_text(
         &tracked_text::Attrs::new()
             .family(tracked_text::Family::Name(&draw.style.family))
             .weight(tracked_text::Weight(draw.style.weight))
-            .letter_spacing(draw.style.tracking_em * size),
+            // Cosmic Text's public letter-spacing unit is em. It resolves the value
+            // against Metrics::font_size while shaping, so converting it to pixels
+            // here would multiply by the font size a second time.
+            .letter_spacing(draw.style.tracking_em),
         tracked_text::Shaping::Advanced,
         None,
     );
@@ -1296,12 +1299,12 @@ mod tests {
         assert!(weights.contains(&800));
     }
 
-    fn tracked_layout(text: &str, width: f32, spacing: f32) -> Vec<(f32, Vec<f32>)> {
+    fn tracked_layout(text: &str, width: f32, size: f32, spacing_em: f32) -> Vec<(f32, Vec<f32>)> {
         let mut db = tracked_text::fontdb::Database::new();
         db.load_font_data(MANROPE.to_vec());
         let mut fonts = tracked_text::FontSystem::new_with_locale_and_db("en-US".into(), db);
         let mut buffer =
-            tracked_text::Buffer::new(&mut fonts, tracked_text::Metrics::new(11.5, 14.375));
+            tracked_text::Buffer::new(&mut fonts, tracked_text::Metrics::new(size, size * 1.25));
         buffer.set_size(&mut fonts, Some(width), Some(200.0));
         buffer.set_text(
             &mut fonts,
@@ -1309,7 +1312,7 @@ mod tests {
             &tracked_text::Attrs::new()
                 .family(tracked_text::Family::Name("Manrope"))
                 .weight(tracked_text::Weight(700))
-                .letter_spacing(spacing),
+                .letter_spacing(spacing_em),
             tracked_text::Shaping::Advanced,
             None,
         );
@@ -1321,30 +1324,54 @@ mod tests {
     }
 
     #[test]
-    fn tracked_run_width_is_the_sum_of_its_tracked_advances() {
-        let runs = tracked_layout("EYEBROW", 1_000.0, 11.5 * 0.14);
-        assert_eq!(runs.len(), 1);
-        let (measured, advances) = &runs[0];
+    fn eyebrow_advance_is_exactly_natural_plus_token_tracking() {
+        let text = "READY NOW · 3";
+        let natural = tracked_layout(text, 1_000.0, 11.5, 0.0);
+        let tracked = tracked_layout(text, 1_000.0, 11.5, 0.14);
+        assert_eq!(natural.len(), 1);
+        assert_eq!(tracked.len(), 1);
+        let (measured, advances) = &tracked[0];
+        let natural_advances = &natural[0].1;
+        assert_eq!(advances.len(), natural_advances.len());
+        for (index, (advance, natural_advance)) in advances.iter().zip(natural_advances).enumerate()
+        {
+            let expected = natural_advance + 0.14 * 11.5;
+            assert!(
+                (advance - expected).abs() < 0.001,
+                "glyph {index}: {advance} != {natural_advance} + {}",
+                0.14 * 11.5
+            );
+        }
         let advance_sum: f32 = advances.iter().sum();
         assert!(
             (measured - advance_sum).abs() < 0.001,
             "{measured} != {advance_sum}"
         );
+        assert!(
+            (70.0..=110.0).contains(measured),
+            "eyebrow width {measured}px is outside the ruled band"
+        );
     }
 
     #[test]
-    fn tracked_eyebrow_wraps_before_crossing_the_node_clip() {
-        let text = "TRACKED EYEBROW";
-        let untracked_width = tracked_layout(text, 1_000.0, 0.0)[0].0;
-        let tracked_width = tracked_layout(text, 1_000.0, 11.5 * 0.14)[0].0;
-        assert!(tracked_width > untracked_width);
+    fn eyebrow_fits_220px_on_one_line_and_text_scale_doubles_width() {
+        let text = "READY NOW · 3";
+        let scale_one = tracked_layout(text, 220.0, 11.5, 0.14);
+        let scale_two = tracked_layout(text, 440.0, 23.0, 0.14);
+        assert_eq!(scale_one.len(), 1);
+        assert_eq!(scale_two.len(), 1);
+        assert!((scale_two[0].0 - scale_one[0].0 * 2.0).abs() < 0.001);
+    }
 
-        let node_width = (untracked_width + tracked_width) / 2.0;
-        assert_eq!(tracked_layout(text, node_width, 0.0).len(), 1);
-        let tracked = tracked_layout(text, node_width, 11.5 * 0.14);
-        assert!(tracked.len() > 1, "tracking-aware text did not wrap");
-        assert!(tracked
-            .iter()
-            .all(|(line_width, _)| *line_width <= node_width));
+    #[test]
+    fn untracked_roles_keep_byte_identical_advances() {
+        for role in [TypeRole::Body, TypeRole::Label] {
+            let style = parse_type_role(role);
+            assert_eq!(style.tracking_em, 0.0);
+            let baseline = tracked_layout("Baseline text", 1_000.0, style.size_px, 0.0);
+            let resolved =
+                tracked_layout("Baseline text", 1_000.0, style.size_px, style.tracking_em);
+            assert_eq!(resolved, baseline, "{role:?} advances changed");
+        }
     }
 }
