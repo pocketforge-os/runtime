@@ -169,6 +169,7 @@ pub struct Rasterizer {
     glyphs: tracked_text::SwashCache,
     previous: Vec<NodeSnapshot>,
     images: ImageCache,
+    rounded_shadows: HashMap<(u8, u8, u32), RoundedShadowAsset>,
     theme_base: ThemeBase,
     style: ResolvedStyleSnapshot,
     typography: TypographySnapshot,
@@ -180,7 +181,19 @@ struct ShadowAsset {
     elevation: Elevation,
     side: usize,
     margin: usize,
+    offset_x: f32,
+    offset_y: f32,
+    blur: f32,
+    spread: f32,
+    color: [u8; 4],
     rgba: &'static [u8],
+}
+
+struct RoundedShadowAsset {
+    side: usize,
+    slice_margin: usize,
+    effect_margin: usize,
+    rgba: Vec<u8>,
 }
 
 const SHADOW_ASSETS: &[ShadowAsset] = include!(concat!(env!("OUT_DIR"), "/shadow_assets.rs"));
@@ -231,6 +244,7 @@ impl Rasterizer {
             glyphs: tracked_text::SwashCache::new(),
             previous: Vec::new(),
             images: ImageCache::default(),
+            rounded_shadows: HashMap::new(),
             theme_base: ThemeBase::Dusk,
             style: pf_theme::flagship()
                 .resolved_style(ThemeBase::Dusk)
@@ -282,6 +296,7 @@ impl Rasterizer {
             fonts: &mut self.fonts,
             glyphs: &mut self.glyphs,
             images: &mut self.images,
+            rounded_shadows: &mut self.rounded_shadows,
             notes: &mut notes,
             style: &self.style,
             typography: &self.typography,
@@ -563,6 +578,7 @@ struct DrawContext<'a> {
     fonts: &'a mut tracked_text::FontSystem,
     glyphs: &'a mut tracked_text::SwashCache,
     images: &'a mut ImageCache,
+    rounded_shadows: &'a mut HashMap<(u8, u8, u32), RoundedShadowAsset>,
     notes: &'a mut Vec<RenderNote>,
     style: &'a ResolvedStyleSnapshot,
     typography: &'a TypographySnapshot,
@@ -595,8 +611,9 @@ fn draw_node(
     let radius = clamped_radius(transformed_radius, b) * scale;
 
     if node.elevation != Elevation::None {
-        draw_shadow(
+        draw_node_shadow(
             pm,
+            context.rounded_shadows,
             shadow_asset(context.style.base(), node.elevation),
             b,
             scale,
@@ -604,8 +621,9 @@ fn draw_node(
         );
     }
     if node.state.focused && node.elevation != Elevation::Focus {
-        draw_shadow(
+        draw_node_shadow(
             pm,
+            context.rounded_shadows,
             shadow_asset(context.style.base(), Elevation::Focus),
             b,
             scale,
@@ -987,41 +1005,183 @@ fn draw_focus_ring(
     Ok(())
 }
 
-fn draw_shadow(pm: &mut Pixmap, asset: &ShadowAsset, b: Bounds, scale: f32, radius: f32) {
-    if asset.margin == 0 {
+fn draw_node_shadow(
+    pm: &mut Pixmap,
+    cache: &mut HashMap<(u8, u8, u32), RoundedShadowAsset>,
+    asset: &ShadowAsset,
+    b: Bounds,
+    scale: f32,
+    radius: f32,
+) {
+    if radius <= 0.0 {
+        draw_shadow(
+            pm,
+            asset.rgba,
+            asset.side,
+            asset.margin,
+            asset.margin,
+            b,
+            scale,
+        );
         return;
     }
-    let margin = (asset.margin as f32 * scale).round().max(1.0) as i32;
+    let logical_radius = (radius / scale).round().max(1.0) as u32;
+    let key = (
+        theme_base_key(asset.base),
+        elevation_key(asset.elevation),
+        logical_radius,
+    );
+    let rounded = cache
+        .entry(key)
+        .or_insert_with(|| bake_rounded_shadow(asset, logical_radius as usize));
+    draw_shadow(
+        pm,
+        &rounded.rgba,
+        rounded.side,
+        rounded.slice_margin,
+        rounded.effect_margin,
+        b,
+        scale,
+    );
+}
+
+fn theme_base_key(base: ThemeBase) -> u8 {
+    match base {
+        ThemeBase::Dusk => 0,
+        ThemeBase::Day => 1,
+        ThemeBase::HighContrast => 2,
+    }
+}
+
+fn elevation_key(elevation: Elevation) -> u8 {
+    match elevation {
+        Elevation::None => 0,
+        Elevation::Elev1 => 1,
+        Elevation::Elev2 => 2,
+        Elevation::Focus => 3,
+    }
+}
+
+fn bake_rounded_shadow(asset: &ShadowAsset, radius: usize) -> RoundedShadowAsset {
+    let core = radius * 2 + 3;
+    let side = asset.margin * 2 + core;
+    let mut mask = vec![0.0f32; side * side];
+    let grow = asset.spread.round() as isize;
+    let left = asset.margin as isize + asset.offset_x.round() as isize - grow;
+    let top = asset.margin as isize + asset.offset_y.round() as isize - grow;
+    let width = core as f32 + (grow * 2) as f32;
+    let expanded_radius = (radius as f32 + grow as f32).max(0.0);
+    for y in 0..side {
+        for x in 0..side {
+            mask[y * side + x] = rounded_coverage(
+                x as f32 + 0.5 - left as f32,
+                y as f32 + 0.5 - top as f32,
+                width,
+                width,
+                expanded_radius,
+            );
+        }
+    }
+    blur_mask(&mut mask, side, asset.blur);
+    // The legacy 3px source establishes the shipped straight-edge penumbra intensity. A larger
+    // rounded source has more blur mass, so normalize it to that edge sample while retaining the
+    // rounded mask's corner falloff.
+    let legacy_edge_alpha =
+        f32::from(asset.rgba[(asset.margin * asset.side + asset.side / 2) * 4 + 3]);
+    let rounded_edge_alpha = mask[asset.margin * side + side / 2] * f32::from(asset.color[3]);
+    let normalization = if rounded_edge_alpha > 0.0 {
+        legacy_edge_alpha / rounded_edge_alpha
+    } else {
+        1.0
+    };
+    let mut rgba = Vec::with_capacity(side * side * 4);
+    for alpha in mask {
+        rgba.extend_from_slice(&[
+            asset.color[0],
+            asset.color[1],
+            asset.color[2],
+            (alpha * normalization * f32::from(asset.color[3])).round() as u8,
+        ]);
+    }
+    RoundedShadowAsset {
+        side,
+        slice_margin: asset.margin + radius,
+        effect_margin: asset.margin,
+        rgba,
+    }
+}
+
+fn blur_mask(mask: &mut [f32], side: usize, blur: f32) {
+    if blur <= 0.0 {
+        return;
+    }
+    let radius = blur.ceil() as isize;
+    let sigma = blur / 2.0;
+    let kernel: Vec<f32> = (-radius..=radius)
+        .map(|x| (-(x * x) as f32 / (2.0 * sigma * sigma)).exp())
+        .collect();
+    let sum: f32 = kernel.iter().sum();
+    let kernel: Vec<f32> = kernel.into_iter().map(|value| value / sum).collect();
+    let mut tmp = vec![0.0; mask.len()];
+    for y in 0..side {
+        for x in 0..side {
+            tmp[y * side + x] = (-radius..=radius)
+                .filter_map(|offset| {
+                    usize::try_from(x as isize + offset)
+                        .ok()
+                        .filter(|position| *position < side)
+                        .map(|position| {
+                            mask[y * side + position] * kernel[(offset + radius) as usize]
+                        })
+                })
+                .sum();
+        }
+    }
+    for y in 0..side {
+        for x in 0..side {
+            mask[y * side + x] = (-radius..=radius)
+                .filter_map(|offset| {
+                    usize::try_from(y as isize + offset)
+                        .ok()
+                        .filter(|position| *position < side)
+                        .map(|position| {
+                            tmp[position * side + x] * kernel[(offset + radius) as usize]
+                        })
+                })
+                .sum();
+        }
+    }
+}
+
+fn draw_shadow(
+    pm: &mut Pixmap,
+    rgba: &[u8],
+    side: usize,
+    source_margin: usize,
+    effect_margin: usize,
+    b: Bounds,
+    scale: f32,
+) {
+    if effect_margin == 0 {
+        return;
+    }
+    let margin = (effect_margin as f32 * scale).round().max(1.0) as i32;
+    let destination_margin = (source_margin as f32 * scale).round().max(1.0) as i32;
     let left = (b.x * scale).round() as i32 - margin;
     let top = (b.y * scale).round() as i32 - margin;
     let width = (b.width * scale).round().max(1.0) as i32 + margin * 2;
     let height = (b.height * scale).round().max(1.0) as i32 + margin * 2;
     for dy in 0..height {
-        let sy = slice_coordinate(dy, height, asset.side, asset.margin, margin);
+        let sy = slice_coordinate(dy, height, side, source_margin, destination_margin);
         for dx in 0..width {
             let x = left + dx;
             let y = top + dy;
             if x < 0 || y < 0 || x >= pm.width() as i32 || y >= pm.height() as i32 {
                 continue;
             }
-            let sx = slice_coordinate(dx, width, asset.side, asset.margin, margin);
-            let index = (sy * asset.side + sx) * 4;
-            let coverage = if radius > 0.0 {
-                rounded_coverage(
-                    dx as f32 + 0.5,
-                    dy as f32 + 0.5,
-                    width as f32,
-                    height as f32,
-                    radius + margin as f32,
-                )
-            } else {
-                1.0
-            };
-            if coverage == 0.0 {
-                continue;
-            }
-            let mut color: [u8; 4] = asset.rgba[index..index + 4].try_into().unwrap();
-            color[3] = (f32::from(color[3]) * coverage).round() as u8;
+            let sx = slice_coordinate(dx, width, side, source_margin, destination_margin);
+            let index = (sy * side + sx) * 4;
+            let color: [u8; 4] = rgba[index..index + 4].try_into().unwrap();
             blend_pixel(pm, x as u32, y as u32, color);
         }
     }
@@ -1944,6 +2104,62 @@ mod tests {
     }
 
     #[test]
+    fn rounded_shadow_bakes_from_radius_silhouette_and_keeps_straight_penumbra() {
+        for elevation in [Elevation::Elev1, Elevation::Elev2, Elevation::Focus] {
+            let square = shadow_asset(ThemeBase::Dusk, elevation);
+            for radius in [16usize, 20] {
+                let rounded = bake_rounded_shadow(square, radius);
+                let alpha =
+                    |rgba: &[u8], side: usize, x: usize, y: usize| rgba[(y * side + x) * 4 + 3];
+
+                // The old square source has its strongest corner contribution here. A rounded
+                // source removes that corner before blur, including for a 40px pill (r=20).
+                let square_corner = alpha(
+                    square.rgba,
+                    square.side,
+                    square.margin + 1,
+                    square.margin + 1,
+                );
+                let rounded_corner =
+                    alpha(&rounded.rgba, rounded.side, square.margin, square.margin);
+                assert!(
+                    rounded_corner <= 8 && rounded_corner <= square_corner,
+                    "{elevation:?} r={radius}: rounded={rounded_corner}, square={square_corner}"
+                );
+
+                // Far from the corner, the rounded mask is the same half-plane as the square
+                // mask, so its blur must retain the existing straight-edge penumbra profile.
+                let square_edge = alpha(square.rgba, square.side, square.side / 2, square.margin);
+                let rounded_edge =
+                    alpha(&rounded.rgba, rounded.side, rounded.side / 2, square.margin);
+                assert!(
+                    rounded_edge.abs_diff(square_edge) <= 1,
+                    "{elevation:?} r={radius}: rounded={rounded_edge}, square={square_edge}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn zero_radius_shadow_draw_remains_byte_identical_to_prebaked_asset_path() {
+        let asset = shadow_asset(ThemeBase::Dusk, Elevation::Elev2);
+        let bounds = Bounds::new(32.0, 32.0, 40.0, 40.0);
+        let mut expected = Pixmap::new(112, 112).unwrap();
+        draw_shadow(
+            &mut expected,
+            asset.rgba,
+            asset.side,
+            asset.margin,
+            asset.margin,
+            bounds,
+            1.0,
+        );
+        let mut actual = Pixmap::new(112, 112).unwrap();
+        draw_node_shadow(&mut actual, &mut HashMap::new(), asset, bounds, 1.0, 0.0);
+        assert_eq!(actual.data(), expected.data());
+    }
+
+    #[test]
     fn nine_slice_edge_texels_keep_scaled_source_provenance() {
         let side = 7usize;
         let margin = 2usize;
@@ -1958,6 +2174,11 @@ mod tests {
             elevation: Elevation::Elev1,
             side,
             margin,
+            offset_x: 0.0,
+            offset_y: 0.0,
+            blur: 0.0,
+            spread: 0.0,
+            color: [0, 0, 0, 255],
             rgba: Box::leak(rgba.into_boxed_slice()),
         };
 
@@ -1965,10 +2186,12 @@ mod tests {
             let mut pm = Pixmap::new(64, 32).unwrap();
             draw_shadow(
                 &mut pm,
-                &asset,
+                asset.rgba,
+                asset.side,
+                asset.margin,
+                asset.margin,
                 Bounds::new(10.0, 10.0, 12.0, 8.0),
                 scale,
-                0.0,
             );
             pm
         };
