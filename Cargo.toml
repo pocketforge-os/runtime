@@ -45,6 +45,7 @@ pf-ports = { path = "crates/pf-ports", version = "0.0.1" }
 pf-scene = { path = "crates/pf-scene", version = "0.0.1" }
 pf-input-map = { path = "crates/pf-input-map", version = "0.0.1" }
 pf-render = { path = "crates/pf-render", version = "0.0.1" }
+pf-theme = { path = "crates/pf-theme", version = "0.0.1" }
 pf-framehost-wayland = { path = "crates/pf-framehost-wayland", version = "0.0.1" }
 pf-session-authority = { path = "crates/pf-session-authority", version = "0.0.1" }
 serde = { version = "1", features = ["derive"] }

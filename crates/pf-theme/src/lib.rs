@@ -13,6 +13,50 @@ use std::path::{Component, Path, PathBuf};
 
 const MANIFEST: &str = "manifest.json";
 const TOKENS: &str = "tokens.json";
+/// Base-scoped tokens whose resolved values are consumed by native renderers.
+pub const STYLE_TOKENS: &[&str] = &[
+    "--color-surface-canvas",
+    "--color-surface-raised",
+    "--color-surface-overlay",
+    "--color-surface-sunken",
+    "--color-surface-scrim",
+    "--color-text-primary",
+    "--color-text-secondary",
+    "--color-text-muted",
+    "--color-text-inverse",
+    "--color-border-hairline",
+    "--color-border-strong",
+    "--color-focus-ring",
+    "--color-focus-glow",
+    "--focus-ring-width",
+    "--focus-ring-offset",
+    "--state-rest-surface",
+    "--state-rest-text",
+    "--state-focused-ring",
+    "--state-focused-text",
+    "--state-selected-accent",
+    "--state-pressed-shift",
+    "--state-disabled-text",
+    "--state-disabled-border",
+    "--state-unavailable-text",
+    "--state-unavailable-veil",
+    "--state-destructive-accent",
+    "--color-status-ready",
+    "--color-status-attention",
+    "--color-status-stopped",
+    "--deco-plate-a-bg",
+    "--deco-plate-a-fg",
+    "--deco-plate-b-bg",
+    "--deco-plate-b-fg",
+    "--deco-plate-c-bg",
+    "--deco-plate-c-fg",
+    "--deco-plate-d-bg",
+    "--deco-plate-d-fg",
+    "--deco-plate-e-bg",
+    "--deco-plate-e-fg",
+    "--deco-plate-f-bg",
+    "--deco-plate-f-fg",
+];
 const BASE_TOKENS: &[&str] = &[
     "--color-surface-canvas",
     "--color-surface-raised",
@@ -104,27 +148,80 @@ const THEME_TOKENS: &[&str] = &[
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum Base {
-    Dark,
-    Light,
+    Dusk,
+    Day,
     HighContrast,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Rgba {
+    pub red: u8,
+    pub green: u8,
+    pub blue: u8,
+    pub alpha: u8,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Length {
+    pub pixels: f32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum StyleValue {
+    Color(Rgba),
+    Length(Length),
+}
+
+/// Fully parsed, base-specific native-rendering values from `tokens.json`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ResolvedStyleSnapshot {
+    base: Base,
+    values: BTreeMap<String, StyleValue>,
+}
+
+impl ResolvedStyleSnapshot {
+    pub fn base(&self) -> Base {
+        self.base
+    }
+
+    pub fn resolve(&self, key: &str) -> Result<StyleValue, ResolveError> {
+        self.values
+            .get(key)
+            .copied()
+            .ok_or_else(|| ResolveError::UnknownStyleKey(key.into()))
+    }
+
+    pub fn color(&self, key: &str) -> Result<Rgba, ResolveError> {
+        match self.resolve(key)? {
+            StyleValue::Color(value) => Ok(value),
+            StyleValue::Length(_) => Err(ResolveError::StyleTypeMismatch(key.into())),
+        }
+    }
+
+    pub fn length(&self, key: &str) -> Result<Length, ResolveError> {
+        match self.resolve(key)? {
+            StyleValue::Length(value) => Ok(value),
+            StyleValue::Color(_) => Err(ResolveError::StyleTypeMismatch(key.into())),
+        }
+    }
 }
 impl Base {
     fn key(self) -> &'static str {
         match self {
-            Self::Dark => "dark",
-            Self::Light => "light",
+            Self::Dusk => "dark",
+            Self::Day => "light",
             Self::HighContrast => "high-contrast",
         }
     }
     fn css_selector(self) -> &'static str {
         match self {
-            Self::Dark => ":root",
-            Self::Light => "[data-base=\"day\"]",
+            Self::Dusk => ":root",
+            Self::Day => "[data-base=\"day\"]",
             Self::HighContrast => "[data-base=\"contrast\"]",
         }
     }
 }
-const BASES: [Base; 3] = [Base::Dark, Base::Light, Base::HighContrast];
+const BASES: [Base; 3] = [Base::Dusk, Base::Day, Base::HighContrast];
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct Manifest {
@@ -233,6 +330,30 @@ impl Theme {
     ) -> Result<&'a str, ResolveError> {
         self.resolve(base, &node.style_token)
     }
+
+    pub fn resolved_style(&self, base: Base) -> Result<ResolvedStyleSnapshot, ResolveError> {
+        let mut values = BTreeMap::new();
+        for &key in STYLE_TOKENS {
+            let raw = self.resolve(base, key)?;
+            let value = if is_style_length(key) {
+                StyleValue::Length(parse_length(raw).ok_or_else(|| {
+                    ResolveError::InvalidResolvedValue {
+                        key: key.into(),
+                        value: raw.into(),
+                    }
+                })?)
+            } else {
+                StyleValue::Color(parse_rgba(raw).ok_or_else(|| {
+                    ResolveError::InvalidResolvedValue {
+                        key: key.into(),
+                        value: raw.into(),
+                    }
+                })?)
+            };
+            values.insert(key.into(), value);
+        }
+        Ok(ResolvedStyleSnapshot { base, values })
+    }
     pub fn resolve_motion(
         &self,
         intent: &str,
@@ -293,6 +414,32 @@ pub enum ResolveError {
     AbsentBase(Base),
     AbsentToken { base: Base, key: String },
     UnknownMotion(String),
+    UnknownStyleKey(String),
+    StyleTypeMismatch(String),
+    InvalidResolvedValue { key: String, value: String },
+}
+
+fn is_style_length(key: &str) -> bool {
+    matches!(
+        key,
+        "--focus-ring-width" | "--focus-ring-offset" | "--state-pressed-shift"
+    )
+}
+
+fn parse_length(value: &str) -> Option<Length> {
+    Some(Length {
+        pixels: value.strip_suffix("px")?.parse().ok()?,
+    })
+}
+
+fn parse_rgba(value: &str) -> Option<Rgba> {
+    let parsed = parse_color(value)?;
+    Some(Rgba {
+        red: (parsed[0] * 255.0).round() as u8,
+        green: (parsed[1] * 255.0).round() as u8,
+        blue: (parsed[2] * 255.0).round() as u8,
+        alpha: (parsed[3] * 255.0).round() as u8,
+    })
 }
 #[derive(Debug)]
 pub enum LoadError {
@@ -398,6 +545,8 @@ fn read_json<T: for<'a> Deserialize<'a>>(
 pub fn flagship() -> Theme {
     let manifest = serde_json::from_str(include_str!("../vendor/package/manifest.json"))
         .expect("embedded flagship manifest");
+    // Fixture source: pocketforge-os/design/theme-quiet-console/package/tokens.json
+    // at design commit d5b97d97430ec67ccedbe1508e4c55a184843f8c.
     let tokens = serde_json::from_str(include_str!("../vendor/package/tokens.json"))
         .expect("embedded flagship tokens");
     Theme { manifest, tokens }
@@ -823,6 +972,60 @@ fn lum(c: [f64; 4]) -> f64 {
 }
 fn contrast(a: f64, b: f64) -> f64 {
     (a.max(b) + 0.05) / (a.min(b) + 0.05)
+}
+
+#[cfg(test)]
+mod resolved_style_tests {
+    use super::*;
+
+    #[test]
+    fn every_native_style_token_is_exactly_typed_in_all_bases() {
+        let theme = flagship();
+        for base in BASES {
+            let snapshot = theme.resolved_style(base).unwrap();
+            assert_eq!(snapshot.base(), base);
+            for &key in STYLE_TOKENS {
+                let raw = theme.resolve(base, key).unwrap();
+                let expected = if is_style_length(key) {
+                    StyleValue::Length(parse_length(raw).unwrap())
+                } else {
+                    StyleValue::Color(parse_rgba(raw).unwrap())
+                };
+                assert_eq!(snapshot.resolve(key).unwrap(), expected, "{base:?} {key}");
+            }
+        }
+    }
+
+    #[test]
+    fn representative_ruled_values_match_tokens_json() {
+        let theme = flagship();
+        let samples = [
+            ("--color-surface-canvas", ["#171512", "#f2eee4", "#000000"]),
+            ("--color-focus-ring", ["#f3dfae", "#8a6414", "#ffd83d"]),
+            (
+                "--state-destructive-accent",
+                ["#e07a6e", "#a83a2e", "#ff8d80"],
+            ),
+        ];
+        for (key, expected) in samples {
+            for (index, base) in BASES.into_iter().enumerate() {
+                assert_eq!(theme.resolve(base, key).unwrap(), expected[index]);
+                assert_eq!(
+                    theme.resolved_style(base).unwrap().color(key).unwrap(),
+                    parse_rgba(expected[index]).unwrap()
+                );
+            }
+        }
+        assert_eq!(
+            theme
+                .resolved_style(Base::Dusk)
+                .unwrap()
+                .color("--deco-plate-a-bg")
+                .unwrap()
+                .alpha,
+            0x48
+        );
+    }
 }
 
 fn reject_symlinks(root: &Path) -> Result<(), LoadError> {

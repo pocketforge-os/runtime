@@ -1,14 +1,16 @@
 //! Deterministic scene rasterization on the ruled Cosmic Text/Swash/tiny-skia stack.
 //!
-//! This crate exposes only the minimal raster palette seam. Unifying these colors with
-//! the full `pf-theme` token set is intentionally left to a follow-on change.
+//! All paint colors are resolved from the active `pf-theme` base at presentation time.
 
 use cosmic_text::{fontdb, Attrs, Buffer, Color, Family, FontSystem, Metrics, Shaping, SwashCache};
 use pf_scene::{Bounds, ImageFit, ImageSource, Node, NodeContent, Scene, SurfaceMetrics};
+pub use pf_theme::Base as ThemeBase;
+use pf_theme::{ResolvedStyleSnapshot, Rgba};
 use std::collections::{HashMap, VecDeque};
 use std::io::Cursor;
 use tiny_skia::{
-    Color as SkColor, FilterQuality, Mask, Paint, Pixmap, PixmapPaint, Rect, Transform,
+    Color as SkColor, FilterQuality, Mask, Paint, PathBuilder, Pixmap, PixmapPaint, Rect, Stroke,
+    Transform,
 };
 
 const MANROPE: &[u8] =
@@ -19,46 +21,6 @@ const CJK: &[u8] = include_bytes!("../fonts/NotoSansCJK-Regular.ttc");
 /// Maximum decoded PNG dimensions accepted by the rasterizer (8 megapixels).
 pub const MAX_IMAGE_PIXELS: u64 = 8_000_000;
 const IMAGE_CACHE_CAPACITY: usize = 16;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct Palette {
-    pub background: (u8, u8, u8),
-    pub text: (u8, u8, u8),
-    pub node_default: (u8, u8, u8),
-    pub node_focused: (u8, u8, u8),
-    pub node_selected: (u8, u8, u8),
-    pub node_disabled: (u8, u8, u8),
-}
-
-impl Palette {
-    pub const fn standard() -> Self {
-        Self {
-            background: (13, 17, 23),
-            text: (244, 234, 220),
-            node_default: (26, 36, 48),
-            node_focused: (36, 65, 95),
-            node_selected: (44, 58, 72),
-            node_disabled: (32, 36, 42),
-        }
-    }
-
-    pub const fn high_contrast() -> Self {
-        Self {
-            background: (0, 0, 0),
-            text: (255, 255, 255),
-            node_default: (0, 0, 0),
-            node_focused: (0, 102, 204),
-            node_selected: (80, 80, 80),
-            node_disabled: (20, 20, 20),
-        }
-    }
-}
-
-impl Default for Palette {
-    fn default() -> Self {
-        Self::standard()
-    }
-}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DamageRect {
@@ -113,7 +75,8 @@ pub struct Rasterizer {
     glyphs: SwashCache,
     previous: Vec<NodeSnapshot>,
     images: ImageCache,
-    palette: Palette,
+    theme_base: ThemeBase,
+    style: ResolvedStyleSnapshot,
 }
 
 #[derive(Clone, PartialEq)]
@@ -123,6 +86,7 @@ struct NodeSnapshot {
     sibling_index: usize,
     bounds: Bounds,
     label: String,
+    style_token: String,
     focused: bool,
     disabled: bool,
     selected: bool,
@@ -153,13 +117,19 @@ impl Rasterizer {
             glyphs: SwashCache::new(),
             previous: Vec::new(),
             images: ImageCache::default(),
-            palette: Palette::standard(),
+            theme_base: ThemeBase::Dusk,
+            style: pf_theme::flagship()
+                .resolved_style(ThemeBase::Dusk)
+                .expect("embedded dusk style snapshot"),
         }
     }
 
-    pub fn set_palette(&mut self, palette: Palette) {
-        if self.palette != palette {
-            self.palette = palette;
+    pub fn set_theme_base(&mut self, base: ThemeBase) {
+        if self.theme_base != base {
+            self.style = pf_theme::flagship()
+                .resolved_style(base)
+                .expect("embedded theme base is complete and typed");
+            self.theme_base = base;
             self.previous.clear();
         }
     }
@@ -172,12 +142,12 @@ impl Rasterizer {
         let width = physical(metrics.logical_width, metrics.scale)?;
         let height = physical(metrics.logical_height, metrics.scale)?;
         let mut pixmap = Pixmap::new(width, height).ok_or(RenderError::InvalidSurface)?;
-        let background = self.palette.background;
+        let background = style_color(&self.style, "--color-surface-canvas")?;
         pixmap.fill(SkColor::from_rgba8(
-            background.0,
-            background.1,
-            background.2,
-            255,
+            background.red,
+            background.green,
+            background.blue,
+            background.alpha,
         ));
         let mut notes = Vec::new();
         let mut context = DrawContext {
@@ -185,9 +155,9 @@ impl Rasterizer {
             glyphs: &mut self.glyphs,
             images: &mut self.images,
             notes: &mut notes,
-            palette: self.palette,
+            style: &self.style,
         };
-        draw_node(&mut pixmap, &mut context, scene.root(), metrics.scale);
+        draw_node(&mut pixmap, &mut context, scene.root(), metrics.scale)?;
         let mut current = Vec::new();
         collect(scene.root(), None, 0, &mut current);
         let damage = damage(&self.previous, &current, metrics.scale, width, height);
@@ -208,9 +178,10 @@ impl Default for Rasterizer {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RenderError {
     InvalidSurface,
+    UnknownStyleKey(String),
 }
 
 fn physical(logical: f32, scale: f32) -> Result<u32, RenderError> {
@@ -234,6 +205,7 @@ fn collect(
         sibling_index,
         bounds: node.bounds,
         label: node.accessible_label.clone(),
+        style_token: node.style_token.clone(),
         focused: node.state.focused,
         disabled: node.state.disabled,
         selected: node.state.selected,
@@ -298,26 +270,67 @@ struct DrawContext<'a> {
     glyphs: &'a mut SwashCache,
     images: &'a mut ImageCache,
     notes: &'a mut Vec<RenderNote>,
-    palette: Palette,
+    style: &'a ResolvedStyleSnapshot,
 }
 
-fn draw_node(pm: &mut Pixmap, context: &mut DrawContext<'_>, node: &Node, scale: f32) {
+fn style_color(style: &ResolvedStyleSnapshot, key: &str) -> Result<Rgba, RenderError> {
+    style.color(key).map_err(|_| {
+        debug_assert!(false, "unknown or non-color style key: {key}");
+        RenderError::UnknownStyleKey(key.into())
+    })
+}
+
+fn draw_node(
+    pm: &mut Pixmap,
+    context: &mut DrawContext<'_>,
+    node: &Node,
+    scale: f32,
+) -> Result<(), RenderError> {
     let b = node.bounds;
-    let color = if node.state.focused {
-        context.palette.node_focused
-    } else if node.state.disabled {
-        context.palette.node_disabled
-    } else if node.state.selected {
-        context.palette.node_selected
+    let surface_key = if node.state.selected {
+        "--state-selected-accent"
     } else {
-        context.palette.node_default
+        &node.style_token
     };
+    let color = style_color(context.style, surface_key)?;
     if let Some(rect) = Rect::from_xywh(b.x * scale, b.y * scale, b.width * scale, b.height * scale)
     {
         let mut paint = Paint::default();
-        paint.set_color_rgba8(color.0, color.1, color.2, 255);
+        paint.set_color_rgba8(color.red, color.green, color.blue, color.alpha);
         pm.fill_rect(rect, &paint, Transform::identity(), None);
+        if node.state.focused {
+            let ring = style_color(context.style, "--state-focused-ring")?;
+            paint.set_color_rgba8(ring.red, ring.green, ring.blue, ring.alpha);
+            let width = context
+                .style
+                .length("--focus-ring-width")
+                .expect("typed focus width")
+                .pixels
+                * scale;
+            let stroke = Stroke {
+                width,
+                ..Stroke::default()
+            };
+            let inset = width / 2.0;
+            if let Some(ring_rect) = Rect::from_xywh(
+                rect.x() + inset,
+                rect.y() + inset,
+                rect.width() - width,
+                rect.height() - width,
+            ) {
+                let path = PathBuilder::from_rect(ring_rect);
+                pm.stroke_path(&path, &paint, &stroke, Transform::identity(), None);
+            }
+        }
     }
+    let text_key = if node.state.disabled {
+        "--state-disabled-text"
+    } else if node.state.focused {
+        "--state-focused-text"
+    } else {
+        "--state-rest-text"
+    };
+    let text = style_color(context.style, text_key)?;
     match &node.content {
         NodeContent::Label => draw_text(
             pm,
@@ -331,7 +344,7 @@ fn draw_node(pm: &mut Pixmap, context: &mut DrawContext<'_>, node: &Node, scale:
                 height: (b.height - 5.0).max(0.0) * scale,
                 size: 15.0 * scale,
                 clip: (b.x * scale, b.y * scale, b.width * scale, b.height * scale),
-                color: context.palette.text,
+                color: text,
             },
         ),
         NodeContent::Image { source, fit } => {
@@ -341,8 +354,9 @@ fn draw_node(pm: &mut Pixmap, context: &mut DrawContext<'_>, node: &Node, scale:
         }
     }
     for child in &node.children {
-        draw_node(pm, context, child, scale);
+        draw_node(pm, context, child, scale)?;
     }
+    Ok(())
 }
 
 fn draw_image(
@@ -475,7 +489,7 @@ struct TextDraw<'a> {
     height: f32,
     size: f32,
     clip: (f32, f32, f32, f32),
-    color: (u8, u8, u8),
+    color: Rgba,
 }
 
 fn draw_text(pm: &mut Pixmap, fonts: &mut FontSystem, glyphs: &mut SwashCache, draw: TextDraw<'_>) {
@@ -491,7 +505,12 @@ fn draw_text(pm: &mut Pixmap, fonts: &mut FontSystem, glyphs: &mut SwashCache, d
     buffer.draw(
         fonts,
         glyphs,
-        Color::rgb(draw.color.0, draw.color.1, draw.color.2),
+        Color::rgba(
+            draw.color.red,
+            draw.color.green,
+            draw.color.blue,
+            draw.color.alpha,
+        ),
         |gx, gy, gw, gh, color| {
             let alpha = color.a() as u32;
             let pixmap_width = pm.width() as usize;
@@ -540,7 +559,7 @@ mod tests {
             Role::Button,
             label,
             Bounds::new(3.0, 4.0, 250.0, 80.0),
-            "card",
+            "--state-rest-surface",
         )
         .with_action(NodeAction::Activate);
         Scene::new(root, NodeId::new("root").unwrap()).unwrap()
@@ -569,29 +588,36 @@ mod tests {
     }
 
     #[test]
-    fn standard_palette_is_the_default_and_high_contrast_changes_pixels() {
-        let scene = fixture("Palette");
+    fn dusk_is_the_default_and_all_bases_are_selectable() {
+        let scene = fixture("Theme");
         let default = Rasterizer::new().render(&scene, metrics()).unwrap();
-        let mut explicit_standard = Rasterizer::new();
-        explicit_standard.set_palette(Palette::standard());
+        let mut explicit_dusk = Rasterizer::new();
+        explicit_dusk.set_theme_base(ThemeBase::Dusk);
         assert_eq!(
             default.rgba,
-            explicit_standard.render(&scene, metrics()).unwrap().rgba
+            explicit_dusk.render(&scene, metrics()).unwrap().rgba
         );
 
         let mut high_contrast = Rasterizer::new();
-        high_contrast.set_palette(Palette::high_contrast());
+        high_contrast.set_theme_base(ThemeBase::HighContrast);
         let frame = high_contrast.render(&scene, metrics()).unwrap();
         assert_eq!(&frame.rgba[..4], &[0, 0, 0, 255]);
         assert!(frame
             .rgba
             .chunks_exact(4)
             .any(|pixel| pixel == [255, 255, 255, 255]));
+
+        let mut day = Rasterizer::new();
+        day.set_theme_base(ThemeBase::Day);
+        assert_eq!(
+            &day.render(&scene, metrics()).unwrap().rgba[..4],
+            &[242, 238, 228, 255]
+        );
     }
 
     #[test]
-    fn palette_change_invalidates_damage_once_but_identical_set_does_not() {
-        let scene = fixture("Palette");
+    fn theme_base_change_invalidates_damage_once_but_identical_set_does_not() {
+        let scene = fixture("Theme");
         let surface = metrics();
         let full_surface = Some(DamageRect {
             x: 0,
@@ -601,10 +627,10 @@ mod tests {
         });
         let mut rasterizer = Rasterizer::new();
 
-        let standard = rasterizer.render(&scene, surface).unwrap();
-        assert_eq!(&standard.rgba[..4], &[13, 17, 23, 255]);
+        let dusk = rasterizer.render(&scene, surface).unwrap();
+        assert_eq!(&dusk.rgba[..4], &[23, 21, 18, 255]);
 
-        rasterizer.set_palette(Palette::high_contrast());
+        rasterizer.set_theme_base(ThemeBase::HighContrast);
         let changed = rasterizer.render(&scene, surface).unwrap();
         assert_eq!(changed.damage, full_surface);
         assert_eq!(&changed.rgba[..4], &[0, 0, 0, 255]);
@@ -614,8 +640,56 @@ mod tests {
             .any(|pixel| pixel == [255, 255, 255, 255]));
 
         assert_eq!(rasterizer.render(&scene, surface).unwrap().damage, None);
-        rasterizer.set_palette(Palette::high_contrast());
+        rasterizer.set_theme_base(ThemeBase::HighContrast);
         assert_eq!(rasterizer.render(&scene, surface).unwrap().damage, None);
+    }
+
+    #[test]
+    fn focused_row_uses_base_ring_on_base_canvas() {
+        let mut root = Node::new(
+            NodeId::new("focused").unwrap(),
+            Role::Button,
+            "",
+            Bounds::new(3.0, 4.0, 250.0, 80.0),
+            "--state-rest-surface",
+        )
+        .with_action(NodeAction::Activate);
+        root.state.focused = true;
+        let scene = Scene::new(root, NodeId::new("focused").unwrap()).unwrap();
+        let dusk = Rasterizer::new().render(&scene, metrics()).unwrap();
+        assert_eq!(&dusk.rgba[..4], &[23, 21, 18, 255]);
+        assert!(dusk
+            .rgba
+            .chunks_exact(4)
+            .any(|pixel| pixel == [243, 223, 174, 255]));
+
+        let mut contrast = Rasterizer::new();
+        contrast.set_theme_base(ThemeBase::HighContrast);
+        let contrast = contrast.render(&scene, metrics()).unwrap();
+        assert_eq!(&contrast.rgba[..4], &[0, 0, 0, 255]);
+        assert!(contrast
+            .rgba
+            .chunks_exact(4)
+            .any(|pixel| pixel == [255, 216, 61, 255]));
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "unknown or non-color style key")]
+    fn unknown_node_style_key_fails_loudly_in_debug() {
+        let root = Node::new(
+            NodeId::new("unknown").unwrap(),
+            Role::Button,
+            "",
+            Bounds::new(3.0, 4.0, 250.0, 80.0),
+            "--not-a-real-style",
+        );
+        Rasterizer::new()
+            .render(
+                &Scene::new(root, NodeId::new("unknown").unwrap()).unwrap(),
+                metrics(),
+            )
+            .unwrap();
     }
 
     fn image_fixture(bytes: &'static [u8], fit: ImageFit) -> Scene {
@@ -624,7 +698,7 @@ mod tests {
             Role::Button,
             "cover art",
             Bounds::new(17.0, 11.0, 173.0, 129.0),
-            "art",
+            "--state-rest-surface",
         )
         .with_action(NodeAction::Activate)
         .with_image(
@@ -650,7 +724,7 @@ mod tests {
             .unwrap();
         assert!(first.notes.is_empty());
         assert_eq!(frame_hash(&first.rgba), frame_hash(&second.rgba));
-        assert_eq!(frame_hash(&first.rgba), 4_451_243_305_016_117_238);
+        assert_eq!(frame_hash(&first.rgba), 10_636_224_959_707_624_994);
     }
 
     #[test]
@@ -733,7 +807,7 @@ mod tests {
                 } else {
                     Bounds::new(50.0, 30.0, 80.0, 40.0)
                 },
-                "card",
+                "--state-rest-surface",
             )
         });
         let root = Node::new(
@@ -741,7 +815,7 @@ mod tests {
             Role::Button,
             "",
             Bounds::new(0.0, 0.0, 150.0, 90.0),
-            "root",
+            "--state-rest-surface",
         )
         .with_action(NodeAction::Activate)
         .with_children(children.into());
@@ -775,7 +849,7 @@ mod tests {
             Role::Button,
             "This label wraps across far more lines than fit",
             bounds,
-            "card",
+            "--state-rest-surface",
         )
         .with_action(NodeAction::Activate);
         let scene = Scene::new(node, NodeId::new("root").unwrap()).unwrap();
@@ -784,7 +858,7 @@ mod tests {
             for x in 0..frame.width {
                 if !(40..82).contains(&x) || !(30..54).contains(&y) {
                     let offset = (y * frame.width + x) as usize * 4;
-                    assert_eq!(&frame.rgba[offset..offset + 4], &[13, 17, 23, 255]);
+                    assert_eq!(&frame.rgba[offset..offset + 4], &[23, 21, 18, 255]);
                 }
             }
         }

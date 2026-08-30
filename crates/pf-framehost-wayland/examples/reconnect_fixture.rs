@@ -34,7 +34,7 @@ fn fixture() -> Scene {
         // Keep this identical to pf-framehost's offscreen/fbdev trait-parity fixture.
         "続ける",
         Bounds::new(7.0, 9.0, 120.0, 51.0),
-        "card",
+        "--state-rest-surface",
     )
     .with_action(NodeAction::Activate);
     Scene::new(node, NodeId::new("fixture-card").unwrap()).unwrap()

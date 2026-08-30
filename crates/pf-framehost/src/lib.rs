@@ -1,7 +1,7 @@
 //! Frame hosts own presentation while `pf-render` owns pixels and layout.
 
 use pf_ports::{FrameHost, PresentAck, PresentFailure, PresentResult};
-use pf_render::{DamageRect, Palette, RasterFrame, Rasterizer};
+use pf_render::{DamageRect, RasterFrame, Rasterizer, ThemeBase};
 use pf_scene::{Insets, Orientation, Scene, SurfaceMetrics};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Seek, SeekFrom, Write};
@@ -35,8 +35,8 @@ impl FrameHost for OffscreenHost {
     fn metrics(&self) -> SurfaceMetrics {
         self.metrics
     }
-    fn set_palette(&mut self, palette: Palette) {
-        self.renderer.set_palette(palette);
+    fn set_theme_base(&mut self, base: ThemeBase) {
+        self.renderer.set_theme_base(base);
     }
     fn present(&mut self, scene: &Scene) -> PresentResult {
         self.frame = Some(
@@ -204,8 +204,8 @@ impl FrameHost for FbdevHost {
     fn metrics(&self) -> SurfaceMetrics {
         self.metrics
     }
-    fn set_palette(&mut self, palette: Palette) {
-        self.renderer.set_palette(palette);
+    fn set_theme_base(&mut self, base: ThemeBase) {
+        self.renderer.set_theme_base(base);
     }
     fn present(&mut self, scene: &Scene) -> PresentResult {
         let frame = self
@@ -366,7 +366,7 @@ mod tests {
             Role::Button,
             "続ける",
             Bounds::new(7.0, 9.0, 120.0, 51.0),
-            "card",
+            "--state-rest-surface",
         )
         .with_action(NodeAction::Activate);
         Scene::new(n, NodeId::new("card").unwrap()).unwrap()
@@ -421,7 +421,7 @@ mod tests {
     }
 
     #[test]
-    fn offscreen_palette_takes_effect_on_next_present() {
+    fn offscreen_theme_base_takes_effect_on_next_present() {
         let mut host = OffscreenHost::new(SurfaceMetrics {
             logical_width: 319.0,
             logical_height: 181.0,
@@ -429,15 +429,15 @@ mod tests {
             safe_insets: Insets::default(),
             orientation: Orientation::Landscape,
         });
-        host.set_palette(Palette::high_contrast());
+        host.set_theme_base(ThemeBase::HighContrast);
         host.present(&scene()).unwrap();
         assert_high_contrast_frame(host.frame().unwrap());
     }
 
     #[test]
-    fn fbdev_palette_takes_effect_on_next_present() {
+    fn fbdev_theme_base_takes_effect_on_next_present() {
         let (mut host, _) = host(PixelFormat::Xrgb8888, false);
-        host.set_palette(Palette::high_contrast());
+        host.set_theme_base(ThemeBase::HighContrast);
         host.present(&scene()).unwrap();
         assert_high_contrast_frame(host.frame().unwrap());
     }
@@ -452,7 +452,7 @@ mod tests {
                 } else {
                     Bounds::new(50.0, 30.0, 80.0, 40.0)
                 },
-                "card",
+                "--state-rest-surface",
             )
         });
         let root = Node::new(
@@ -460,7 +460,7 @@ mod tests {
             Role::Button,
             "",
             Bounds::new(0.0, 0.0, 150.0, 90.0),
-            "root",
+            "--state-rest-surface",
         )
         .with_action(NodeAction::Activate)
         .with_children(children.into());
@@ -472,7 +472,7 @@ mod tests {
             Role::Button,
             label,
             Bounds::new(40.0, 30.0, 42.0, 24.0),
-            "card",
+            "--state-rest-surface",
         )
         .with_action(NodeAction::Activate);
         Scene::new(root, NodeId::new("root").unwrap()).unwrap()
