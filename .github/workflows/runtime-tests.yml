@@ -119,6 +119,11 @@ jobs:
           cargo --version
           cargo clippy --version
 
+      - name: Install desktop keyboard native dependency
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes libxkbcommon-dev
+
       - name: Cache cargo registry + target
         uses: actions/cache@1bd1e32a3bdc45362d1e726936510720a7c30a57  # v4
         with:
@@ -173,6 +178,11 @@ jobs:
         run: |
           cargo test --locked --workspace --no-fail-fast -- --nocapture
 
+      - name: cargo test — Wayland desktop keyboard feature
+        working-directory: runtime
+        run: |
+          cargo test --locked -p pf-framehost-wayland --features keyboard
+
       # The point of the cross-build step: prove a plain `cargo build
       # --target aarch64-unknown-linux-musl` links with NO per-invocation
       # RUSTFLAGS override on a runner whose default `cc` cannot emit
@@ -186,6 +196,8 @@ jobs:
             -p pf-input-collect --bin pf-input-collect
           cargo build --locked --target aarch64-unknown-linux-musl \
             -p pf-collect-ui --bin pf-collect-ui
+          cargo build --locked --target aarch64-unknown-linux-musl \
+            -p pf-framehost-wayland
 
       # LINT GATE (tsp-7rts). Until this step existed, no workflow in this repo ran
       # clippy at all — so lint failures accumulated in the tree with nothing able to
@@ -213,3 +225,5 @@ jobs:
         working-directory: runtime
         run: |
           cargo clippy --locked --workspace --all-targets -- -D warnings
+          cargo clippy --locked -p pf-framehost-wayland --all-targets \
+            --features keyboard -- -D warnings

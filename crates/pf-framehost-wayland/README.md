@@ -8,12 +8,15 @@ buffers and forwards raster damage with `wl_surface.damage_buffer`.
 loss is returned through `FrameHost` as `PresentFailure::SurfaceLost`; callers can use
 `WaylandHost::reconnect()` to rebuild the connection and all protocol objects.
 
-Keyboard input is additive: the host binds an available `wl_seat`/`wl_keyboard`, uses
+Keyboard input is available through the opt-in `keyboard` feature for desktop and
+simulator hosts. It binds an available `wl_seat`/`wl_keyboard`, uses
 the compositor's XKB keymap, and exposes transitions through the non-blocking
 `WaylandHost::poll_key_event()`. `KeyEvent::key` provides stable shell meanings while
 `KeyEvent::keysym` preserves the raw layout-aware keysym. `repeat_info()` exposes the
 compositor's rate and delay; repeat generation remains the caller's responsibility.
 No seat or keyboard capability is a supported state and simply produces no events.
+The feature is off by default so device/musl builds add no XKB native dependency;
+device input continues to use the evdev path.
 
 Headless smoke test (Ubuntu/Weston):
 

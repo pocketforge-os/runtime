@@ -7,21 +7,30 @@
 use pf_ports::{FrameHost, PresentAck, PresentFailure, PresentResult};
 use pf_render::{DamageRect, Rasterizer};
 use pf_scene::{Insets, Orientation, Scene, SurfaceMetrics};
+#[cfg(feature = "keyboard")]
 use std::collections::{HashMap, VecDeque};
 use std::fs::File;
 use std::io::{Seek, SeekFrom, Write};
-use std::os::fd::{AsFd, AsRawFd};
+use std::os::fd::AsFd;
+#[cfg(feature = "keyboard")]
+use std::os::fd::AsRawFd;
 use wayland_client::protocol::{
-    wl_buffer, wl_compositor, wl_keyboard, wl_registry, wl_seat, wl_shm, wl_shm_pool, wl_surface,
+    wl_buffer, wl_compositor, wl_registry, wl_shm, wl_shm_pool, wl_surface,
 };
-use wayland_client::{delegate_noop, Connection, Dispatch, EventQueue, QueueHandle, WEnum};
+#[cfg(feature = "keyboard")]
+use wayland_client::protocol::{wl_keyboard, wl_seat};
+#[cfg(feature = "keyboard")]
+use wayland_client::WEnum;
+use wayland_client::{delegate_noop, Connection, Dispatch, EventQueue, QueueHandle};
 use wayland_protocols::xdg::shell::client::{xdg_surface, xdg_toplevel, xdg_wm_base};
+#[cfg(feature = "keyboard")]
 use xkbcommon::xkb;
 
 const DEFAULT_WIDTH: u32 = 640;
 const DEFAULT_HEIGHT: u32 = 480;
 
 /// Press/release state reported by the compositor.
+#[cfg(feature = "keyboard")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum KeyState {
     Pressed,
@@ -29,6 +38,7 @@ pub enum KeyState {
 }
 
 /// Layout-aware key meaning used by the PocketForge shell.
+#[cfg(feature = "keyboard")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Key {
     Up,
@@ -42,6 +52,7 @@ pub enum Key {
 }
 
 /// One keyboard transition. `keysym` is retained for consumers needing more than [`Key`].
+#[cfg(feature = "keyboard")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct KeyEvent {
     /// Physical evdev keycode, stable across layout and modifier changes.
@@ -52,6 +63,7 @@ pub struct KeyEvent {
 }
 
 /// Compositor-provided repeat settings. This crate deliberately does not synthesize repeats.
+#[cfg(feature = "keyboard")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RepeatInfo {
     pub rate: i32,
@@ -94,13 +106,21 @@ struct State {
     compositor: Option<wl_compositor::WlCompositor>,
     shm: Option<wl_shm::WlShm>,
     wm_base: Option<xdg_wm_base::XdgWmBase>,
+    #[cfg(feature = "keyboard")]
     seat: Option<wl_seat::WlSeat>,
+    #[cfg(feature = "keyboard")]
     seat_name: Option<u32>,
+    #[cfg(feature = "keyboard")]
     keyboard: Option<wl_keyboard::WlKeyboard>,
+    #[cfg(feature = "keyboard")]
     xkb_context: xkb::Context,
+    #[cfg(feature = "keyboard")]
     xkb_state: Option<xkb::State>,
+    #[cfg(feature = "keyboard")]
     pressed_keys: HashMap<u32, (u32, Key)>,
+    #[cfg(feature = "keyboard")]
     key_events: VecDeque<KeyEvent>,
+    #[cfg(feature = "keyboard")]
     repeat_info: Option<RepeatInfo>,
     surface: Option<wl_surface::WlSurface>,
     xdg_surface: Option<xdg_surface::XdgSurface>,
@@ -118,13 +138,21 @@ impl State {
             compositor: None,
             shm: None,
             wm_base: None,
+            #[cfg(feature = "keyboard")]
             seat: None,
+            #[cfg(feature = "keyboard")]
             seat_name: None,
+            #[cfg(feature = "keyboard")]
             keyboard: None,
+            #[cfg(feature = "keyboard")]
             xkb_context: xkb::Context::new(xkb::CONTEXT_NO_FLAGS),
+            #[cfg(feature = "keyboard")]
             xkb_state: None,
+            #[cfg(feature = "keyboard")]
             pressed_keys: HashMap::new(),
+            #[cfg(feature = "keyboard")]
             key_events: VecDeque::new(),
+            #[cfg(feature = "keyboard")]
             repeat_info: None,
             surface: None,
             xdg_surface: None,
@@ -155,6 +183,7 @@ impl State {
         self.toplevel = Some(toplevel);
     }
 
+    #[cfg(feature = "keyboard")]
     fn clear_pressed_keys(&mut self) {
         self.pressed_keys.clear();
     }
@@ -171,7 +200,7 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
     ) {
         if let wl_registry::Event::Global {
             name,
-            interface,
+            ref interface,
             version,
         } = event
         {
@@ -181,6 +210,7 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
                 }
                 "wl_shm" => state.shm = Some(registry.bind(name, 1, qh, ())),
                 "xdg_wm_base" => state.wm_base = Some(registry.bind(name, 1, qh, ())),
+                #[cfg(feature = "keyboard")]
                 "wl_seat" if state.seat.is_none() => {
                     state.seat = Some(registry.bind(name, version.min(7), qh, ()));
                     state.seat_name = Some(name);
@@ -188,7 +218,9 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
                 _ => return,
             }
             state.init_xdg(qh);
-        } else if let wl_registry::Event::GlobalRemove { name } = event {
+        }
+        #[cfg(feature = "keyboard")]
+        if let wl_registry::Event::GlobalRemove { name } = event {
             if state.seat_name == Some(name) {
                 state.keyboard = None;
                 state.xkb_state = None;
@@ -200,6 +232,7 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
     }
 }
 
+#[cfg(feature = "keyboard")]
 impl Dispatch<wl_seat::WlSeat, ()> for State {
     fn event(
         state: &mut Self,
@@ -224,6 +257,7 @@ impl Dispatch<wl_seat::WlSeat, ()> for State {
     }
 }
 
+#[cfg(feature = "keyboard")]
 impl Dispatch<wl_keyboard::WlKeyboard, ()> for State {
     fn event(
         state: &mut Self,
@@ -302,6 +336,7 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for State {
     }
 }
 
+#[cfg(feature = "keyboard")]
 fn key_event_from_evdev(
     xkb_state: &xkb::State,
     pressed_keys: &mut HashMap<u32, (u32, Key)>,
@@ -328,6 +363,7 @@ fn key_event_from_evdev(
     }
 }
 
+#[cfg(feature = "keyboard")]
 fn translate_keysym(keysym: u32) -> Key {
     match keysym {
         0xff52 => Key::Up,
@@ -476,16 +512,19 @@ impl WaylandHost {
     /// Return the next queued keyboard transition without waiting for the compositor.
     ///
     /// A compositor without a seat/keyboard (or a disconnected compositor) simply yields `None`.
+    #[cfg(feature = "keyboard")]
     pub fn poll_key_event(&mut self) -> Option<KeyEvent> {
         self.pump_events_nonblocking();
         self.state.key_events.pop_front()
     }
 
     /// Return the most recently advertised compositor repeat settings.
+    #[cfg(feature = "keyboard")]
     pub fn repeat_info(&self) -> Option<RepeatInfo> {
         self.state.repeat_info
     }
 
+    #[cfg(feature = "keyboard")]
     fn pump_events_nonblocking(&mut self) {
         if self.queue.dispatch_pending(&mut self.state).is_err() {
             return;
@@ -642,6 +681,7 @@ mod tests {
             .contains("wl_shm"));
     }
 
+    #[cfg(feature = "keyboard")]
     #[test]
     fn shell_keysyms_have_stable_meanings() {
         assert_eq!(translate_keysym(0xff52), Key::Up);
@@ -655,6 +695,7 @@ mod tests {
         assert_eq!(translate_keysym(0x100_0000), Key::Other(0x100_0000));
     }
 
+    #[cfg(feature = "keyboard")]
     #[test]
     fn fabricated_evdev_event_uses_received_xkb_layout() {
         let context = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
@@ -683,6 +724,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "keyboard")]
     #[test]
     fn release_uses_press_translation_after_modifiers_change() {
         let context = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
@@ -712,6 +754,7 @@ mod tests {
         assert!(pressed_keys.is_empty());
     }
 
+    #[cfg(feature = "keyboard")]
     #[test]
     fn keyboard_leave_clears_held_keys() {
         let context = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
