@@ -63,7 +63,7 @@ fn flagship_passes_all_load_gates() {
 fn resolution_scene_motion_and_fallback_are_typed() {
     let theme = flagship();
     assert_eq!(
-        theme.resolve(Base::Dark, "--color-text-primary").unwrap(),
+        theme.resolve(Base::Dusk, "--color-text-primary").unwrap(),
         "#f4efe6"
     );
     let node = Node::new(
@@ -73,14 +73,14 @@ fn resolution_scene_motion_and_fallback_are_typed() {
         Bounds::new(0., 0., 1., 1.),
         "--color-text-primary",
     );
-    assert_eq!(theme.resolve_node(Base::Light, &node).unwrap(), "#26221a");
+    assert_eq!(theme.resolve_node(Base::Day, &node).unwrap(), "#26221a");
     assert_eq!(
         theme.resolve_motion("launch", false).unwrap().duration_ms,
         420
     );
     assert_eq!(theme.resolve_motion("launch", true).unwrap().duration_ms, 0);
     assert!(matches!(
-        theme.resolve(Base::Dark, "--not-a-token"),
+        theme.resolve(Base::Dusk, "--not-a-token"),
         Err(ResolveError::UnknownToken(_))
     ));
 
@@ -104,7 +104,7 @@ fn broken_package_reports_a_specific_gate() {
     assert!(matches!(
         load(&root),
         Err(LoadError::MissingToken {
-            base: Some(Base::Dark),
+            base: Some(Base::Dusk),
             ..
         })
     ));

@@ -8,7 +8,7 @@ fn main() {
         Role::Button,
         "Wayland fixture",
         Bounds::new(16.0, 16.0, 180.0, 64.0),
-        "card",
+        "--state-rest-surface",
     )
     .with_action(NodeAction::Activate);
     let scene = Scene::new(node, NodeId::new("fixture-card").unwrap()).unwrap();

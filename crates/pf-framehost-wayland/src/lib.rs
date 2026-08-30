@@ -5,7 +5,7 @@
 //! the rasterizer's damage rectangle.
 
 use pf_ports::{FrameHost, PresentAck, PresentFailure, PresentResult};
-use pf_render::{DamageRect, Palette, Rasterizer};
+use pf_render::{DamageRect, Rasterizer, ThemeBase};
 use pf_scene::{Insets, Orientation, Scene, SurfaceMetrics};
 #[cfg(feature = "keyboard")]
 use std::collections::{HashMap, VecDeque};
@@ -733,8 +733,8 @@ impl FrameHost for WaylandHost {
         }
     }
 
-    fn set_palette(&mut self, palette: Palette) {
-        set_renderer_palette(&mut self.renderer, palette);
+    fn set_theme_base(&mut self, base: ThemeBase) {
+        set_renderer_theme_base(&mut self.renderer, base);
     }
 
     fn present(&mut self, scene: &Scene) -> PresentResult {
@@ -752,8 +752,8 @@ impl FrameHost for WaylandHost {
     }
 }
 
-fn set_renderer_palette(renderer: &mut Rasterizer, palette: Palette) {
-    renderer.set_palette(palette);
+fn set_renderer_theme_base(renderer: &mut Rasterizer, base: ThemeBase) {
+    renderer.set_theme_base(base);
 }
 
 #[cfg(test)]
@@ -766,17 +766,17 @@ mod tests {
     }
 
     #[test]
-    fn host_palette_forwarder_changes_the_next_render() {
+    fn host_theme_base_forwarder_changes_the_next_render() {
         let node = Node::new(
             NodeId::new("root").unwrap(),
             Role::Text,
             "Palette",
             Bounds::new(3.0, 4.0, 100.0, 40.0),
-            "card",
+            "--state-rest-surface",
         );
         let scene = Scene::new(node, NodeId::new("root").unwrap()).unwrap();
         let mut renderer = Rasterizer::new();
-        set_renderer_palette(&mut renderer, Palette::high_contrast());
+        set_renderer_theme_base(&mut renderer, ThemeBase::HighContrast);
         let frame = renderer
             .render(
                 &scene,

@@ -489,6 +489,7 @@ version = "0.0.1"
 dependencies = [
  "cosmic-text",
  "pf-scene",
+ "pf-theme",
  "png",
  "tiny-skia",
 ]
