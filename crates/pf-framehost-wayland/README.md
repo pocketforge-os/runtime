@@ -8,6 +8,13 @@ buffers and forwards raster damage with `wl_surface.damage_buffer`.
 loss is returned through `FrameHost` as `PresentFailure::SurfaceLost`; callers can use
 `WaylandHost::reconnect()` to rebuild the connection and all protocol objects.
 
+Keyboard input is additive: the host binds an available `wl_seat`/`wl_keyboard`, uses
+the compositor's XKB keymap, and exposes transitions through the non-blocking
+`WaylandHost::poll_key_event()`. `KeyEvent::key` provides stable shell meanings while
+`KeyEvent::keysym` preserves the raw layout-aware keysym. `repeat_info()` exposes the
+compositor's rate and delay; repeat generation remains the caller's responsibility.
+No seat or keyboard capability is a supported state and simply produces no events.
+
 Headless smoke test (Ubuntu/Weston):
 
 ```sh
@@ -21,4 +28,3 @@ rustup target add aarch64-unknown-linux-gnu
 CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
   cargo build --locked --target aarch64-unknown-linux-gnu -p pf-framehost-wayland
 ```
-
