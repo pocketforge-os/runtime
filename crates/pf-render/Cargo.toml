@@ -10,6 +10,7 @@ authors.workspace = true
 
 [dependencies]
 cosmic-text = { version = "0.12", default-features = false, features = ["std", "swash"] }
+cosmic-text-tracking = { package = "cosmic-text", version = "0.15", default-features = false, features = ["std", "swash"] }
 pf-scene = { workspace = true }
 pf-theme = { workspace = true }
 png = "0.17"

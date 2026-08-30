@@ -5,6 +5,7 @@
 use cosmic_text::{
     fontdb, Attrs, Buffer, Color, Family, FontSystem, Metrics, Shaping, SwashCache, Weight,
 };
+use cosmic_text_tracking as tracked_text;
 use pf_scene::{Bounds, ImageFit, ImageSource, Node, NodeContent, Scene, SurfaceMetrics, TypeRole};
 pub use pf_theme::Base as ThemeBase;
 use pf_theme::{ResolvedStyleSnapshot, Rgba};
@@ -167,6 +168,8 @@ pub enum RenderNote {
 pub struct Rasterizer {
     fonts: FontSystem,
     glyphs: SwashCache,
+    tracked_fonts: tracked_text::FontSystem,
+    tracked_glyphs: tracked_text::SwashCache,
     previous: Vec<NodeSnapshot>,
     images: ImageCache,
     theme_base: ThemeBase,
@@ -206,13 +209,20 @@ struct ImageCache {
 impl Rasterizer {
     pub fn new() -> Self {
         let mut db = fontdb::Database::new();
+        let mut tracked_db = tracked_text::fontdb::Database::new();
         // Never call load_system_fonts: output must depend only on repository bytes.
         for data in [MANROPE, FRAUNCES, CJK] {
             db.load_font_data(data.to_vec());
+            tracked_db.load_font_data(data.to_vec());
         }
         Self {
             fonts: FontSystem::new_with_locale_and_db("en-US".into(), db),
             glyphs: SwashCache::new(),
+            tracked_fonts: tracked_text::FontSystem::new_with_locale_and_db(
+                "en-US".into(),
+                tracked_db,
+            ),
+            tracked_glyphs: tracked_text::SwashCache::new(),
             previous: Vec::new(),
             images: ImageCache::default(),
             theme_base: ThemeBase::Dusk,
@@ -265,6 +275,8 @@ impl Rasterizer {
         let mut context = DrawContext {
             fonts: &mut self.fonts,
             glyphs: &mut self.glyphs,
+            tracked_fonts: &mut self.tracked_fonts,
+            tracked_glyphs: &mut self.tracked_glyphs,
             images: &mut self.images,
             notes: &mut notes,
             style: &self.style,
@@ -405,6 +417,8 @@ fn bounds_rect(b: Bounds, scale: f32, width: u32, height: u32, outset: f32) -> D
 struct DrawContext<'a> {
     fonts: &'a mut FontSystem,
     glyphs: &'a mut SwashCache,
+    tracked_fonts: &'a mut tracked_text::FontSystem,
+    tracked_glyphs: &'a mut tracked_text::SwashCache,
     images: &'a mut ImageCache,
     notes: &'a mut Vec<RenderNote>,
     style: &'a ResolvedStyleSnapshot,
@@ -477,11 +491,8 @@ fn draw_node(
     };
     let text = style_color(context.style, text_key)?;
     match &node.content {
-        NodeContent::Label => draw_text(
-            pm,
-            context.fonts,
-            context.glyphs,
-            TextDraw {
+        NodeContent::Label => {
+            let draw = TextDraw {
                 text: &node.accessible_label,
                 x: (b.x + 6.0) * scale,
                 y: (b.y + 5.0) * scale,
@@ -493,8 +504,13 @@ fn draw_node(
                 line_height: node.line_height,
                 clip: (b.x * scale, b.y * scale, b.width * scale, b.height * scale),
                 color: text,
-            },
-        ),
+            };
+            if draw.style.tracking_em == 0.0 {
+                draw_text(pm, context.fonts, context.glyphs, draw);
+            } else {
+                draw_tracked_text(pm, context.tracked_fonts, context.tracked_glyphs, draw);
+            }
+        }
         NodeContent::Image { source, fit } => {
             if let Err(note) = draw_image(pm, context.images, source, *fit, b, scale) {
                 context.notes.push(note);
@@ -663,12 +679,9 @@ fn draw_text(pm: &mut Pixmap, fonts: &mut FontSystem, glyphs: &mut SwashCache, d
         draw.color.blue,
         draw.color.alpha,
     );
-    let tracking = draw.style.tracking_em * size;
     for run in buffer.layout_runs() {
-        for (index, glyph) in run.glyphs.iter().enumerate() {
-            // Tracking is component typography, applied after shaping so ligatures, clusters,
-            // variable axes, and CJK fallback all remain Cosmic Text's responsibility.
-            let physical = glyph.physical((index as f32 * tracking, 0.0), 1.0);
+        for glyph in run.glyphs {
+            let physical = glyph.physical((0.0, 0.0), 1.0);
             let color = glyph.color_opt.unwrap_or(default_color);
             glyphs.with_pixels(fonts, physical.cache_key, color, |x, y, color| {
                 blend_text_pixel(
@@ -683,7 +696,62 @@ fn draw_text(pm: &mut Pixmap, fonts: &mut FontSystem, glyphs: &mut SwashCache, d
     }
 }
 
+fn draw_tracked_text(
+    pm: &mut Pixmap,
+    fonts: &mut tracked_text::FontSystem,
+    glyphs: &mut tracked_text::SwashCache,
+    draw: TextDraw<'_>,
+) {
+    let size = draw.style.size_px * draw.text_scale * draw.surface_scale;
+    let line_height = draw.line_height.map_or(size * 1.25, |value| size * value);
+    let mut buffer =
+        tracked_text::Buffer::new(fonts, tracked_text::Metrics::new(size, line_height));
+    buffer.set_size(fonts, Some(draw.width), Some(draw.height));
+    buffer.set_text(
+        fonts,
+        draw.text,
+        &tracked_text::Attrs::new()
+            .family(tracked_text::Family::Name(&draw.style.family))
+            .weight(tracked_text::Weight(draw.style.weight))
+            .letter_spacing(draw.style.tracking_em * size),
+        tracked_text::Shaping::Advanced,
+        None,
+    );
+    buffer.shape_until_scroll(fonts, false);
+    let default_color = tracked_text::Color::rgba(
+        draw.color.red,
+        draw.color.green,
+        draw.color.blue,
+        draw.color.alpha,
+    );
+    for run in buffer.layout_runs() {
+        for glyph in run.glyphs {
+            let physical = glyph.physical((0.0, 0.0), 1.0);
+            let color = glyph.color_opt.unwrap_or(default_color);
+            glyphs.with_pixels(fonts, physical.cache_key, color, |x, y, color| {
+                blend_text_pixel_rgba(
+                    pm,
+                    &draw,
+                    physical.x + x,
+                    run.line_y as i32 + physical.y + y,
+                    [color.r(), color.g(), color.b(), color.a()],
+                );
+            });
+        }
+    }
+}
+
 fn blend_text_pixel(pm: &mut Pixmap, draw: &TextDraw<'_>, gx: i32, gy: i32, color: Color) {
+    blend_text_pixel_rgba(
+        pm,
+        draw,
+        gx,
+        gy,
+        [color.r(), color.g(), color.b(), color.a()],
+    );
+}
+
+fn blend_text_pixel_rgba(pm: &mut Pixmap, draw: &TextDraw<'_>, gx: i32, gy: i32, color: [u8; 4]) {
     let px = gx + draw.x as i32;
     let py = gy + draw.y as i32;
     if px < draw.clip.0.floor() as i32
@@ -697,15 +765,15 @@ fn blend_text_pixel(pm: &mut Pixmap, draw: &TextDraw<'_>, gx: i32, gy: i32, colo
     {
         return;
     }
-    let alpha = color.a() as u32;
+    let alpha = color[3] as u32;
     let pixmap_width = pm.width() as usize;
     let dst = &mut pm.pixels_mut()[py as usize * pixmap_width + px as usize];
     let old = dst.demultiply();
     let inv = 255 - alpha;
     *dst = tiny_skia::PremultipliedColorU8::from_rgba(
-        ((color.r() as u32 * alpha + old.red() as u32 * inv) / 255) as u8,
-        ((color.g() as u32 * alpha + old.green() as u32 * inv) / 255) as u8,
-        ((color.b() as u32 * alpha + old.blue() as u32 * inv) / 255) as u8,
+        ((color[0] as u32 * alpha + old.red() as u32 * inv) / 255) as u8,
+        ((color[1] as u32 * alpha + old.green() as u32 * inv) / 255) as u8,
+        ((color[2] as u32 * alpha + old.blue() as u32 * inv) / 255) as u8,
         255,
     )
     .expect("opaque text blend is valid");
@@ -1212,5 +1280,68 @@ mod tests {
         let cached = rasterizer.render(&scene, metrics()).unwrap();
         assert_eq!(cold.rgba, cached.rgba);
         assert_eq!(cached.damage, None);
+    }
+
+    #[test]
+    fn untracked_body_raster_matches_round_one_byte_for_byte() {
+        use std::hash::{DefaultHasher, Hash, Hasher};
+        let frame = Rasterizer::new()
+            .render(&copy_fixture(), metrics())
+            .unwrap();
+        let mut hasher = DefaultHasher::new();
+        frame.rgba.hash(&mut hasher);
+        assert_eq!(hasher.finish(), 0xb5a5_0c58_8bfe_9a94);
+    }
+
+    fn tracked_layout(text: &str, width: f32, spacing: f32) -> Vec<(f32, Vec<f32>)> {
+        let mut db = tracked_text::fontdb::Database::new();
+        db.load_font_data(MANROPE.to_vec());
+        let mut fonts = tracked_text::FontSystem::new_with_locale_and_db("en-US".into(), db);
+        let mut buffer =
+            tracked_text::Buffer::new(&mut fonts, tracked_text::Metrics::new(11.5, 14.375));
+        buffer.set_size(&mut fonts, Some(width), Some(200.0));
+        buffer.set_text(
+            &mut fonts,
+            text,
+            &tracked_text::Attrs::new()
+                .family(tracked_text::Family::Name("Manrope"))
+                .weight(tracked_text::Weight(700))
+                .letter_spacing(spacing),
+            tracked_text::Shaping::Advanced,
+            None,
+        );
+        buffer.shape_until_scroll(&mut fonts, false);
+        buffer
+            .layout_runs()
+            .map(|run| (run.line_w, run.glyphs.iter().map(|glyph| glyph.w).collect()))
+            .collect()
+    }
+
+    #[test]
+    fn tracked_run_width_is_the_sum_of_its_tracked_advances() {
+        let runs = tracked_layout("EYEBROW", 1_000.0, 11.5 * 0.14);
+        assert_eq!(runs.len(), 1);
+        let (measured, advances) = &runs[0];
+        let advance_sum: f32 = advances.iter().sum();
+        assert!(
+            (measured - advance_sum).abs() < 0.001,
+            "{measured} != {advance_sum}"
+        );
+    }
+
+    #[test]
+    fn tracked_eyebrow_wraps_before_crossing_the_node_clip() {
+        let text = "TRACKED EYEBROW";
+        let untracked_width = tracked_layout(text, 1_000.0, 0.0)[0].0;
+        let tracked_width = tracked_layout(text, 1_000.0, 11.5 * 0.14)[0].0;
+        assert!(tracked_width > untracked_width);
+
+        let node_width = (untracked_width + tracked_width) / 2.0;
+        assert_eq!(tracked_layout(text, node_width, 0.0).len(), 1);
+        let tracked = tracked_layout(text, node_width, 11.5 * 0.14);
+        assert!(tracked.len() > 1, "tracking-aware text did not wrap");
+        assert!(tracked
+            .iter()
+            .all(|(line_width, _)| *line_width <= node_width));
     }
 }
