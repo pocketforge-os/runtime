@@ -136,6 +136,29 @@ fn default_command_templates_use_one_session_keyed_unit_for_the_lifecycle() {
         ]
     );
 }
+
+#[test]
+fn desktop_sim_templates_create_and_remove_session_markers() {
+    let dir = scratch("desktop-sim");
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    let mut system = CommandSystem::new(CommandTemplates::desktop_sim(&dir));
+    let request = LaunchRequest {
+        item_id: "game".into(),
+    };
+    let marker = dir.join("sessions/session-1.running");
+
+    assert!(system.start_foreground(&request, "session-1").unwrap());
+    assert!(marker.is_file());
+    system.request_graceful_stop("session-1").unwrap();
+    assert!(!marker.exists());
+    system.request_graceful_stop("session-1").unwrap();
+    system.enforce_termination("session-1").unwrap();
+    system.activate_selected_owner().unwrap();
+    assert!(dir.join("shell-selected").is_file());
+
+    fs::remove_dir_all(dir).unwrap();
+}
 impl FakeSystem {
     fn available() -> Self {
         Self {
