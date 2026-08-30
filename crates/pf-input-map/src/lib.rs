@@ -12,7 +12,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 const SCHEMA_VERSION: u32 = 1;
-const PROTECTED: [&str; 3] = ["Activate", "Back", "SafeReturn"];
+const PROTECTED: [&str; 4] = ["Activate", "Back", "SafeReturn", "Start"];
 const FACE_ACTIONS: [&str; 6] = [
     "Activate",
     "Back",
@@ -21,7 +21,7 @@ const FACE_ACTIONS: [&str; 6] = [
     "Search.submit",
     "Search.cancel",
 ];
-const ACTIONS: [&str; 11] = [
+const ACTIONS: [&str; 12] = [
     "Activate",
     "Back",
     "Move.up",
@@ -33,6 +33,7 @@ const ACTIONS: [&str; 11] = [
     "Search.submit",
     "Search.cancel",
     "SafeReturn",
+    "Start",
 ];
 const POSITIONS: [&str; 12] = [
     "east", "south", "west", "north", "start", "select", "guide", "home", "l1", "r1", "l2", "r2",
@@ -428,6 +429,19 @@ impl EffectiveMap {
             .as_ref()
             .map(|(_, m)| m.clone())
             .unwrap_or_else(|| contract.effective_map.clone());
+        if persisted.is_some() {
+            for action in PROTECTED {
+                if !mappings.iter().any(|mapping| mapping.action == action) {
+                    mappings.extend(
+                        contract
+                            .effective_map
+                            .iter()
+                            .filter(|mapping| mapping.action == action)
+                            .cloned(),
+                    );
+                }
+            }
+        }
         let mut events = VecDeque::new();
         let stored_device = persisted
             .as_ref()

@@ -36,6 +36,12 @@ fn per_device_shipped_defaults_cover_all_device_classes() {
         map(BUTTONLESS).binding("global", "SafeReturn"),
         Some(&chord("select", "start"))
     );
+    for fixture in [A523, A133, BUTTONLESS] {
+        assert_eq!(
+            map(fixture).binding("global", "Start"),
+            Some(&Binding::single("start"))
+        );
+    }
 }
 
 #[test]
@@ -250,6 +256,18 @@ fn rejects_safe_return_collision_across_contexts() {
 }
 
 #[test]
+fn rejects_start_collision_across_contexts() {
+    let mut engine = RemapEngine::new(map(A133), MemoryStore::default());
+    assert_eq!(
+        engine.begin("global", "Start", Binding::single("east")),
+        Err(MapError::Collision {
+            first: "Start".into(),
+            second: "Activate".into()
+        })
+    );
+}
+
+#[test]
 fn capture_rejects_reusing_back_for_activate_without_creating_partial_state() {
     let mut engine = RemapEngine::new(map(A133), MemoryStore::default());
     assert_eq!(
@@ -300,6 +318,32 @@ fn persisted_protected_collision_is_rejected_then_re_resolved_to_shipped_default
             && old_binding == Binding::single("south")
             && effective_binding == Binding::single("east")
     ));
+}
+
+#[test]
+fn legacy_persisted_map_keeps_user_remaps_and_adds_new_shipped_protected_actions() {
+    let device = contract(A133);
+    let shipped_start = device
+        .effective_map
+        .iter()
+        .find(|mapping| mapping.action == "Start")
+        .unwrap()
+        .clone();
+    let mut persisted = device.effective_map.clone();
+    persisted.retain(|mapping| mapping.action != "Start");
+    persisted
+        .iter_mut()
+        .find(|mapping| mapping.action == "Activate")
+        .unwrap()
+        .binding = Binding::single("west");
+
+    let effective = EffectiveMap::from_persisted(device, Some(("a133".into(), persisted))).unwrap();
+
+    assert_eq!(
+        effective.binding("shell", "Activate"),
+        Some(&Binding::single("west"))
+    );
+    assert!(effective.mappings().contains(&shipped_start));
 }
 
 #[test]
