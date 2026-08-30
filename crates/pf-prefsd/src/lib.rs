@@ -7,6 +7,7 @@ use std::collections::BTreeMap;
 use std::io;
 use std::os::fd::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
@@ -30,6 +31,94 @@ pub enum RpcResponse {
     Values { values: BTreeMap<String, Value> },
     Ok,
     Error { message: String },
+}
+
+/// Error returned by a short-lived prefs daemon RPC.
+#[derive(Debug)]
+pub enum ClientError {
+    Transport(io::Error),
+    Protocol(String),
+    Remote(String),
+}
+
+impl std::fmt::Display for ClientError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Transport(error) => write!(formatter, "preference daemon unavailable: {error}"),
+            Self::Protocol(error) => {
+                write!(formatter, "invalid preference daemon response: {error}")
+            }
+            Self::Remote(error) => write!(formatter, "preference daemon rejected request: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for ClientError {}
+
+/// Fresh-connection-per-request client for the serial v1 daemon protocol.
+#[derive(Clone, Debug)]
+pub struct Client {
+    socket: PathBuf,
+}
+
+impl Client {
+    pub fn new(socket: impl Into<PathBuf>) -> Self {
+        Self {
+            socket: socket.into(),
+        }
+    }
+
+    pub fn socket(&self) -> &Path {
+        &self.socket
+    }
+
+    pub fn get(&self, key: &str) -> Result<Value, ClientError> {
+        match self.call(&RpcRequest::Get { key: key.into() })? {
+            RpcResponse::Value { value } => Ok(value),
+            response => Err(unexpected_response(response)),
+        }
+    }
+
+    pub fn get_all(&self) -> Result<BTreeMap<String, Value>, ClientError> {
+        match self.call(&RpcRequest::GetAll)? {
+            RpcResponse::Values { values } => Ok(values),
+            response => Err(unexpected_response(response)),
+        }
+    }
+
+    pub fn set(&self, key: &str, value: Value) -> Result<Value, ClientError> {
+        match self.call(&RpcRequest::Set {
+            key: key.into(),
+            value,
+        })? {
+            RpcResponse::Value { value } => Ok(value),
+            response => Err(unexpected_response(response)),
+        }
+    }
+
+    fn call(&self, request: &RpcRequest) -> Result<RpcResponse, ClientError> {
+        let mut stream = UnixStream::connect(&self.socket).map_err(ClientError::Transport)?;
+        stream
+            .set_read_timeout(Some(CONNECTION_TIMEOUT))
+            .and_then(|()| stream.set_write_timeout(Some(CONNECTION_TIMEOUT)))
+            .map_err(ClientError::Transport)?;
+        let body = serde_json::to_vec(request)
+            .map_err(|error| ClientError::Protocol(error.to_string()))?;
+        pf_wire::write_frame(&mut stream, &body)
+            .map_err(|error| ClientError::Transport(map_wire_error(error)))?;
+        let body = pf_wire::read_frame(&mut stream)
+            .map_err(|error| ClientError::Transport(map_wire_error(error)))?;
+        match serde_json::from_slice(&body)
+            .map_err(|error| ClientError::Protocol(error.to_string()))?
+        {
+            RpcResponse::Error { message } => Err(ClientError::Remote(message)),
+            response => Ok(response),
+        }
+    }
+}
+
+fn unexpected_response(response: RpcResponse) -> ClientError {
+    ClientError::Protocol(format!("unexpected response: {response:?}"))
 }
 
 /// The peer's kernel-attested Unix credentials.
