@@ -27,10 +27,29 @@ pub enum RpcRequest {
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "result", rename_all = "snake_case")]
 pub enum RpcResponse {
-    Value { value: Value },
-    Values { values: BTreeMap<String, Value> },
+    Value {
+        value: Value,
+    },
+    Values {
+        values: BTreeMap<String, Value>,
+    },
     Ok,
-    Error { message: String },
+    Error {
+        message: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        kind: Option<ErrorKind>,
+    },
+}
+
+/// Machine-readable classification for daemon failures.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ErrorKind {
+    InvalidValue,
+    Store,
+    Internal,
+    #[serde(other)]
+    Unknown,
 }
 
 /// Error returned by a short-lived prefs daemon RPC.
@@ -38,7 +57,10 @@ pub enum RpcResponse {
 pub enum ClientError {
     Transport(io::Error),
     Protocol(String),
-    Remote(String),
+    Remote {
+        message: String,
+        kind: Option<ErrorKind>,
+    },
 }
 
 impl std::fmt::Display for ClientError {
@@ -48,7 +70,9 @@ impl std::fmt::Display for ClientError {
             Self::Protocol(error) => {
                 write!(formatter, "invalid preference daemon response: {error}")
             }
-            Self::Remote(error) => write!(formatter, "preference daemon rejected request: {error}"),
+            Self::Remote { message, .. } => {
+                write!(formatter, "preference daemon rejected request: {message}")
+            }
         }
     }
 }
@@ -111,7 +135,7 @@ impl Client {
         match serde_json::from_slice(&body)
             .map_err(|error| ClientError::Protocol(error.to_string()))?
         {
-            RpcResponse::Error { message } => Err(ClientError::Remote(message)),
+            RpcResponse::Error { message, kind } => Err(ClientError::Remote { message, kind }),
             response => Ok(response),
         }
     }
@@ -175,6 +199,7 @@ pub fn serve_connection(store: &PrefsStore, stream: &mut UnixStream) -> io::Resu
         Ok(request) => handle_rpc(store, request),
         Err(error) => RpcResponse::Error {
             message: format!("invalid request: {error}"),
+            kind: Some(ErrorKind::Internal),
         },
     };
     let body = serde_json::to_vec(&response).map_err(io::Error::other)?;
@@ -250,41 +275,63 @@ pub fn serve_until_with_timeout(
 }
 
 fn handle_rpc(store: &PrefsStore, request: RpcRequest) -> RpcResponse {
-    let result = (|| -> Result<RpcResponse, Box<dyn std::error::Error>> {
-        match request {
-            RpcRequest::Get { key } => {
-                let value = store.load()?.value(&key)?;
-                Ok(RpcResponse::Value {
-                    value: value_to_json(value),
-                })
-            }
-            RpcRequest::GetAll => {
-                let prefs = store.load()?;
-                let values = SCHEMA
+    let result: Result<RpcResponse, (ErrorKind, pf_prefs::PrefError)> = match request {
+        RpcRequest::Get { key } => store
+            .load()
+            .and_then(|prefs| prefs.value(&key))
+            .map(|value| RpcResponse::Value {
+                value: value_to_json(value),
+            })
+            .map_err(|error| (classify_pref_error(&error), error)),
+        RpcRequest::GetAll => store
+            .load()
+            .and_then(|prefs| {
+                SCHEMA
                     .iter()
                     .map(|spec| {
                         prefs
                             .value(spec.key)
                             .map(|value| (spec.key.to_owned(), value_to_json(value)))
                     })
-                    .collect::<Result<_, _>>()?;
-                Ok(RpcResponse::Values { values })
-            }
-            RpcRequest::Set { key, value } => {
-                let value = json_to_value(&key, value)?;
-                store.apply(&key, value)?;
-                Ok(RpcResponse::Value {
-                    value: value_to_json(store.load()?.value(&key)?),
-                })
-            }
-        }
-    })();
-    result.unwrap_or_else(|error| RpcResponse::Error {
+                    .collect()
+            })
+            .map(|values| RpcResponse::Values { values })
+            .map_err(|error| (classify_pref_error(&error), error)),
+        RpcRequest::Set { key, value } => json_to_value(&key, value)
+            .map_err(|error| (ErrorKind::InvalidValue, error))
+            .and_then(|value| {
+                store
+                    .apply(&key, value)
+                    .map_err(|error| (classify_pref_error(&error), error))
+            })
+            .and_then(|_| {
+                store
+                    .load()
+                    .and_then(|prefs| prefs.value(&key))
+                    .map_err(|error| (classify_pref_error(&error), error))
+            })
+            .map(|value| RpcResponse::Value {
+                value: value_to_json(value),
+            }),
+    };
+    result.unwrap_or_else(|(kind, error)| RpcResponse::Error {
         message: error.to_string(),
+        kind: Some(kind),
     })
 }
 
-fn json_to_value(key: &str, value: Value) -> Result<PrefValue, Box<dyn std::error::Error>> {
+fn classify_pref_error(error: &pf_prefs::PrefError) -> ErrorKind {
+    match error {
+        pf_prefs::PrefError::UnknownKey(_)
+        | pf_prefs::PrefError::Type { .. }
+        | pf_prefs::PrefError::Range { .. } => ErrorKind::InvalidValue,
+        pf_prefs::PrefError::Io(_)
+        | pf_prefs::PrefError::Parse(_)
+        | pf_prefs::PrefError::UnsupportedVersion { .. } => ErrorKind::Store,
+    }
+}
+
+fn json_to_value(key: &str, value: Value) -> Result<PrefValue, pf_prefs::PrefError> {
     let spec =
         pf_prefs::spec(key).ok_or_else(|| pf_prefs::PrefError::UnknownKey(key.to_owned()))?;
     let candidate = match spec.kind {
@@ -300,7 +347,7 @@ fn json_to_value(key: &str, value: Value) -> Result<PrefValue, Box<dyn std::erro
         expected: pf_prefs::schema::kind_name(spec.kind),
         got: json_kind(&value),
     })?;
-    Ok(pf_prefs::validate(key, candidate)?)
+    pf_prefs::validate(key, candidate)
 }
 
 fn json_kind(value: &Value) -> &'static str {

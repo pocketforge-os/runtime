@@ -5,6 +5,7 @@ use pf_ports::{
 use pf_prefs::PrefsStore;
 use pf_prefs_port::{PrefsPreferencePort, USER_AUTHORITY};
 use pf_prefsd::{serve_until_with_timeout, Client};
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
 use std::process::Command;
@@ -74,6 +75,40 @@ fn daemon_mode_is_coherent_and_never_falls_back_when_down() {
         PreferenceValue::Integer(60)
     );
     assert!(!direct.join("prefs.json").exists());
+
+    std::fs::write(state.join("prefs.json"), b"{bad json").unwrap();
+    assert_eq!(
+        port.read(&PreferenceKey("brightness".into())),
+        Err(PreferenceError::BackendUnavailable)
+    );
+    assert_eq!(
+        port.submit_change(PreferenceChange {
+            key: PreferenceKey("brightness".into()),
+            value: PreferenceValue::Integer(40),
+            authority: ChangeAuthority(USER_AUTHORITY.into()),
+        }),
+        Err(PreferenceError::BackendUnavailable)
+    );
+    let corrupt_cli = Command::new(env!("CARGO_BIN_EXE_pf-settings"))
+        .args(["get", "brightness"])
+        .env("PF_PREFSD_SOCK", &socket)
+        .output()
+        .unwrap();
+    assert!(!corrupt_cli.status.success());
+    assert!(!String::from_utf8_lossy(&corrupt_cli.stderr).contains("invalid value"));
+
+    std::fs::remove_file(state.join("prefs.json")).unwrap();
+    let original_mode = std::fs::metadata(&state).unwrap().permissions().mode();
+    std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o500)).unwrap();
+    assert_eq!(
+        port.submit_change(PreferenceChange {
+            key: PreferenceKey("brightness".into()),
+            value: PreferenceValue::Integer(40),
+            authority: ChangeAuthority(USER_AUTHORITY.into()),
+        }),
+        Err(PreferenceError::BackendUnavailable)
+    );
+    std::fs::set_permissions(&state, std::fs::Permissions::from_mode(original_mode)).unwrap();
 
     stop.store(true, Ordering::Release);
     thread.join().unwrap();

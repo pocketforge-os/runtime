@@ -11,7 +11,7 @@ use pf_ports::{
     PreferenceError, PreferenceKey, PreferencePoll, PreferencePort, PreferenceValue,
 };
 use pf_prefs::{PrefError, PrefValue, PrefsStore, SCHEMA};
-use pf_prefsd::{Client, ClientError};
+use pf_prefsd::{Client, ClientError, ErrorKind};
 
 /// The authority name used by the standard settings control plane.
 pub const USER_AUTHORITY: &str = "user";
@@ -174,7 +174,10 @@ fn map_client_error(_error: ClientError) -> PreferenceError {
 
 fn map_client_set_error(error: ClientError) -> PreferenceError {
     match error {
-        ClientError::Remote(_) => PreferenceError::InvalidValue,
+        ClientError::Remote {
+            kind: Some(ErrorKind::InvalidValue),
+            ..
+        } => PreferenceError::InvalidValue,
         error => map_client_error(error),
     }
 }
@@ -235,6 +238,31 @@ fn map_backend_error(error: PrefError) -> PreferenceError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn daemon_error_kinds_fail_toward_infrastructure() {
+        assert_eq!(
+            map_client_set_error(ClientError::Remote {
+                message: "schema skew".into(),
+                kind: Some(ErrorKind::InvalidValue),
+            }),
+            PreferenceError::InvalidValue
+        );
+        for kind in [
+            Some(ErrorKind::Store),
+            Some(ErrorKind::Internal),
+            Some(ErrorKind::Unknown),
+            None,
+        ] {
+            assert_eq!(
+                map_client_set_error(ClientError::Remote {
+                    message: "daemon failure".into(),
+                    kind,
+                }),
+                PreferenceError::BackendUnavailable
+            );
+        }
+    }
     use pf_ports::{MonotonicTime, PreferencePort};
     use std::path::PathBuf;
 

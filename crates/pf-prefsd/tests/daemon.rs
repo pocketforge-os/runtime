@@ -1,4 +1,4 @@
-use pf_prefsd::{serve_until_with_timeout, RpcResponse};
+use pf_prefsd::{serve_until_with_timeout, ErrorKind, RpcResponse};
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -214,6 +214,23 @@ fn invalid_sets_do_not_change_the_store() {
 }
 
 #[test]
+fn invalid_enum_is_classified_as_invalid_value() {
+    let scratch = Scratch::new("invalid-enum");
+    let server = Server::start(&scratch.0);
+    let response = rpc(
+        &server.socket,
+        serde_json::json!({"method":"set", "key":"textScale", "value":"110%"}),
+    );
+    assert!(matches!(
+        response,
+        RpcResponse::Error {
+            kind: Some(ErrorKind::InvalidValue),
+            ..
+        }
+    ));
+}
+
+#[test]
 fn bad_requests_do_not_stop_the_daemon() {
     let scratch = Scratch::new("bad-request");
     let server = Server::start(&scratch.0);
@@ -247,9 +264,10 @@ fn corrupt_store_errors_are_surfaced_for_get_and_set() {
         serde_json::json!({"method":"get", "key":"brightness"}),
         serde_json::json!({"method":"set", "key":"brightness", "value":40}),
     ] {
-        let RpcResponse::Error { message } = rpc(&server.socket, request) else {
+        let RpcResponse::Error { message, kind } = rpc(&server.socket, request) else {
             panic!("corrupt state did not produce an error");
         };
+        assert_eq!(kind, Some(ErrorKind::Store));
         assert!(message.contains("not a valid JSON object"));
     }
 }
