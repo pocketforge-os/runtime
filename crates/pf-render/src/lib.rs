@@ -630,25 +630,25 @@ fn draw_node(
             pm.fill_rect(rect, &paint, Transform::identity(), None);
         }
         if node.state.selected {
-            fill_token_rect(
+            fill_token_rect_clipped(
                 pm,
                 context.style,
                 "--state-selected-accent",
-                rect.x(),
-                rect.y(),
-                3.0 * scale,
-                rect.height(),
+                Rect::from_xywh(rect.x(), rect.y(), 3.0 * scale, rect.height())
+                    .expect("positive selected accent bounds"),
+                rect,
+                radius,
             )?;
         }
         if node.state.destructive {
-            fill_token_rect(
+            fill_token_rect_clipped(
                 pm,
                 context.style,
                 "--state-destructive-accent",
-                rect.x(),
-                rect.y(),
-                rect.width(),
-                3.0 * scale,
+                Rect::from_xywh(rect.x(), rect.y(), rect.width(), 3.0 * scale)
+                    .expect("positive destructive accent bounds"),
+                rect,
+                radius,
             )?;
         }
     }
@@ -785,21 +785,29 @@ fn draw_state_glyph(
     Ok(())
 }
 
-fn fill_token_rect(
+fn fill_token_rect_clipped(
     pm: &mut Pixmap,
     style: &ResolvedStyleSnapshot,
     key: &str,
-    x: f32,
-    y: f32,
-    width: f32,
-    height: f32,
+    fill_rect: Rect,
+    silhouette: Rect,
+    radius: f32,
 ) -> Result<(), RenderError> {
     let color = style_color(style, key)?;
-    if let Some(rect) = Rect::from_xywh(x, y, width, height) {
-        let mut paint = Paint::default();
-        paint.set_color_rgba8(color.red, color.green, color.blue, color.alpha);
-        pm.fill_rect(rect, &paint, Transform::identity(), None);
-    }
+    let mut paint = Paint::default();
+    paint.set_color_rgba8(color.red, color.green, color.blue, color.alpha);
+    let mut mask = Mask::new(pm.width(), pm.height()).expect("pixmap has valid dimensions");
+    mask.fill_path(
+        &if radius > 0.0 {
+            rounded_rect_path(silhouette, radius)
+        } else {
+            PathBuilder::from_rect(silhouette)
+        },
+        tiny_skia::FillRule::Winding,
+        true,
+        Transform::identity(),
+    );
+    pm.fill_rect(fill_rect, &paint, Transform::identity(), Some(&mask));
     Ok(())
 }
 
@@ -1424,6 +1432,51 @@ mod tests {
             pixel(&frame, 40, 40),
             token_rgba(ThemeBase::Dusk, "--color-surface-canvas")
         );
+    }
+
+    #[test]
+    fn rounded_state_accents_are_clipped_to_node_silhouette() {
+        let background = token_rgba(ThemeBase::Dusk, "--color-surface-canvas");
+        let selected = token_rgba(ThemeBase::Dusk, "--state-selected-accent");
+        let destructive = token_rgba(ThemeBase::Dusk, "--state-destructive-accent");
+
+        for radius in [6.0, 10.0, 16.0, 25.0] {
+            let selected_frame = Rasterizer::new()
+                .render(
+                    &state_scene(|node| {
+                        node.corner_radius = radius;
+                        node.state.selected = true;
+                    }),
+                    metrics(),
+                )
+                .unwrap();
+            assert_eq!(
+                pixel(&selected_frame, 20, 20),
+                background,
+                "radius {radius}"
+            );
+            assert_eq!(pixel(&selected_frame, 20, 45), selected, "radius {radius}");
+
+            let destructive_frame = Rasterizer::new()
+                .render(
+                    &state_scene(|node| {
+                        node.corner_radius = radius;
+                        node.state.destructive = true;
+                    }),
+                    metrics(),
+                )
+                .unwrap();
+            assert_eq!(
+                pixel(&destructive_frame, 20, 20),
+                background,
+                "radius {radius}"
+            );
+            assert_eq!(
+                pixel(&destructive_frame, 60, 20),
+                destructive,
+                "radius {radius}"
+            );
+        }
     }
 
     #[test]
