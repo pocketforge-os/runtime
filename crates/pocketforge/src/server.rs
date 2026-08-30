@@ -11,11 +11,15 @@
 use std::io;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::Arc;
+use std::time::Duration;
 
 use pf_prefsd::{RpcRequest as PrefsRequest, RpcResponse as PrefsResponse};
 use pf_wire::{recv_request, send_response, Op, PreferenceKind, Request, Response, Status};
 
 use crate::backend::{Backend, Pose};
+
+// Keep the broker's client round trip below prefsd's 3s CONNECTION_TIMEOUT.
+const PREFSD_ROUND_TRIP_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Compute the response to one request by delegating to the backend. Pure (no I/O), so it is
 /// directly unit-testable and shared by every transport.
@@ -81,8 +85,18 @@ fn get_preference(key: &str) -> Response {
 }
 
 fn get_preference_at(socket: impl AsRef<std::path::Path>, key: &str) -> Response {
+    get_preference_at_with_timeout(socket, key, PREFSD_ROUND_TRIP_TIMEOUT)
+}
+
+fn get_preference_at_with_timeout(
+    socket: impl AsRef<std::path::Path>,
+    key: &str,
+    timeout: Duration,
+) -> Response {
     let result = (|| -> Result<PrefsResponse, Box<dyn std::error::Error>> {
         let mut stream = UnixStream::connect(socket)?;
+        stream.set_read_timeout(Some(timeout))?;
+        stream.set_write_timeout(Some(timeout))?;
         let body = serde_json::to_vec(&PrefsRequest::Get {
             key: key.to_owned(),
         })?;
@@ -194,5 +208,32 @@ mod tests {
         let response = get_preference_at(scratch("absent"), "reduceMotion");
         assert_eq!(response.preference_kind, PreferenceKind::NotFound);
         assert!(!response.applied);
+    }
+
+    #[test]
+    fn unresponsive_prefsd_degrades_within_client_deadline() {
+        let socket = scratch("unresponsive").with_extension("sock");
+        let _ = std::fs::remove_file(&socket);
+        let listener = UnixListener::bind(&socket).unwrap();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (_stream, _) = listener.accept().unwrap();
+            release_rx.recv().unwrap();
+        });
+
+        let timeout = Duration::from_millis(50);
+        let started = std::time::Instant::now();
+        let response = get_preference_at_with_timeout(&socket, "reduceMotion", timeout);
+        let elapsed = started.elapsed();
+
+        assert_eq!(response.preference_kind, PreferenceKind::NotFound);
+        assert!(!response.applied);
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "unresponsive prefsd took {elapsed:?} to degrade"
+        );
+        release_tx.send(()).unwrap();
+        server.join().unwrap();
+        let _ = std::fs::remove_file(socket);
     }
 }
