@@ -177,6 +177,8 @@ pub struct Node {
     pub type_role: TypeRole,
     /// Component-owned line-height multiplier. `None` uses the font's normal line box.
     pub line_height: Option<f32>,
+    /// Corner radius in logical pixels. Zero retains the sharp-rectangle geometry.
+    pub corner_radius: f32,
     pub elevation: Elevation,
     pub children: Vec<Node>,
 }
@@ -200,6 +202,7 @@ impl Node {
             content: NodeContent::Label,
             type_role: TypeRole::Body,
             line_height: None,
+            corner_radius: 0.0,
             elevation: Elevation::None,
             children: Vec::new(),
         }
@@ -236,6 +239,19 @@ impl Node {
 
     pub fn with_elevation(mut self, elevation: Elevation) -> Self {
         self.elevation = elevation;
+        self
+    }
+
+    /// Rounds this node's painted and clipped silhouette.
+    ///
+    /// Non-finite and non-positive values use the backward-compatible sharp shape;
+    /// the renderer clamps positive values to half the shorter side.
+    pub fn with_corner_radius(mut self, radius: f32) -> Self {
+        self.corner_radius = if radius.is_finite() && radius > 0.0 {
+            radius
+        } else {
+            0.0
+        };
         self
     }
 
@@ -764,5 +780,20 @@ mod tests {
                 fit: ImageFit::Cover,
             }
         );
+    }
+
+    #[test]
+    fn corner_radius_defaults_sharp_and_sanitizes_builder_values() {
+        let node = Node::new(
+            id("card"),
+            Role::Group,
+            "card",
+            Bounds::new(0.0, 0.0, 20.0, 10.0),
+            "surface",
+        );
+        assert_eq!(node.corner_radius, 0.0);
+        assert_eq!(node.clone().with_corner_radius(6.0).corner_radius, 6.0);
+        assert_eq!(node.clone().with_corner_radius(f32::NAN).corner_radius, 0.0);
+        assert_eq!(node.with_corner_radius(-1.0).corner_radius, 0.0);
     }
 }

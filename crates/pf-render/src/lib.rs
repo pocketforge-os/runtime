@@ -195,6 +195,7 @@ struct NodeSnapshot {
     style_token: String,
     type_role: TypeRole,
     line_height: Option<f32>,
+    corner_radius: f32,
     focused: bool,
     pressed: bool,
     disabled: bool,
@@ -378,6 +379,7 @@ fn collect(
         style_token: node.style_token.clone(),
         type_role: node.type_role,
         line_height: node.line_height,
+        corner_radius: node.corner_radius,
         focused: node.state.focused,
         pressed: node.state.pressed,
         disabled: node.state.disabled,
@@ -588,6 +590,9 @@ fn draw_node(
         .pixels;
     let transform = node_transform(node, ancestor_transform, pressed_shift);
     let b = transform.map_bounds(node.bounds);
+    let transformed_radius =
+        node.corner_radius * transform.scale_x.abs().min(transform.scale_y.abs());
+    let radius = clamped_radius(transformed_radius, b) * scale;
 
     if node.elevation != Elevation::None {
         draw_shadow(
@@ -595,6 +600,7 @@ fn draw_node(
             shadow_asset(context.style.base(), node.elevation),
             b,
             scale,
+            radius,
         );
     }
     if node.state.focused && node.elevation != Elevation::Focus {
@@ -603,6 +609,7 @@ fn draw_node(
             shadow_asset(context.style.base(), Elevation::Focus),
             b,
             scale,
+            radius,
         );
     }
 
@@ -611,7 +618,17 @@ fn draw_node(
     {
         let mut paint = Paint::default();
         paint.set_color_rgba8(color.red, color.green, color.blue, color.alpha);
-        pm.fill_rect(rect, &paint, Transform::identity(), None);
+        if radius > 0.0 {
+            pm.fill_path(
+                &rounded_rect_path(rect, radius),
+                &paint,
+                tiny_skia::FillRule::Winding,
+                Transform::identity(),
+                None,
+            );
+        } else {
+            pm.fill_rect(rect, &paint, Transform::identity(), None);
+        }
         if node.state.selected {
             fill_token_rect(
                 pm,
@@ -663,7 +680,7 @@ fn draw_node(
             draw_text(pm, context.fonts, context.glyphs, draw);
         }
         NodeContent::Image { source, fit } => {
-            if let Err(note) = draw_image(pm, context.images, source, *fit, b, scale) {
+            if let Err(note) = draw_image(pm, context.images, source, *fit, b, scale, radius) {
                 context.notes.push(note);
             }
         }
@@ -675,19 +692,25 @@ fn draw_node(
         if let Some(rect) =
             Rect::from_xywh(b.x * scale, b.y * scale, b.width * scale, b.height * scale)
         {
-            stroke_token_rect(pm, context.style, "--state-disabled-border", rect, scale)?;
+            stroke_token_rect(
+                pm,
+                context.style,
+                "--state-disabled-border",
+                rect,
+                scale,
+                radius,
+            )?;
         }
         draw_state_glyph(pm, context.style, b, scale, StateGlyph::Disabled)?;
     }
     if node.state.unavailable {
-        fill_token_rect(
+        fill_token_rounded_rect(
             pm,
             context.style,
             "--state-unavailable-veil",
-            b.x * scale,
-            b.y * scale,
-            b.width * scale,
-            b.height * scale,
+            b,
+            scale,
+            radius,
         )?;
         draw_state_glyph(pm, context.style, b, scale, StateGlyph::Unavailable)?;
     }
@@ -695,18 +718,10 @@ fn draw_node(
         draw_state_glyph(pm, context.style, b, scale, StateGlyph::Destructive)?;
     }
     if node.state.scrimmed {
-        fill_token_rect(
-            pm,
-            context.style,
-            "--color-surface-scrim",
-            b.x * scale,
-            b.y * scale,
-            b.width * scale,
-            b.height * scale,
-        )?;
+        fill_token_rounded_rect(pm, context.style, "--color-surface-scrim", b, scale, radius)?;
     }
     if node.state.focused {
-        draw_focus_ring(pm, context.style, b, scale)?;
+        draw_focus_ring(pm, context.style, b, scale, radius)?;
     }
     Ok(())
 }
@@ -788,18 +803,125 @@ fn fill_token_rect(
     Ok(())
 }
 
+fn fill_token_rounded_rect(
+    pm: &mut Pixmap,
+    style: &ResolvedStyleSnapshot,
+    key: &str,
+    bounds: Bounds,
+    scale: f32,
+    radius: f32,
+) -> Result<(), RenderError> {
+    let color = style_color(style, key)?;
+    if let Some(rect) = Rect::from_xywh(
+        bounds.x * scale,
+        bounds.y * scale,
+        bounds.width * scale,
+        bounds.height * scale,
+    ) {
+        let mut paint = Paint::default();
+        paint.set_color_rgba8(color.red, color.green, color.blue, color.alpha);
+        if radius > 0.0 {
+            pm.fill_path(
+                &rounded_rect_path(rect, radius),
+                &paint,
+                tiny_skia::FillRule::Winding,
+                Transform::identity(),
+                None,
+            );
+        } else {
+            pm.fill_rect(rect, &paint, Transform::identity(), None);
+        }
+    }
+    Ok(())
+}
+
+fn clamped_radius(radius: f32, bounds: Bounds) -> f32 {
+    if radius.is_finite() && radius > 0.0 {
+        radius.min(bounds.width.min(bounds.height).max(0.0) / 2.0)
+    } else {
+        0.0
+    }
+}
+
+fn rounded_rect_path(rect: Rect, radius: f32) -> tiny_skia::Path {
+    let radius = radius.min(rect.width().min(rect.height()) / 2.0).max(0.0);
+    if radius == 0.0 {
+        return PathBuilder::from_rect(rect);
+    }
+    // Standard cubic approximation of a quarter circle.
+    const KAPPA: f32 = 0.552_284_8;
+    let left = rect.left();
+    let top = rect.top();
+    let right = rect.right();
+    let bottom = rect.bottom();
+    let control = radius * KAPPA;
+    let mut path = PathBuilder::new();
+    path.move_to(left + radius, top);
+    path.line_to(right - radius, top);
+    path.cubic_to(
+        right - radius + control,
+        top,
+        right,
+        top + radius - control,
+        right,
+        top + radius,
+    );
+    path.line_to(right, bottom - radius);
+    path.cubic_to(
+        right,
+        bottom - radius + control,
+        right - radius + control,
+        bottom,
+        right - radius,
+        bottom,
+    );
+    path.line_to(left + radius, bottom);
+    path.cubic_to(
+        left + radius - control,
+        bottom,
+        left,
+        bottom - radius + control,
+        left,
+        bottom - radius,
+    );
+    path.line_to(left, top + radius);
+    path.cubic_to(
+        left,
+        top + radius - control,
+        left + radius - control,
+        top,
+        left + radius,
+        top,
+    );
+    path.close();
+    path.finish().expect("rounded rectangle path")
+}
+
+fn rounded_coverage(x: f32, y: f32, width: f32, height: f32, radius: f32) -> f32 {
+    let radius = radius.min(width.min(height) / 2.0).max(0.0);
+    let cx = x.clamp(radius, width - radius);
+    let cy = y.clamp(radius, height - radius);
+    let distance = ((x - cx).powi(2) + (y - cy).powi(2)).sqrt();
+    (radius + 0.5 - distance).clamp(0.0, 1.0)
+}
+
 fn stroke_token_rect(
     pm: &mut Pixmap,
     style: &ResolvedStyleSnapshot,
     key: &str,
     rect: Rect,
     scale: f32,
+    radius: f32,
 ) -> Result<(), RenderError> {
     let color = style_color(style, key)?;
     let mut paint = Paint::default();
     paint.set_color_rgba8(color.red, color.green, color.blue, color.alpha);
     pm.stroke_path(
-        &PathBuilder::from_rect(rect),
+        &if radius > 0.0 {
+            rounded_rect_path(rect, radius)
+        } else {
+            PathBuilder::from_rect(rect)
+        },
         &paint,
         &Stroke {
             width: scale,
@@ -817,6 +939,7 @@ fn draw_focus_ring(
     style: &ResolvedStyleSnapshot,
     b: Bounds,
     scale: f32,
+    radius: f32,
 ) -> Result<(), RenderError> {
     let width = style
         .length("--focus-ring-width")
@@ -839,7 +962,11 @@ fn draw_focus_ring(
         let mut paint = Paint::default();
         paint.set_color_rgba8(ring.red, ring.green, ring.blue, ring.alpha);
         pm.stroke_path(
-            &PathBuilder::from_rect(rect),
+            &if radius > 0.0 {
+                rounded_rect_path(rect, radius + outset)
+            } else {
+                PathBuilder::from_rect(rect)
+            },
             &paint,
             &Stroke {
                 width,
@@ -852,7 +979,7 @@ fn draw_focus_ring(
     Ok(())
 }
 
-fn draw_shadow(pm: &mut Pixmap, asset: &ShadowAsset, b: Bounds, scale: f32) {
+fn draw_shadow(pm: &mut Pixmap, asset: &ShadowAsset, b: Bounds, scale: f32, radius: f32) {
     if asset.margin == 0 {
         return;
     }
@@ -871,12 +998,23 @@ fn draw_shadow(pm: &mut Pixmap, asset: &ShadowAsset, b: Bounds, scale: f32) {
             }
             let sx = slice_coordinate(dx, width, asset.side, asset.margin, margin);
             let index = (sy * asset.side + sx) * 4;
-            blend_pixel(
-                pm,
-                x as u32,
-                y as u32,
-                asset.rgba[index..index + 4].try_into().unwrap(),
-            );
+            let coverage = if radius > 0.0 {
+                rounded_coverage(
+                    dx as f32 + 0.5,
+                    dy as f32 + 0.5,
+                    width as f32,
+                    height as f32,
+                    radius + margin as f32,
+                )
+            } else {
+                1.0
+            };
+            if coverage == 0.0 {
+                continue;
+            }
+            let mut color: [u8; 4] = asset.rgba[index..index + 4].try_into().unwrap();
+            color[3] = (f32::from(color[3]) * coverage).round() as u8;
+            blend_pixel(pm, x as u32, y as u32, color);
         }
     }
 }
@@ -926,6 +1064,7 @@ fn draw_image(
     fit: ImageFit,
     bounds: Bounds,
     surface_scale: f32,
+    radius: f32,
 ) -> Result<(), RenderNote> {
     let image = cache.get_or_decode(source)?;
     let target_width = bounds.width * surface_scale;
@@ -953,10 +1092,33 @@ fn draw_image(
     let bottom = ((bounds.y + bounds.height) * surface_scale)
         .ceil()
         .clamp(0.0, target.height() as f32) as u32;
-    for row in top.min(target.height())..bottom {
-        let start = (row * target.width() + left.min(target.width())) as usize;
-        let end = (row * target.width() + right) as usize;
-        mask_data[start..end].fill(255);
+    if radius > 0.0 {
+        let rect = Rect::from_xywh(
+            bounds.x * surface_scale,
+            bounds.y * surface_scale,
+            target_width,
+            target_height,
+        )
+        .expect("positive image bounds");
+        let mut mask = Mask::from_vec(
+            mask_data,
+            tiny_skia::IntSize::from_wh(target.width(), target.height())
+                .expect("pixmap has valid dimensions"),
+        )
+        .expect("mask matches target dimensions");
+        mask.fill_path(
+            &rounded_rect_path(rect, radius),
+            tiny_skia::FillRule::Winding,
+            true,
+            Transform::identity(),
+        );
+        mask_data = mask.data().to_vec();
+    } else {
+        for row in top.min(target.height())..bottom {
+            let start = (row * target.width() + left.min(target.width())) as usize;
+            let end = (row * target.width() + right) as usize;
+            mask_data[start..end].fill(255);
+        }
     }
     let mask_size = tiny_skia::IntSize::from_wh(target.width(), target.height())
         .expect("pixmap has valid dimensions");
@@ -1170,6 +1332,97 @@ mod tests {
                 .render(&fixture("再開 日本語"), metrics())
                 .unwrap()
                 .rgba
+        );
+    }
+
+    fn rounded_fixture(radius: f32) -> Scene {
+        let root = Node::new(
+            NodeId::new("rounded").unwrap(),
+            Role::Group,
+            "",
+            Bounds::new(20.0, 20.0, 40.0, 40.0),
+            "--state-rest-surface",
+        )
+        .with_corner_radius(radius);
+        Scene::new(root, NodeId::new("rounded").unwrap()).unwrap()
+    }
+
+    #[test]
+    fn rounded_fills_have_transparent_aa_corners_and_pill_clamp() {
+        let background = token_rgba(ThemeBase::Dusk, "--color-surface-canvas");
+        let fill = token_rgba(ThemeBase::Dusk, "--state-rest-surface");
+        for radius in [6.0, 10.0, 16.0] {
+            let frame = Rasterizer::new()
+                .render(&rounded_fixture(radius), metrics())
+                .unwrap();
+            assert_eq!(pixel(&frame, 20, 20), background, "radius {radius}");
+            assert_eq!(
+                pixel(&frame, 20 + radius as u32, 21),
+                fill,
+                "radius {radius}"
+            );
+            assert!(
+                (20..20 + radius as u32 + 1).any(|x| {
+                    let p = pixel(&frame, x, 20);
+                    p != background && p != fill
+                }),
+                "radius {radius} has no antialias coverage"
+            );
+        }
+        let clamped = Rasterizer::new()
+            .render(&rounded_fixture(20.0), metrics())
+            .unwrap();
+        let pill = Rasterizer::new()
+            .render(&rounded_fixture(999.0), metrics())
+            .unwrap();
+        assert_eq!(clamped.rgba, pill.rgba);
+    }
+
+    #[test]
+    fn explicit_zero_radius_is_byte_identical_to_default() {
+        let default = Rasterizer::new()
+            .render(&fixture("same"), metrics())
+            .unwrap();
+        let zero_scene = Scene::new(
+            Node::new(
+                NodeId::new("root").unwrap(),
+                Role::Button,
+                "same",
+                Bounds::new(3.0, 4.0, 250.0, 80.0),
+                "--state-rest-surface",
+            )
+            .with_action(NodeAction::Activate)
+            .with_corner_radius(0.0),
+            NodeId::new("root").unwrap(),
+        )
+        .unwrap();
+        let explicit = Rasterizer::new().render(&zero_scene, metrics()).unwrap();
+        assert_eq!(default.rgba, explicit.rgba);
+    }
+
+    #[test]
+    fn rounded_image_content_is_clipped_to_node_silhouette() {
+        let root = Node::new(
+            NodeId::new("art").unwrap(),
+            Role::ListItem,
+            "",
+            Bounds::new(20.0, 20.0, 40.0, 40.0),
+            "--state-rest-surface",
+        )
+        .with_corner_radius(16.0)
+        .with_image(
+            ImageSource::new("rounded-art", Arc::<[u8]>::from(IMAGE_PNG)),
+            ImageFit::Cover,
+        );
+        let scene = Scene::new(root, NodeId::new("art").unwrap()).unwrap();
+        let frame = Rasterizer::new().render(&scene, metrics()).unwrap();
+        assert_eq!(
+            pixel(&frame, 20, 20),
+            token_rgba(ThemeBase::Dusk, "--color-surface-canvas")
+        );
+        assert_ne!(
+            pixel(&frame, 40, 40),
+            token_rgba(ThemeBase::Dusk, "--color-surface-canvas")
         );
     }
 
@@ -1657,7 +1910,13 @@ mod tests {
 
         let raster = |scale: f32| {
             let mut pm = Pixmap::new(64, 32).unwrap();
-            draw_shadow(&mut pm, &asset, Bounds::new(10.0, 10.0, 12.0, 8.0), scale);
+            draw_shadow(
+                &mut pm,
+                &asset,
+                Bounds::new(10.0, 10.0, 12.0, 8.0),
+                scale,
+                0.0,
+            );
             pm
         };
         let half = raster(0.5);
