@@ -206,15 +206,40 @@ fn resolve_walk(
             )
         });
         resolve_subtree(node, metrics, origin, scale, measure, cache);
-        for child in &mut node.children {
-            if child.layout.is_none() {
-                resolve_walk(child, metrics, Some(node.bounds), scale, measure, cache);
-            }
-        }
+        resolve_legacy_islands(node, metrics, scale, measure, cache);
         return;
     }
     for child in &mut node.children {
         resolve_walk(child, metrics, Some(node.bounds), scale, measure, cache);
+    }
+}
+
+fn resolve_legacy_islands(
+    node: &mut Node,
+    metrics: Metrics,
+    scale: f32,
+    measure: &dyn TextMeasure,
+    cache: &mut LayoutCache,
+) {
+    for child in &mut node.children {
+        if child.layout.is_none() {
+            // Taffy treated this island as an opaque leaf. Its own box is resolved, but
+            // its descendants still need the normal walk, enclosed by that box.
+            for descendant in &mut child.children {
+                resolve_walk(
+                    descendant,
+                    metrics,
+                    Some(child.bounds),
+                    scale,
+                    measure,
+                    cache,
+                );
+            }
+        } else {
+            // This styled child was already resolved as part of `node`'s subtree. Scan
+            // through it for opaque islands without resolving it again as a fresh root.
+            resolve_legacy_islands(child, metrics, scale, measure, cache);
+        }
     }
 }
 
@@ -902,6 +927,43 @@ mod tests {
             root.children[1].children[0].children[0].bounds,
             Bounds::new(13.0, 11.0, 50.0, 20.0),
             "walking legacy islands must recurse to participating roots at any depth"
+        );
+    }
+
+    #[test]
+    fn migrated_child_resolves_in_legacy_island_below_styled_child_without_reresolve() {
+        let descendant =
+            node("descendant", Bounds::new(0.0, 0.0, 0.0, 0.0)).with_layout(LayoutStyle {
+                width: LayoutValue::Pct(1.0),
+                height: LayoutValue::Pct(1.0),
+                ..LayoutStyle::default()
+            });
+        let island =
+            node("island", Bounds::new(0.0, 0.0, 60.0, 20.0)).with_children(vec![descendant]);
+        let styled = node("styled", Bounds::new(0.0, 0.0, 0.0, 0.0))
+            .with_layout(LayoutStyle {
+                width: LayoutValue::Px(120.0),
+                height: LayoutValue::Px(40.0),
+                ..LayoutStyle::default()
+            })
+            .with_children(vec![island]);
+        let mut root = node("root", Bounds::new(5.0, 7.0, 0.0, 0.0))
+            .with_layout(LayoutStyle {
+                width: LayoutValue::Px(200.0),
+                height: LayoutValue::Px(80.0),
+                ..LayoutStyle::default()
+            })
+            .with_children(vec![styled]);
+        let mut cache = LayoutCache::default();
+
+        resolve_layout(&mut root, metrics(320.0), 1.0, &Measure, &mut cache);
+
+        let island = &root.children[0].children[0];
+        assert_eq!(island.children[0].bounds, island.bounds);
+        assert_eq!(
+            cache.entries.len(),
+            2,
+            "only the outer subtree and the descendant below the island are fresh roots"
         );
     }
 
