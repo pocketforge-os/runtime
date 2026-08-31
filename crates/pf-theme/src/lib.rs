@@ -108,6 +108,7 @@ const THEME_TOKENS: &[&str] = &[
     "--type-family-ui",
     "--type-family-display",
     "--type-family-plate",
+    "--type-plate-size",
     "--type-hero-size",
     "--type-hero-weight",
     "--type-title-size",

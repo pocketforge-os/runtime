@@ -5,7 +5,7 @@
 use cosmic_text_tracking as tracked_text;
 use pf_scene::{
     Bounds, Elevation, ImageFit, ImageSource, Node, NodeContent, Role, Scene, SurfaceMetrics,
-    TypeRole,
+    TextAlign, TypeRole,
 };
 pub use pf_theme::Base as ThemeBase;
 use pf_theme::{ResolvedStyleSnapshot, Rgba};
@@ -68,9 +68,15 @@ fn parse_type_role(role: TypeRole) -> ResolvedTypeStyle {
         .expect("embedded flagship type tokens are valid JSON");
     let values = theme["theme"].as_object().expect("theme token object");
     if role == TypeRole::Plate {
+        let size = token(values, "--type-plate-size");
         return ResolvedTypeStyle {
             family: token(values, "--type-family-plate").into(),
-            size_px: ROOT_FONT_SIZE,
+            size_px: size
+                .strip_suffix("rem")
+                .expect("type size is rem")
+                .parse::<f32>()
+                .expect("numeric type size")
+                * ROOT_FONT_SIZE,
             weight: 500,
             tracking_em: 0.0,
         };
@@ -256,6 +262,7 @@ struct NodeSnapshot {
     style_token: String,
     type_role: TypeRole,
     line_height: Option<f32>,
+    text_align: TextAlign,
     corner_radius: f32,
     focused: bool,
     pressed: bool,
@@ -446,6 +453,7 @@ fn collect(
         style_token: node.style_token.clone(),
         type_role: node.type_role,
         line_height: node.line_height,
+        text_align: node.text_align,
         corner_radius: normalized_corner_radius(node.corner_radius),
         focused: node.state.focused,
         pressed: node.state.pressed,
@@ -744,16 +752,31 @@ fn draw_node(
     let text = style_color(context.style, text_key)?;
     match &node.content {
         NodeContent::Label if paints_accessible_label(node) => {
+            let (x, y, width, height) = match node.text_align {
+                TextAlign::Start => (
+                    (b.x + 6.0) * scale,
+                    (b.y + 5.0) * scale,
+                    (b.width - 12.0).max(1.0) * scale,
+                    (b.height - 5.0).max(0.0) * scale,
+                ),
+                TextAlign::Center => (
+                    b.x * scale,
+                    b.y * scale,
+                    b.width.max(1.0) * scale,
+                    b.height.max(0.0) * scale,
+                ),
+            };
             let draw = TextDraw {
                 text: &node.accessible_label,
-                x: (b.x + 6.0) * scale,
-                y: (b.y + 5.0) * scale,
-                width: (b.width - 12.0).max(1.0) * scale,
-                height: (b.height - 5.0).max(0.0) * scale,
+                x,
+                y,
+                width,
+                height,
                 style: context.typography.resolve(node.type_role),
                 text_scale: context.text_scale,
                 surface_scale: scale,
                 line_height: node.line_height,
+                align: node.text_align,
                 clip: (b.x * scale, b.y * scale, b.width * scale, b.height * scale),
                 color: text,
             };
@@ -1601,6 +1624,7 @@ struct TextDraw<'a> {
     text_scale: f32,
     surface_scale: f32,
     line_height: Option<f32>,
+    align: TextAlign,
     clip: (f32, f32, f32, f32),
     color: Rgba,
 }
@@ -1629,7 +1653,21 @@ fn draw_text(
         tracked_text::Shaping::Advanced,
         None,
     );
+    if draw.align == TextAlign::Center {
+        for line in &mut buffer.lines {
+            line.set_align(Some(tracked_text::Align::Center));
+        }
+    }
     buffer.shape_until_scroll(fonts, false);
+    let vertical_offset = if draw.align == TextAlign::Center {
+        let content_height = buffer
+            .layout_runs()
+            .map(|run| run.line_top + run.line_height)
+            .fold(0.0_f32, f32::max);
+        ((draw.height - content_height) / 2.0).max(0.0)
+    } else {
+        0.0
+    };
     let default_color = tracked_text::Color::rgba(
         draw.color.red,
         draw.color.green,
@@ -1645,7 +1683,7 @@ fn draw_text(
                     pm,
                     &draw,
                     physical.x + x,
-                    run.line_y as i32 + physical.y + y,
+                    (run.line_y + vertical_offset) as i32 + physical.y + y,
                     [color.r(), color.g(), color.b(), color.a()],
                 );
             });
@@ -1684,7 +1722,7 @@ fn blend_text_pixel_rgba(pm: &mut Pixmap, draw: &TextDraw<'_>, gx: i32, gy: i32,
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pf_scene::{ImageSource, Insets, NodeAction, NodeId, Orientation, Role};
+    use pf_scene::{ImageSource, Insets, NodeAction, NodeId, Orientation, Role, TextAlign};
     use std::sync::Arc;
 
     const IMAGE_PNG: &[u8] = include_bytes!("../../../spikes/consent-ui/baseline/s01-initial.png");
@@ -3082,6 +3120,16 @@ mod tests {
     }
 
     #[test]
+    fn plate_size_is_resolved_from_the_vendored_token() {
+        assert_eq!(
+            TypographySnapshot::flagship()
+                .resolve(TypeRole::Plate)
+                .size_px,
+            56.0
+        );
+    }
+
+    #[test]
     fn fraunces_is_exclusively_bound_to_plate_text() {
         let typography = TypographySnapshot::flagship();
         for role in [
@@ -3117,6 +3165,37 @@ mod tests {
             .flat_map(|y| (0..frame.width).map(move |x| (x, y)))
             .filter(|&(x, y)| pixel(frame, x, y) == text)
             .collect()
+    }
+
+    #[test]
+    fn centered_text_ink_is_horizontally_centered_in_its_node_box() {
+        let scene = |align| {
+            let node = Node::new(
+                NodeId::new("aligned-copy").unwrap(),
+                Role::Text,
+                "O",
+                Bounds::new(40.0, 30.0, 100.0, 80.0),
+                "--state-rest-surface",
+            )
+            .with_text_align(align);
+            Scene::new(node, NodeId::new("aligned-copy").unwrap()).unwrap()
+        };
+        let ink_center = |align| {
+            let frame = Rasterizer::new().render(&scene(align), metrics()).unwrap();
+            let ink = text_ink(&frame);
+            let left = ink.iter().map(|point| point.0).min().unwrap();
+            let right = ink.iter().map(|point| point.0).max().unwrap();
+            (left + right) as f32 / 2.0
+        };
+
+        let box_center = 90.0;
+        let centered = ink_center(TextAlign::Center);
+        let started = ink_center(TextAlign::Start);
+        assert!(
+            (centered - box_center).abs() <= 1.0,
+            "centered ink midpoint was {centered}"
+        );
+        assert!((started - box_center).abs() > 1.0);
     }
 
     #[test]
@@ -3186,6 +3265,7 @@ mod tests {
                 text_scale: 1.0,
                 surface_scale: 1.0,
                 line_height: None,
+                align: TextAlign::Start,
                 clip: (0.0, 0.0, 300.0, 60.0),
                 color: Rgba {
                     red: 255,
