@@ -206,6 +206,11 @@ fn resolve_walk(
             )
         });
         resolve_subtree(node, metrics, origin, scale, measure, cache);
+        for child in &mut node.children {
+            if child.layout.is_none() {
+                resolve_walk(child, metrics, Some(node.bounds), scale, measure, cache);
+            }
+        }
         return;
     }
     for child in &mut node.children {
@@ -805,6 +810,99 @@ mod tests {
         assert_eq!(root.children[0].bounds.x, 0.0);
         assert_eq!(root.children[1].bounds, Bounds::new(40.0, 0.0, 30.0, 20.0));
         assert_eq!(root.children[2].bounds.x, 70.0);
+    }
+
+    #[test]
+    fn migrated_child_inside_flowed_legacy_island_uses_resolved_island_box() {
+        let zero_edges = Edges {
+            top: LayoutValue::Px(0.0),
+            right: LayoutValue::Px(0.0),
+            bottom: LayoutValue::Px(0.0),
+            left: LayoutValue::Px(0.0),
+        };
+        let nested = node("nested", Bounds::new(0.0, 0.0, 0.0, 0.0)).with_layout(LayoutStyle {
+            width: LayoutValue::Pct(1.0),
+            height: LayoutValue::Pct(1.0),
+            margin: zero_edges,
+            ..LayoutStyle::default()
+        });
+        let island =
+            node("island", Bounds::new(99.0, 77.0, 60.0, 30.0)).with_children(vec![nested]);
+        let spacer = node("spacer", Bounds::new(0.0, 0.0, 0.0, 0.0)).with_layout(LayoutStyle {
+            width: LayoutValue::Px(40.0),
+            height: LayoutValue::Px(30.0),
+            flex_shrink: 0.0,
+            margin: zero_edges,
+            ..LayoutStyle::default()
+        });
+        let mut root = node("root", Bounds::new(5.0, 7.0, 0.0, 0.0))
+            .with_layout(LayoutStyle {
+                width: LayoutValue::Px(200.0),
+                height: LayoutValue::Px(30.0),
+                flex_direction: FlexDirection::RowReverse,
+                margin: zero_edges,
+                ..LayoutStyle::default()
+            })
+            .with_children(vec![spacer, island]);
+        let mut cache = LayoutCache::default();
+
+        resolve_layout(&mut root, metrics(320.0), 1.0, &Measure, &mut cache);
+
+        assert_eq!(root.children[1].bounds, Bounds::new(105.0, 7.0, 60.0, 30.0));
+        assert_eq!(
+            root.children[1].children[0].bounds,
+            Bounds::new(105.0, 7.0, 60.0, 30.0)
+        );
+
+        root.layout.as_mut().unwrap().flex_direction = FlexDirection::Row;
+        resolve_layout(&mut root, metrics(320.0), 1.0, &Measure, &mut cache);
+        assert_eq!(
+            cache.hits(),
+            1,
+            "the unchanged nested subtree must hit its cache"
+        );
+        assert_eq!(
+            root.children[1].children[0].bounds,
+            Bounds::new(45.0, 7.0, 60.0, 30.0),
+            "the cache hit must mount at the island's reflowed origin"
+        );
+    }
+
+    #[test]
+    fn migrated_child_resolves_through_two_nested_legacy_islands() {
+        let nested = node("nested", Bounds::new(0.0, 0.0, 0.0, 0.0)).with_layout(LayoutStyle {
+            width: LayoutValue::Pct(1.0),
+            height: LayoutValue::Pct(1.0),
+            ..LayoutStyle::default()
+        });
+        let inner = node("inner", Bounds::new(13.0, 11.0, 50.0, 20.0)).with_children(vec![nested]);
+        let outer = node("outer", Bounds::new(0.0, 0.0, 70.0, 30.0)).with_children(vec![inner]);
+        let spacer = node("spacer", Bounds::new(0.0, 0.0, 0.0, 0.0)).with_layout(LayoutStyle {
+            width: LayoutValue::Px(40.0),
+            height: LayoutValue::Px(30.0),
+            flex_shrink: 0.0,
+            ..LayoutStyle::default()
+        });
+        let mut root = node("root", Bounds::new(5.0, 7.0, 0.0, 0.0))
+            .with_layout(LayoutStyle {
+                width: LayoutValue::Px(200.0),
+                height: LayoutValue::Px(30.0),
+                flex_direction: FlexDirection::RowReverse,
+                ..LayoutStyle::default()
+            })
+            .with_children(vec![spacer, outer]);
+        resolve_layout(
+            &mut root,
+            metrics(320.0),
+            1.0,
+            &Measure,
+            &mut LayoutCache::default(),
+        );
+        assert_eq!(
+            root.children[1].children[0].children[0].bounds,
+            Bounds::new(13.0, 11.0, 50.0, 20.0),
+            "walking legacy islands must recurse to participating roots at any depth"
+        );
     }
 
     #[test]
