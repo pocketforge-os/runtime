@@ -5,7 +5,7 @@
 use cosmic_text_tracking as tracked_text;
 use pf_scene::{
     Bounds, Elevation, ImageFit, ImageSource, Node, NodeContent, Role, Scene, SurfaceMetrics,
-    TextAlign, TypeRole,
+    TextAlign, TextMeasure, TypeRole,
 };
 pub use pf_theme::Base as ThemeBase;
 use pf_theme::{ResolvedStyleSnapshot, Rgba};
@@ -290,13 +290,8 @@ struct ImageCache {
 
 impl Rasterizer {
     pub fn new() -> Self {
-        let mut db = tracked_text::fontdb::Database::new();
-        // Never call load_system_fonts: output must depend only on repository bytes.
-        for data in [MANROPE, FRAUNCES, CJK] {
-            db.load_font_data(data.to_vec());
-        }
         Self {
-            fonts: tracked_text::FontSystem::new_with_locale_and_db("en-US".into(), db),
+            fonts: production_font_system(),
             glyphs: tracked_text::SwashCache::new(),
             previous: Vec::new(),
             images: ImageCache::default(),
@@ -408,6 +403,103 @@ impl Rasterizer {
             notes,
         })
     }
+}
+
+impl TextMeasure for Rasterizer {
+    fn measure(
+        &self,
+        text: &str,
+        role: TypeRole,
+        align: TextAlign,
+        scale: f32,
+        max_width: Option<f32>,
+        line_height: Option<f32>,
+    ) -> (f32, f32) {
+        // Measurement deliberately enters through the same embedded fonts, role snapshot,
+        // metrics, attributes and Advanced shaping configuration used by `draw_text`.
+        let mut fonts = production_font_system();
+        let style = self.typography.resolve(role);
+        let (size, line_height) = production_text_metrics(style, scale, line_height);
+        let insets = text_content_insets(align);
+        let content_max_width = max_width.map(|width| (width - insets.horizontal()).max(1.0));
+        let mut buffer =
+            tracked_text::Buffer::new(&mut fonts, tracked_text::Metrics::new(size, line_height));
+        buffer.set_size(&mut fonts, content_max_width, None);
+        buffer.set_text(
+            &mut fonts,
+            text,
+            &production_text_attrs(style),
+            tracked_text::Shaping::Advanced,
+            None,
+        );
+        buffer.shape_until_scroll(&mut fonts, false);
+        let (width, height) = buffer
+            .layout_runs()
+            .fold((0.0_f32, 0.0_f32), |(w, h), run| {
+                (w.max(run.line_w), h.max(run.line_top + run.line_height))
+            });
+        (width + insets.horizontal(), height + insets.vertical())
+    }
+}
+
+#[derive(Clone, Copy)]
+struct TextContentInsets {
+    left: f32,
+    top: f32,
+    right: f32,
+    bottom: f32,
+}
+
+impl TextContentInsets {
+    fn horizontal(self) -> f32 {
+        self.left + self.right
+    }
+
+    fn vertical(self) -> f32 {
+        self.top + self.bottom
+    }
+}
+
+fn text_content_insets(align: TextAlign) -> TextContentInsets {
+    match align {
+        TextAlign::Start => TextContentInsets {
+            left: 6.0,
+            top: 5.0,
+            right: 6.0,
+            bottom: 0.0,
+        },
+        TextAlign::Center => TextContentInsets {
+            left: 0.0,
+            top: 0.0,
+            right: 0.0,
+            bottom: 0.0,
+        },
+    }
+}
+
+fn production_font_system() -> tracked_text::FontSystem {
+    let mut db = tracked_text::fontdb::Database::new();
+    // Never call load_system_fonts: measure and paint depend on the same repository bytes.
+    for data in [MANROPE, FRAUNCES, CJK] {
+        db.load_font_data(data.to_vec());
+    }
+    tracked_text::FontSystem::new_with_locale_and_db("en-US".into(), db)
+}
+
+fn production_text_metrics(
+    style: &ResolvedTypeStyle,
+    scale: f32,
+    line_height: Option<f32>,
+) -> (f32, f32) {
+    let size = style.size_px * scale;
+    (size, line_height.map_or(size * 1.25, |value| size * value))
+}
+
+fn production_text_attrs(style: &ResolvedTypeStyle) -> tracked_text::Attrs<'_> {
+    tracked_text::Attrs::new()
+        .family(tracked_text::Family::Name(&style.family))
+        .weight(tracked_text::Weight(style.weight))
+        .letter_spacing(style.tracking_em)
 }
 
 impl Default for Rasterizer {
@@ -766,20 +858,11 @@ fn draw_node(
             // ink token wins over rest, unavailable, and focused state ink.
             let text_key = resolved_text_ink_token(node);
             let text = style_color(context.style, text_key)?;
-            let (x, y, width, height) = match node.text_align {
-                TextAlign::Start => (
-                    (b.x + 6.0) * scale,
-                    (b.y + 5.0) * scale,
-                    (b.width - 12.0).max(1.0) * scale,
-                    (b.height - 5.0).max(0.0) * scale,
-                ),
-                TextAlign::Center => (
-                    b.x * scale,
-                    b.y * scale,
-                    b.width.max(1.0) * scale,
-                    b.height.max(0.0) * scale,
-                ),
-            };
+            let insets = text_content_insets(node.text_align);
+            let x = (b.x + insets.left) * scale;
+            let y = (b.y + insets.top) * scale;
+            let width = (b.width - insets.horizontal()).max(1.0) * scale;
+            let height = (b.height - insets.vertical()).max(0.0) * scale;
             let draw = TextDraw {
                 text: &node.accessible_label,
                 x,
@@ -1649,21 +1732,20 @@ fn draw_text(
     glyphs: &mut tracked_text::SwashCache,
     draw: TextDraw<'_>,
 ) {
-    let size = draw.style.size_px * draw.text_scale * draw.surface_scale;
-    let line_height = draw.line_height.map_or(size * 1.25, |value| size * value);
+    let (size, line_height) = production_text_metrics(
+        draw.style,
+        draw.text_scale * draw.surface_scale,
+        draw.line_height,
+    );
     let mut buffer =
         tracked_text::Buffer::new(fonts, tracked_text::Metrics::new(size, line_height));
     buffer.set_size(fonts, Some(draw.width), Some(draw.height));
     buffer.set_text(
         fonts,
         draw.text,
-        &tracked_text::Attrs::new()
-            .family(tracked_text::Family::Name(&draw.style.family))
-            .weight(tracked_text::Weight(draw.style.weight))
-            // Cosmic Text's public letter-spacing unit is em. It resolves the value
-            // against Metrics::font_size while shaping, so converting it to pixels
-            // here would multiply by the font size a second time.
-            .letter_spacing(draw.style.tracking_em),
+        // Cosmic Text's public letter-spacing unit is em. The shared production attrs keep
+        // measurement and paint on one configuration path.
+        &production_text_attrs(draw.style),
         tracked_text::Shaping::Advanced,
         None,
     );
@@ -1736,7 +1818,10 @@ fn blend_text_pixel_rgba(pm: &mut Pixmap, draw: &TextDraw<'_>, gx: i32, gy: i32,
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pf_scene::{ImageSource, Insets, NodeAction, NodeId, Orientation, Role, TextAlign};
+    use pf_scene::{
+        resolve_layout, ImageSource, Insets, LayoutCache, LayoutStyle, LayoutValue, NodeAction,
+        NodeId, Orientation, Role, TextAlign,
+    };
     use std::sync::Arc;
 
     const IMAGE_PNG: &[u8] = include_bytes!("../../../spikes/consent-ui/baseline/s01-initial.png");
@@ -3344,6 +3429,126 @@ mod tests {
             assert_eq!(style.weight, weight, "{role:?}");
             assert_eq!(style.tracking_em, tracking_em, "{role:?}");
         }
+    }
+
+    #[test]
+    fn wrapped_measurement_uses_the_same_custom_line_height_as_paint() {
+        let rasterizer = Rasterizer::new();
+        let text = "Wrapped text needs several lines at this narrow width";
+        let width = 72.0;
+        let multiplier = 1.8;
+        let measured = rasterizer.measure(
+            text,
+            TypeRole::Body,
+            TextAlign::Center,
+            1.0,
+            Some(width),
+            Some(multiplier),
+        );
+
+        // Reproduce draw_text's shaping inputs to establish the painter's content height.
+        let mut fonts = production_font_system();
+        let style = rasterizer.typography.resolve(TypeRole::Body);
+        let (size, line_height) = production_text_metrics(style, 1.0, Some(multiplier));
+        let mut painted =
+            tracked_text::Buffer::new(&mut fonts, tracked_text::Metrics::new(size, line_height));
+        painted.set_size(&mut fonts, Some(width), None);
+        painted.set_text(
+            &mut fonts,
+            text,
+            &production_text_attrs(style),
+            tracked_text::Shaping::Advanced,
+            None,
+        );
+        painted.shape_until_scroll(&mut fonts, false);
+        let painted_height = painted
+            .layout_runs()
+            .map(|run| run.line_top + run.line_height)
+            .fold(0.0_f32, f32::max);
+
+        assert_eq!(measured.1, painted_height);
+        let default_height = rasterizer
+            .measure(
+                text,
+                TypeRole::Body,
+                TextAlign::Center,
+                1.0,
+                Some(width),
+                None,
+            )
+            .1;
+        assert_ne!(measured.1, default_height);
+    }
+
+    #[test]
+    fn start_aligned_layout_measures_the_width_the_painter_uses() {
+        fn painted_height(rasterizer: &Rasterizer, text: &str, width: f32) -> f32 {
+            let mut fonts = production_font_system();
+            let style = rasterizer.typography.resolve(TypeRole::Body);
+            let (size, line_height) = production_text_metrics(style, 1.0, None);
+            let mut buffer = tracked_text::Buffer::new(
+                &mut fonts,
+                tracked_text::Metrics::new(size, line_height),
+            );
+            buffer.set_size(&mut fonts, Some(width), None);
+            buffer.set_text(
+                &mut fonts,
+                text,
+                &production_text_attrs(style),
+                tracked_text::Shaping::Advanced,
+                None,
+            );
+            buffer.shape_until_scroll(&mut fonts, false);
+            buffer
+                .layout_runs()
+                .map(|run| run.line_top + run.line_height)
+                .fold(0.0_f32, f32::max)
+        }
+
+        let rasterizer = Rasterizer::new();
+        let text = "A label near the wrapping boundary";
+        let insets = text_content_insets(TextAlign::Start);
+        let box_width = (40..300)
+            .map(|width| width as f32)
+            .find(|width| {
+                painted_height(&rasterizer, text, *width)
+                    < painted_height(&rasterizer, text, *width - insets.horizontal())
+            })
+            .expect("fixture has a width where the start insets add a line");
+        let painter_content_height =
+            painted_height(&rasterizer, text, box_width - insets.horizontal());
+
+        let mut node = Node::new(
+            NodeId::new("wrapped-label").unwrap(),
+            Role::Text,
+            text,
+            Bounds::new(0.0, 0.0, 0.0, 0.0),
+            "--state-rest-surface",
+        )
+        .with_type_role(TypeRole::Body)
+        .with_text_align(TextAlign::Start)
+        .with_layout(LayoutStyle {
+            width: LayoutValue::Px(box_width),
+            ..LayoutStyle::default()
+        });
+        resolve_layout(
+            &mut node,
+            SurfaceMetrics {
+                logical_width: 320.0,
+                logical_height: 240.0,
+                scale: 1.0,
+                safe_insets: Insets::default(),
+                orientation: Orientation::Landscape,
+            },
+            1.0,
+            &rasterizer,
+            &mut LayoutCache::default(),
+        );
+
+        assert_eq!(
+            node.bounds.height,
+            painter_content_height + insets.vertical()
+        );
     }
 
     #[test]

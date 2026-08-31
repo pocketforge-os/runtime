@@ -10,3 +10,6 @@ authors.workspace = true
 
 [lib]
 name = "pf_scene"
+
+[dependencies]
+taffy.workspace = true

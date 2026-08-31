@@ -57,6 +57,7 @@ toml = "0.8"
 # ioctls, SCM_RIGHTS). The wire/facade crates stay dependency-light; this is the one place
 # raw syscalls are unavoidable, and libc gives the correct struct layouts + ioctl FFI.
 libc = "0.2"
+taffy = { version = "0.7.7", default-features = false, features = ["std", "taffy_tree", "flexbox", "grid", "content_size"] }
 
 # A release profile that prefers determinism + small daemons (E2 ships privileged
 # broker code; the ABI/wire are the contract, not the binary size, but keep it lean).

@@ -7,6 +7,9 @@ use std::collections::HashSet;
 use std::fmt;
 use std::sync::Arc;
 
+mod layout;
+pub use layout::*;
+
 /// Stable identity for a semantic node across scene revisions.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct NodeId(String);
@@ -28,7 +31,7 @@ impl NodeId {
 }
 
 /// A node's accessibility role.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum Role {
     Group,
     Heading,
@@ -92,7 +95,7 @@ pub struct Bounds {
 ///
 /// The identifier must identify the bytes immutably. Renderers use it as their
 /// decoded-image cache key and never resolve files or network resources.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct ImageSource {
     pub id: String,
     pub bytes: Arc<[u8]>,
@@ -108,7 +111,7 @@ impl ImageSource {
 }
 
 /// How an image is scaled while preserving its aspect ratio.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum ImageFit {
     /// Fill the node bounds, cropping equally from the overflowing dimension.
     Cover,
@@ -117,7 +120,7 @@ pub enum ImageFit {
 }
 
 /// Renderer-independent visual content carried by a node.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Hash, PartialEq)]
 pub enum NodeContent {
     /// Render the accessible label as text (the legacy/default behavior).
     Label,
@@ -178,6 +181,8 @@ pub struct Node {
     pub accessible_label: String,
     pub state: NodeState,
     pub bounds: Bounds,
+    /// Typed, optional layout participation. `None` permanently retains explicit bounds.
+    pub layout: Option<LayoutStyle>,
     /// Theme-owned style key; never a resolved color or pixel value.
     pub style_token: String,
     /// `Some` makes the node focusable and states what activation means.
@@ -211,6 +216,7 @@ impl Node {
             accessible_label: accessible_label.into(),
             state: NodeState::default(),
             bounds,
+            layout: None,
             style_token: style_token.into(),
             action: None,
             content: NodeContent::Label,
@@ -231,6 +237,11 @@ impl Node {
 
     pub fn with_children(mut self, children: Vec<Node>) -> Self {
         self.children = children;
+        self
+    }
+
+    pub fn with_layout(mut self, layout: LayoutStyle) -> Self {
+        self.layout = Some(layout);
         self
     }
 
