@@ -250,6 +250,8 @@ struct NodeSnapshot {
     parent_id: Option<String>,
     sibling_index: usize,
     bounds: Bounds,
+    /// Participates in damage tracking exactly when the accessible label is painted:
+    /// text/heading role plus `NodeContent::Label`.
     label: String,
     style_token: String,
     type_role: TypeRole,
@@ -474,7 +476,7 @@ fn collect(
 }
 
 fn paints_accessible_label(node: &Node) -> bool {
-    matches!(node.role, Role::Text | Role::Heading)
+    matches!(node.role, Role::Text | Role::Heading) && matches!(node.content, NodeContent::Label)
 }
 
 /// Axis-aligned logical-space transform carried by the paint walk. Pressed geometry only
@@ -1755,6 +1757,43 @@ mod tests {
             assert_eq!(named.damage, None, "{role:?} label caused damage");
             assert_eq!(named.rgba, unnamed.rgba, "{role:?} label changed pixels");
         }
+    }
+
+    #[test]
+    fn only_painted_accessible_label_changes_damage_rendered_content() {
+        let image_scene = |label| {
+            let root = Node::new(
+                NodeId::new("image").unwrap(),
+                Role::Text,
+                label,
+                Bounds::new(20.0, 20.0, 160.0, 60.0),
+                "--state-rest-surface",
+            )
+            .with_image(
+                ImageSource::new("alt-text-image", Arc::<[u8]>::from(IMAGE_PNG)),
+                ImageFit::Cover,
+            );
+            Scene::new(root, NodeId::new("image").unwrap()).unwrap()
+        };
+
+        let mut image_rasterizer = Rasterizer::new();
+        let original_image = image_rasterizer
+            .render(&image_scene("original alt text"), metrics())
+            .unwrap();
+        let renamed_image = image_rasterizer
+            .render(&image_scene("updated alt text"), metrics())
+            .unwrap();
+        assert_eq!(renamed_image.damage, None);
+        assert_eq!(renamed_image.rgba, original_image.rgba);
+
+        let mut text_rasterizer = Rasterizer::new();
+        text_rasterizer
+            .render(&label_scene(Role::Text, "original text"), metrics())
+            .unwrap();
+        let renamed_text = text_rasterizer
+            .render(&label_scene(Role::Text, "updated text"), metrics())
+            .unwrap();
+        assert!(renamed_text.damage.is_some());
     }
 
     #[test]
