@@ -263,6 +263,7 @@ struct NodeSnapshot {
     type_role: TypeRole,
     line_height: Option<f32>,
     text_align: TextAlign,
+    ink_token: Option<String>,
     corner_radius: f32,
     focused: bool,
     pressed: bool,
@@ -454,6 +455,7 @@ fn collect(
         type_role: node.type_role,
         line_height: node.line_height,
         text_align: node.text_align,
+        ink_token: node.ink_token.clone(),
         corner_radius: normalized_corner_radius(node.corner_radius),
         focused: node.state.focused,
         pressed: node.state.pressed,
@@ -740,8 +742,12 @@ fn draw_node(
             )?;
         }
     }
+    // Disabled ink remains state-owned for legibility. Otherwise an explicit node ink
+    // token wins over rest, unavailable, and focused state ink.
     let text_key = if node.state.disabled {
         "--state-disabled-text"
+    } else if let Some(ink_token) = node.ink_token.as_deref() {
+        ink_token
     } else if node.state.unavailable {
         "--state-unavailable-text"
     } else if node.state.focused {
@@ -1788,6 +1794,53 @@ mod tests {
                 .unwrap();
             assert_ne!(labeled.rgba, unlabeled.rgba, "{role:?} label did not paint");
         }
+    }
+
+    #[test]
+    fn text_ink_override_paints_token_color_and_disabled_state_keeps_precedence() {
+        let override_token = "--color-status-ready";
+        let scene = |disabled| {
+            let mut node = Node::new(
+                NodeId::new("ink-override").unwrap(),
+                Role::Text,
+                "MMMM",
+                Bounds::new(20.0, 20.0, 160.0, 60.0),
+                "--state-rest-surface",
+            )
+            .with_ink_token(override_token);
+            node.state.disabled = disabled;
+            Scene::new(node, NodeId::new("ink-override").unwrap()).unwrap()
+        };
+
+        let enabled = Rasterizer::new().render(&scene(false), metrics()).unwrap();
+        assert!(
+            enabled
+                .rgba
+                .chunks_exact(4)
+                .any(|pixel| pixel == token_rgba(ThemeBase::Dusk, override_token)),
+            "override ink color did not appear in painted glyphs"
+        );
+
+        let disabled = Rasterizer::new().render(&scene(true), metrics()).unwrap();
+        assert!(disabled
+            .rgba
+            .chunks_exact(4)
+            .any(|pixel| { pixel == token_rgba(ThemeBase::Dusk, "--state-disabled-text") }));
+        assert!(!disabled
+            .rgba
+            .chunks_exact(4)
+            .any(|pixel| pixel == token_rgba(ThemeBase::Dusk, override_token)));
+    }
+
+    #[test]
+    fn absent_text_ink_override_is_byte_identical_to_existing_label_fixture() {
+        let original = label_scene(Role::Text, "default ink");
+        assert_eq!(original.root().ink_token, None);
+
+        let explicit_none = label_scene(Role::Text, "default ink");
+        let original_frame = Rasterizer::new().render(&original, metrics()).unwrap();
+        let none_frame = Rasterizer::new().render(&explicit_none, metrics()).unwrap();
+        assert_eq!(none_frame.rgba, original_frame.rgba);
     }
 
     #[test]
