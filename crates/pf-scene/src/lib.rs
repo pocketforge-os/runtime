@@ -189,6 +189,8 @@ pub struct Node {
     pub line_height: Option<f32>,
     /// Paint-only text alignment. Semantic label participation is unaffected.
     pub text_align: TextAlign,
+    /// Optional theme token used for painted text ink. `None` keeps state-driven ink.
+    pub ink_token: Option<String>,
     /// Corner radius in logical pixels. Zero retains the sharp-rectangle geometry.
     pub corner_radius: f32,
     pub elevation: Elevation,
@@ -215,6 +217,7 @@ impl Node {
             type_role: TypeRole::Body,
             line_height: None,
             text_align: TextAlign::Start,
+            ink_token: None,
             corner_radius: 0.0,
             elevation: Elevation::None,
             children: Vec::new(),
@@ -252,6 +255,11 @@ impl Node {
 
     pub fn with_text_align(mut self, align: TextAlign) -> Self {
         self.text_align = align;
+        self
+    }
+
+    pub fn with_ink_token(mut self, token: impl Into<String>) -> Self {
+        self.ink_token = Some(token.into());
         self
     }
 

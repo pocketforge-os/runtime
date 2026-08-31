@@ -263,6 +263,7 @@ struct NodeSnapshot {
     type_role: TypeRole,
     line_height: Option<f32>,
     text_align: TextAlign,
+    ink_token: Option<String>,
     corner_radius: f32,
     focused: bool,
     pressed: bool,
@@ -454,6 +455,7 @@ fn collect(
         type_role: node.type_role,
         line_height: node.line_height,
         text_align: node.text_align,
+        ink_token: effective_painted_ink_token(node).map(str::to_owned),
         corner_radius: normalized_corner_radius(node.corner_radius),
         focused: node.state.focused,
         pressed: node.state.pressed,
@@ -485,6 +487,24 @@ fn collect(
 
 fn paints_accessible_label(node: &Node) -> bool {
     matches!(node.role, Role::Text | Role::Heading) && matches!(node.content, NodeContent::Label)
+}
+
+fn resolved_text_ink_token(node: &Node) -> &str {
+    if node.state.disabled {
+        "--state-disabled-text"
+    } else if let Some(ink_token) = node.ink_token.as_deref() {
+        ink_token
+    } else if node.state.unavailable {
+        "--state-unavailable-text"
+    } else if node.state.focused {
+        "--state-focused-text"
+    } else {
+        "--state-rest-text"
+    }
+}
+
+fn effective_painted_ink_token(node: &Node) -> Option<&str> {
+    paints_accessible_label(node).then(|| resolved_text_ink_token(node))
 }
 
 /// Axis-aligned logical-space transform carried by the paint walk. Pressed geometry only
@@ -740,18 +760,12 @@ fn draw_node(
             )?;
         }
     }
-    let text_key = if node.state.disabled {
-        "--state-disabled-text"
-    } else if node.state.unavailable {
-        "--state-unavailable-text"
-    } else if node.state.focused {
-        "--state-focused-text"
-    } else {
-        "--state-rest-text"
-    };
-    let text = style_color(context.style, text_key)?;
     match &node.content {
         NodeContent::Label if paints_accessible_label(node) => {
+            // Disabled ink remains state-owned for legibility. Otherwise an explicit node
+            // ink token wins over rest, unavailable, and focused state ink.
+            let text_key = resolved_text_ink_token(node);
+            let text = style_color(context.style, text_key)?;
             let (x, y, width, height) = match node.text_align {
                 TextAlign::Start => (
                     (b.x + 6.0) * scale,
@@ -1791,6 +1805,109 @@ mod tests {
     }
 
     #[test]
+    fn text_ink_override_paints_token_color_and_disabled_state_keeps_precedence() {
+        let override_token = "--color-status-ready";
+        let scene = |disabled| {
+            let mut node = Node::new(
+                NodeId::new("ink-override").unwrap(),
+                Role::Text,
+                "MMMM",
+                Bounds::new(20.0, 20.0, 160.0, 60.0),
+                "--state-rest-surface",
+            )
+            .with_ink_token(override_token);
+            node.state.disabled = disabled;
+            Scene::new(node, NodeId::new("ink-override").unwrap()).unwrap()
+        };
+
+        let enabled = Rasterizer::new().render(&scene(false), metrics()).unwrap();
+        assert!(
+            enabled
+                .rgba
+                .chunks_exact(4)
+                .any(|pixel| pixel == token_rgba(ThemeBase::Dusk, override_token)),
+            "override ink color did not appear in painted glyphs"
+        );
+
+        let disabled = Rasterizer::new().render(&scene(true), metrics()).unwrap();
+        assert!(disabled
+            .rgba
+            .chunks_exact(4)
+            .any(|pixel| { pixel == token_rgba(ThemeBase::Dusk, "--state-disabled-text") }));
+        assert!(!disabled
+            .rgba
+            .chunks_exact(4)
+            .any(|pixel| pixel == token_rgba(ThemeBase::Dusk, override_token)));
+    }
+
+    #[test]
+    fn bogus_ink_token_is_ignored_unless_the_node_paints_text() {
+        let group = || {
+            Node::new(
+                NodeId::new("group").unwrap(),
+                Role::Group,
+                "semantic label",
+                Bounds::new(20.0, 20.0, 160.0, 60.0),
+                "--state-rest-surface",
+            )
+        };
+        let image = || {
+            Node::new(
+                NodeId::new("image").unwrap(),
+                Role::Text,
+                "image alt text",
+                Bounds::new(20.0, 20.0, 160.0, 60.0),
+                "--state-rest-surface",
+            )
+            .with_image(
+                ImageSource::new("ink-test-image", Arc::<[u8]>::from(IMAGE_PNG)),
+                ImageFit::Cover,
+            )
+        };
+
+        for (without_token, with_token) in [
+            (group(), group().with_ink_token("--not-a-real-color")),
+            (image(), image().with_ink_token("--not-a-real-color")),
+        ] {
+            let render = |node: Node| {
+                let root_id = node.id.clone();
+                Rasterizer::new().render(&Scene::new(node, root_id).unwrap(), metrics())
+            };
+            let without_token = render(without_token).unwrap();
+            let with_token = render(with_token).unwrap();
+            assert_eq!(with_token.rgba, without_token.rgba);
+        }
+
+        let painted = label_scene(Role::Text, "visible text");
+        let painted = Scene::new(
+            painted.root().clone().with_ink_token("--not-a-real-color"),
+            NodeId::new("label").unwrap(),
+        )
+        .unwrap();
+        let painted_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            Rasterizer::new().render(&painted, metrics())
+        }));
+        if cfg!(debug_assertions) {
+            assert!(painted_result.is_err(), "debug build must reject unknown ink");
+        } else {
+            assert_eq!(
+                painted_result.unwrap().unwrap_err(),
+                RenderError::UnknownStyleKey("--not-a-real-color".to_owned())
+            );
+        }
+    }
+
+    #[test]
+    fn absent_text_ink_override_matches_pre_ink_default_raster() {
+        let scene = label_scene(Role::Text, "default ink");
+        assert_eq!(scene.root().ink_token, None);
+
+        let frame = Rasterizer::new().render(&scene, metrics()).unwrap();
+        // Pins the pre-ink-field default raster so an absent override cannot drift silently.
+        assert_eq!(frame_hash(&frame.rgba), 9_368_088_083_885_669_672);
+    }
+
+    #[test]
     fn transparent_node_surface_is_a_no_op_while_content_still_paints() {
         let artwork = || {
             Node::new(
@@ -1905,6 +2022,51 @@ mod tests {
             .render(&label_scene(Role::Text, "updated text"), metrics())
             .unwrap();
         assert!(renamed_text.damage.is_some());
+    }
+
+    #[test]
+    fn only_effective_painted_ink_changes_damage_rendered_content() {
+        let ink_scene = |role, disabled, ink_token| {
+            let mut node = Node::new(
+                NodeId::new("ink-damage").unwrap(),
+                role,
+                "visible text",
+                Bounds::new(20.0, 20.0, 160.0, 60.0),
+                "--state-rest-surface",
+            )
+            .with_ink_token(ink_token);
+            node.state.disabled = disabled;
+            Scene::new(node, NodeId::new("ink-damage").unwrap()).unwrap()
+        };
+
+        let render_mutation = |role, disabled| {
+            let mut rasterizer = Rasterizer::new();
+            let original = rasterizer
+                .render(
+                    &ink_scene(role, disabled, "--color-status-ready"),
+                    metrics(),
+                )
+                .unwrap();
+            let mutated = rasterizer
+                .render(
+                    &ink_scene(role, disabled, "--state-destructive-accent"),
+                    metrics(),
+                )
+                .unwrap();
+            (original, mutated)
+        };
+
+        let (disabled_original, disabled_mutated) = render_mutation(Role::Text, true);
+        assert_eq!(disabled_mutated.damage, None);
+        assert_eq!(disabled_mutated.rgba, disabled_original.rgba);
+
+        let (non_label_original, non_label_mutated) = render_mutation(Role::Group, false);
+        assert_eq!(non_label_mutated.damage, None);
+        assert_eq!(non_label_mutated.rgba, non_label_original.rgba);
+
+        let (enabled_original, enabled_mutated) = render_mutation(Role::Text, false);
+        assert!(enabled_mutated.damage.is_some());
+        assert_ne!(enabled_mutated.rgba, enabled_original.rgba);
     }
 
     #[test]
