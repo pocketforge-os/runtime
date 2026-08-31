@@ -455,7 +455,7 @@ fn collect(
         type_role: node.type_role,
         line_height: node.line_height,
         text_align: node.text_align,
-        ink_token: node.ink_token.clone(),
+        ink_token: effective_painted_ink_token(node).map(str::to_owned),
         corner_radius: normalized_corner_radius(node.corner_radius),
         focused: node.state.focused,
         pressed: node.state.pressed,
@@ -487,6 +487,24 @@ fn collect(
 
 fn paints_accessible_label(node: &Node) -> bool {
     matches!(node.role, Role::Text | Role::Heading) && matches!(node.content, NodeContent::Label)
+}
+
+fn resolved_text_ink_token(node: &Node) -> &str {
+    if node.state.disabled {
+        "--state-disabled-text"
+    } else if let Some(ink_token) = node.ink_token.as_deref() {
+        ink_token
+    } else if node.state.unavailable {
+        "--state-unavailable-text"
+    } else if node.state.focused {
+        "--state-focused-text"
+    } else {
+        "--state-rest-text"
+    }
+}
+
+fn effective_painted_ink_token(node: &Node) -> Option<&str> {
+    paints_accessible_label(node).then(|| resolved_text_ink_token(node))
 }
 
 /// Axis-aligned logical-space transform carried by the paint walk. Pressed geometry only
@@ -744,17 +762,7 @@ fn draw_node(
     }
     // Disabled ink remains state-owned for legibility. Otherwise an explicit node ink
     // token wins over rest, unavailable, and focused state ink.
-    let text_key = if node.state.disabled {
-        "--state-disabled-text"
-    } else if let Some(ink_token) = node.ink_token.as_deref() {
-        ink_token
-    } else if node.state.unavailable {
-        "--state-unavailable-text"
-    } else if node.state.focused {
-        "--state-focused-text"
-    } else {
-        "--state-rest-text"
-    };
+    let text_key = resolved_text_ink_token(node);
     let text = style_color(context.style, text_key)?;
     match &node.content {
         NodeContent::Label if paints_accessible_label(node) => {
@@ -1957,6 +1965,51 @@ mod tests {
             .render(&label_scene(Role::Text, "updated text"), metrics())
             .unwrap();
         assert!(renamed_text.damage.is_some());
+    }
+
+    #[test]
+    fn only_effective_painted_ink_changes_damage_rendered_content() {
+        let ink_scene = |role, disabled, ink_token| {
+            let mut node = Node::new(
+                NodeId::new("ink-damage").unwrap(),
+                role,
+                "visible text",
+                Bounds::new(20.0, 20.0, 160.0, 60.0),
+                "--state-rest-surface",
+            )
+            .with_ink_token(ink_token);
+            node.state.disabled = disabled;
+            Scene::new(node, NodeId::new("ink-damage").unwrap()).unwrap()
+        };
+
+        let render_mutation = |role, disabled| {
+            let mut rasterizer = Rasterizer::new();
+            let original = rasterizer
+                .render(
+                    &ink_scene(role, disabled, "--color-status-ready"),
+                    metrics(),
+                )
+                .unwrap();
+            let mutated = rasterizer
+                .render(
+                    &ink_scene(role, disabled, "--state-destructive-accent"),
+                    metrics(),
+                )
+                .unwrap();
+            (original, mutated)
+        };
+
+        let (disabled_original, disabled_mutated) = render_mutation(Role::Text, true);
+        assert_eq!(disabled_mutated.damage, None);
+        assert_eq!(disabled_mutated.rgba, disabled_original.rgba);
+
+        let (non_label_original, non_label_mutated) = render_mutation(Role::Group, false);
+        assert_eq!(non_label_mutated.damage, None);
+        assert_eq!(non_label_mutated.rgba, non_label_original.rgba);
+
+        let (enabled_original, enabled_mutated) = render_mutation(Role::Text, false);
+        assert!(enabled_mutated.damage.is_some());
+        assert_ne!(enabled_mutated.rgba, enabled_original.rgba);
     }
 
     #[test]
