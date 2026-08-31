@@ -7,6 +7,9 @@ use std::collections::HashSet;
 use std::fmt;
 use std::sync::Arc;
 
+mod layout;
+pub use layout::*;
+
 /// Stable identity for a semantic node across scene revisions.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct NodeId(String);
@@ -178,6 +181,8 @@ pub struct Node {
     pub accessible_label: String,
     pub state: NodeState,
     pub bounds: Bounds,
+    /// Typed, optional layout participation. `None` permanently retains explicit bounds.
+    pub layout: Option<LayoutStyle>,
     /// Theme-owned style key; never a resolved color or pixel value.
     pub style_token: String,
     /// `Some` makes the node focusable and states what activation means.
@@ -211,6 +216,7 @@ impl Node {
             accessible_label: accessible_label.into(),
             state: NodeState::default(),
             bounds,
+            layout: None,
             style_token: style_token.into(),
             action: None,
             content: NodeContent::Label,
@@ -231,6 +237,11 @@ impl Node {
 
     pub fn with_children(mut self, children: Vec<Node>) -> Self {
         self.children = children;
+        self
+    }
+
+    pub fn with_layout(mut self, layout: LayoutStyle) -> Self {
+        self.layout = Some(layout);
         self
     }
 

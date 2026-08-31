@@ -5,7 +5,7 @@
 use cosmic_text_tracking as tracked_text;
 use pf_scene::{
     Bounds, Elevation, ImageFit, ImageSource, Node, NodeContent, Role, Scene, SurfaceMetrics,
-    TextAlign, TypeRole,
+    TextAlign, TextMeasure, TypeRole,
 };
 pub use pf_theme::Base as ThemeBase;
 use pf_theme::{ResolvedStyleSnapshot, Rgba};
@@ -290,13 +290,8 @@ struct ImageCache {
 
 impl Rasterizer {
     pub fn new() -> Self {
-        let mut db = tracked_text::fontdb::Database::new();
-        // Never call load_system_fonts: output must depend only on repository bytes.
-        for data in [MANROPE, FRAUNCES, CJK] {
-            db.load_font_data(data.to_vec());
-        }
         Self {
-            fonts: tracked_text::FontSystem::new_with_locale_and_db("en-US".into(), db),
+            fonts: production_font_system(),
             glyphs: tracked_text::SwashCache::new(),
             previous: Vec::new(),
             images: ImageCache::default(),
@@ -408,6 +403,63 @@ impl Rasterizer {
             notes,
         })
     }
+}
+
+impl TextMeasure for Rasterizer {
+    fn measure(
+        &self,
+        text: &str,
+        role: TypeRole,
+        scale: f32,
+        max_width: Option<f32>,
+    ) -> (f32, f32) {
+        // Measurement deliberately enters through the same embedded fonts, role snapshot,
+        // metrics, attributes and Advanced shaping configuration used by `draw_text`.
+        let mut fonts = production_font_system();
+        let style = self.typography.resolve(role);
+        let (size, line_height) = production_text_metrics(style, scale, None);
+        let mut buffer = tracked_text::Buffer::new(
+            &mut fonts,
+            tracked_text::Metrics::new(size, line_height),
+        );
+        buffer.set_size(&mut fonts, max_width, None);
+        buffer.set_text(
+            &mut fonts,
+            text,
+            &production_text_attrs(style),
+            tracked_text::Shaping::Advanced,
+            None,
+        );
+        buffer.shape_until_scroll(&mut fonts, false);
+        buffer.layout_runs().fold((0.0_f32, 0.0_f32), |(w, h), run| {
+            (w.max(run.line_w), h.max(run.line_top + run.line_height))
+        })
+    }
+}
+
+fn production_font_system() -> tracked_text::FontSystem {
+    let mut db = tracked_text::fontdb::Database::new();
+    // Never call load_system_fonts: measure and paint depend on the same repository bytes.
+    for data in [MANROPE, FRAUNCES, CJK] {
+        db.load_font_data(data.to_vec());
+    }
+    tracked_text::FontSystem::new_with_locale_and_db("en-US".into(), db)
+}
+
+fn production_text_metrics(
+    style: &ResolvedTypeStyle,
+    scale: f32,
+    line_height: Option<f32>,
+) -> (f32, f32) {
+    let size = style.size_px * scale;
+    (size, line_height.map_or(size * 1.25, |value| size * value))
+}
+
+fn production_text_attrs(style: &ResolvedTypeStyle) -> tracked_text::Attrs<'_> {
+    tracked_text::Attrs::new()
+        .family(tracked_text::Family::Name(&style.family))
+        .weight(tracked_text::Weight(style.weight))
+        .letter_spacing(style.tracking_em)
 }
 
 impl Default for Rasterizer {
@@ -1649,21 +1701,20 @@ fn draw_text(
     glyphs: &mut tracked_text::SwashCache,
     draw: TextDraw<'_>,
 ) {
-    let size = draw.style.size_px * draw.text_scale * draw.surface_scale;
-    let line_height = draw.line_height.map_or(size * 1.25, |value| size * value);
+    let (size, line_height) = production_text_metrics(
+        draw.style,
+        draw.text_scale * draw.surface_scale,
+        draw.line_height,
+    );
     let mut buffer =
         tracked_text::Buffer::new(fonts, tracked_text::Metrics::new(size, line_height));
     buffer.set_size(fonts, Some(draw.width), Some(draw.height));
     buffer.set_text(
         fonts,
         draw.text,
-        &tracked_text::Attrs::new()
-            .family(tracked_text::Family::Name(&draw.style.family))
-            .weight(tracked_text::Weight(draw.style.weight))
-            // Cosmic Text's public letter-spacing unit is em. It resolves the value
-            // against Metrics::font_size while shaping, so converting it to pixels
-            // here would multiply by the font size a second time.
-            .letter_spacing(draw.style.tracking_em),
+        // Cosmic Text's public letter-spacing unit is em. The shared production attrs keep
+        // measurement and paint on one configuration path.
+        &production_text_attrs(draw.style),
         tracked_text::Shaping::Advanced,
         None,
     );
