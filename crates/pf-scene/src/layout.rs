@@ -89,6 +89,7 @@ pub struct LayoutStyle {
     pub min_width: LayoutValue,
     pub min_height: LayoutValue,
     pub max_width: LayoutValue,
+    pub max_height: LayoutValue,
     pub inset: Edges<LayoutValue>,
     pub overflow: (Overflow, Overflow),
     pub box_sizing: BoxSizing,
@@ -113,6 +114,7 @@ impl Default for LayoutStyle {
             min_width: LayoutValue::Auto,
             min_height: LayoutValue::Auto,
             max_width: LayoutValue::Auto,
+            max_height: LayoutValue::Auto,
             inset: Edges::default(),
             overflow: (Overflow::Visible, Overflow::Visible),
             box_sizing: BoxSizing::BorderBox,
@@ -122,8 +124,14 @@ impl Default for LayoutStyle {
 }
 
 pub trait TextMeasure {
-    fn measure(&self, text: &str, role: TypeRole, scale: f32, max_width: Option<f32>)
-        -> (f32, f32);
+    fn measure(
+        &self,
+        text: &str,
+        role: TypeRole,
+        scale: f32,
+        max_width: Option<f32>,
+        line_height: Option<f32>,
+    ) -> (f32, f32);
 }
 
 #[derive(Default)]
@@ -209,7 +217,7 @@ fn resolve_subtree(
         apply_bounds(root, &bounds);
         return;
     }
-    let mut tree: tf::TaffyTree<Option<(String, TypeRole)>> = tf::TaffyTree::new();
+    let mut tree: tf::TaffyTree<Option<(String, TypeRole, Option<f32>)>> = tf::TaffyTree::new();
     // Bounds are logical values. Pixel snapping belongs to the renderer and would break
     // exact explicit-bounds legacy islands here.
     tree.disable_rounding();
@@ -223,14 +231,14 @@ fn resolve_subtree(
             height: tf::AvailableSpace::Definite(metrics.logical_height),
         },
         |known, available, _, context, _| {
-            let Some(Some((text, role))) = context else {
+            let Some(Some((text, role, line_height))) = context else {
                 return tf::Size::ZERO;
             };
             let max_width = known.width.or(match available.width {
                 tf::AvailableSpace::Definite(v) => Some(v),
                 _ => None,
             });
-            let (width, height) = measure.measure(text, *role, scale, max_width);
+            let (width, height) = measure.measure(text, *role, scale, max_width, *line_height);
             tf::Size {
                 width: known.width.unwrap_or(width),
                 height: known.height.unwrap_or(height),
@@ -246,7 +254,7 @@ fn resolve_subtree(
 }
 
 fn build_node(
-    tree: &mut tf::TaffyTree<Option<(String, TypeRole)>>,
+    tree: &mut tf::TaffyTree<Option<(String, TypeRole, Option<f32>)>>,
     node: &Node,
     measure: &dyn TextMeasure,
     scale: f32,
@@ -270,7 +278,11 @@ fn build_node(
     let label = if matches!(node.content, NodeContent::Label)
         && matches!(node.role, Role::Text | Role::Heading)
     {
-        Some((node.accessible_label.clone(), node.type_role))
+        Some((
+            node.accessible_label.clone(),
+            node.type_role,
+            node.line_height,
+        ))
     } else {
         None
     };
@@ -322,7 +334,7 @@ fn to_taffy(s: &LayoutStyle) -> tf::Style {
         },
         max_size: tf::Size {
             width: dim(s.max_width),
-            height: tf::Dimension::Auto,
+            height: dim(s.max_height),
         },
         inset: rect_auto(s.inset),
         overflow: Point {
@@ -425,7 +437,7 @@ fn map_overflow(v: Overflow) -> TaffyOverflow {
 }
 
 fn write_layout(
-    tree: &tf::TaffyTree<Option<(String, TypeRole)>>,
+    tree: &tf::TaffyTree<Option<(String, TypeRole, Option<f32>)>>,
     node: &mut Node,
     ids: &HashMap<NodeId, tf::NodeId>,
     origin: (f32, f32),
@@ -473,6 +485,7 @@ fn hash_node(n: &Node, h: &mut impl Hasher) {
     n.content.hash(h);
     n.type_role.hash(h);
     n.role.hash(h);
+    n.line_height.map(f32::to_bits).hash(h);
     hash_style(n.layout.as_ref(), h);
     if n.layout.is_none() {
         for value in [n.bounds.x, n.bounds.y, n.bounds.width, n.bounds.height] {
@@ -494,7 +507,14 @@ mod tests {
 
     struct Measure;
     impl TextMeasure for Measure {
-        fn measure(&self, text: &str, role: TypeRole, scale: f32, max: Option<f32>) -> (f32, f32) {
+        fn measure(
+            &self,
+            text: &str,
+            role: TypeRole,
+            scale: f32,
+            max: Option<f32>,
+            line_height: Option<f32>,
+        ) -> (f32, f32) {
             let role_scale = match role {
                 TypeRole::Hero => 2.0,
                 _ => 1.0,
@@ -502,7 +522,7 @@ mod tests {
             let content_width = text.chars().map(u32::from).sum::<u32>() as f32;
             (
                 (content_width * role_scale * scale).min(max.unwrap_or(f32::MAX)),
-                10.0 * role_scale * scale,
+                10.0 * role_scale * scale * line_height.unwrap_or(1.0),
             )
         }
     }
@@ -581,6 +601,7 @@ mod tests {
             min_width: LayoutValue::Px(10.0),
             min_height: LayoutValue::Px(11.0),
             max_width: LayoutValue::Px(90.0),
+            max_height: LayoutValue::Px(91.0),
             inset: Edges {
                 top: LayoutValue::Px(7.0),
                 ..Edges::default()
@@ -601,12 +622,38 @@ mod tests {
         assert_eq!(t.size.height, tf::Dimension::Percent(0.5));
         assert_eq!(t.min_size.width, tf::Dimension::Length(10.0));
         assert_eq!(t.max_size.width, tf::Dimension::Length(90.0));
+        assert_eq!(t.max_size.height, tf::Dimension::Length(91.0));
         assert_eq!(t.padding.left, tf::LengthPercentage::Length(4.0));
         assert_eq!(t.margin.left, tf::LengthPercentageAuto::Auto);
         assert_eq!(t.inset.top, tf::LengthPercentageAuto::Length(7.0));
         assert_eq!(t.overflow.x, TaffyOverflow::Hidden);
         assert_eq!(t.box_sizing, tf::BoxSizing::ContentBox);
         assert_eq!(t.grid_template_columns.len(), 3);
+    }
+
+    #[test]
+    fn max_height_caps_taller_measured_content() {
+        let style = LayoutStyle {
+            max_height: LayoutValue::Px(25.0),
+            ..LayoutStyle::default()
+        };
+        let mut root = node("root", Bounds::new(0.0, 0.0, 0.0, 0.0)).with_layout(style);
+        root.role = Role::Text;
+        root.line_height = Some(4.0);
+
+        resolve_layout(
+            &mut root,
+            metrics(320.0),
+            1.0,
+            &Measure,
+            &mut LayoutCache::default(),
+        );
+
+        assert!(
+            root.bounds.height <= 25.0,
+            "resolved bounds: {:?}",
+            root.bounds
+        );
     }
 
     #[test]
@@ -674,5 +721,11 @@ mod tests {
         resolve_layout(&mut root, metrics(1_000.0), 1.0, &Measure, &mut cache);
         assert_ne!(root.bounds, relabeled, "a type-role change must remeasure");
         assert_eq!(cache.hits(), 1, "changed type role must miss the cache");
+
+        let retyped = root.bounds;
+        root.line_height = Some(1.5);
+        resolve_layout(&mut root, metrics(1_000.0), 1.0, &Measure, &mut cache);
+        assert_ne!(root.bounds, retyped, "a line-height change must remeasure");
+        assert_eq!(cache.hits(), 1, "changed line height must miss the cache");
     }
 }

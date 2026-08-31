@@ -412,16 +412,15 @@ impl TextMeasure for Rasterizer {
         role: TypeRole,
         scale: f32,
         max_width: Option<f32>,
+        line_height: Option<f32>,
     ) -> (f32, f32) {
         // Measurement deliberately enters through the same embedded fonts, role snapshot,
         // metrics, attributes and Advanced shaping configuration used by `draw_text`.
         let mut fonts = production_font_system();
         let style = self.typography.resolve(role);
-        let (size, line_height) = production_text_metrics(style, scale, None);
-        let mut buffer = tracked_text::Buffer::new(
-            &mut fonts,
-            tracked_text::Metrics::new(size, line_height),
-        );
+        let (size, line_height) = production_text_metrics(style, scale, line_height);
+        let mut buffer =
+            tracked_text::Buffer::new(&mut fonts, tracked_text::Metrics::new(size, line_height));
         buffer.set_size(&mut fonts, max_width, None);
         buffer.set_text(
             &mut fonts,
@@ -431,9 +430,11 @@ impl TextMeasure for Rasterizer {
             None,
         );
         buffer.shape_until_scroll(&mut fonts, false);
-        buffer.layout_runs().fold((0.0_f32, 0.0_f32), |(w, h), run| {
-            (w.max(run.line_w), h.max(run.line_top + run.line_height))
-        })
+        buffer
+            .layout_runs()
+            .fold((0.0_f32, 0.0_f32), |(w, h), run| {
+                (w.max(run.line_w), h.max(run.line_top + run.line_height))
+            })
     }
 }
 
@@ -3395,6 +3396,41 @@ mod tests {
             assert_eq!(style.weight, weight, "{role:?}");
             assert_eq!(style.tracking_em, tracking_em, "{role:?}");
         }
+    }
+
+    #[test]
+    fn wrapped_measurement_uses_the_same_custom_line_height_as_paint() {
+        let rasterizer = Rasterizer::new();
+        let text = "Wrapped text needs several lines at this narrow width";
+        let width = 72.0;
+        let multiplier = 1.8;
+        let measured = rasterizer.measure(text, TypeRole::Body, 1.0, Some(width), Some(multiplier));
+
+        // Reproduce draw_text's shaping inputs to establish the painter's content height.
+        let mut fonts = production_font_system();
+        let style = rasterizer.typography.resolve(TypeRole::Body);
+        let (size, line_height) = production_text_metrics(style, 1.0, Some(multiplier));
+        let mut painted =
+            tracked_text::Buffer::new(&mut fonts, tracked_text::Metrics::new(size, line_height));
+        painted.set_size(&mut fonts, Some(width), None);
+        painted.set_text(
+            &mut fonts,
+            text,
+            &production_text_attrs(style),
+            tracked_text::Shaping::Advanced,
+            None,
+        );
+        painted.shape_until_scroll(&mut fonts, false);
+        let painted_height = painted
+            .layout_runs()
+            .map(|run| run.line_top + run.line_height)
+            .fold(0.0_f32, f32::max);
+
+        assert_eq!(measured.1, painted_height);
+        let default_height = rasterizer
+            .measure(text, TypeRole::Body, 1.0, Some(width), None)
+            .1;
+        assert_ne!(measured.1, default_height);
     }
 
     #[test]
