@@ -1690,6 +1690,13 @@ mod tests {
     const IMAGE_PNG: &[u8] = include_bytes!("../../../spikes/consent-ui/baseline/s01-initial.png");
     const CORRUPT_PNG: &[u8] = include_bytes!("../tests/fixtures/corrupt.png");
     fn fixture(label: &str) -> Scene {
+        let caption = Node::new(
+            NodeId::new("caption").unwrap(),
+            Role::Text,
+            label,
+            Bounds::new(3.0, 4.0, 250.0, 80.0),
+            "--state-rest-surface",
+        );
         let root = Node::new(
             NodeId::new("root").unwrap(),
             Role::Button,
@@ -1697,7 +1704,8 @@ mod tests {
             Bounds::new(3.0, 4.0, 250.0, 80.0),
             "--state-rest-surface",
         )
-        .with_action(NodeAction::Activate);
+        .with_action(NodeAction::Activate)
+        .with_children(vec![caption]);
         Scene::new(root, NodeId::new("root").unwrap()).unwrap()
     }
     fn metrics() -> SurfaceMetrics {
@@ -1915,6 +1923,13 @@ mod tests {
         let default = Rasterizer::new()
             .render(&fixture("same"), metrics())
             .unwrap();
+        let caption = Node::new(
+            NodeId::new("caption").unwrap(),
+            Role::Text,
+            "same",
+            Bounds::new(3.0, 4.0, 250.0, 80.0),
+            "--state-rest-surface",
+        );
         let zero_scene = Scene::new(
             Node::new(
                 NodeId::new("root").unwrap(),
@@ -1924,6 +1939,7 @@ mod tests {
                 "--state-rest-surface",
             )
             .with_action(NodeAction::Activate)
+            .with_children(vec![caption])
             .with_corner_radius(0.0),
             NodeId::new("root").unwrap(),
         )
@@ -2929,6 +2945,44 @@ mod tests {
         assert_eq!(second.damage, None);
     }
 
+    #[test]
+    fn semantic_button_with_explicit_caption_matches_text_fixture() {
+        let bounds = Bounds::new(7.0, 9.0, 120.0, 51.0);
+        let text = Node::new(
+            NodeId::new("card").unwrap(),
+            Role::Text,
+            "続ける",
+            bounds,
+            "--state-rest-surface",
+        );
+        let expected = Scene::new(text, NodeId::new("card").unwrap()).unwrap();
+
+        let caption = Node::new(
+            NodeId::new("caption").unwrap(),
+            Role::Text,
+            "続ける",
+            bounds,
+            "--state-rest-surface",
+        );
+        let button = Node::new(
+            NodeId::new("card").unwrap(),
+            Role::Button,
+            "続ける",
+            bounds,
+            "--state-rest-surface",
+        )
+        .with_children(vec![caption]);
+        let actual = Scene::new(button, NodeId::new("card").unwrap()).unwrap();
+
+        assert_eq!(
+            Rasterizer::new().render(&actual, metrics()).unwrap().rgba,
+            Rasterizer::new()
+                .render(&expected, metrics())
+                .unwrap()
+                .rgba
+        );
+    }
+
     fn overlapping_scene(order: [&str; 2]) -> Scene {
         let children = order.map(|id| {
             Node::new(
@@ -2977,6 +3031,13 @@ mod tests {
     #[test]
     fn wrapping_text_is_clipped_to_node_bounds() {
         let bounds = Bounds::new(40.0, 30.0, 42.0, 24.0);
+        let caption = Node::new(
+            NodeId::new("caption").unwrap(),
+            Role::Text,
+            "This label wraps across far more lines than fit",
+            bounds,
+            "--state-rest-surface",
+        );
         let node = Node::new(
             NodeId::new("root").unwrap(),
             Role::Button,
@@ -2984,7 +3045,8 @@ mod tests {
             bounds,
             "--state-rest-surface",
         )
-        .with_action(NodeAction::Activate);
+        .with_action(NodeAction::Activate)
+        .with_children(vec![caption]);
         let scene = Scene::new(node, NodeId::new("root").unwrap()).unwrap();
         let frame = Rasterizer::new().render(&scene, metrics()).unwrap();
         for y in 0..frame.height {

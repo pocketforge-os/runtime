@@ -1,6 +1,6 @@
 use pf_framehost_wayland::WaylandHost;
 use pf_ports::{FrameHost, PresentFailure};
-use pf_scene::{Bounds, Node, NodeAction, NodeId, Role, Scene};
+use pf_scene::{Bounds, Node, NodeId, Role, Scene};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::thread;
@@ -28,15 +28,22 @@ fn start(runtime: &Path, socket: &str) -> Child {
 }
 
 fn fixture() -> Scene {
-    let node = Node::new(
-        NodeId::new("fixture-card").unwrap(),
-        Role::Button,
+    let caption = Node::new(
+        NodeId::new("fixture-caption").unwrap(),
+        Role::Text,
         // Keep this identical to pf-framehost's offscreen/fbdev trait-parity fixture.
         "続ける",
         Bounds::new(7.0, 9.0, 120.0, 51.0),
         "--state-rest-surface",
+    );
+    let node = Node::new(
+        NodeId::new("fixture-card").unwrap(),
+        Role::Button,
+        "続ける",
+        Bounds::new(7.0, 9.0, 120.0, 51.0),
+        "--state-rest-surface",
     )
-    .with_action(NodeAction::Activate);
+    .with_children(vec![caption]);
     Scene::new(node, NodeId::new("fixture-card").unwrap()).unwrap()
 }
 
