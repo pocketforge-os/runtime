@@ -65,6 +65,12 @@ pub enum BoxSizing {
     BorderBox,
     ContentBox,
 }
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum Position {
+    #[default]
+    Relative,
+    Absolute,
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Edges<T: Copy + Default> {
@@ -77,6 +83,7 @@ pub struct Edges<T: Copy + Default> {
 #[derive(Clone, Debug, PartialEq)]
 pub struct LayoutStyle {
     pub display: Display,
+    pub position: Position,
     pub flex_direction: FlexDirection,
     pub align_items: Option<AlignItems>,
     pub justify_content: Option<JustifyContent>,
@@ -102,6 +109,7 @@ impl Default for LayoutStyle {
     fn default() -> Self {
         Self {
             display: Display::Flex,
+            position: Position::Relative,
             flex_direction: FlexDirection::Row,
             align_items: None,
             justify_content: None,
@@ -230,8 +238,14 @@ fn resolve_subtree(
     tree.compute_layout_with_measure(
         root_id,
         tf::Size {
-            width: tf::AvailableSpace::Definite(metrics.logical_width),
-            height: tf::AvailableSpace::Definite(metrics.logical_height),
+            width: tf::AvailableSpace::Definite(
+                (metrics.logical_width - metrics.safe_insets.left - metrics.safe_insets.right)
+                    .max(0.0),
+            ),
+            height: tf::AvailableSpace::Definite(
+                (metrics.logical_height - metrics.safe_insets.top - metrics.safe_insets.bottom)
+                    .max(0.0),
+            ),
         },
         |known, available, _, context, _| {
             let Some(Some((text, role, align, line_height))) = context else {
@@ -250,7 +264,10 @@ fn resolve_subtree(
         },
     )
     .expect("layout computation succeeds");
-    let origin = (root.bounds.x, root.bounds.y);
+    let origin = (
+        root.bounds.x + metrics.safe_insets.left,
+        root.bounds.y + metrics.safe_insets.top,
+    );
     write_layout(&tree, root, &ids, origin);
     let mut result = Vec::new();
     collect_bounds(root, &mut result);
@@ -311,7 +328,10 @@ fn to_taffy(s: &LayoutStyle) -> tf::Style {
             Display::Grid => tf::Display::Grid,
             Display::None => tf::Display::None,
         },
-        position: tf::Position::Relative,
+        position: match s.position {
+            Position::Relative => tf::Position::Relative,
+            Position::Absolute => tf::Position::Absolute,
+        },
         flex_direction: match s.flex_direction {
             FlexDirection::Row => tf::FlexDirection::Row,
             FlexDirection::Column => tf::FlexDirection::Column,
@@ -364,13 +384,8 @@ fn to_taffy(s: &LayoutStyle) -> tf::Style {
 }
 fn legacy_style(b: Bounds) -> tf::Style {
     tf::Style {
-        position: tf::Position::Absolute,
-        inset: tf::Rect {
-            left: tf::LengthPercentageAuto::Length(b.x),
-            top: tf::LengthPercentageAuto::Length(b.y),
-            right: tf::LengthPercentageAuto::Auto,
-            bottom: tf::LengthPercentageAuto::Auto,
-        },
+        position: tf::Position::Relative,
+        flex_shrink: 0.0,
         size: tf::Size {
             width: tf::Dimension::Length(b.width),
             height: tf::Dimension::Length(b.height),
@@ -447,17 +462,17 @@ fn write_layout(
     ids: &HashMap<NodeId, tf::NodeId>,
     origin: (f32, f32),
 ) {
-    // A legacy island's explicit bounds are authoritative, including its descendants.
-    // Its Taffy node exists only to expose that geometry to the participating parent.
-    if node.layout.is_none() {
-        return;
-    }
     let l = tree.layout(ids[&node.id]).expect("computed");
     let here = (origin.0 + l.location.x, origin.1 + l.location.y);
     node.bounds.x = here.0;
     node.bounds.y = here.1;
     node.bounds.width = l.size.width;
     node.bounds.height = l.size.height;
+    // A legacy island participates in its parent's flow, but its descendants remain
+    // an opaque legacy subtree whose explicit bounds are authoritative.
+    if node.layout.is_none() {
+        return;
+    }
     for child in &mut node.children {
         write_layout(tree, child, ids, here)
     }
@@ -562,7 +577,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_island_keeps_explicit_bounds() {
+    fn legacy_island_keeps_explicit_size_and_uses_flow_position() {
         let island = node("island", Bounds::new(17.0, 23.0, 31.0, 41.0));
         let style = LayoutStyle {
             width: LayoutValue::Px(200.0),
@@ -579,13 +594,91 @@ mod tests {
             &Measure,
             &mut LayoutCache::default(),
         );
-        assert_eq!(root.children[0].bounds, Bounds::new(17.0, 23.0, 31.0, 41.0));
+        assert_eq!(root.children[0].bounds, Bounds::new(5.0, 6.0, 31.0, 41.0));
+    }
+
+    #[test]
+    fn safe_insets_reduce_available_space_and_offset_the_subtree() {
+        let style = LayoutStyle {
+            width: LayoutValue::Pct(1.0),
+            height: LayoutValue::Pct(1.0),
+            ..LayoutStyle::default()
+        };
+        let scene = node("root", Bounds::new(7.0, 11.0, 0.0, 0.0)).with_layout(style);
+        let mut without_insets = scene.clone();
+        let mut with_insets = scene;
+        let mut inset_metrics = metrics(320.0);
+        inset_metrics.safe_insets = Insets {
+            top: 13.0,
+            right: 17.0,
+            bottom: 19.0,
+            left: 23.0,
+        };
+
+        resolve_layout(
+            &mut without_insets,
+            metrics(320.0),
+            1.0,
+            &Measure,
+            &mut LayoutCache::default(),
+        );
+        resolve_layout(
+            &mut with_insets,
+            inset_metrics,
+            1.0,
+            &Measure,
+            &mut LayoutCache::default(),
+        );
+
+        assert_eq!(without_insets.bounds, Bounds::new(7.0, 11.0, 320.0, 240.0));
+        assert_eq!(with_insets.bounds, Bounds::new(30.0, 24.0, 280.0, 208.0));
+    }
+
+    #[test]
+    fn legacy_island_reserves_space_between_migrated_flex_siblings() {
+        let zero_edges = Edges {
+            top: LayoutValue::Px(0.0),
+            right: LayoutValue::Px(0.0),
+            bottom: LayoutValue::Px(0.0),
+            left: LayoutValue::Px(0.0),
+        };
+        let fixed = |width| LayoutStyle {
+            width: LayoutValue::Px(width),
+            height: LayoutValue::Px(20.0),
+            flex_shrink: 0.0,
+            margin: zero_edges,
+            ..LayoutStyle::default()
+        };
+        let first = node("first", Bounds::new(0.0, 0.0, 0.0, 0.0)).with_layout(fixed(40.0));
+        let island = node("island", Bounds::new(99.0, 77.0, 30.0, 20.0));
+        let third = node("third", Bounds::new(0.0, 0.0, 0.0, 0.0)).with_layout(fixed(50.0));
+        let mut root = node("root", Bounds::new(0.0, 0.0, 0.0, 0.0))
+            .with_layout(LayoutStyle {
+                width: LayoutValue::Px(200.0),
+                height: LayoutValue::Px(20.0),
+                margin: zero_edges,
+                ..LayoutStyle::default()
+            })
+            .with_children(vec![first, island, third]);
+
+        resolve_layout(
+            &mut root,
+            metrics(320.0),
+            1.0,
+            &Measure,
+            &mut LayoutCache::default(),
+        );
+
+        assert_eq!(root.children[0].bounds.x, 0.0);
+        assert_eq!(root.children[1].bounds, Bounds::new(40.0, 0.0, 30.0, 20.0));
+        assert_eq!(root.children[2].bounds.x, 70.0);
     }
 
     #[test]
     fn style_inventory_maps_to_taffy() {
         let s = LayoutStyle {
             display: Display::Grid,
+            position: Position::Absolute,
             flex_direction: FlexDirection::ColumnReverse,
             align_items: Some(AlignItems::Center),
             justify_content: Some(JustifyContent::SpaceEvenly),
@@ -619,6 +712,7 @@ mod tests {
         };
         let t = to_taffy(&s);
         assert_eq!(t.display, tf::Display::Grid);
+        assert_eq!(t.position, tf::Position::Absolute);
         assert_eq!(t.flex_direction, tf::FlexDirection::ColumnReverse);
         assert_eq!(t.align_items, Some(tf::AlignItems::Center));
         assert_eq!(t.justify_content, Some(tf::JustifyContent::SpaceEvenly));
