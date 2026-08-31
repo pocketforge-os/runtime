@@ -469,7 +469,10 @@ fn input_hash(root: &Node) -> u64 {
 }
 fn hash_node(n: &Node, h: &mut impl Hasher) {
     n.id.hash(h);
-    n.accessible_label.len().hash(h);
+    n.accessible_label.hash(h);
+    n.content.hash(h);
+    n.type_role.hash(h);
+    n.role.hash(h);
     hash_style(n.layout.as_ref(), h);
     if n.layout.is_none() {
         for value in [n.bounds.x, n.bounds.y, n.bounds.width, n.bounds.height] {
@@ -491,10 +494,15 @@ mod tests {
 
     struct Measure;
     impl TextMeasure for Measure {
-        fn measure(&self, text: &str, _: TypeRole, scale: f32, max: Option<f32>) -> (f32, f32) {
+        fn measure(&self, text: &str, role: TypeRole, scale: f32, max: Option<f32>) -> (f32, f32) {
+            let role_scale = match role {
+                TypeRole::Hero => 2.0,
+                _ => 1.0,
+            };
+            let content_width = text.chars().map(u32::from).sum::<u32>() as f32;
             (
-                (text.len() as f32 * 8.0 * scale).min(max.unwrap_or(f32::MAX)),
-                10.0 * scale,
+                (content_width * role_scale * scale).min(max.unwrap_or(f32::MAX)),
+                10.0 * role_scale * scale,
             )
         }
     }
@@ -637,5 +645,34 @@ mod tests {
             laid_out(123.0, 1.25, "deterministic", 4, &mut fresh_a),
             laid_out(123.0, 1.25, "deterministic", 4, &mut fresh_b)
         );
+    }
+
+    #[test]
+    fn cache_tracks_measurement_selecting_node_fields() {
+        let mut cache = LayoutCache::default();
+        let mut root =
+            node("root", Bounds::new(0.0, 0.0, 0.0, 0.0)).with_layout(LayoutStyle::default());
+        root.role = Role::Text;
+        root.accessible_label = "az".into();
+
+        resolve_layout(&mut root, metrics(1_000.0), 1.0, &Measure, &mut cache);
+        let initial = root.bounds;
+        resolve_layout(&mut root, metrics(1_000.0), 1.0, &Measure, &mut cache);
+        assert_eq!(root.bounds, initial);
+        assert_eq!(cache.hits(), 1, "an unchanged resolve must hit the cache");
+
+        root.accessible_label = "ay".into();
+        resolve_layout(&mut root, metrics(1_000.0), 1.0, &Measure, &mut cache);
+        assert_ne!(
+            root.bounds, initial,
+            "same-length label content must remeasure"
+        );
+        assert_eq!(cache.hits(), 1, "changed label content must miss the cache");
+
+        let relabeled = root.bounds;
+        root.type_role = TypeRole::Hero;
+        resolve_layout(&mut root, metrics(1_000.0), 1.0, &Measure, &mut cache);
+        assert_ne!(root.bounds, relabeled, "a type-role change must remeasure");
+        assert_eq!(cache.hits(), 1, "changed type role must miss the cache");
     }
 }

@@ -31,7 +31,7 @@ impl NodeId {
 }
 
 /// A node's accessibility role.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum Role {
     Group,
     Heading,
@@ -95,7 +95,7 @@ pub struct Bounds {
 ///
 /// The identifier must identify the bytes immutably. Renderers use it as their
 /// decoded-image cache key and never resolve files or network resources.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct ImageSource {
     pub id: String,
     pub bytes: Arc<[u8]>,
@@ -111,7 +111,7 @@ impl ImageSource {
 }
 
 /// How an image is scaled while preserving its aspect ratio.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum ImageFit {
     /// Fill the node bounds, cropping equally from the overflowing dimension.
     Cover,
@@ -120,7 +120,7 @@ pub enum ImageFit {
 }
 
 /// Renderer-independent visual content carried by a node.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Hash, PartialEq)]
 pub enum NodeContent {
     /// Render the accessible label as text (the legacy/default behavior).
     Label,
