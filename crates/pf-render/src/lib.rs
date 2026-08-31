@@ -760,12 +760,12 @@ fn draw_node(
             )?;
         }
     }
-    // Disabled ink remains state-owned for legibility. Otherwise an explicit node ink
-    // token wins over rest, unavailable, and focused state ink.
-    let text_key = resolved_text_ink_token(node);
-    let text = style_color(context.style, text_key)?;
     match &node.content {
         NodeContent::Label if paints_accessible_label(node) => {
+            // Disabled ink remains state-owned for legibility. Otherwise an explicit node
+            // ink token wins over rest, unavailable, and focused state ink.
+            let text_key = resolved_text_ink_token(node);
+            let text = style_color(context.style, text_key)?;
             let (x, y, width, height) = match node.text_align {
                 TextAlign::Start => (
                     (b.x + 6.0) * scale,
@@ -1838,6 +1838,63 @@ mod tests {
             .rgba
             .chunks_exact(4)
             .any(|pixel| pixel == token_rgba(ThemeBase::Dusk, override_token)));
+    }
+
+    #[test]
+    fn bogus_ink_token_is_ignored_unless_the_node_paints_text() {
+        let group = || {
+            Node::new(
+                NodeId::new("group").unwrap(),
+                Role::Group,
+                "semantic label",
+                Bounds::new(20.0, 20.0, 160.0, 60.0),
+                "--state-rest-surface",
+            )
+        };
+        let image = || {
+            Node::new(
+                NodeId::new("image").unwrap(),
+                Role::Text,
+                "image alt text",
+                Bounds::new(20.0, 20.0, 160.0, 60.0),
+                "--state-rest-surface",
+            )
+            .with_image(
+                ImageSource::new("ink-test-image", Arc::<[u8]>::from(IMAGE_PNG)),
+                ImageFit::Cover,
+            )
+        };
+
+        for (without_token, with_token) in [
+            (group(), group().with_ink_token("--not-a-real-color")),
+            (image(), image().with_ink_token("--not-a-real-color")),
+        ] {
+            let render = |node: Node| {
+                let root_id = node.id.clone();
+                Rasterizer::new().render(&Scene::new(node, root_id).unwrap(), metrics())
+            };
+            let without_token = render(without_token).unwrap();
+            let with_token = render(with_token).unwrap();
+            assert_eq!(with_token.rgba, without_token.rgba);
+        }
+
+        let painted = label_scene(Role::Text, "visible text");
+        let painted = Scene::new(
+            painted.root().clone().with_ink_token("--not-a-real-color"),
+            NodeId::new("label").unwrap(),
+        )
+        .unwrap();
+        let painted_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            Rasterizer::new().render(&painted, metrics())
+        }));
+        if cfg!(debug_assertions) {
+            assert!(painted_result.is_err(), "debug build must reject unknown ink");
+        } else {
+            assert_eq!(
+                painted_result.unwrap().unwrap_err(),
+                RenderError::UnknownStyleKey("--not-a-real-color".to_owned())
+            );
+        }
     }
 
     #[test]
