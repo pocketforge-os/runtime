@@ -107,6 +107,12 @@ pub struct LayoutStyle {
 
 impl Default for LayoutStyle {
     fn default() -> Self {
+        let zero_edges = Edges {
+            top: LayoutValue::Px(0.0),
+            right: LayoutValue::Px(0.0),
+            bottom: LayoutValue::Px(0.0),
+            left: LayoutValue::Px(0.0),
+        };
         Self {
             display: Display::Flex,
             position: Position::Relative,
@@ -117,8 +123,8 @@ impl Default for LayoutStyle {
             flex_shrink: 1.0,
             flex_basis: LayoutValue::Auto,
             gap: (LayoutValue::Px(0.0), LayoutValue::Px(0.0)),
-            padding: Edges::default(),
-            margin: Edges::default(),
+            padding: zero_edges,
+            margin: zero_edges,
             width: LayoutValue::Auto,
             height: LayoutValue::Auto,
             min_width: LayoutValue::Auto,
@@ -668,6 +674,74 @@ mod tests {
             &mut LayoutCache::default(),
         );
         assert_eq!(root.children[0].bounds, Bounds::new(5.0, 6.0, 31.0, 41.0));
+    }
+
+    #[test]
+    fn default_margins_keep_a_fixed_child_at_flex_start() {
+        let child = node("child", Bounds::new(0.0, 0.0, 0.0, 0.0)).with_layout(LayoutStyle {
+            width: LayoutValue::Px(40.0),
+            height: LayoutValue::Px(20.0),
+            ..LayoutStyle::default()
+        });
+        let mut root = node("root", Bounds::new(0.0, 0.0, 0.0, 0.0))
+            .with_layout(LayoutStyle {
+                width: LayoutValue::Px(200.0),
+                height: LayoutValue::Px(20.0),
+                ..LayoutStyle::default()
+            })
+            .with_children(vec![child]);
+
+        resolve_layout(
+            &mut root,
+            metrics(320.0),
+            1.0,
+            &Measure,
+            &mut LayoutCache::default(),
+        );
+
+        assert_eq!(root.children[0].bounds, Bounds::new(0.0, 0.0, 40.0, 20.0));
+    }
+
+    #[test]
+    fn explicit_auto_margins_center_a_fixed_child() {
+        let child = node("child", Bounds::new(0.0, 0.0, 0.0, 0.0)).with_layout(LayoutStyle {
+            width: LayoutValue::Px(40.0),
+            height: LayoutValue::Px(20.0),
+            margin: Edges::default(),
+            ..LayoutStyle::default()
+        });
+        let mut root = node("root", Bounds::new(0.0, 0.0, 0.0, 0.0))
+            .with_layout(LayoutStyle {
+                width: LayoutValue::Px(200.0),
+                height: LayoutValue::Px(20.0),
+                ..LayoutStyle::default()
+            })
+            .with_children(vec![child]);
+
+        resolve_layout(
+            &mut root,
+            metrics(320.0),
+            1.0,
+            &Measure,
+            &mut LayoutCache::default(),
+        );
+
+        assert_eq!(root.children[0].bounds, Bounds::new(80.0, 0.0, 40.0, 20.0));
+    }
+
+    #[test]
+    fn edge_defaults_are_context_appropriate() {
+        let style = LayoutStyle::default();
+        let zero_edges = Edges {
+            top: LayoutValue::Px(0.0),
+            right: LayoutValue::Px(0.0),
+            bottom: LayoutValue::Px(0.0),
+            left: LayoutValue::Px(0.0),
+        };
+
+        assert_eq!(style.margin, zero_edges);
+        assert_eq!(style.padding, zero_edges);
+        assert_eq!(style.inset, Edges::default());
     }
 
     #[test]
