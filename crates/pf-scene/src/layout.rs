@@ -550,7 +550,11 @@ fn collect_bounds(n: &Node, origin: (f32, f32), out: &mut Vec<(NodeId, Bounds)>)
 }
 fn apply_bounds(n: &mut Node, b: &[(NodeId, Bounds)], origin: (f32, f32)) {
     if let Some((_, v)) = b.iter().find(|(id, _)| id == &n.id) {
-        n.bounds = Bounds::new(v.x + origin.0, v.y + origin.1, v.width, v.height)
+        n.bounds = Bounds {
+            x: v.x + origin.0,
+            y: v.y + origin.1,
+            ..*v
+        };
     }
     for c in &mut n.children {
         apply_bounds(c, b, origin)
@@ -1085,6 +1089,48 @@ mod tests {
         assert_eq!(
             laid_out(123.0, 1.25, "deterministic", 4, &mut fresh_a),
             laid_out(123.0, 1.25, "deterministic", 4, &mut fresh_b)
+        );
+    }
+
+    #[test]
+    fn cache_restore_preserves_bounds_constraints() {
+        let style = LayoutStyle {
+            width: LayoutValue::Px(80.0),
+            height: LayoutValue::Px(40.0),
+            ..LayoutStyle::default()
+        };
+        let constraints = (12.0, 14.0, Some(120.0), Some(140.0));
+        let mut bounds = Bounds::new(3.0, 4.0, 0.0, 0.0);
+        bounds.min_width = constraints.0;
+        bounds.min_height = constraints.1;
+        bounds.max_width = constraints.2;
+        bounds.max_height = constraints.3;
+        let mut root = node("root", bounds).with_layout(style);
+        let mut cache = LayoutCache::default();
+
+        resolve_layout(&mut root, metrics(320.0), 1.0, &Measure, &mut cache);
+        assert_eq!(
+            (
+                root.bounds.min_width,
+                root.bounds.min_height,
+                root.bounds.max_width,
+                root.bounds.max_height,
+            ),
+            constraints,
+            "a cache miss must preserve legacy bounds constraints"
+        );
+
+        resolve_layout(&mut root, metrics(320.0), 1.0, &Measure, &mut cache);
+        assert_eq!(cache.hits(), 1, "the second resolve must hit the cache");
+        assert_eq!(
+            (
+                root.bounds.min_width,
+                root.bounds.min_height,
+                root.bounds.max_width,
+                root.bounds.max_height,
+            ),
+            constraints,
+            "a cache hit must preserve legacy bounds constraints"
         );
     }
 
