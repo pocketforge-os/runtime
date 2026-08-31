@@ -140,6 +140,14 @@ pub enum TypeRole {
     Plate,
 }
 
+/// Horizontal alignment for painted text inside its node bounds.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum TextAlign {
+    #[default]
+    Start,
+    Center,
+}
+
 impl Bounds {
     /// Creates unconstrained logical bounds at the supplied position and size.
     pub fn new(x: f32, y: f32, width: f32, height: f32) -> Self {
@@ -179,6 +187,8 @@ pub struct Node {
     pub type_role: TypeRole,
     /// Component-owned line-height multiplier. `None` uses the font's normal line box.
     pub line_height: Option<f32>,
+    /// Paint-only text alignment. Semantic label participation is unaffected.
+    pub text_align: TextAlign,
     /// Corner radius in logical pixels. Zero retains the sharp-rectangle geometry.
     pub corner_radius: f32,
     pub elevation: Elevation,
@@ -204,6 +214,7 @@ impl Node {
             content: NodeContent::Label,
             type_role: TypeRole::Body,
             line_height: None,
+            text_align: TextAlign::Start,
             corner_radius: 0.0,
             elevation: Elevation::None,
             children: Vec::new(),
@@ -236,6 +247,11 @@ impl Node {
             .is_finite()
             .then_some(multiplier)
             .filter(|v| *v > 0.0);
+        self
+    }
+
+    pub fn with_text_align(mut self, align: TextAlign) -> Self {
+        self.text_align = align;
         self
     }
 
