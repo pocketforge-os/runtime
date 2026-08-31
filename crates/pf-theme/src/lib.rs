@@ -15,6 +15,7 @@ const MANIFEST: &str = "manifest.json";
 const TOKENS: &str = "tokens.json";
 /// Base-scoped tokens whose resolved values are consumed by native renderers.
 pub const STYLE_TOKENS: &[&str] = &[
+    "--color-transparent",
     "--color-surface-canvas",
     "--color-surface-raised",
     "--color-surface-overlay",
@@ -58,6 +59,7 @@ pub const STYLE_TOKENS: &[&str] = &[
     "--deco-plate-f-fg",
 ];
 const BASE_TOKENS: &[&str] = &[
+    "--color-transparent",
     "--color-surface-canvas",
     "--color-surface-raised",
     "--color-surface-overlay",
@@ -1026,6 +1028,27 @@ mod resolved_style_tests {
                 .alpha,
             0x48
         );
+    }
+
+    #[test]
+    fn transparent_color_is_base_independent() {
+        let theme = flagship();
+        for base in BASES {
+            assert_eq!(
+                theme.resolve(base, "--color-transparent").unwrap(),
+                "rgba(0, 0, 0, 0)"
+            );
+            assert_eq!(
+                theme
+                    .resolved_style(base)
+                    .unwrap()
+                    .color("--color-transparent")
+                    .unwrap()
+                    .alpha,
+                0,
+                "{base:?}"
+            );
+        }
     }
 }
 

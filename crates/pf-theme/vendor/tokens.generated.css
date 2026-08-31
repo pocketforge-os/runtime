@@ -58,6 +58,7 @@
   --color-text-muted: #8f8879;
   --color-text-primary: #f4efe6;
   --color-text-secondary: #c9c2b4;
+  --color-transparent: rgba(0, 0, 0, 0);
   --deco-aura-opacity: 0.55;
   --deco-plate-a-bg: #23303048;
   --deco-plate-a-fg: #9fc4bc;
@@ -105,6 +106,7 @@
   --color-text-muted: #6b634d;
   --color-text-primary: #26221a;
   --color-text-secondary: #57503f;
+  --color-transparent: rgba(0, 0, 0, 0);
   --deco-aura-opacity: 0.55;
   --deco-plate-a-bg: #dce7e448;
   --deco-plate-a-fg: #3c6a60;
@@ -152,6 +154,7 @@
   --color-text-muted: #bdbdbd;
   --color-text-primary: #ffffff;
   --color-text-secondary: #e8e8e8;
+  --color-transparent: rgba(0, 0, 0, 0);
   --deco-aura-opacity: 0;
   --deco-plate-a-bg: #0a0a0a48;
   --deco-plate-a-fg: #baf0e4;

@@ -1791,6 +1791,71 @@ mod tests {
     }
 
     #[test]
+    fn transparent_node_surface_is_a_no_op_while_content_still_paints() {
+        let artwork = || {
+            Node::new(
+                NodeId::new("artwork").unwrap(),
+                Role::Group,
+                "",
+                Bounds::new(20.0, 20.0, 160.0, 60.0),
+                "--state-rest-surface",
+            )
+        };
+        let scene = |children| {
+            Scene::new(
+                artwork().with_children(children),
+                NodeId::new("artwork").unwrap(),
+            )
+            .unwrap()
+        };
+
+        let baseline = Rasterizer::new().render(&scene(vec![]), metrics()).unwrap();
+        let transparent_surface = Node::new(
+            NodeId::new("transparent-surface").unwrap(),
+            Role::Group,
+            "",
+            Bounds::new(30.0, 30.0, 100.0, 30.0),
+            "--color-transparent",
+        );
+        let surface_frame = Rasterizer::new()
+            .render(&scene(vec![transparent_surface]), metrics())
+            .unwrap();
+        assert_eq!(surface_frame.rgba, baseline.rgba);
+
+        let text = Node::new(
+            NodeId::new("text").unwrap(),
+            Role::Text,
+            "Transparent surface",
+            Bounds::new(30.0, 30.0, 100.0, 30.0),
+            "--color-transparent",
+        );
+        let text_frame = Rasterizer::new()
+            .render(&scene(vec![text]), metrics())
+            .unwrap();
+        assert_ne!(text_frame.rgba, baseline.rgba, "glyphs must still paint");
+
+        let child = Node::new(
+            NodeId::new("child").unwrap(),
+            Role::Group,
+            "",
+            Bounds::new(40.0, 40.0, 20.0, 10.0),
+            "--color-status-ready",
+        );
+        let transparent_parent = Node::new(
+            NodeId::new("transparent-parent").unwrap(),
+            Role::Group,
+            "",
+            Bounds::new(30.0, 30.0, 100.0, 30.0),
+            "--color-transparent",
+        )
+        .with_children(vec![child]);
+        let child_frame = Rasterizer::new()
+            .render(&scene(vec![transparent_parent]), metrics())
+            .unwrap();
+        assert_ne!(child_frame.rgba, baseline.rgba, "children must still paint");
+    }
+
+    #[test]
     fn non_text_accessible_label_changes_do_not_damage_rendered_content() {
         for role in [Role::Button, Role::ListItem, Role::Group, Role::Toggle] {
             let mut rasterizer = Rasterizer::new();
