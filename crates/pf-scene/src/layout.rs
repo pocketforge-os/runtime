@@ -181,28 +181,42 @@ pub fn resolve_layout(
     measure: &dyn TextMeasure,
     cache: &mut LayoutCache,
 ) {
-    resolve_walk(root, metrics, text_scale, measure, cache);
+    resolve_walk(root, metrics, None, text_scale, measure, cache);
 }
 
 fn resolve_walk(
     node: &mut Node,
     metrics: Metrics,
+    enclosing_legacy: Option<Bounds>,
     scale: f32,
     measure: &dyn TextMeasure,
     cache: &mut LayoutCache,
 ) {
     if node.layout.is_some() {
-        resolve_subtree(node, metrics, scale, measure, cache);
+        let (metrics, origin) = enclosing_legacy.map_or((metrics, None), |bounds| {
+            (
+                Metrics {
+                    logical_width: bounds.width,
+                    logical_height: bounds.height,
+                    scale: metrics.scale,
+                    safe_insets: Insets::default(),
+                    orientation: metrics.orientation,
+                },
+                Some((bounds.x, bounds.y)),
+            )
+        });
+        resolve_subtree(node, metrics, origin, scale, measure, cache);
         return;
     }
     for child in &mut node.children {
-        resolve_walk(child, metrics, scale, measure, cache);
+        resolve_walk(child, metrics, Some(node.bounds), scale, measure, cache);
     }
 }
 
 fn resolve_subtree(
     root: &mut Node,
     metrics: Metrics,
+    containing_origin: Option<(f32, f32)>,
     scale: f32,
     measure: &dyn TextMeasure,
     cache: &mut LayoutCache,
@@ -221,7 +235,7 @@ fn resolve_subtree(
         ],
         text_scale: scale.to_bits(),
         typography_revision: cache.typography_revision,
-        inputs: input_hash(root),
+        inputs: input_hash(root, containing_origin.is_none()),
     };
     if let Some(bounds) = cache.entries.get(&key).cloned() {
         cache.hits += 1;
@@ -264,7 +278,7 @@ fn resolve_subtree(
         },
     )
     .expect("layout computation succeeds");
-    let root_origin = (root.bounds.x, root.bounds.y);
+    let root_origin = containing_origin.unwrap_or((root.bounds.x, root.bounds.y));
     write_root_layout(&tree, root, &ids, root_origin, metrics.safe_insets);
     let mut result = Vec::new();
     collect_bounds(root, &mut result);
@@ -509,11 +523,13 @@ fn apply_bounds(n: &mut Node, b: &[(NodeId, Bounds)]) {
         apply_bounds(c, b)
     }
 }
-fn input_hash(root: &Node) -> u64 {
+fn input_hash(root: &Node, authored_origin_is_input: bool) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
-    // A participating subtree is mounted at its root's existing logical origin.
-    root.bounds.x.to_bits().hash(&mut h);
-    root.bounds.y.to_bits().hash(&mut h);
+    if authored_origin_is_input {
+        // A top-level participating subtree is mounted at its authored logical origin.
+        root.bounds.x.to_bits().hash(&mut h);
+        root.bounds.y.to_bits().hash(&mut h);
+    }
     hash_node(root, &mut h, true);
     h.finish()
 }
@@ -667,6 +683,54 @@ mod tests {
             cache.hits(),
             1,
             "an unchanged re-resolve must hit the cache"
+        );
+    }
+
+    #[test]
+    fn nested_subtree_uses_enclosing_legacy_box_without_surface_insets_and_cache_staleness() {
+        let nested = node("nested", Bounds::new(0.0, 0.0, 0.0, 0.0)).with_layout(LayoutStyle {
+            width: LayoutValue::Pct(1.0),
+            height: LayoutValue::Pct(1.0),
+            ..LayoutStyle::default()
+        });
+        let parent =
+            node("parent", Bounds::new(41.0, 53.0, 100.0, 80.0)).with_children(vec![nested]);
+        let mut root =
+            node("root", Bounds::new(0.0, 0.0, 320.0, 240.0)).with_children(vec![parent]);
+        let mut surface = metrics(320.0);
+        surface.safe_insets = Insets {
+            top: 13.0,
+            right: 17.0,
+            bottom: 19.0,
+            left: 23.0,
+        };
+        let mut cache = LayoutCache::default();
+
+        resolve_layout(&mut root, surface, 1.0, &Measure, &mut cache);
+        assert_eq!(
+            root.children[0].children[0].bounds,
+            Bounds::new(41.0, 53.0, 100.0, 80.0)
+        );
+        assert_eq!(cache.hits(), 0);
+
+        root.children[0].bounds = Bounds::new(61.0, 71.0, 120.0, 90.0);
+        resolve_layout(&mut root, surface, 1.0, &Measure, &mut cache);
+        assert_eq!(
+            root.children[0].children[0].bounds,
+            Bounds::new(61.0, 71.0, 120.0, 90.0),
+            "the enclosing box must participate in the nested-root cache key"
+        );
+        assert_eq!(
+            cache.hits(),
+            0,
+            "a resized enclosing box must miss the cache"
+        );
+
+        resolve_layout(&mut root, surface, 1.0, &Measure, &mut cache);
+        assert_eq!(
+            cache.hits(),
+            1,
+            "an unchanged enclosing box must hit the cache"
         );
     }
 
