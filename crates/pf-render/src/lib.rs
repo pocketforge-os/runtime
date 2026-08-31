@@ -4,7 +4,8 @@
 
 use cosmic_text_tracking as tracked_text;
 use pf_scene::{
-    Bounds, Elevation, ImageFit, ImageSource, Node, NodeContent, Scene, SurfaceMetrics, TypeRole,
+    Bounds, Elevation, ImageFit, ImageSource, Node, NodeContent, Role, Scene, SurfaceMetrics,
+    TypeRole,
 };
 pub use pf_theme::Base as ThemeBase;
 use pf_theme::{ResolvedStyleSnapshot, Rgba};
@@ -249,6 +250,8 @@ struct NodeSnapshot {
     parent_id: Option<String>,
     sibling_index: usize,
     bounds: Bounds,
+    /// Participates in damage tracking exactly when the accessible label is painted:
+    /// text/heading role plus `NodeContent::Label`.
     label: String,
     style_token: String,
     type_role: TypeRole,
@@ -435,7 +438,11 @@ fn collect(
         parent_id: parent_id.map(str::to_owned),
         sibling_index,
         bounds: transform.map_bounds(node.bounds),
-        label: node.accessible_label.clone(),
+        label: if paints_accessible_label(node) {
+            node.accessible_label.clone()
+        } else {
+            String::new()
+        },
         style_token: node.style_token.clone(),
         type_role: node.type_role,
         line_height: node.line_height,
@@ -466,6 +473,10 @@ fn collect(
             pressed_shift,
         );
     }
+}
+
+fn paints_accessible_label(node: &Node) -> bool {
+    matches!(node.role, Role::Text | Role::Heading) && matches!(node.content, NodeContent::Label)
 }
 
 /// Axis-aligned logical-space transform carried by the paint walk. Pressed geometry only
@@ -732,7 +743,7 @@ fn draw_node(
     };
     let text = style_color(context.style, text_key)?;
     match &node.content {
-        NodeContent::Label => {
+        NodeContent::Label if paints_accessible_label(node) => {
             let draw = TextDraw {
                 text: &node.accessible_label,
                 x: (b.x + 6.0) * scale,
@@ -748,6 +759,7 @@ fn draw_node(
             };
             draw_text(pm, context.fonts, context.glyphs, draw);
         }
+        NodeContent::Label => {}
         NodeContent::Image { source, fit } => {
             if let Err(note) = draw_image(pm, context.images, source, *fit, b, scale, radius) {
                 context.notes.push(note);
@@ -1678,6 +1690,13 @@ mod tests {
     const IMAGE_PNG: &[u8] = include_bytes!("../../../spikes/consent-ui/baseline/s01-initial.png");
     const CORRUPT_PNG: &[u8] = include_bytes!("../tests/fixtures/corrupt.png");
     fn fixture(label: &str) -> Scene {
+        let caption = Node::new(
+            NodeId::new("caption").unwrap(),
+            Role::Text,
+            label,
+            Bounds::new(3.0, 4.0, 250.0, 80.0),
+            "--state-rest-surface",
+        );
         let root = Node::new(
             NodeId::new("root").unwrap(),
             Role::Button,
@@ -1685,7 +1704,8 @@ mod tests {
             Bounds::new(3.0, 4.0, 250.0, 80.0),
             "--state-rest-surface",
         )
-        .with_action(NodeAction::Activate);
+        .with_action(NodeAction::Activate)
+        .with_children(vec![caption]);
         Scene::new(root, NodeId::new("root").unwrap()).unwrap()
     }
     fn metrics() -> SurfaceMetrics {
@@ -1697,6 +1717,93 @@ mod tests {
             orientation: Orientation::Landscape,
         }
     }
+
+    fn label_scene(role: Role, label: &str) -> Scene {
+        let root = Node::new(
+            NodeId::new("label").unwrap(),
+            role,
+            label,
+            Bounds::new(20.0, 20.0, 160.0, 60.0),
+            "--state-rest-surface",
+        );
+        Scene::new(root, NodeId::new("label").unwrap()).unwrap()
+    }
+
+    #[test]
+    fn accessible_labels_paint_only_for_text_roles() {
+        for role in [Role::Button, Role::ListItem, Role::Group, Role::Toggle] {
+            let labeled = Rasterizer::new()
+                .render(&label_scene(role, "container name"), metrics())
+                .unwrap();
+            let unlabeled = Rasterizer::new()
+                .render(&label_scene(role, ""), metrics())
+                .unwrap();
+            assert_eq!(labeled.rgba, unlabeled.rgba, "{role:?} label painted");
+        }
+
+        for role in [Role::Text, Role::Heading] {
+            let labeled = Rasterizer::new()
+                .render(&label_scene(role, "visible text"), metrics())
+                .unwrap();
+            let unlabeled = Rasterizer::new()
+                .render(&label_scene(role, ""), metrics())
+                .unwrap();
+            assert_ne!(labeled.rgba, unlabeled.rgba, "{role:?} label did not paint");
+        }
+    }
+
+    #[test]
+    fn non_text_accessible_label_changes_do_not_damage_rendered_content() {
+        for role in [Role::Button, Role::ListItem, Role::Group, Role::Toggle] {
+            let mut rasterizer = Rasterizer::new();
+            let unnamed = rasterizer
+                .render(&label_scene(role, ""), metrics())
+                .unwrap();
+            let named = rasterizer
+                .render(&label_scene(role, "semantic name"), metrics())
+                .unwrap();
+            assert_eq!(named.damage, None, "{role:?} label caused damage");
+            assert_eq!(named.rgba, unnamed.rgba, "{role:?} label changed pixels");
+        }
+    }
+
+    #[test]
+    fn only_painted_accessible_label_changes_damage_rendered_content() {
+        let image_scene = |label| {
+            let root = Node::new(
+                NodeId::new("image").unwrap(),
+                Role::Text,
+                label,
+                Bounds::new(20.0, 20.0, 160.0, 60.0),
+                "--state-rest-surface",
+            )
+            .with_image(
+                ImageSource::new("alt-text-image", Arc::<[u8]>::from(IMAGE_PNG)),
+                ImageFit::Cover,
+            );
+            Scene::new(root, NodeId::new("image").unwrap()).unwrap()
+        };
+
+        let mut image_rasterizer = Rasterizer::new();
+        let original_image = image_rasterizer
+            .render(&image_scene("original alt text"), metrics())
+            .unwrap();
+        let renamed_image = image_rasterizer
+            .render(&image_scene("updated alt text"), metrics())
+            .unwrap();
+        assert_eq!(renamed_image.damage, None);
+        assert_eq!(renamed_image.rgba, original_image.rgba);
+
+        let mut text_rasterizer = Rasterizer::new();
+        text_rasterizer
+            .render(&label_scene(Role::Text, "original text"), metrics())
+            .unwrap();
+        let renamed_text = text_rasterizer
+            .render(&label_scene(Role::Text, "updated text"), metrics())
+            .unwrap();
+        assert!(renamed_text.damage.is_some());
+    }
+
     #[test]
     fn deterministic_between_fresh_runs() {
         assert_eq!(
@@ -1816,6 +1923,13 @@ mod tests {
         let default = Rasterizer::new()
             .render(&fixture("same"), metrics())
             .unwrap();
+        let caption = Node::new(
+            NodeId::new("caption").unwrap(),
+            Role::Text,
+            "same",
+            Bounds::new(3.0, 4.0, 250.0, 80.0),
+            "--state-rest-surface",
+        );
         let zero_scene = Scene::new(
             Node::new(
                 NodeId::new("root").unwrap(),
@@ -1825,6 +1939,7 @@ mod tests {
                 "--state-rest-surface",
             )
             .with_action(NodeAction::Activate)
+            .with_children(vec![caption])
             .with_corner_radius(0.0),
             NodeId::new("root").unwrap(),
         )
@@ -1930,7 +2045,7 @@ mod tests {
 
     #[test]
     fn dusk_is_the_default_and_all_bases_are_selectable() {
-        let scene = fixture("Theme");
+        let scene = label_scene(Role::Text, "Theme");
         let default = Rasterizer::new().render(&scene, metrics()).unwrap();
         let mut explicit_dusk = Rasterizer::new();
         explicit_dusk.set_theme_base(ThemeBase::Dusk);
@@ -1958,7 +2073,7 @@ mod tests {
 
     #[test]
     fn theme_base_change_invalidates_damage_once_but_identical_set_does_not() {
-        let scene = fixture("Theme");
+        let scene = label_scene(Role::Text, "Theme");
         let surface = metrics();
         let full_surface = Some(DamageRect {
             x: 0,
@@ -2830,6 +2945,44 @@ mod tests {
         assert_eq!(second.damage, None);
     }
 
+    #[test]
+    fn semantic_button_with_explicit_caption_matches_text_fixture() {
+        let bounds = Bounds::new(7.0, 9.0, 120.0, 51.0);
+        let text = Node::new(
+            NodeId::new("card").unwrap(),
+            Role::Text,
+            "続ける",
+            bounds,
+            "--state-rest-surface",
+        );
+        let expected = Scene::new(text, NodeId::new("card").unwrap()).unwrap();
+
+        let caption = Node::new(
+            NodeId::new("caption").unwrap(),
+            Role::Text,
+            "続ける",
+            bounds,
+            "--state-rest-surface",
+        );
+        let button = Node::new(
+            NodeId::new("card").unwrap(),
+            Role::Button,
+            "続ける",
+            bounds,
+            "--state-rest-surface",
+        )
+        .with_children(vec![caption]);
+        let actual = Scene::new(button, NodeId::new("card").unwrap()).unwrap();
+
+        assert_eq!(
+            Rasterizer::new().render(&actual, metrics()).unwrap().rgba,
+            Rasterizer::new()
+                .render(&expected, metrics())
+                .unwrap()
+                .rgba
+        );
+    }
+
     fn overlapping_scene(order: [&str; 2]) -> Scene {
         let children = order.map(|id| {
             Node::new(
@@ -2878,6 +3031,13 @@ mod tests {
     #[test]
     fn wrapping_text_is_clipped_to_node_bounds() {
         let bounds = Bounds::new(40.0, 30.0, 42.0, 24.0);
+        let caption = Node::new(
+            NodeId::new("caption").unwrap(),
+            Role::Text,
+            "This label wraps across far more lines than fit",
+            bounds,
+            "--state-rest-surface",
+        );
         let node = Node::new(
             NodeId::new("root").unwrap(),
             Role::Button,
@@ -2885,7 +3045,8 @@ mod tests {
             bounds,
             "--state-rest-surface",
         )
-        .with_action(NodeAction::Activate);
+        .with_action(NodeAction::Activate)
+        .with_children(vec![caption]);
         let scene = Scene::new(node, NodeId::new("root").unwrap()).unwrap();
         let frame = Rasterizer::new().render(&scene, metrics()).unwrap();
         for y in 0..frame.height {

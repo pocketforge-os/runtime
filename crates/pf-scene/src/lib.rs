@@ -165,6 +165,8 @@ impl Bounds {
 pub struct Node {
     pub id: NodeId,
     pub role: Role,
+    /// Semantic name; painted only via explicit text roles (Text/Heading). Containers carry
+    /// names without visual effect.
     pub accessible_label: String,
     pub state: NodeState,
     pub bounds: Bounds,

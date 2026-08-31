@@ -371,12 +371,11 @@ mod tests {
     fn scene() -> Scene {
         let n = Node::new(
             NodeId::new("card").unwrap(),
-            Role::Button,
+            Role::Text,
             "続ける",
             Bounds::new(7.0, 9.0, 120.0, 51.0),
             "--state-rest-surface",
-        )
-        .with_action(NodeAction::Activate);
+        );
         Scene::new(n, NodeId::new("card").unwrap()).unwrap()
     }
     fn info(format: PixelFormat) -> FbInfo {
@@ -514,12 +513,11 @@ mod tests {
     fn wrapping_scene(label: &str) -> Scene {
         let root = Node::new(
             NodeId::new("root").unwrap(),
-            Role::Button,
+            Role::Text,
             label,
             Bounds::new(40.0, 30.0, 42.0, 24.0),
             "--state-rest-surface",
-        )
-        .with_action(NodeAction::Activate);
+        );
         Scene::new(root, NodeId::new("root").unwrap()).unwrap()
     }
     fn assert_current_page_matches_frame(host: &mut FbdevHost) {
