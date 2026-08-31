@@ -1833,14 +1833,13 @@ mod tests {
     }
 
     #[test]
-    fn absent_text_ink_override_is_byte_identical_to_existing_label_fixture() {
-        let original = label_scene(Role::Text, "default ink");
-        assert_eq!(original.root().ink_token, None);
+    fn absent_text_ink_override_matches_pre_ink_default_raster() {
+        let scene = label_scene(Role::Text, "default ink");
+        assert_eq!(scene.root().ink_token, None);
 
-        let explicit_none = label_scene(Role::Text, "default ink");
-        let original_frame = Rasterizer::new().render(&original, metrics()).unwrap();
-        let none_frame = Rasterizer::new().render(&explicit_none, metrics()).unwrap();
-        assert_eq!(none_frame.rgba, original_frame.rgba);
+        let frame = Rasterizer::new().render(&scene, metrics()).unwrap();
+        // Pins the pre-ink-field default raster so an absent override cannot drift silently.
+        assert_eq!(frame_hash(&frame.rgba), 9_368_088_083_885_669_672);
     }
 
     #[test]
