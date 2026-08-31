@@ -1,10 +1,12 @@
-use crate::{Bounds, Node, NodeContent, NodeId, Role, SurfaceMetrics, TypeRole};
+use crate::{Bounds, Node, NodeContent, NodeId, Role, SurfaceMetrics, TextAlign, TypeRole};
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use taffy::prelude as tf;
 use taffy::{geometry::Point, style::Overflow as TaffyOverflow, TaffyError};
 
 pub type Metrics = SurfaceMetrics;
+type MeasureContext = (String, TypeRole, TextAlign, Option<f32>);
+type LayoutTree = tf::TaffyTree<Option<MeasureContext>>;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub enum LayoutValue {
@@ -128,6 +130,7 @@ pub trait TextMeasure {
         &self,
         text: &str,
         role: TypeRole,
+        align: TextAlign,
         scale: f32,
         max_width: Option<f32>,
         line_height: Option<f32>,
@@ -217,7 +220,7 @@ fn resolve_subtree(
         apply_bounds(root, &bounds);
         return;
     }
-    let mut tree: tf::TaffyTree<Option<(String, TypeRole, Option<f32>)>> = tf::TaffyTree::new();
+    let mut tree = LayoutTree::new();
     // Bounds are logical values. Pixel snapping belongs to the renderer and would break
     // exact explicit-bounds legacy islands here.
     tree.disable_rounding();
@@ -231,14 +234,15 @@ fn resolve_subtree(
             height: tf::AvailableSpace::Definite(metrics.logical_height),
         },
         |known, available, _, context, _| {
-            let Some(Some((text, role, line_height))) = context else {
+            let Some(Some((text, role, align, line_height))) = context else {
                 return tf::Size::ZERO;
             };
             let max_width = known.width.or(match available.width {
                 tf::AvailableSpace::Definite(v) => Some(v),
                 _ => None,
             });
-            let (width, height) = measure.measure(text, *role, scale, max_width, *line_height);
+            let (width, height) =
+                measure.measure(text, *role, *align, scale, max_width, *line_height);
             tf::Size {
                 width: known.width.unwrap_or(width),
                 height: known.height.unwrap_or(height),
@@ -254,7 +258,7 @@ fn resolve_subtree(
 }
 
 fn build_node(
-    tree: &mut tf::TaffyTree<Option<(String, TypeRole, Option<f32>)>>,
+    tree: &mut LayoutTree,
     node: &Node,
     measure: &dyn TextMeasure,
     scale: f32,
@@ -281,6 +285,7 @@ fn build_node(
         Some((
             node.accessible_label.clone(),
             node.type_role,
+            node.text_align,
             node.line_height,
         ))
     } else {
@@ -437,7 +442,7 @@ fn map_overflow(v: Overflow) -> TaffyOverflow {
 }
 
 fn write_layout(
-    tree: &tf::TaffyTree<Option<(String, TypeRole, Option<f32>)>>,
+    tree: &LayoutTree,
     node: &mut Node,
     ids: &HashMap<NodeId, tf::NodeId>,
     origin: (f32, f32),
@@ -484,6 +489,7 @@ fn hash_node(n: &Node, h: &mut impl Hasher) {
     n.accessible_label.hash(h);
     n.content.hash(h);
     n.type_role.hash(h);
+    std::mem::discriminant(&n.text_align).hash(h);
     n.role.hash(h);
     n.line_height.map(f32::to_bits).hash(h);
     hash_style(n.layout.as_ref(), h);
@@ -511,6 +517,7 @@ mod tests {
             &self,
             text: &str,
             role: TypeRole,
+            _align: TextAlign,
             scale: f32,
             max: Option<f32>,
             line_height: Option<f32>,
