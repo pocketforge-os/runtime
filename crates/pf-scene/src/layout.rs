@@ -1,4 +1,4 @@
-use crate::{Bounds, Node, NodeContent, NodeId, Role, SurfaceMetrics, TextAlign, TypeRole};
+use crate::{Bounds, Insets, Node, NodeContent, NodeId, Role, SurfaceMetrics, TextAlign, TypeRole};
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use taffy::prelude as tf;
@@ -264,11 +264,8 @@ fn resolve_subtree(
         },
     )
     .expect("layout computation succeeds");
-    let origin = (
-        root.bounds.x + metrics.safe_insets.left,
-        root.bounds.y + metrics.safe_insets.top,
-    );
-    write_layout(&tree, root, &ids, origin);
+    let root_origin = (root.bounds.x, root.bounds.y);
+    write_root_layout(&tree, root, &ids, root_origin, metrics.safe_insets);
     let mut result = Vec::new();
     collect_bounds(root, &mut result);
     cache.entries.insert(key, result);
@@ -477,6 +474,27 @@ fn write_layout(
         write_layout(tree, child, ids, here)
     }
 }
+fn write_root_layout(
+    tree: &LayoutTree,
+    root: &mut Node,
+    ids: &HashMap<NodeId, tf::NodeId>,
+    authored_origin: (f32, f32),
+    safe_insets: Insets,
+) {
+    let layout = tree.layout(ids[&root.id]).expect("computed");
+    root.bounds.x = authored_origin.0;
+    root.bounds.y = authored_origin.1;
+    root.bounds.width = layout.size.width;
+    root.bounds.height = layout.size.height;
+
+    let interior_origin = (
+        authored_origin.0 + safe_insets.left,
+        authored_origin.1 + safe_insets.top,
+    );
+    for child in &mut root.children {
+        write_layout(tree, child, ids, interior_origin)
+    }
+}
 fn collect_bounds(n: &Node, out: &mut Vec<(NodeId, Bounds)>) {
     out.push((n.id.clone(), n.bounds));
     for c in &n.children {
@@ -496,10 +514,10 @@ fn input_hash(root: &Node) -> u64 {
     // A participating subtree is mounted at its root's existing logical origin.
     root.bounds.x.to_bits().hash(&mut h);
     root.bounds.y.to_bits().hash(&mut h);
-    hash_node(root, &mut h);
+    hash_node(root, &mut h, true);
     h.finish()
 }
-fn hash_node(n: &Node, h: &mut impl Hasher) {
+fn hash_node(n: &Node, h: &mut impl Hasher, participating: bool) {
     n.id.hash(h);
     n.accessible_label.hash(h);
     n.content.hash(h);
@@ -509,12 +527,19 @@ fn hash_node(n: &Node, h: &mut impl Hasher) {
     n.line_height.map(f32::to_bits).hash(h);
     hash_style(n.layout.as_ref(), h);
     if n.layout.is_none() {
-        for value in [n.bounds.x, n.bounds.y, n.bounds.width, n.bounds.height] {
+        let values: &[f32] = if participating {
+            // A legacy island's position is a layout output; only its authored size is input.
+            &[n.bounds.width, n.bounds.height]
+        } else {
+            // Descendants of a legacy island are opaque and keep all authored bounds.
+            &[n.bounds.x, n.bounds.y, n.bounds.width, n.bounds.height]
+        };
+        for value in values {
             value.to_bits().hash(h);
         }
     }
     for c in &n.children {
-        hash_node(c, h)
+        hash_node(c, h, participating && n.layout.is_some())
     }
 }
 fn hash_style(s: Option<&LayoutStyle>, h: &mut impl Hasher) {
@@ -598,13 +623,16 @@ mod tests {
     }
 
     #[test]
-    fn safe_insets_reduce_available_space_and_offset_the_subtree() {
+    fn safe_insets_reduce_available_space_and_offset_the_subtree_interior_idempotently() {
         let style = LayoutStyle {
             width: LayoutValue::Pct(1.0),
             height: LayoutValue::Pct(1.0),
             ..LayoutStyle::default()
         };
-        let scene = node("root", Bounds::new(7.0, 11.0, 0.0, 0.0)).with_layout(style);
+        let child = node("child", Bounds::new(0.0, 0.0, 10.0, 20.0));
+        let scene = node("root", Bounds::new(7.0, 11.0, 0.0, 0.0))
+            .with_layout(style)
+            .with_children(vec![child]);
         let mut without_insets = scene.clone();
         let mut with_insets = scene;
         let mut inset_metrics = metrics(320.0);
@@ -622,16 +650,24 @@ mod tests {
             &Measure,
             &mut LayoutCache::default(),
         );
-        resolve_layout(
-            &mut with_insets,
-            inset_metrics,
-            1.0,
-            &Measure,
-            &mut LayoutCache::default(),
-        );
+        let mut cache = LayoutCache::default();
+        resolve_layout(&mut with_insets, inset_metrics, 1.0, &Measure, &mut cache);
 
         assert_eq!(without_insets.bounds, Bounds::new(7.0, 11.0, 320.0, 240.0));
-        assert_eq!(with_insets.bounds, Bounds::new(30.0, 24.0, 280.0, 208.0));
+        assert_eq!(with_insets.bounds, Bounds::new(7.0, 11.0, 280.0, 208.0));
+        assert_eq!(
+            with_insets.children[0].bounds,
+            Bounds::new(30.0, 24.0, 10.0, 20.0)
+        );
+
+        let first_bounds = format!("{:?}", with_insets);
+        resolve_layout(&mut with_insets, inset_metrics, 1.0, &Measure, &mut cache);
+        assert_eq!(format!("{:?}", with_insets), first_bounds);
+        assert_eq!(
+            cache.hits(),
+            1,
+            "an unchanged re-resolve must hit the cache"
+        );
     }
 
     #[test]
