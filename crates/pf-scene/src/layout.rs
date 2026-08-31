@@ -235,11 +235,12 @@ fn resolve_subtree(
         ],
         text_scale: scale.to_bits(),
         typography_revision: cache.typography_revision,
-        inputs: input_hash(root, containing_origin.is_none()),
+        inputs: input_hash(root),
     };
+    let root_origin = containing_origin.unwrap_or((root.bounds.x, root.bounds.y));
     if let Some(bounds) = cache.entries.get(&key).cloned() {
         cache.hits += 1;
-        apply_bounds(root, &bounds);
+        apply_bounds(root, &bounds, root_origin);
         return;
     }
     let mut tree = LayoutTree::new();
@@ -278,10 +279,9 @@ fn resolve_subtree(
         },
     )
     .expect("layout computation succeeds");
-    let root_origin = containing_origin.unwrap_or((root.bounds.x, root.bounds.y));
     write_root_layout(&tree, root, &ids, root_origin, metrics.safe_insets);
     let mut result = Vec::new();
-    collect_bounds(root, &mut result);
+    collect_bounds(root, root_origin, &mut result);
     cache.entries.insert(key, result);
 }
 
@@ -509,27 +509,25 @@ fn write_root_layout(
         write_layout(tree, child, ids, interior_origin)
     }
 }
-fn collect_bounds(n: &Node, out: &mut Vec<(NodeId, Bounds)>) {
-    out.push((n.id.clone(), n.bounds));
+fn collect_bounds(n: &Node, origin: (f32, f32), out: &mut Vec<(NodeId, Bounds)>) {
+    let mut relative = n.bounds;
+    relative.x -= origin.0;
+    relative.y -= origin.1;
+    out.push((n.id.clone(), relative));
     for c in &n.children {
-        collect_bounds(c, out)
+        collect_bounds(c, origin, out)
     }
 }
-fn apply_bounds(n: &mut Node, b: &[(NodeId, Bounds)]) {
+fn apply_bounds(n: &mut Node, b: &[(NodeId, Bounds)], origin: (f32, f32)) {
     if let Some((_, v)) = b.iter().find(|(id, _)| id == &n.id) {
-        n.bounds = *v
+        n.bounds = Bounds::new(v.x + origin.0, v.y + origin.1, v.width, v.height)
     }
     for c in &mut n.children {
-        apply_bounds(c, b)
+        apply_bounds(c, b, origin)
     }
 }
-fn input_hash(root: &Node, authored_origin_is_input: bool) -> u64 {
+fn input_hash(root: &Node) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
-    if authored_origin_is_input {
-        // A top-level participating subtree is mounted at its authored logical origin.
-        root.bounds.x.to_bits().hash(&mut h);
-        root.bounds.y.to_bits().hash(&mut h);
-    }
     hash_node(root, &mut h, true);
     h.finish()
 }
@@ -731,6 +729,41 @@ mod tests {
             cache.hits(),
             1,
             "an unchanged enclosing box must hit the cache"
+        );
+    }
+
+    #[test]
+    fn cached_nested_subtree_reanchors_when_enclosing_legacy_box_moves() {
+        let nested = node("nested", Bounds::new(0.0, 0.0, 0.0, 0.0)).with_layout(LayoutStyle {
+            width: LayoutValue::Pct(1.0),
+            height: LayoutValue::Pct(1.0),
+            ..LayoutStyle::default()
+        });
+        let parent =
+            node("parent", Bounds::new(41.0, 53.0, 100.0, 80.0)).with_children(vec![nested]);
+        let mut root =
+            node("root", Bounds::new(0.0, 0.0, 320.0, 240.0)).with_children(vec![parent]);
+        let mut cache = LayoutCache::default();
+
+        resolve_layout(&mut root, metrics(320.0), 1.0, &Measure, &mut cache);
+        assert_eq!(
+            root.children[0].children[0].bounds,
+            Bounds::new(41.0, 53.0, 100.0, 80.0)
+        );
+        assert_eq!(cache.hits(), 0);
+
+        root.children[0].bounds = Bounds::new(61.0, 71.0, 100.0, 80.0);
+        resolve_layout(&mut root, metrics(320.0), 1.0, &Measure, &mut cache);
+
+        assert_eq!(
+            cache.hits(),
+            1,
+            "moving an unchanged enclosing box must hit the cache"
+        );
+        assert_eq!(
+            root.children[0].children[0].bounds,
+            Bounds::new(61.0, 71.0, 100.0, 80.0),
+            "cached bounds must re-anchor to the current enclosing origin"
         );
     }
 
