@@ -265,6 +265,8 @@ struct NodeSnapshot {
     text_align: TextAlign,
     ink_token: Option<String>,
     corner_radius: f32,
+    border_token: Option<String>,
+    border_width: f32,
     focused: bool,
     pressed: bool,
     disabled: bool,
@@ -533,6 +535,7 @@ fn collect(
     pressed_shift: f32,
 ) {
     let transform = node_transform(node, ancestor_transform, pressed_shift);
+    let border_width = normalized_border_width(node.border_width);
     out.push(NodeSnapshot {
         id: node.id.as_str().into(),
         parent_id: parent_id.map(str::to_owned),
@@ -549,6 +552,10 @@ fn collect(
         text_align: node.text_align,
         ink_token: effective_painted_ink_token(node).map(str::to_owned),
         corner_radius: normalized_corner_radius(node.corner_radius),
+        border_token: (border_width > 0.0)
+            .then(|| node.border_token.clone())
+            .flatten(),
+        border_width: node.border_token.as_ref().map_or(0.0, |_| border_width),
         focused: node.state.focused,
         pressed: node.state.pressed,
         disabled: node.state.disabled,
@@ -852,6 +859,21 @@ fn draw_node(
             )?;
         }
     }
+    if let Some(border_token) = node
+        .border_token
+        .as_deref()
+        .filter(|_| normalized_border_width(node.border_width) > 0.0)
+    {
+        stroke_node_border(
+            pm,
+            context.style,
+            border_token,
+            b,
+            scale,
+            radius,
+            normalized_border_width(node.border_width),
+        )?;
+    }
     match &node.content {
         NodeContent::Label if paints_accessible_label(node) => {
             // Disabled ink remains state-owned for legibility. Otherwise an explicit node
@@ -1086,6 +1108,14 @@ fn normalized_corner_radius(radius: f32) -> f32 {
     }
 }
 
+fn normalized_border_width(width: f32) -> f32 {
+    if width.is_finite() && width > 0.0 {
+        width
+    } else {
+        0.0
+    }
+}
+
 fn rounded_rect_path(rect: Rect, radius: Radii) -> tiny_skia::Path {
     let rx = radius.x.min(rect.width() / 2.0).max(0.0);
     let ry = radius.y.min(rect.height() / 2.0).max(0.0);
@@ -1180,6 +1210,48 @@ fn stroke_token_rect(
         &Stroke {
             width: scale,
             dash: StrokeDash::new(vec![4.0 * scale, 3.0 * scale], 0.0),
+            ..Stroke::default()
+        },
+        Transform::identity(),
+        None,
+    );
+    Ok(())
+}
+
+fn stroke_node_border(
+    pm: &mut Pixmap,
+    style: &ResolvedStyleSnapshot,
+    key: &str,
+    bounds: Bounds,
+    scale: f32,
+    radius: Radii,
+    logical_width: f32,
+) -> Result<(), RenderError> {
+    let width = (logical_width * scale).max(1.0);
+    let half = width / 2.0;
+    let physical_width = bounds.width * scale;
+    let physical_height = bounds.height * scale;
+    let Some(rect) = Rect::from_xywh(
+        bounds.x * scale + half,
+        bounds.y * scale + half,
+        physical_width - width,
+        physical_height - width,
+    ) else {
+        return Ok(());
+    };
+    let color = style_color(style, key)?;
+    let mut paint = Paint::default();
+    paint.set_color_rgba8(color.red, color.green, color.blue, color.alpha);
+    let inset_radius = Radii::new((radius.x - half).max(0.0), (radius.y - half).max(0.0));
+    pm.stroke_path(
+        &if inset_radius.is_rounded() {
+            rounded_rect_path(rect, inset_radius)
+        } else {
+            PathBuilder::from_rect(rect)
+        },
+        &paint,
+        &Stroke {
+            width,
             ..Stroke::default()
         },
         Transform::identity(),
@@ -2209,6 +2281,90 @@ mod tests {
             .render(&rounded_fixture(999.0), metrics())
             .unwrap();
         assert_eq!(clamped.rgba, pill.rgba);
+    }
+
+    fn border_fixture(bounds: Bounds, radius: f32, fill_token: &str) -> Scene {
+        let root = Node::new(
+            NodeId::new("bordered").unwrap(),
+            Role::Group,
+            "",
+            bounds,
+            fill_token,
+        )
+        .with_corner_radius(radius)
+        .with_border("--color-border-strong", 2.0);
+        Scene::new(root, NodeId::new("bordered").unwrap()).unwrap()
+    }
+
+    #[test]
+    fn border_only_round_shapes_are_rings_contained_by_bounds() {
+        let canvas = token_rgba(ThemeBase::Dusk, "--color-surface-canvas");
+        for bounds in [
+            Bounds::new(20.0, 20.0, 24.0, 24.0),
+            Bounds::new(20.0, 20.0, 80.0, 24.0),
+        ] {
+            let frame = Rasterizer::new()
+                .render(
+                    &border_fixture(bounds, bounds.height / 2.0, "--color-transparent"),
+                    metrics(),
+                )
+                .unwrap();
+            let left = bounds.x as u32;
+            let top = bounds.y as u32;
+            let right = (bounds.x + bounds.width - 1.0) as u32;
+            let bottom = (bounds.y + bounds.height - 1.0) as u32;
+            let mid_x = (bounds.x + bounds.width / 2.0) as u32;
+            let mid_y = (bounds.y + bounds.height / 2.0) as u32;
+
+            assert_ne!(pixel(&frame, mid_x, top), canvas);
+            assert_ne!(pixel(&frame, mid_x, bottom), canvas);
+            assert_ne!(pixel(&frame, left, mid_y), canvas);
+            assert_ne!(pixel(&frame, right, mid_y), canvas);
+            assert_eq!(pixel(&frame, mid_x, mid_y), canvas);
+            assert_eq!(pixel(&frame, left - 1, mid_y), canvas);
+            assert_eq!(pixel(&frame, right + 1, mid_y), canvas);
+            assert_eq!(pixel(&frame, mid_x, top - 1), canvas);
+            assert_eq!(pixel(&frame, mid_x, bottom + 1), canvas);
+        }
+    }
+
+    #[test]
+    fn border_paints_over_fill_and_uses_its_own_token() {
+        let frame = Rasterizer::new()
+            .render(
+                &border_fixture(
+                    Bounds::new(20.0, 20.0, 40.0, 40.0),
+                    8.0,
+                    "--state-rest-surface",
+                ),
+                metrics(),
+            )
+            .unwrap();
+        let border = token_rgba(ThemeBase::Dusk, "--color-border-strong");
+        let fill = token_rgba(ThemeBase::Dusk, "--state-rest-surface");
+        assert_eq!(pixel(&frame, 20, 40), border);
+        assert_eq!(pixel(&frame, 22, 40), fill);
+        assert_eq!(pixel(&frame, 40, 40), fill);
+    }
+
+    #[test]
+    fn default_border_is_byte_identical_to_explicitly_disabled_border() {
+        let original = rounded_fixture(8.0);
+        let mut root = Node::new(
+            NodeId::new("rounded").unwrap(),
+            Role::Group,
+            "",
+            Bounds::new(20.0, 20.0, 40.0, 40.0),
+            "--state-rest-surface",
+        )
+        .with_corner_radius(8.0);
+        root.border_token = Some("--color-border-strong".into());
+        root.border_width = 0.0;
+        let disabled = Scene::new(root, NodeId::new("rounded").unwrap()).unwrap();
+        assert_eq!(
+            Rasterizer::new().render(&original, metrics()).unwrap().rgba,
+            Rasterizer::new().render(&disabled, metrics()).unwrap().rgba
+        );
     }
 
     #[test]
