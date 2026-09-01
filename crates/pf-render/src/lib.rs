@@ -859,21 +859,6 @@ fn draw_node(
             )?;
         }
     }
-    if let Some(border_token) = node
-        .border_token
-        .as_deref()
-        .filter(|_| normalized_border_width(node.border_width) > 0.0)
-    {
-        stroke_node_border(
-            pm,
-            context.style,
-            border_token,
-            b,
-            scale,
-            radius,
-            normalized_border_width(node.border_width),
-        )?;
-    }
     match &node.content {
         NodeContent::Label if paints_accessible_label(node) => {
             // Disabled ink remains state-owned for legibility. Otherwise an explicit node
@@ -907,6 +892,23 @@ fn draw_node(
                 context.notes.push(note);
             }
         }
+    }
+    // A node's border sits above all of its own content, but below descendants.
+    // In particular, an opaque full-bounds image must not erase the border.
+    if let Some(border_token) = node
+        .border_token
+        .as_deref()
+        .filter(|_| normalized_border_width(node.border_width) > 0.0)
+    {
+        stroke_node_border(
+            pm,
+            context.style,
+            border_token,
+            b,
+            scale,
+            radius,
+            normalized_border_width(node.border_width),
+        )?;
     }
     for child in &node.children {
         draw_node(pm, context, child, scale, transform)?;
@@ -2345,6 +2347,56 @@ mod tests {
         assert_eq!(pixel(&frame, 20, 40), border);
         assert_eq!(pixel(&frame, 22, 40), fill);
         assert_eq!(pixel(&frame, 40, 40), fill);
+    }
+
+    #[test]
+    fn border_paints_over_full_bounds_image_content() {
+        let bounds = Bounds::new(20.0, 20.0, 80.0, 40.0);
+        let root = Node::new(
+            NodeId::new("bordered-image").unwrap(),
+            Role::Group,
+            "",
+            bounds,
+            "--color-transparent",
+        )
+        .with_image(
+            ImageSource::new("border-image", Arc::<[u8]>::from(IMAGE_PNG)),
+            ImageFit::Cover,
+        )
+        .with_corner_radius(8.0)
+        .with_border("--color-border-strong", 2.0);
+        let scene = Scene::new(root, NodeId::new("bordered-image").unwrap()).unwrap();
+        let frame = Rasterizer::new().render(&scene, metrics()).unwrap();
+        let border = token_rgba(ThemeBase::Dusk, "--color-border-strong");
+
+        assert_eq!(pixel(&frame, 60, 20), border);
+        assert_eq!(pixel(&frame, 60, 59), border);
+        assert_eq!(pixel(&frame, 20, 40), border);
+        assert_eq!(pixel(&frame, 99, 40), border);
+    }
+
+    #[test]
+    fn text_and_border_both_survive_node_content_painting() {
+        let root = Node::new(
+            NodeId::new("bordered-text").unwrap(),
+            Role::Text,
+            "MMMM",
+            Bounds::new(20.0, 20.0, 160.0, 60.0),
+            "--color-transparent",
+        )
+        .with_ink_token("--color-status-ready")
+        .with_corner_radius(8.0)
+        .with_border("--color-border-strong", 1.0);
+        let scene = Scene::new(root, NodeId::new("bordered-text").unwrap()).unwrap();
+        let frame = Rasterizer::new().render(&scene, metrics()).unwrap();
+        let border = token_rgba(ThemeBase::Dusk, "--color-border-strong");
+        let text = token_rgba(ThemeBase::Dusk, "--color-status-ready");
+
+        assert_eq!(pixel(&frame, 100, 20), border);
+        assert!(
+            frame.rgba.chunks_exact(4).any(|pixel| pixel == text),
+            "text glyph ink was lost when the border painted"
+        );
     }
 
     #[test]
