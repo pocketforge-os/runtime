@@ -198,6 +198,10 @@ pub struct Node {
     pub ink_token: Option<String>,
     /// Corner radius in logical pixels. Zero retains the sharp-rectangle geometry.
     pub corner_radius: f32,
+    /// Optional theme token for a border painted inside this node's bounds.
+    pub border_token: Option<String>,
+    /// Border width in logical pixels. Zero disables border painting.
+    pub border_width: f32,
     pub elevation: Elevation,
     pub children: Vec<Node>,
 }
@@ -225,6 +229,8 @@ impl Node {
             text_align: TextAlign::Start,
             ink_token: None,
             corner_radius: 0.0,
+            border_token: None,
+            border_width: 0.0,
             elevation: Elevation::None,
             children: Vec::new(),
         }
@@ -286,6 +292,17 @@ impl Node {
     pub fn with_corner_radius(mut self, radius: f32) -> Self {
         self.corner_radius = if radius.is_finite() && radius > 0.0 {
             radius
+        } else {
+            0.0
+        };
+        self
+    }
+
+    /// Adds a theme-token border painted inside the node's rounded silhouette.
+    pub fn with_border(mut self, token: impl Into<String>, width: f32) -> Self {
+        self.border_token = Some(token.into());
+        self.border_width = if width.is_finite() && width > 0.0 {
+            width
         } else {
             0.0
         };
@@ -832,5 +849,41 @@ mod tests {
         assert_eq!(node.clone().with_corner_radius(6.0).corner_radius, 6.0);
         assert_eq!(node.clone().with_corner_radius(f32::NAN).corner_radius, 0.0);
         assert_eq!(node.with_corner_radius(-1.0).corner_radius, 0.0);
+    }
+
+    #[test]
+    fn border_fields_default_off_and_round_trip_with_node() {
+        let default = Node::new(
+            id("card"),
+            Role::Group,
+            "card",
+            Bounds::new(0.0, 0.0, 20.0, 10.0),
+            "surface",
+        );
+        assert_eq!(default.border_token, None);
+        assert_eq!(default.border_width, 0.0);
+
+        let bordered = default.clone().with_border("--color-border-strong", 1.5);
+        let round_tripped = bordered.clone();
+        assert_eq!(
+            round_tripped.border_token.as_deref(),
+            Some("--color-border-strong")
+        );
+        assert_eq!(round_tripped.border_width, 1.5);
+        assert_eq!(round_tripped, bordered);
+
+        assert_eq!(
+            default
+                .clone()
+                .with_border("--color-border-strong", f32::NAN)
+                .border_width,
+            0.0
+        );
+        assert_eq!(
+            default
+                .with_border("--color-border-strong", -1.0)
+                .border_width,
+            0.0
+        );
     }
 }
