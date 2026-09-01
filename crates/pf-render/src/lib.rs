@@ -1229,10 +1229,13 @@ fn stroke_node_border(
     radius: Radii,
     logical_width: f32,
 ) -> Result<(), RenderError> {
-    let width = (logical_width * scale).max(1.0);
-    let half = width / 2.0;
     let physical_width = bounds.width * scale;
     let physical_height = bounds.height * scale;
+    let effective_width = logical_width
+        .min(bounds.width / 2.0)
+        .min(bounds.height / 2.0);
+    let width = (effective_width * scale).max(1.0);
+    let half = width / 2.0;
     let Some(rect) = Rect::from_xywh(
         bounds.x * scale + half,
         bounds.y * scale + half,
@@ -2347,6 +2350,27 @@ mod tests {
         assert_eq!(pixel(&frame, 20, 40), border);
         assert_eq!(pixel(&frame, 22, 40), fill);
         assert_eq!(pixel(&frame, 40, 40), fill);
+    }
+
+    #[test]
+    fn oversized_border_consumes_the_box_instead_of_disappearing() {
+        let root = Node::new(
+            NodeId::new("oversized-border").unwrap(),
+            Role::Group,
+            "",
+            Bounds::new(20.0, 20.0, 10.0, 10.0),
+            "--color-transparent",
+        )
+        .with_border("--color-border-strong", 10.0);
+        let scene = Scene::new(root, NodeId::new("oversized-border").unwrap()).unwrap();
+        let frame = Rasterizer::new().render(&scene, metrics()).unwrap();
+        let border = token_rgba(ThemeBase::Dusk, "--color-border-strong");
+
+        assert_eq!(pixel(&frame, 20, 25), border);
+        assert_eq!(pixel(&frame, 29, 25), border);
+        assert_eq!(pixel(&frame, 25, 20), border);
+        assert_eq!(pixel(&frame, 25, 29), border);
+        assert_eq!(pixel(&frame, 25, 25), border);
     }
 
     #[test]
