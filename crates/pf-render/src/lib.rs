@@ -12,8 +12,8 @@ use pf_theme::{ResolvedStyleSnapshot, Rgba};
 use std::collections::{HashMap, VecDeque};
 use std::io::Cursor;
 use tiny_skia::{
-    Color as SkColor, FilterQuality, Mask, Paint, PathBuilder, Pixmap, PixmapPaint, Rect, Stroke,
-    StrokeDash, Transform,
+    Color as SkColor, FilterQuality, Mask, Paint, Path, PathBuilder, PathSegment, Pixmap,
+    PixmapPaint, Rect, Stroke, StrokeDash, Transform,
 };
 
 const MANROPE: &[u8] =
@@ -775,6 +775,106 @@ fn style_color(style: &ResolvedStyleSnapshot, key: &str) -> Result<Rgba, RenderE
     })
 }
 
+fn surface_rect(width: u32, height: u32) -> Rect {
+    Rect::from_xywh(0.0, 0.0, width as f32, height as f32).expect("pixmap dimensions are positive")
+}
+
+fn fill_rect_clipped(pm: &mut Pixmap, rect: Rect, paint: &Paint<'_>, mask: Option<&Mask>) {
+    if let Some(rect) = rect.intersect(&surface_rect(pm.width(), pm.height())) {
+        pm.fill_path(
+            &PathBuilder::from_rect(rect),
+            paint,
+            tiny_skia::FillRule::Winding,
+            Transform::identity(),
+            mask,
+        );
+    }
+}
+
+/// Restricts renderer-owned paths to the pixmap before tiny-skia scan conversion.
+/// All current stroke paths are lines or axis-aligned rounded rectangles, so clipping
+/// their points preserves visible geometry while removing offscreen and zero-length work.
+fn clipped_path(path: &Path, width: u32, height: u32) -> Option<Path> {
+    path.bounds().intersect(&surface_rect(width, height))?;
+
+    let clamp = |point: tiny_skia::Point| {
+        tiny_skia::Point::from_xy(
+            point.x.clamp(0.0, width as f32),
+            point.y.clamp(0.0, height as f32),
+        )
+    };
+    let mut builder = PathBuilder::new();
+    let mut current = None;
+    let mut subpath_start = None;
+    let mut has_length = false;
+    for segment in path.segments() {
+        match segment {
+            PathSegment::MoveTo(point) => {
+                let point = clamp(point);
+                builder.move_to(point.x, point.y);
+                current = Some(point);
+                subpath_start = Some(point);
+            }
+            PathSegment::LineTo(point) => {
+                let point = clamp(point);
+                has_length |= current.is_some_and(|from| from != point);
+                builder.line_to(point.x, point.y);
+                current = Some(point);
+            }
+            PathSegment::QuadTo(control, point) => {
+                let control = clamp(control);
+                let point = clamp(point);
+                has_length |= current.is_some_and(|from| from != control || from != point);
+                builder.quad_to(control.x, control.y, point.x, point.y);
+                current = Some(point);
+            }
+            PathSegment::CubicTo(control1, control2, point) => {
+                let control1 = clamp(control1);
+                let control2 = clamp(control2);
+                let point = clamp(point);
+                has_length |= current
+                    .is_some_and(|from| from != control1 || from != control2 || from != point);
+                builder.cubic_to(
+                    control1.x, control1.y, control2.x, control2.y, point.x, point.y,
+                );
+                current = Some(point);
+            }
+            PathSegment::Close => {
+                has_length |= current
+                    .zip(subpath_start)
+                    .is_some_and(|(from, to)| from != to);
+                builder.close();
+                current = subpath_start;
+            }
+        }
+    }
+    has_length.then(|| builder.finish()).flatten()
+}
+
+fn stroke_path_clipped(pm: &mut Pixmap, path: &Path, paint: &Paint<'_>, stroke: &Stroke) {
+    if !stroke.width.is_finite() || stroke.width <= 0.0 {
+        return;
+    }
+    let Some(path) = clipped_path(path, pm.width(), pm.height()) else {
+        return;
+    };
+    let mut stroke = stroke.clone();
+    stroke.width = stroke.width.max(1.0);
+    pm.stroke_path(&path, paint, &stroke, Transform::identity(), None);
+}
+
+fn fill_path_clipped(pm: &mut Pixmap, path: &Path, paint: &Paint<'_>) {
+    if let Some(path) = clipped_path(path, pm.width(), pm.height()) {
+        pm.fill_path(
+            &path,
+            paint,
+            tiny_skia::FillRule::Winding,
+            Transform::identity(),
+            None,
+        );
+    }
+}
+
 fn draw_node(
     pm: &mut Pixmap,
     context: &mut DrawContext<'_>,
@@ -826,15 +926,9 @@ fn draw_node(
         let mut paint = Paint::default();
         paint.set_color_rgba8(color.red, color.green, color.blue, color.alpha);
         if radius.is_rounded() {
-            pm.fill_path(
-                &rounded_rect_path(rect, radius),
-                &paint,
-                tiny_skia::FillRule::Winding,
-                Transform::identity(),
-                None,
-            );
+            fill_path_clipped(pm, &rounded_rect_path(rect, radius), &paint);
         } else {
-            pm.fill_rect(rect, &paint, Transform::identity(), None);
+            fill_rect_clipped(pm, rect, &paint, None);
         }
         if node.state.selected {
             fill_token_rect_clipped(
@@ -1005,7 +1099,7 @@ fn draw_state_glyph(
         }
     }
     if let Some(path) = path.finish() {
-        pm.stroke_path(&path, &paint, &stroke, Transform::identity(), None);
+        stroke_path_clipped(pm, &path, &paint, &stroke);
     }
     Ok(())
 }
@@ -1022,17 +1116,20 @@ fn fill_token_rect_clipped(
     let mut paint = Paint::default();
     paint.set_color_rgba8(color.red, color.green, color.blue, color.alpha);
     let mut mask = Mask::new(pm.width(), pm.height()).expect("pixmap has valid dimensions");
-    mask.fill_path(
-        &if radius.is_rounded() {
-            rounded_rect_path(silhouette, radius)
-        } else {
-            PathBuilder::from_rect(silhouette)
-        },
-        tiny_skia::FillRule::Winding,
-        true,
-        Transform::identity(),
-    );
-    pm.fill_rect(fill_rect, &paint, Transform::identity(), Some(&mask));
+    let silhouette = if radius.is_rounded() {
+        rounded_rect_path(silhouette, radius)
+    } else {
+        PathBuilder::from_rect(silhouette)
+    };
+    if let Some(silhouette) = clipped_path(&silhouette, pm.width(), pm.height()) {
+        mask.fill_path(
+            &silhouette,
+            tiny_skia::FillRule::Winding,
+            true,
+            Transform::identity(),
+        );
+    }
+    fill_rect_clipped(pm, fill_rect, &paint, Some(&mask));
     Ok(())
 }
 
@@ -1054,15 +1151,9 @@ fn fill_token_rounded_rect(
         let mut paint = Paint::default();
         paint.set_color_rgba8(color.red, color.green, color.blue, color.alpha);
         if radius.is_rounded() {
-            pm.fill_path(
-                &rounded_rect_path(rect, radius),
-                &paint,
-                tiny_skia::FillRule::Winding,
-                Transform::identity(),
-                None,
-            );
+            fill_path_clipped(pm, &rounded_rect_path(rect, radius), &paint);
         } else {
-            pm.fill_rect(rect, &paint, Transform::identity(), None);
+            fill_rect_clipped(pm, rect, &paint, None);
         }
     }
     Ok(())
@@ -1202,7 +1293,8 @@ fn stroke_token_rect(
     let color = style_color(style, key)?;
     let mut paint = Paint::default();
     paint.set_color_rgba8(color.red, color.green, color.blue, color.alpha);
-    pm.stroke_path(
+    stroke_path_clipped(
+        pm,
         &if radius.is_rounded() {
             rounded_rect_path(rect, radius)
         } else {
@@ -1214,8 +1306,6 @@ fn stroke_token_rect(
             dash: StrokeDash::new(vec![4.0 * scale, 3.0 * scale], 0.0),
             ..Stroke::default()
         },
-        Transform::identity(),
-        None,
     );
     Ok(())
 }
@@ -1248,7 +1338,8 @@ fn stroke_node_border(
     let mut paint = Paint::default();
     paint.set_color_rgba8(color.red, color.green, color.blue, color.alpha);
     let inset_radius = Radii::new((radius.x - half).max(0.0), (radius.y - half).max(0.0));
-    pm.stroke_path(
+    stroke_path_clipped(
+        pm,
         &if inset_radius.is_rounded() {
             rounded_rect_path(rect, inset_radius)
         } else {
@@ -1259,8 +1350,6 @@ fn stroke_node_border(
             width,
             ..Stroke::default()
         },
-        Transform::identity(),
-        None,
     );
     Ok(())
 }
@@ -1292,7 +1381,8 @@ fn draw_focus_ring(
         let ring = style_color(style, "--state-focused-ring")?;
         let mut paint = Paint::default();
         paint.set_color_rgba8(ring.red, ring.green, ring.blue, ring.alpha);
-        pm.stroke_path(
+        stroke_path_clipped(
+            pm,
             &if radius.is_rounded() {
                 rounded_rect_path(rect, Radii::new(radius.x + outset, radius.y + outset))
             } else {
@@ -1303,8 +1393,6 @@ fn draw_focus_ring(
                 width,
                 ..Stroke::default()
             },
-            Transform::identity(),
-            None,
         );
     }
     Ok(())
@@ -1691,12 +1779,18 @@ fn draw_image(
                 .expect("pixmap has valid dimensions"),
         )
         .expect("mask matches target dimensions");
-        mask.fill_path(
+        if let Some(path) = clipped_path(
             &rounded_rect_path(rect, radius),
-            tiny_skia::FillRule::Winding,
-            true,
-            Transform::identity(),
-        );
+            target.width(),
+            target.height(),
+        ) {
+            mask.fill_path(
+                &path,
+                tiny_skia::FillRule::Winding,
+                true,
+                Transform::identity(),
+            );
+        }
         mask_data = mask.data().to_vec();
     } else {
         for row in top.min(target.height())..bottom {
@@ -2441,6 +2535,53 @@ mod tests {
             Rasterizer::new().render(&original, metrics()).unwrap().rgba,
             Rasterizer::new().render(&disabled, metrics()).unwrap().rgba
         );
+    }
+
+    #[test]
+    fn bordered_and_stroked_nodes_at_surface_edges_never_panic() {
+        for surface_width in [480.0, 640.0, 800.0, 1280.0] {
+            for (inset_left, inset_top) in [(0.0, 0.0), (24.0, 32.0)] {
+                for bounds in [
+                    // Exact launcher#68 failure: 640px pixmap, x=504, width=152.
+                    Bounds::new(surface_width - 136.0, 16.0, 152.0, 32.0),
+                    Bounds::new(inset_left - 12.0, inset_top + 20.0, 24.0, 24.0),
+                    Bounds::new(surface_width - 12.0, inset_top + 20.0, 24.0, 24.0),
+                    Bounds::new(surface_width + 24.0, inset_top + 20.0, 24.0, 24.0),
+                    Bounds::new(inset_left + 20.0, -48.0, 80.0, 24.0),
+                ] {
+                    let mut node = Node::new(
+                        NodeId::new("edge-stroke").unwrap(),
+                        Role::Group,
+                        "",
+                        bounds,
+                        "--color-transparent",
+                    )
+                    .with_corner_radius(12.0)
+                    .with_border("--color-border-strong", 1.0);
+                    node.state.disabled = true;
+                    node.state.focused = true;
+                    node.state.destructive = true;
+                    let scene = Scene::new(node, NodeId::new("edge-stroke").unwrap()).unwrap();
+                    Rasterizer::new()
+                        .render(
+                            &scene,
+                            SurfaceMetrics {
+                                logical_width: surface_width,
+                                logical_height: 720.0,
+                                scale: 1.0,
+                                safe_insets: Insets {
+                                    top: inset_top,
+                                    right: 0.0,
+                                    bottom: 0.0,
+                                    left: inset_left,
+                                },
+                                orientation: Orientation::Landscape,
+                            },
+                        )
+                        .unwrap();
+                }
+            }
+        }
     }
 
     #[test]
