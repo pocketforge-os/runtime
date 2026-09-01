@@ -2444,6 +2444,54 @@ mod tests {
     }
 
     #[test]
+    fn bordered_and_stroked_nodes_at_surface_edges_never_panic() {
+        for surface_width in [480.0, 640.0, 800.0, 1280.0] {
+            for (inset_left, inset_top) in [(0.0, 0.0), (24.0, 32.0)] {
+                for bounds in [
+                    // Library-like trailing card straddling the 640px surface edge.
+                    Bounds::new(surface_width - 136.0, 16.0, 152.0, 32.0),
+                    Bounds::new(0.5, inset_top + 20.0, 0.6, 24.0),
+                    Bounds::new(inset_left - 12.0, inset_top + 20.0, 24.0, 24.0),
+                    Bounds::new(surface_width - 12.0, inset_top + 20.0, 24.0, 24.0),
+                    Bounds::new(surface_width + 24.0, inset_top + 20.0, 24.0, 24.0),
+                    Bounds::new(inset_left + 20.0, -48.0, 80.0, 24.0),
+                ] {
+                    let mut node = Node::new(
+                        NodeId::new("edge-stroke").unwrap(),
+                        Role::Group,
+                        "",
+                        bounds,
+                        "--color-transparent",
+                    )
+                    .with_corner_radius(12.0)
+                    .with_border("--color-border-strong", 1.0);
+                    node.state.disabled = true;
+                    node.state.focused = true;
+                    node.state.destructive = true;
+                    let scene = Scene::new(node, NodeId::new("edge-stroke").unwrap()).unwrap();
+                    Rasterizer::new()
+                        .render(
+                            &scene,
+                            SurfaceMetrics {
+                                logical_width: surface_width,
+                                logical_height: 720.0,
+                                scale: 1.0,
+                                safe_insets: Insets {
+                                    top: inset_top,
+                                    right: 0.0,
+                                    bottom: 0.0,
+                                    left: inset_left,
+                                },
+                                orientation: Orientation::Landscape,
+                            },
+                        )
+                        .unwrap();
+                }
+            }
+        }
+    }
+
+    #[test]
     fn non_uniform_pressed_rounding_uses_elliptical_fill_and_ring_geometry() {
         let mut node = Node::new(
             NodeId::new("ellipse").unwrap(),
