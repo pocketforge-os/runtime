@@ -13,7 +13,7 @@ cosmic-text-tracking = { package = "cosmic-text", version = "0.15", default-feat
 pf-scene = { workspace = true }
 pf-theme = { workspace = true }
 png = "0.17"
-tiny-skia = "0.11"
+tiny-skia = "0.12"
 serde_json = "1"
 
 [build-dependencies]
