@@ -196,6 +196,8 @@ pub struct Node {
     pub text_align: TextAlign,
     /// Optional theme token used for painted text ink. `None` keeps state-driven ink.
     pub ink_token: Option<String>,
+    /// Paint text at 100% metrics instead of applying the global accessibility text scale.
+    pub fixed_paint_scale: bool,
     /// Corner radius in logical pixels. Zero retains the sharp-rectangle geometry.
     pub corner_radius: f32,
     /// Optional theme token for a border painted inside this node's bounds.
@@ -228,6 +230,7 @@ impl Node {
             line_height: None,
             text_align: TextAlign::Start,
             ink_token: None,
+            fixed_paint_scale: false,
             corner_radius: 0.0,
             border_token: None,
             border_width: 0.0,
@@ -277,6 +280,12 @@ impl Node {
 
     pub fn with_ink_token(mut self, token: impl Into<String>) -> Self {
         self.ink_token = Some(token.into());
+        self
+    }
+
+    /// Declares that this node's text belongs to fixed-size artwork.
+    pub fn with_fixed_paint_scale(mut self) -> Self {
+        self.fixed_paint_scale = true;
         self
     }
 
@@ -885,5 +894,22 @@ mod tests {
                 .border_width,
             0.0
         );
+    }
+
+    #[test]
+    fn fixed_paint_scale_defaults_off_and_round_trips_with_node() {
+        let default = Node::new(
+            id("plate-label"),
+            Role::Text,
+            "A",
+            Bounds::new(0.0, 0.0, 20.0, 10.0),
+            "surface",
+        );
+        assert!(!default.fixed_paint_scale);
+
+        let fixed = default.with_fixed_paint_scale();
+        let round_tripped = fixed.clone();
+        assert!(round_tripped.fixed_paint_scale);
+        assert_eq!(round_tripped, fixed);
     }
 }
