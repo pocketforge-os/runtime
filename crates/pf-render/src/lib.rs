@@ -264,6 +264,7 @@ struct NodeSnapshot {
     line_height: Option<f32>,
     text_align: TextAlign,
     ink_token: Option<String>,
+    fixed_paint_scale: bool,
     corner_radius: f32,
     border_token: Option<String>,
     border_width: f32,
@@ -551,6 +552,7 @@ fn collect(
         line_height: node.line_height,
         text_align: node.text_align,
         ink_token: effective_painted_ink_token(node).map(str::to_owned),
+        fixed_paint_scale: node.fixed_paint_scale,
         corner_radius: normalized_corner_radius(node.corner_radius),
         border_token: (border_width > 0.0)
             .then(|| node.border_token.clone())
@@ -877,7 +879,11 @@ fn draw_node(
                 width,
                 height,
                 style: context.typography.resolve(node.type_role),
-                text_scale: context.text_scale,
+                text_scale: if node.fixed_paint_scale {
+                    1.0
+                } else {
+                    context.text_scale
+                },
                 surface_scale: scale,
                 line_height: node.line_height,
                 align: node.text_align,
@@ -2050,7 +2056,10 @@ mod tests {
             Rasterizer::new().render(&painted, metrics())
         }));
         if cfg!(debug_assertions) {
-            assert!(painted_result.is_err(), "debug build must reject unknown ink");
+            assert!(
+                painted_result.is_err(),
+                "debug build must reject unknown ink"
+            );
         } else {
             assert_eq!(
                 painted_result.unwrap().unwrap_err(),
@@ -3606,10 +3615,7 @@ mod tests {
 
         assert_eq!(
             Rasterizer::new().render(&actual, metrics()).unwrap().rgba,
-            Rasterizer::new()
-                .render(&expected, metrics())
-                .unwrap()
-                .rgba
+            Rasterizer::new().render(&expected, metrics()).unwrap().rgba
         );
     }
 
@@ -3928,6 +3934,27 @@ mod tests {
             two_bottom > one_bottom * 3 / 2,
             "{one_bottom} -> {two_bottom}"
         );
+    }
+
+    #[test]
+    fn fixed_paint_scale_text_has_identical_ink_at_100_and_200_percent() {
+        let root = Node::new(
+            NodeId::new("plate-label").unwrap(),
+            Role::Text,
+            "PLATE A",
+            Bounds::new(8.0, 8.0, 150.0, 60.0),
+            "--state-rest-surface",
+        )
+        .with_type_role(TypeRole::Plate)
+        .with_fixed_paint_scale();
+        let scene = Scene::new(root, NodeId::new("plate-label").unwrap()).unwrap();
+
+        let one = Rasterizer::new().render(&scene, metrics()).unwrap();
+        let mut large = Rasterizer::new();
+        large.set_text_scale(2.0).unwrap();
+        let two = large.render(&scene, metrics()).unwrap();
+
+        assert_eq!(text_ink(&one), text_ink(&two));
     }
 
     #[test]
