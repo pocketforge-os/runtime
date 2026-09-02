@@ -552,7 +552,7 @@ fn collect(
         line_height: node.line_height,
         text_align: node.text_align,
         ink_token: effective_painted_ink_token(node).map(str::to_owned),
-        fixed_paint_scale: node.fixed_paint_scale,
+        fixed_paint_scale: paints_accessible_label(node) && node.fixed_paint_scale,
         corner_radius: normalized_corner_radius(node.corner_radius),
         border_token: (border_width > 0.0)
             .then(|| node.border_token.clone())
@@ -2238,6 +2238,39 @@ mod tests {
         let (enabled_original, enabled_mutated) = render_mutation(Role::Text, false);
         assert!(enabled_mutated.damage.is_some());
         assert_ne!(enabled_mutated.rgba, enabled_original.rgba);
+    }
+
+    #[test]
+    fn fixed_paint_scale_only_damages_nodes_that_paint_accessible_labels() {
+        let scale_scene = |role, fixed_paint_scale| {
+            let mut node = Node::new(
+                NodeId::new("paint-scale-damage").unwrap(),
+                role,
+                "visible text",
+                Bounds::new(20.0, 20.0, 160.0, 60.0),
+                "--state-rest-surface",
+            );
+            node.fixed_paint_scale = fixed_paint_scale;
+            Scene::new(node, NodeId::new("paint-scale-damage").unwrap()).unwrap()
+        };
+
+        let render_mutation = |role| {
+            let mut rasterizer = Rasterizer::new();
+            let original = rasterizer
+                .render(&scale_scene(role, false), metrics())
+                .unwrap();
+            let mutated = rasterizer
+                .render(&scale_scene(role, true), metrics())
+                .unwrap();
+            (original, mutated)
+        };
+
+        let (group_original, group_mutated) = render_mutation(Role::Group);
+        assert_eq!(group_mutated.damage, None);
+        assert_eq!(group_mutated.rgba, group_original.rgba);
+
+        let (_, text_mutated) = render_mutation(Role::Text);
+        assert!(text_mutated.damage.is_some());
     }
 
     #[test]
