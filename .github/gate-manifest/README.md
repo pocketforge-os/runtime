@@ -154,10 +154,12 @@ gives it teeth.
 
 ## Modelling choices (so a future editor understands, not reverts)
 
-- **An `if:` on a required job/step is treated as skippable** unless the manifest
-  whitelists it with `allow_if = true`. Evaluating GitHub expression truthiness for
-  arbitrary events is out of scope, so the conservative reading is "a conditional
-  required gate might skip".
+- **An `if:` on a required job/step is treated as skippable** unless the manifest's
+  `allow_if` is the exact approved expression string (compared with whitespace
+  normalized for equivalent YAML folded-scalar formatting). A missing or changed
+  job condition fails closed. Evaluating arbitrary GitHub expression truthiness is
+  out of scope, so the conservative reading is "an unapproved conditional required
+  gate might skip".
 - **`no-unlocked-cargo` is a universal invariant**, not a single-step presence
   check: *every* lock-consuming `cargo` invocation across *all* workflows must
   carry `--locked` (version/help forms exempt). That is the true shape of the

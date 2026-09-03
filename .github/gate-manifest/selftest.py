@@ -117,6 +117,26 @@ def m_if_skip_clippy(root):
     _dump(root, RUNTIME_TESTS, wf)
 
 
+def m_change_approved_job_if(root):
+    wf = _load(root, RUNTIME_TESTS)
+    job = _test_job(wf)
+    job["if"] = "false && " + job["if"]
+    _dump(root, RUNTIME_TESTS, wf)
+
+
+def m_remove_approved_job_if(root):
+    wf = _load(root, RUNTIME_TESTS)
+    _test_job(wf).pop("if")
+    _dump(root, RUNTIME_TESTS, wf)
+
+
+def m_reformat_approved_job_if(root):
+    wf = _load(root, RUNTIME_TESTS)
+    job = _test_job(wf)
+    job["if"] = job["if"].replace(" || ", "\n    ||\n")
+    _dump(root, RUNTIME_TESTS, wf)
+
+
 def m_weaken_clippy_flags(root):
     wf = _load(root, RUNTIME_TESTS)
     job = _test_job(wf)
@@ -165,11 +185,17 @@ CASES = [
     (m_or_true_clippy,           "|| true",                       "clippy tail `|| true` (NEUTERED)"),
     (m_path_exclude_crates,      "guarded path 'crates/**'",      "paths filter excludes crates/** (FILTERED)"),
     (m_if_skip_clippy,           "conditionally skippable",       "clippy `if:` skip (SKIPPED STEP)"),
+    (m_change_approved_job_if,   "does not match",                "approved job `if:` changed (WHITELIST MISMATCH)"),
+    (m_remove_approved_job_if,   "does not match",                "approved job `if:` removed (WHITELIST MISMATCH)"),
     (m_weaken_clippy_flags,      "[clippy-workspace]",            "clippy `-D warnings` removed (WEAKENED/vacuous)"),
     (m_drop_matrix_row,          "[prefs-e2e-unification]",       "a133 matrix row dropped (silent single-row)"),
     (m_strip_platform_env,       "[workspace-tests]",             "PF_PLATFORM_DIR unset (VACUOUS skip)"),
     (m_remove_platform_checkout, "[workspace-tests]",             "platform checkout removed (VACUOUS skip)"),
     (m_delete_whole_workflow,    "does not exist",                "whole runtime-tests.yml deleted (EXCLUDED JOB)"),
+]
+
+PASS_CASES = [
+    (m_reformat_approved_job_if, "approved job `if:` whitespace/line-folding changed"),
 ]
 
 
@@ -196,6 +222,19 @@ def main(argv=None):
         ok = ok and passed
         results.append(("POSITIVE (unmutated tree)", "expect PASS", passed,
                         "PASS" if passed else f"UNEXPECTED FAIL: {failures}"))
+
+    # Formatting-only differences must compare equal after YAML folding/whitespace
+    # normalization; otherwise equivalent folded and single-line forms would drift.
+    for mutate, label in PASS_CASES:
+        with tempfile.TemporaryDirectory() as td:
+            dst = Path(td)
+            _copy_tree(src, dst)
+            mutate(dst)
+            failures = check_gates.evaluate(str(dst / ".github" / "quality-gates.toml"), str(dst))
+            passed = len(failures) == 0
+            ok = ok and passed
+            results.append((label, "expect PASS", passed,
+                            "PASS" if passed else f"UNEXPECTED FAIL: {failures}"))
 
     # --- NEGATIVE controls: each mutation must make it RED for the right gate  #
     for mutate, expect_sub, label in CASES:
