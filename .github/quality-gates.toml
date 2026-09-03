@@ -92,6 +92,8 @@ id = "lockfile-up-to-date"
 invariant = "Cargo.lock already satisfies every manifest — dependency resolution does not need to change it. Catches a manifest edit landed without the matching lock entries (the runtime#35 / tsp-ovee case)."
 workflow = ".github/workflows/runtime-tests.yml"
 job = "test"
+# Accepted fork-skip posture: self-hosted CI skips fork PRs, never same-repo code PRs.
+allow_if = "github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository"
 required_tokens = ["cargo metadata", "--locked"]
 guards_paths = ["crates/**", "Cargo.toml", "Cargo.lock"]
 should_be_required_check = true
@@ -102,6 +104,8 @@ id = "workspace-tests"
 invariant = "The WHOLE workspace's tests pass with the real platform assets present, so the platform-backed acceptance tests actually RUN instead of silently skipping (the tsp-bwrg.8 / tsp-ozbp.16 design)."
 workflow = ".github/workflows/runtime-tests.yml"
 job = "test"
+# Accepted fork-skip posture: self-hosted CI skips fork PRs, never same-repo code PRs.
+allow_if = "github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository"
 required_tokens = ["cargo test", "--locked", "--workspace"]
 # Anti-vacuity: the platform-backed tests SKIP (read as green while checking
 # nothing) unless PF_PLATFORM_DIR is set AND the platform repo is checked out.
@@ -118,6 +122,8 @@ id = "musl-cross-build"
 invariant = "The a133 device binaries (pf-input-collect, pf-collect-ui) link for aarch64-unknown-linux-musl with NO per-invocation RUSTFLAGS override — proving the workspace .cargo/config.toml linker pin works on a stock runner."
 workflow = ".github/workflows/runtime-tests.yml"
 job = "test"
+# Accepted fork-skip posture: self-hosted CI skips fork PRs, never same-repo code PRs.
+allow_if = "github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository"
 required_tokens = ["cargo build", "--locked", "--target aarch64-unknown-linux-musl"]
 guards_paths = ["crates/**", "Cargo.toml", "Cargo.lock", ".cargo/config.toml"]
 should_be_required_check = true
@@ -128,6 +134,8 @@ id = "clippy-workspace"
 invariant = "The whole workspace lints clean with warnings-as-errors across all targets (lib+bin+tests+benches). A hand-listed -p set or a missing -D warnings re-creates the absent-gate defect one level up."
 workflow = ".github/workflows/runtime-tests.yml"
 job = "test"
+# Accepted fork-skip posture: self-hosted CI skips fork PRs, never same-repo code PRs.
+allow_if = "github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository"
 required_tokens = ["cargo clippy", "--locked", "--workspace", "--all-targets", "-D warnings"]
 guards_paths = ["crates/**", "Cargo.toml", "Cargo.lock"]
 should_be_required_check = true
