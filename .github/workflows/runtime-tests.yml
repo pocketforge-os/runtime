@@ -77,7 +77,10 @@ concurrency:
 jobs:
   test:
     name: cargo test + musl cross-build + clippy
-    runs-on: ubuntu-latest
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, pf-builder-vm]
     timeout-minutes: 20
     steps:
       # Runtime is the current PR's tree.
@@ -118,22 +121,6 @@ jobs:
           rustc --version
           cargo --version
           cargo clippy --version
-
-      - name: Install desktop keyboard native dependency
-        run: |
-          sudo apt-get update
-          sudo apt-get install --yes libxkbcommon-dev
-
-      - name: Cache cargo registry + target
-        uses: actions/cache@1bd1e32a3bdc45362d1e726936510720a7c30a57  # v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            runtime/target
-          key: runtime-tests-${{ runner.os }}-${{ hashFiles('runtime/Cargo.lock') }}
-          restore-keys: |
-            runtime-tests-${{ runner.os }}-
 
       # LOCKFILE GATE (tsp-ovee). `--locked` makes cargo REFUSE to rewrite Cargo.lock,
       # so this step is red exactly when the committed lock does not already satisfy the
