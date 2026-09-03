@@ -176,7 +176,12 @@ def _step_neutered(job: dict, step: dict):
     return False, ""
 
 
-def _job_reachable(wf: dict, wf_path: str, job: dict, gate: dict, defaults: dict, allow_if: bool):
+def _normalize_if(value: str) -> str:
+    """Normalize insignificant YAML folding/formatting whitespace in an expression."""
+    return " ".join(value.split())
+
+
+def _job_reachable(wf: dict, wf_path: str, job: dict, gate: dict, defaults: dict, allow_if):
     """Is the job that must contain this gate actually reachable on a normal PR?"""
     reasons = []
     on_spec = _norm_on(wf)
@@ -192,7 +197,18 @@ def _job_reachable(wf: dict, wf_path: str, job: dict, gate: dict, defaults: dict
         reasons.append(f"{wf_path}: {why}")
     if job.get("continue-on-error") in (True, "true"):
         reasons.append(f"{wf_path}: job {gate['job']!r} is continue-on-error (its red cannot fail the run)")
-    if "if" in job and not allow_if:
+    job_if = job.get("if")
+    if allow_if is not None:
+        if not isinstance(allow_if, str):
+            reasons.append(
+                f"{wf_path}: gate {gate['id']!r} allow_if must be the exact approved expression string"
+            )
+        elif not isinstance(job_if, str) or _normalize_if(job_if) != _normalize_if(allow_if):
+            reasons.append(
+                f"{wf_path}: job {gate['job']!r} if expression {job_if!r} does not match "
+                f"the approved allow_if expression {allow_if!r}"
+            )
+    elif "if" in job:
         reasons.append(
             f"{wf_path}: job {gate['job']!r} is conditionally skippable (if: {job.get('if')!r}); "
             "a required gate must not be — whitelist with allow_if only if it never skips a code PR"
@@ -308,7 +324,7 @@ def evaluate(manifest_path: str, repo_root: str):
             failures.append(f"[{gid}] job {gate['job']!r} not found in {rel}")
             continue
 
-        allow_if = bool(gate.get("allow_if", False))
+        allow_if = gate.get("allow_if")
         reachable, why = _job_reachable(wf, rel, job, gate, defaults, allow_if)
         if not reachable:
             for r in why:
