@@ -283,11 +283,13 @@ struct NodeSnapshot {
     scrimmed: bool,
     elevation: Elevation,
     content: ContentSnapshot,
-    /// The resolved (mapped) bounds of this focused node's decoration-ring target, if any. It is
-    /// carried in the snapshot so that a target change — a switch to a different descendant, or
-    /// the same descendant moving — registers as a diff and damages the relocated ring/glow,
-    /// which the owner's own bounds would otherwise miss.
-    decoration_ring: Option<Bounds>,
+    /// The resolved (mapped) bounds AND logical radii of this focused node's decoration-ring
+    /// target, if any. Both halves of the painted ring geometry are carried so that a target
+    /// change — a switch to a different descendant, the same descendant moving, OR a corner-radius
+    /// change with unchanged bounds — registers as a diff and damages the relocated ring/glow,
+    /// which the owner's own bounds would otherwise miss. The radii are pre-surface-scale (surface
+    /// scale is constant per frame), so they exist purely for change detection, not the rect.
+    decoration_ring: Option<(Bounds, Radii)>,
 }
 
 #[derive(Clone, PartialEq)]
@@ -589,8 +591,20 @@ fn collect(
             .as_ref()
             .filter(|_| node.state.focused)
             .and_then(|target| {
-                descend_to_decoration_target(node, transform, target, pressed_shift)
-                    .map(|(bounds, _, _)| bounds)
+                descend_to_decoration_target(node, transform, target, pressed_shift).map(
+                    |(bounds, target_transform, corner_radius)| {
+                        // Logical (pre-surface-scale) clamped radii: a change here means the
+                        // painted ring corners changed even when the bounds did not.
+                        let radii = clamped_radii(
+                            Radii::new(
+                                corner_radius * target_transform.scale_x.abs(),
+                                corner_radius * target_transform.scale_y.abs(),
+                            ),
+                            bounds,
+                        );
+                        (bounds, radii)
+                    },
+                )
             }),
     });
     for (index, child) in node.children.iter().enumerate() {
@@ -808,7 +822,7 @@ fn damage(
             // moved (or switched) decoration is fully repainted — the incremental-damage hot path
             // this primitive's animation future depends on. `damage()` chains old and new
             // snapshots, so both the pre- and post-move ring rects are unioned here.
-            if let Some(ring) = node.decoration_ring {
+            if let Some((ring, _radii)) = node.decoration_ring {
                 let ring_outset = focus_outset.max(effect_outset(base, Elevation::Focus) * scale);
                 let ring_rect = bounds_rect(ring, scale, width, height, ring_outset);
                 result = Some(result.map_or(ring_rect, |d: DamageRect| d.union(ring_rect)));
@@ -4577,6 +4591,92 @@ mod tests {
             d.y <= 45,
             "damage top {} must cover the ring outset above the moved art (<=45)",
             d.y
+        );
+    }
+
+    // Finding round 2 (blocking, runtime#84): a decoration target whose corner RADIUS changes
+    // without moving must still damage the ring outset. The art overhangs the owner's top edge, so
+    // the ring corners above the art are outside the owner's own damage rect; before the radius was
+    // carried in the snapshot the owner compared equal and those rounded-corner ring pixels went
+    // stale (damage would start at the raw art top, 60).
+    #[test]
+    fn decoration_ring_target_radius_change_damages_ring_outset() {
+        let scene = |radius: f32| {
+            let art = Node::new(
+                NodeId::new("art").unwrap(),
+                Role::ListItem,
+                "",
+                Bounds::new(70.0, 60.0, 180.0, 60.0),
+                "--state-rest-surface",
+            )
+            .with_corner_radius(radius);
+            let owner = Node::new(
+                NodeId::new("card").unwrap(),
+                Role::Button,
+                "",
+                Bounds::new(60.0, 160.0, 200.0, 40.0),
+                "--state-rest-surface",
+            )
+            .with_action(NodeAction::Activate)
+            .with_decoration_ring_target(NodeId::new("art").unwrap())
+            .with_children(vec![art]);
+            Scene::new(owner, NodeId::new("card").unwrap()).unwrap()
+        };
+        let mut r = Rasterizer::new();
+        let _first = r.render(&scene(0.0), metrics()).unwrap();
+        let changed = r.render(&scene(24.0), metrics()).unwrap();
+        let d = changed.damage.expect("a radius change must damage");
+        // The art stays at y=60; the ring outset pulls damage above the raw art top (60). Without
+        // the radius in the snapshot the owner is not re-damaged and damage starts at 60.
+        assert!(
+            d.y <= 55,
+            "damage top {} must cover the ring outset around the re-rounded art (<=55)",
+            d.y
+        );
+    }
+
+    // Finding round 2 (blocking, runtime#84): switching the decoration target between two
+    // descendants that share bounds but differ only in corner radius must register as damage.
+    // Before the radius was carried in the snapshot, the owner's resolved bounds compared equal and
+    // both descendants were unchanged, so the switch produced `damage: None` and left a stale ring.
+    #[test]
+    fn decoration_ring_same_bounds_radius_switch_is_damaged() {
+        let scene = |target: &str| {
+            let bounds = Bounds::new(70.0, 65.0, 120.0, 80.0);
+            let sharp = Node::new(
+                NodeId::new("sharp").unwrap(),
+                Role::ListItem,
+                "",
+                bounds,
+                "--state-rest-surface",
+            )
+            .with_corner_radius(0.0);
+            let round = Node::new(
+                NodeId::new("round").unwrap(),
+                Role::ListItem,
+                "",
+                bounds,
+                "--state-rest-surface",
+            )
+            .with_corner_radius(28.0);
+            let owner = Node::new(
+                NodeId::new("card").unwrap(),
+                Role::Button,
+                "",
+                Bounds::new(60.0, 60.0, 200.0, 120.0),
+                "--state-rest-surface",
+            )
+            .with_action(NodeAction::Activate)
+            .with_decoration_ring_target(NodeId::new(target).unwrap())
+            .with_children(vec![sharp, round]);
+            Scene::new(owner, NodeId::new("card").unwrap()).unwrap()
+        };
+        let mut r = Rasterizer::new();
+        let _first = r.render(&scene("sharp"), metrics()).unwrap();
+        let second = r.render(&scene("round"), metrics()).unwrap();
+        assert!(
+            second.damage.is_some(),
+            "switching to a same-bounds target with a different radius must damage the ring"
         );
     }
 }
