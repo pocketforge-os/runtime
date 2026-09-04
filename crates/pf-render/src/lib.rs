@@ -4,8 +4,8 @@
 
 use cosmic_text_tracking as tracked_text;
 use pf_scene::{
-    Bounds, Elevation, ImageFit, ImageSource, Node, NodeContent, Role, Scene, SurfaceMetrics,
-    TextAlign, TextMeasure, TypeRole,
+    Bounds, Elevation, ImageFit, ImageSource, Node, NodeContent, NodeId, Role, Scene,
+    SurfaceMetrics, TextAlign, TextMeasure, TypeRole,
 };
 pub use pf_theme::Base as ThemeBase;
 use pf_theme::{ResolvedStyleSnapshot, Rgba};
@@ -168,6 +168,12 @@ pub enum RenderNote {
         height: u32,
         max_pixels: u64,
     },
+    /// A focused node named a `decoration_ring_target` that is not among its descendants; the
+    /// renderer fell back to drawing the focus ring and glow on the node's own bounds.
+    DecorationRingTargetMissing {
+        owner_id: String,
+        target_id: String,
+    },
 }
 
 /// Long-lived rasterizer. Cosmic Text's shaping state and Swash's glyph images are retained.
@@ -277,6 +283,13 @@ struct NodeSnapshot {
     scrimmed: bool,
     elevation: Elevation,
     content: ContentSnapshot,
+    /// The resolved (mapped) bounds AND logical radii of this focused node's decoration-ring
+    /// target, if any. Both halves of the painted ring geometry are carried so that a target
+    /// change — a switch to a different descendant, the same descendant moving, OR a corner-radius
+    /// change with unchanged bounds — registers as a diff and damages the relocated ring/glow,
+    /// which the owner's own bounds would otherwise miss. The radii are pre-surface-scale (surface
+    /// scale is constant per frame), so they exist purely for change detection, not the rect.
+    decoration_ring: Option<(Bounds, Radii)>,
 }
 
 #[derive(Clone, PartialEq)]
@@ -573,6 +586,26 @@ fn collect(
                 fit: *fit,
             },
         },
+        decoration_ring: node
+            .decoration_ring_target
+            .as_ref()
+            .filter(|_| node.state.focused)
+            .and_then(|target| {
+                descend_to_decoration_target(node, transform, target, pressed_shift).map(
+                    |(bounds, target_transform, corner_radius)| {
+                        // Logical (pre-surface-scale) clamped radii: a change here means the
+                        // painted ring corners changed even when the bounds did not.
+                        let radii = clamped_radii(
+                            Radii::new(
+                                corner_radius * target_transform.scale_x.abs(),
+                                corner_radius * target_transform.scale_y.abs(),
+                            ),
+                            bounds,
+                        );
+                        (bounds, radii)
+                    },
+                )
+            }),
     });
     for (index, child) in node.children.iter().enumerate() {
         collect(
@@ -678,6 +711,74 @@ fn node_transform(node: &Node, ancestor: LogicalTransform, pressed_shift: f32) -
     composed
 }
 
+/// Walks a focused owner's subtree to the named decoration-ring descendant, composing each
+/// level's transform exactly as the paint walk does, and returns the descendant's final mapped
+/// bounds, the composed transform, and its corner radius. `None` when no descendant carries the
+/// id. Shared by the paint walk (ring/glow geometry) and the snapshot walk (damage tracking) so
+/// both agree on where the relocated ring lives.
+fn descend_to_decoration_target(
+    owner: &Node,
+    owner_transform: LogicalTransform,
+    target: &NodeId,
+    pressed_shift: f32,
+) -> Option<(Bounds, LogicalTransform, f32)> {
+    fn descend(
+        node: &Node,
+        ancestor_transform: LogicalTransform,
+        target: &NodeId,
+        pressed_shift: f32,
+    ) -> Option<(Bounds, LogicalTransform, f32)> {
+        let transform = node_transform(node, ancestor_transform, pressed_shift);
+        if &node.id == target {
+            return Some((
+                transform.map_bounds(node.bounds),
+                transform,
+                normalized_corner_radius(node.corner_radius),
+            ));
+        }
+        node.children
+            .iter()
+            .find_map(|child| descend(child, transform, target, pressed_shift))
+    }
+
+    // Search descendants only; the owner keeps focus, input, and accessibility.
+    owner
+        .children
+        .iter()
+        .find_map(|child| descend(child, owner_transform, target, pressed_shift))
+}
+
+/// Resolves the laid-out geometry a focused node's decoration ring and glow should use.
+///
+/// When a focused node declares a `decoration_ring_target`, its ring and glow hug the named
+/// DESCENDANT's final bounds instead of the node's own, while focus state, input, and
+/// accessibility stay on the owner. The walk composes each level's transform exactly as the
+/// paint walk does, so the ring tracks the descendant across layout changes and any scale
+/// transform on the owner (for example the pressed shrink, or a focused-card scale expressed
+/// through the transform chain). Returns `None` when no descendant carries the id — the caller
+/// then falls back to the owner's own ring geometry.
+fn resolve_decoration_target(
+    owner: &Node,
+    owner_transform: LogicalTransform,
+    target: &NodeId,
+    pressed_shift: f32,
+    scale: f32,
+) -> Option<(Bounds, Radii)> {
+    descend_to_decoration_target(owner, owner_transform, target, pressed_shift).map(
+        |(bounds, transform, corner_radius)| {
+            let radius = clamped_radii(
+                Radii::new(
+                    corner_radius * transform.scale_x.abs(),
+                    corner_radius * transform.scale_y.abs(),
+                ),
+                bounds,
+            )
+            .scaled(scale);
+            (bounds, radius)
+        },
+    )
+}
+
 fn damage(
     old: &[NodeSnapshot],
     new: &[NodeSnapshot],
@@ -716,6 +817,16 @@ fn damage(
             });
             let r = bounds_rect(node.bounds, scale, width, height, outset);
             result = Some(result.map_or(r, |d: DamageRect| d.union(r)));
+            // A relocated ring/glow lives at the descendant's bounds, which may lie outside the
+            // owner's own damage rect. Damage it with the focus-ring and Focus-glow outset so the
+            // moved (or switched) decoration is fully repainted — the incremental-damage hot path
+            // this primitive's animation future depends on. `damage()` chains old and new
+            // snapshots, so both the pre- and post-move ring rects are unioned here.
+            if let Some((ring, _radii)) = node.decoration_ring {
+                let ring_outset = focus_outset.max(effect_outset(base, Elevation::Focus) * scale);
+                let ring_rect = bounds_rect(ring, scale, width, height, ring_outset);
+                result = Some(result.map_or(ring_rect, |d: DamageRect| d.union(ring_rect)));
+            }
         }
     }
     result
@@ -801,7 +912,32 @@ fn draw_node(
     )
     .scaled(scale);
 
-    if node.elevation != Elevation::None {
+    // A focused node may relocate its ring + glow to a named descendant's laid-out bounds
+    // (decoration_ring_target) so the ring hugs the art tile with the label outside it. Focus
+    // state, input, and accessibility stay on this node; only the ring/glow geometry moves, at
+    // the same layer and z-order as today's owner ring. An absent target falls back to the
+    // owner's own geometry (never a panic, never a missing ring) and records a note.
+    let (ring_bounds, ring_radius) = match node
+        .decoration_ring_target
+        .as_ref()
+        .filter(|_| node.state.focused)
+    {
+        Some(target) => resolve_decoration_target(node, transform, target, pressed_shift, scale)
+            .unwrap_or_else(|| {
+                context.notes.push(RenderNote::DecorationRingTargetMissing {
+                    owner_id: node.id.as_str().into(),
+                    target_id: target.as_str().into(),
+                });
+                (b, radius)
+            }),
+        None => (b, radius),
+    };
+
+    // The node's own depth shadow paints at its own bounds — EXCEPT Elevation::Focus, which is
+    // the focus glow and must compose with the ring (drawn at the ring geometry just below), so
+    // it is never drawn here at owner bounds. Splitting it out is what keeps a focused owner
+    // with an explicit Focus elevation from getting glow-at-owner while its ring is at the art.
+    if node.elevation != Elevation::None && node.elevation != Elevation::Focus {
         draw_node_shadow(
             pm,
             context.rounded_shadows,
@@ -811,14 +947,18 @@ fn draw_node(
             radius,
         );
     }
-    if node.state.focused && node.elevation != Elevation::Focus {
+    // The focus glow (Elevation::Focus shadow) follows the ring geometry, whether that depth is
+    // implied by `state.focused` or set explicitly via `elevation == Focus`. Exactly one glow is
+    // drawn, at ring_bounds/ring_radius (which equal the owner's own b/radius when no decoration
+    // target relocates them, so non-decorated nodes stay byte-identical to before).
+    if node.state.focused || node.elevation == Elevation::Focus {
         draw_node_shadow(
             pm,
             context.rounded_shadows,
             shadow_asset(context.style.base(), Elevation::Focus),
-            b,
+            ring_bounds,
             scale,
-            radius,
+            ring_radius,
         );
     }
 
@@ -952,7 +1092,7 @@ fn draw_node(
         fill_token_rounded_rect(pm, context.style, "--color-surface-scrim", b, scale, radius)?;
     }
     if node.state.focused {
-        draw_focus_ring(pm, context.style, b, scale, radius)?;
+        draw_focus_ring(pm, context.style, ring_bounds, scale, ring_radius)?;
     }
     Ok(())
 }
@@ -4157,5 +4297,386 @@ mod tests {
                 tracked_layout("Baseline text", 1_000.0, style.size_px, style.tracking_em);
             assert_eq!(resolved, baseline, "{role:?} advances changed");
         }
+    }
+
+    // A focused card whose focus ring must hug the art tile (label outside), expressed via the
+    // decoration_ring_target primitive. The owner cell keeps focus; the ring/glow relocate to
+    // the named art descendant. `owner_focusable` gates whether Scene resolves focus onto the
+    // owner (a non-focusable owner leaves the attribute inert, for the no-regression case).
+    fn decoration_card_scene(decoration_target: Option<&str>, owner_focusable: bool) -> Scene {
+        let art = Node::new(
+            NodeId::new("art").unwrap(),
+            Role::ListItem,
+            "",
+            Bounds::new(70.0, 65.0, 180.0, 80.0),
+            "--state-rest-surface",
+        )
+        .with_corner_radius(12.0);
+        let label = Node::new(
+            NodeId::new("label").unwrap(),
+            Role::Text,
+            "LABEL",
+            Bounds::new(70.0, 150.0, 180.0, 16.0),
+            "--color-transparent",
+        );
+        let mut owner = Node::new(
+            NodeId::new("card").unwrap(),
+            Role::Button,
+            "",
+            Bounds::new(60.0, 60.0, 200.0, 120.0),
+            "--state-rest-surface",
+        )
+        .with_children(vec![art, label]);
+        if owner_focusable {
+            owner = owner.with_action(NodeAction::Activate);
+        }
+        if let Some(target) = decoration_target {
+            owner = owner.with_decoration_ring_target(NodeId::new(target).unwrap());
+        }
+        Scene::new(owner, NodeId::new("card").unwrap()).unwrap()
+    }
+
+    // (a) A focused node with decoration_ring_target=art draws its ring hugging the art child's
+    // bounds, not the owner cell's.
+    #[test]
+    fn decoration_ring_hugs_named_descendant_not_owner_bounds() {
+        let scene = decoration_card_scene(Some("art"), true);
+        let frame = Rasterizer::new().render(&scene, metrics()).unwrap();
+        let ring = token_rgba(ThemeBase::Dusk, "--state-focused-ring");
+        let canvas = token_rgba(ThemeBase::Dusk, "--color-surface-canvas");
+        let y = 105; // vertical middle of the art tile (y range [65, 145))
+
+        // The ring hugs the art tile's left and right edges (art x range [70, 250)).
+        assert_eq!(pixel(&frame, 65, y), ring, "art left-edge ring");
+        assert_eq!(pixel(&frame, 254, y), ring, "art right-edge ring");
+        // The owner-bounds ring is gone: nothing paints where a ring around the whole cell
+        // (owner x range [60, 260)) would sit.
+        assert_eq!(pixel(&frame, 55, y), canvas, "no ring at owner left edge");
+        assert_eq!(pixel(&frame, 263, y), canvas, "no ring at owner right edge");
+    }
+
+    // (b) The ring tracks the descendant's FINAL bounds after a scale transform on the owner.
+    // A pressed owner scales its subtree; the resolver must compose that transform down to the
+    // target rather than reading its raw scene bounds — the property that makes the declarative
+    // target correct across scale (and why a static rect override was rejected).
+    #[test]
+    fn decoration_ring_follows_scaled_descendant_through_owner_transform() {
+        let art = Node::new(
+            NodeId::new("art").unwrap(),
+            Role::ListItem,
+            "",
+            Bounds::new(70.0, 65.0, 180.0, 80.0),
+            "--state-rest-surface",
+        );
+        let mut owner = Node::new(
+            NodeId::new("card").unwrap(),
+            Role::Button,
+            "",
+            Bounds::new(60.0, 60.0, 200.0, 120.0),
+            "--state-rest-surface",
+        )
+        .with_action(NodeAction::Activate)
+        .with_decoration_ring_target(NodeId::new("art").unwrap())
+        .with_children(vec![art.clone()]);
+        owner.state.pressed = true;
+
+        // The exact shift value is irrelevant to the invariant: the resolver is passed the same
+        // shift used to compute owner_transform, so its result must equal the transform-mapped
+        // art bounds. A pressed owner makes that transform non-identity, so scaled != raw.
+        let shift = 1.0;
+        let owner_transform = node_transform(&owner, LogicalTransform::IDENTITY, shift);
+        let target = NodeId::new("art").unwrap();
+        let (bounds, _radius) =
+            resolve_decoration_target(&owner, owner_transform, &target, shift, 1.0)
+                .expect("art descendant resolves");
+
+        assert_eq!(
+            bounds,
+            owner_transform.map_bounds(art.bounds),
+            "ring tracks the transform-mapped art bounds"
+        );
+        assert_ne!(
+            bounds, art.bounds,
+            "ring is not pinned to the raw (unscaled) art bounds"
+        );
+    }
+
+    // (c) An absent decoration target falls back to the owner-bounds ring (never a panic, never
+    // a missing ring) and reports the miss as a typed render note.
+    #[test]
+    fn decoration_ring_absent_target_falls_back_to_owner_ring_with_note() {
+        let scene = decoration_card_scene(Some("no-such-child"), true);
+        let frame = Rasterizer::new().render(&scene, metrics()).unwrap();
+        let ring = token_rgba(ThemeBase::Dusk, "--state-focused-ring");
+        let canvas = token_rgba(ThemeBase::Dusk, "--color-surface-canvas");
+        let y = 120; // owner vertical middle (y range [60, 180))
+
+        // The fallback draws the owner-bounds ring (owner x range [60, 260)).
+        assert_eq!(
+            pixel(&frame, 55, y),
+            ring,
+            "owner left-edge ring on fallback"
+        );
+        assert_eq!(
+            pixel(&frame, 54, y),
+            canvas,
+            "outside the owner ring is canvas"
+        );
+        assert!(
+            frame.notes.iter().any(|note| matches!(
+                note,
+                RenderNote::DecorationRingTargetMissing { owner_id, target_id }
+                    if owner_id == "card" && target_id == "no-such-child"
+            )),
+            "missing decoration target emits a note; got {:?}",
+            frame.notes
+        );
+    }
+
+    // (d) No-regression: a scene the feature does not trigger is byte-identical to one without
+    // the attribute, and a focused owner without the attribute keeps its own ring.
+    #[test]
+    fn decoration_ring_attribute_is_inert_without_focus_and_absent_is_unchanged() {
+        let absent = Rasterizer::new()
+            .render(&decoration_card_scene(None, false), metrics())
+            .unwrap();
+        let present_unfocused = Rasterizer::new()
+            .render(&decoration_card_scene(Some("art"), false), metrics())
+            .unwrap();
+        assert_eq!(
+            absent.rgba, present_unfocused.rgba,
+            "decoration_ring_target is inert while the owner is not focused"
+        );
+        assert!(
+            present_unfocused.notes.is_empty(),
+            "an inert (unfocused) decoration target emits no note"
+        );
+
+        let focused_no_attr = Rasterizer::new()
+            .render(&decoration_card_scene(None, true), metrics())
+            .unwrap();
+        let ring = token_rgba(ThemeBase::Dusk, "--state-focused-ring");
+        assert_eq!(
+            pixel(&focused_no_attr, 55, 120),
+            ring,
+            "attribute-absent focused owner keeps its own ring"
+        );
+    }
+
+    // Finding 1 (blocking, runtime#84 review): a focused owner with an EXPLICIT Focus elevation
+    // must still compose its glow with the relocated ring — the glow follows the ring, not the
+    // owner. Rendering it is therefore byte-identical to the same owner with no elevation (both
+    // produce exactly one Focus glow at the art plus the ring at the art). Red before the fix:
+    // the explicit-Focus owner drew its glow at owner bounds while the ring sat at the art.
+    //
+    // The owner fill is transparent on purpose: the Focus glow is a soft, offset halo that an
+    // opaque owner fill would occlude, hiding the misplacement. With a transparent owner the glow
+    // shows on the canvas, so glow-at-owner vs glow-at-art differ (measured: 897 pixels under the
+    // pre-fix branches; 0 after the fix).
+    #[test]
+    fn decoration_ring_focus_elevation_glow_composes_with_relocated_ring() {
+        let scene = |elevation| {
+            let art = Node::new(
+                NodeId::new("art").unwrap(),
+                Role::ListItem,
+                "",
+                Bounds::new(70.0, 65.0, 180.0, 80.0),
+                "--state-rest-surface",
+            )
+            .with_corner_radius(12.0);
+            let owner = Node::new(
+                NodeId::new("card").unwrap(),
+                Role::Button,
+                "",
+                Bounds::new(60.0, 60.0, 200.0, 120.0),
+                "--color-transparent",
+            )
+            .with_action(NodeAction::Activate)
+            .with_decoration_ring_target(NodeId::new("art").unwrap())
+            .with_children(vec![art])
+            .with_elevation(elevation);
+            Scene::new(owner, NodeId::new("card").unwrap()).unwrap()
+        };
+        let focus_elev = Rasterizer::new()
+            .render(&scene(Elevation::Focus), metrics())
+            .unwrap();
+        let none_elev = Rasterizer::new()
+            .render(&scene(Elevation::None), metrics())
+            .unwrap();
+        assert_eq!(
+            focus_elev.rgba, none_elev.rgba,
+            "explicit Focus elevation must relocate its glow with the ring, not draw it at owner"
+        );
+    }
+
+    // Finding 2a (blocking, runtime#84 review): switching a focused owner's decoration target on
+    // an otherwise-equal scene must register as damage. Before the fix the snapshot recorded
+    // neither the target nor its resolved bounds, so the change produced `damage: None` and left
+    // a stale ring on screen for incremental consumers.
+    #[test]
+    fn decoration_ring_target_switch_is_damaged() {
+        let scene = |target: &str| {
+            let art_a = Node::new(
+                NodeId::new("art-a").unwrap(),
+                Role::ListItem,
+                "",
+                Bounds::new(70.0, 65.0, 80.0, 80.0),
+                "--state-rest-surface",
+            );
+            let art_b = Node::new(
+                NodeId::new("art-b").unwrap(),
+                Role::ListItem,
+                "",
+                Bounds::new(170.0, 65.0, 80.0, 80.0),
+                "--state-rest-surface",
+            );
+            let owner = Node::new(
+                NodeId::new("card").unwrap(),
+                Role::Button,
+                "",
+                Bounds::new(60.0, 60.0, 200.0, 120.0),
+                "--state-rest-surface",
+            )
+            .with_action(NodeAction::Activate)
+            .with_decoration_ring_target(NodeId::new(target).unwrap())
+            .with_children(vec![art_a, art_b]);
+            Scene::new(owner, NodeId::new("card").unwrap()).unwrap()
+        };
+        let mut r = Rasterizer::new();
+        let _first = r.render(&scene("art-a"), metrics()).unwrap();
+        let second = r.render(&scene("art-b"), metrics()).unwrap();
+        assert!(
+            second.damage.is_some(),
+            "switching the decoration target must damage the relocated ring, not leave it stale"
+        );
+    }
+
+    // Finding 2b (blocking, runtime#84 review): when the decoration target MOVES, damage must
+    // include the ring + glow OUTSET around the descendant, not only its raw bounds. The art tile
+    // here overhangs the owner's top edge, so its ring extends above where the owner's own damage
+    // reaches — isolating the outset. Before the fix the moved child damaged only its raw bounds
+    // (`d.y == 50`), leaving the ring's top edge (y 45..49) as a ghost.
+    #[test]
+    fn decoration_ring_target_move_damages_ring_outset() {
+        let scene = |art_y: f32| {
+            let art = Node::new(
+                NodeId::new("art").unwrap(),
+                Role::ListItem,
+                "",
+                Bounds::new(70.0, art_y, 180.0, 60.0),
+                "--state-rest-surface",
+            );
+            // A small owner low on the surface; the art tile overhangs above it, so the art ring
+            // lies outside the owner's own focus-damage rect and the outset is the sole cause of
+            // any damage above the raw art top.
+            let owner = Node::new(
+                NodeId::new("card").unwrap(),
+                Role::Button,
+                "",
+                Bounds::new(60.0, 160.0, 200.0, 40.0),
+                "--state-rest-surface",
+            )
+            .with_action(NodeAction::Activate)
+            .with_decoration_ring_target(NodeId::new("art").unwrap())
+            .with_children(vec![art]);
+            Scene::new(owner, NodeId::new("card").unwrap()).unwrap()
+        };
+        let mut r = Rasterizer::new();
+        let _first = r.render(&scene(60.0), metrics()).unwrap();
+        let moved = r.render(&scene(50.0), metrics()).unwrap();
+        let d = moved.damage.expect("a target move must damage");
+        // Raw art top after the move is 50; the focus-ring outset (offset 3 + width 2) pulls the
+        // ring top to 45, so damage must start at or above 45. Without the outset it starts at 50.
+        assert!(
+            d.y <= 45,
+            "damage top {} must cover the ring outset above the moved art (<=45)",
+            d.y
+        );
+    }
+
+    // Finding round 2 (blocking, runtime#84): a decoration target whose corner RADIUS changes
+    // without moving must still damage the ring outset. The art overhangs the owner's top edge, so
+    // the ring corners above the art are outside the owner's own damage rect; before the radius was
+    // carried in the snapshot the owner compared equal and those rounded-corner ring pixels went
+    // stale (damage would start at the raw art top, 60).
+    #[test]
+    fn decoration_ring_target_radius_change_damages_ring_outset() {
+        let scene = |radius: f32| {
+            let art = Node::new(
+                NodeId::new("art").unwrap(),
+                Role::ListItem,
+                "",
+                Bounds::new(70.0, 60.0, 180.0, 60.0),
+                "--state-rest-surface",
+            )
+            .with_corner_radius(radius);
+            let owner = Node::new(
+                NodeId::new("card").unwrap(),
+                Role::Button,
+                "",
+                Bounds::new(60.0, 160.0, 200.0, 40.0),
+                "--state-rest-surface",
+            )
+            .with_action(NodeAction::Activate)
+            .with_decoration_ring_target(NodeId::new("art").unwrap())
+            .with_children(vec![art]);
+            Scene::new(owner, NodeId::new("card").unwrap()).unwrap()
+        };
+        let mut r = Rasterizer::new();
+        let _first = r.render(&scene(0.0), metrics()).unwrap();
+        let changed = r.render(&scene(24.0), metrics()).unwrap();
+        let d = changed.damage.expect("a radius change must damage");
+        // The art stays at y=60; the ring outset pulls damage above the raw art top (60). Without
+        // the radius in the snapshot the owner is not re-damaged and damage starts at 60.
+        assert!(
+            d.y <= 55,
+            "damage top {} must cover the ring outset around the re-rounded art (<=55)",
+            d.y
+        );
+    }
+
+    // Finding round 2 (blocking, runtime#84): switching the decoration target between two
+    // descendants that share bounds but differ only in corner radius must register as damage.
+    // Before the radius was carried in the snapshot, the owner's resolved bounds compared equal and
+    // both descendants were unchanged, so the switch produced `damage: None` and left a stale ring.
+    #[test]
+    fn decoration_ring_same_bounds_radius_switch_is_damaged() {
+        let scene = |target: &str| {
+            let bounds = Bounds::new(70.0, 65.0, 120.0, 80.0);
+            let sharp = Node::new(
+                NodeId::new("sharp").unwrap(),
+                Role::ListItem,
+                "",
+                bounds,
+                "--state-rest-surface",
+            )
+            .with_corner_radius(0.0);
+            let round = Node::new(
+                NodeId::new("round").unwrap(),
+                Role::ListItem,
+                "",
+                bounds,
+                "--state-rest-surface",
+            )
+            .with_corner_radius(28.0);
+            let owner = Node::new(
+                NodeId::new("card").unwrap(),
+                Role::Button,
+                "",
+                Bounds::new(60.0, 60.0, 200.0, 120.0),
+                "--state-rest-surface",
+            )
+            .with_action(NodeAction::Activate)
+            .with_decoration_ring_target(NodeId::new(target).unwrap())
+            .with_children(vec![sharp, round]);
+            Scene::new(owner, NodeId::new("card").unwrap()).unwrap()
+        };
+        let mut r = Rasterizer::new();
+        let _first = r.render(&scene("sharp"), metrics()).unwrap();
+        let second = r.render(&scene("round"), metrics()).unwrap();
+        assert!(
+            second.damage.is_some(),
+            "switching to a same-bounds target with a different radius must damage the ring"
+        );
     }
 }
