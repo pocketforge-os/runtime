@@ -205,6 +205,11 @@ pub struct Node {
     /// Border width in logical pixels. Zero disables border painting.
     pub border_width: f32,
     pub elevation: Elevation,
+    /// Optional descendant whose laid-out bounds carry this node's focus ring and glow while
+    /// focus state, input, and accessibility remain on this node. `None` draws the ring on the
+    /// node's own bounds — the default, byte-identical to pre-decoration-ring behavior. Used
+    /// for a focused card whose ring must hug the art tile with the label outside the ring.
+    pub decoration_ring_target: Option<NodeId>,
     pub children: Vec<Node>,
 }
 
@@ -235,6 +240,7 @@ impl Node {
             border_token: None,
             border_width: 0.0,
             elevation: Elevation::None,
+            decoration_ring_target: None,
             children: Vec::new(),
         }
     }
@@ -291,6 +297,15 @@ impl Node {
 
     pub fn with_elevation(mut self, elevation: Elevation) -> Self {
         self.elevation = elevation;
+        self
+    }
+
+    /// Relocates this node's focus ring and glow to the named descendant's laid-out bounds
+    /// while focus state, input, and accessibility stay on this node. The renderer resolves
+    /// the target across layout and any owner scale transform; an absent target falls back to
+    /// this node's own ring (never a panic, never a missing ring).
+    pub fn with_decoration_ring_target(mut self, target: NodeId) -> Self {
+        self.decoration_ring_target = Some(target);
         self
     }
 
