@@ -283,6 +283,11 @@ struct NodeSnapshot {
     scrimmed: bool,
     elevation: Elevation,
     content: ContentSnapshot,
+    /// The resolved (mapped) bounds of this focused node's decoration-ring target, if any. It is
+    /// carried in the snapshot so that a target change — a switch to a different descendant, or
+    /// the same descendant moving — registers as a diff and damages the relocated ring/glow,
+    /// which the owner's own bounds would otherwise miss.
+    decoration_ring: Option<Bounds>,
 }
 
 #[derive(Clone, PartialEq)]
@@ -579,6 +584,14 @@ fn collect(
                 fit: *fit,
             },
         },
+        decoration_ring: node
+            .decoration_ring_target
+            .as_ref()
+            .filter(|_| node.state.focused)
+            .and_then(|target| {
+                descend_to_decoration_target(node, transform, target, pressed_shift)
+                    .map(|(bounds, _, _)| bounds)
+            }),
     });
     for (index, child) in node.children.iter().enumerate() {
         collect(
@@ -684,22 +697,17 @@ fn node_transform(node: &Node, ancestor: LogicalTransform, pressed_shift: f32) -
     composed
 }
 
-/// Resolves the laid-out geometry a focused node's decoration ring and glow should use.
-///
-/// When a focused node declares a `decoration_ring_target`, its ring and glow hug the named
-/// DESCENDANT's final bounds instead of the node's own, while focus state, input, and
-/// accessibility stay on the owner. The walk composes each level's transform exactly as the
-/// paint walk does, so the ring tracks the descendant across layout changes and any scale
-/// transform on the owner (for example the pressed shrink, or a focused-card scale expressed
-/// through the transform chain). Returns `None` when no descendant carries the id — the caller
-/// then falls back to the owner's own ring geometry.
-fn resolve_decoration_target(
+/// Walks a focused owner's subtree to the named decoration-ring descendant, composing each
+/// level's transform exactly as the paint walk does, and returns the descendant's final mapped
+/// bounds, the composed transform, and its corner radius. `None` when no descendant carries the
+/// id. Shared by the paint walk (ring/glow geometry) and the snapshot walk (damage tracking) so
+/// both agree on where the relocated ring lives.
+fn descend_to_decoration_target(
     owner: &Node,
     owner_transform: LogicalTransform,
     target: &NodeId,
     pressed_shift: f32,
-    scale: f32,
-) -> Option<(Bounds, Radii)> {
+) -> Option<(Bounds, LogicalTransform, f32)> {
     fn descend(
         node: &Node,
         ancestor_transform: LogicalTransform,
@@ -724,7 +732,26 @@ fn resolve_decoration_target(
         .children
         .iter()
         .find_map(|child| descend(child, owner_transform, target, pressed_shift))
-        .map(|(bounds, transform, corner_radius)| {
+}
+
+/// Resolves the laid-out geometry a focused node's decoration ring and glow should use.
+///
+/// When a focused node declares a `decoration_ring_target`, its ring and glow hug the named
+/// DESCENDANT's final bounds instead of the node's own, while focus state, input, and
+/// accessibility stay on the owner. The walk composes each level's transform exactly as the
+/// paint walk does, so the ring tracks the descendant across layout changes and any scale
+/// transform on the owner (for example the pressed shrink, or a focused-card scale expressed
+/// through the transform chain). Returns `None` when no descendant carries the id — the caller
+/// then falls back to the owner's own ring geometry.
+fn resolve_decoration_target(
+    owner: &Node,
+    owner_transform: LogicalTransform,
+    target: &NodeId,
+    pressed_shift: f32,
+    scale: f32,
+) -> Option<(Bounds, Radii)> {
+    descend_to_decoration_target(owner, owner_transform, target, pressed_shift).map(
+        |(bounds, transform, corner_radius)| {
             let radius = clamped_radii(
                 Radii::new(
                     corner_radius * transform.scale_x.abs(),
@@ -734,7 +761,8 @@ fn resolve_decoration_target(
             )
             .scaled(scale);
             (bounds, radius)
-        })
+        },
+    )
 }
 
 fn damage(
@@ -775,6 +803,16 @@ fn damage(
             });
             let r = bounds_rect(node.bounds, scale, width, height, outset);
             result = Some(result.map_or(r, |d: DamageRect| d.union(r)));
+            // A relocated ring/glow lives at the descendant's bounds, which may lie outside the
+            // owner's own damage rect. Damage it with the focus-ring and Focus-glow outset so the
+            // moved (or switched) decoration is fully repainted — the incremental-damage hot path
+            // this primitive's animation future depends on. `damage()` chains old and new
+            // snapshots, so both the pre- and post-move ring rects are unioned here.
+            if let Some(ring) = node.decoration_ring {
+                let ring_outset = focus_outset.max(effect_outset(base, Elevation::Focus) * scale);
+                let ring_rect = bounds_rect(ring, scale, width, height, ring_outset);
+                result = Some(result.map_or(ring_rect, |d: DamageRect| d.union(ring_rect)));
+            }
         }
     }
     result
@@ -881,7 +919,11 @@ fn draw_node(
         None => (b, radius),
     };
 
-    if node.elevation != Elevation::None {
+    // The node's own depth shadow paints at its own bounds — EXCEPT Elevation::Focus, which is
+    // the focus glow and must compose with the ring (drawn at the ring geometry just below), so
+    // it is never drawn here at owner bounds. Splitting it out is what keeps a focused owner
+    // with an explicit Focus elevation from getting glow-at-owner while its ring is at the art.
+    if node.elevation != Elevation::None && node.elevation != Elevation::Focus {
         draw_node_shadow(
             pm,
             context.rounded_shadows,
@@ -891,7 +933,11 @@ fn draw_node(
             radius,
         );
     }
-    if node.state.focused && node.elevation != Elevation::Focus {
+    // The focus glow (Elevation::Focus shadow) follows the ring geometry, whether that depth is
+    // implied by `state.focused` or set explicitly via `elevation == Focus`. Exactly one glow is
+    // drawn, at ring_bounds/ring_radius (which equal the owner's own b/radius when no decoration
+    // target relocates them, so non-decorated nodes stay byte-identical to before).
+    if node.state.focused || node.elevation == Elevation::Focus {
         draw_node_shadow(
             pm,
             context.rounded_shadows,
@@ -4400,6 +4446,137 @@ mod tests {
             pixel(&focused_no_attr, 55, 120),
             ring,
             "attribute-absent focused owner keeps its own ring"
+        );
+    }
+
+    // Finding 1 (blocking, runtime#84 review): a focused owner with an EXPLICIT Focus elevation
+    // must still compose its glow with the relocated ring — the glow follows the ring, not the
+    // owner. Rendering it is therefore byte-identical to the same owner with no elevation (both
+    // produce exactly one Focus glow at the art plus the ring at the art). Red before the fix:
+    // the explicit-Focus owner drew its glow at owner bounds while the ring sat at the art.
+    //
+    // The owner fill is transparent on purpose: the Focus glow is a soft, offset halo that an
+    // opaque owner fill would occlude, hiding the misplacement. With a transparent owner the glow
+    // shows on the canvas, so glow-at-owner vs glow-at-art differ (measured: 897 pixels under the
+    // pre-fix branches; 0 after the fix).
+    #[test]
+    fn decoration_ring_focus_elevation_glow_composes_with_relocated_ring() {
+        let scene = |elevation| {
+            let art = Node::new(
+                NodeId::new("art").unwrap(),
+                Role::ListItem,
+                "",
+                Bounds::new(70.0, 65.0, 180.0, 80.0),
+                "--state-rest-surface",
+            )
+            .with_corner_radius(12.0);
+            let owner = Node::new(
+                NodeId::new("card").unwrap(),
+                Role::Button,
+                "",
+                Bounds::new(60.0, 60.0, 200.0, 120.0),
+                "--color-transparent",
+            )
+            .with_action(NodeAction::Activate)
+            .with_decoration_ring_target(NodeId::new("art").unwrap())
+            .with_children(vec![art])
+            .with_elevation(elevation);
+            Scene::new(owner, NodeId::new("card").unwrap()).unwrap()
+        };
+        let focus_elev = Rasterizer::new()
+            .render(&scene(Elevation::Focus), metrics())
+            .unwrap();
+        let none_elev = Rasterizer::new()
+            .render(&scene(Elevation::None), metrics())
+            .unwrap();
+        assert_eq!(
+            focus_elev.rgba, none_elev.rgba,
+            "explicit Focus elevation must relocate its glow with the ring, not draw it at owner"
+        );
+    }
+
+    // Finding 2a (blocking, runtime#84 review): switching a focused owner's decoration target on
+    // an otherwise-equal scene must register as damage. Before the fix the snapshot recorded
+    // neither the target nor its resolved bounds, so the change produced `damage: None` and left
+    // a stale ring on screen for incremental consumers.
+    #[test]
+    fn decoration_ring_target_switch_is_damaged() {
+        let scene = |target: &str| {
+            let art_a = Node::new(
+                NodeId::new("art-a").unwrap(),
+                Role::ListItem,
+                "",
+                Bounds::new(70.0, 65.0, 80.0, 80.0),
+                "--state-rest-surface",
+            );
+            let art_b = Node::new(
+                NodeId::new("art-b").unwrap(),
+                Role::ListItem,
+                "",
+                Bounds::new(170.0, 65.0, 80.0, 80.0),
+                "--state-rest-surface",
+            );
+            let owner = Node::new(
+                NodeId::new("card").unwrap(),
+                Role::Button,
+                "",
+                Bounds::new(60.0, 60.0, 200.0, 120.0),
+                "--state-rest-surface",
+            )
+            .with_action(NodeAction::Activate)
+            .with_decoration_ring_target(NodeId::new(target).unwrap())
+            .with_children(vec![art_a, art_b]);
+            Scene::new(owner, NodeId::new("card").unwrap()).unwrap()
+        };
+        let mut r = Rasterizer::new();
+        let _first = r.render(&scene("art-a"), metrics()).unwrap();
+        let second = r.render(&scene("art-b"), metrics()).unwrap();
+        assert!(
+            second.damage.is_some(),
+            "switching the decoration target must damage the relocated ring, not leave it stale"
+        );
+    }
+
+    // Finding 2b (blocking, runtime#84 review): when the decoration target MOVES, damage must
+    // include the ring + glow OUTSET around the descendant, not only its raw bounds. The art tile
+    // here overhangs the owner's top edge, so its ring extends above where the owner's own damage
+    // reaches — isolating the outset. Before the fix the moved child damaged only its raw bounds
+    // (`d.y == 50`), leaving the ring's top edge (y 45..49) as a ghost.
+    #[test]
+    fn decoration_ring_target_move_damages_ring_outset() {
+        let scene = |art_y: f32| {
+            let art = Node::new(
+                NodeId::new("art").unwrap(),
+                Role::ListItem,
+                "",
+                Bounds::new(70.0, art_y, 180.0, 60.0),
+                "--state-rest-surface",
+            );
+            // A small owner low on the surface; the art tile overhangs above it, so the art ring
+            // lies outside the owner's own focus-damage rect and the outset is the sole cause of
+            // any damage above the raw art top.
+            let owner = Node::new(
+                NodeId::new("card").unwrap(),
+                Role::Button,
+                "",
+                Bounds::new(60.0, 160.0, 200.0, 40.0),
+                "--state-rest-surface",
+            )
+            .with_action(NodeAction::Activate)
+            .with_decoration_ring_target(NodeId::new("art").unwrap())
+            .with_children(vec![art]);
+            Scene::new(owner, NodeId::new("card").unwrap()).unwrap()
+        };
+        let mut r = Rasterizer::new();
+        let _first = r.render(&scene(60.0), metrics()).unwrap();
+        let moved = r.render(&scene(50.0), metrics()).unwrap();
+        let d = moved.damage.expect("a target move must damage");
+        // Raw art top after the move is 50; the focus-ring outset (offset 3 + width 2) pulls the
+        // ring top to 45, so damage must start at or above 45. Without the outset it starts at 50.
+        assert!(
+            d.y <= 45,
+            "damage top {} must cover the ring outset above the moved art (<=45)",
+            d.y
         );
     }
 }
