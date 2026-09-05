@@ -21,7 +21,12 @@ impl Evdev {
         let cpath = std::ffi::CString::new(path.as_ref().as_os_str().as_encoded_bytes())
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path has NUL"))?;
         // SAFETY: cpath is a valid NUL-terminated C string for the lifetime of the call.
-        let raw = unsafe { libc::open(cpath.as_ptr(), libc::O_RDONLY | libc::O_NONBLOCK | libc::O_CLOEXEC) };
+        let raw = unsafe {
+            libc::open(
+                cpath.as_ptr(),
+                libc::O_RDONLY | libc::O_NONBLOCK | libc::O_CLOEXEC,
+            )
+        };
         if raw < 0 {
             return Err(io::Error::last_os_error());
         }
@@ -60,7 +65,11 @@ impl Evdev {
         let mut buf = [0u8; 256];
         // SAFETY: buf is a valid writable buffer of the length passed to the ioctl.
         let n = unsafe {
-            libc::ioctl(self.fd.as_raw_fd(), ioc::eviocgname(buf.len()), buf.as_mut_ptr())
+            libc::ioctl(
+                self.fd.as_raw_fd(),
+                ioc::eviocgname(buf.len()),
+                buf.as_mut_ptr(),
+            )
         };
         if n < 0 {
             return Err(io::Error::last_os_error());
@@ -74,7 +83,11 @@ impl Evdev {
         let mut id: libc::input_id = unsafe { std::mem::zeroed() };
         // SAFETY: &mut id is a valid input_id-sized buffer matching the ioctl's size field.
         let rc = unsafe {
-            libc::ioctl(self.fd.as_raw_fd(), ioc::eviocgid(), &mut id as *mut libc::input_id)
+            libc::ioctl(
+                self.fd.as_raw_fd(),
+                ioc::eviocgid(),
+                &mut id as *mut libc::input_id,
+            )
         };
         if rc < 0 {
             return Err(io::Error::last_os_error());
@@ -82,18 +95,100 @@ impl Evdev {
         Ok((id.bustype, id.vendor, id.product, id.version))
     }
 
+    /// Whether every requested event/code capability is advertised by this opened fd.
+    pub fn supports(&self, event_type: u16, codes: &[u16]) -> io::Result<bool> {
+        if codes.is_empty() {
+            return Ok(true);
+        }
+        let bytes = (codes.iter().copied().max().unwrap() as usize / 8) + 1;
+        let mut bits = vec![0u8; bytes];
+        // SAFETY: bits is writable for the encoded ioctl length and fd is live.
+        let rc = unsafe {
+            libc::ioctl(
+                self.fd.as_raw_fd(),
+                ioc::eviocgbit(event_type, bits.len()),
+                bits.as_mut_ptr(),
+            )
+        };
+        if rc < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(codes
+            .iter()
+            .all(|code| bits[*code as usize / 8] & (1 << (*code % 8)) != 0))
+    }
+
+    /// Return the requested source key codes that are physically down now.
+    pub fn pressed_keys(&self, codes: &[u16]) -> io::Result<Vec<u16>> {
+        if codes.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut bits = vec![0u8; (codes.iter().copied().max().unwrap() as usize / 8) + 1];
+        // SAFETY: bits is writable for the request's encoded length and fd is live.
+        let rc = unsafe {
+            libc::ioctl(
+                self.fd.as_raw_fd(),
+                ioc::eviocgkey(bits.len()),
+                bits.as_mut_ptr(),
+            )
+        };
+        if rc < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(codes
+            .iter()
+            .copied()
+            .filter(|code| bits[*code as usize / 8] & (1 << (*code % 8)) != 0)
+            .collect())
+    }
+
+    /// Read the current value of one absolute axis.
+    pub fn abs_value(&self, code: u16) -> io::Result<i32> {
+        let mut info: libc::input_absinfo = unsafe { std::mem::zeroed() };
+        // SAFETY: info is a valid input_absinfo-sized output buffer and fd is live.
+        let rc = unsafe {
+            libc::ioctl(
+                self.fd.as_raw_fd(),
+                ioc::eviocgabs(code),
+                &mut info as *mut libc::input_absinfo,
+            )
+        };
+        if rc < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(info.value)
+    }
+
     /// Read up to `out.len()` pending events into `out`; returns the count read (0 on `EAGAIN`,
     /// i.e. nothing pending right now — the device is non-blocking).
     pub fn read_events(&self, out: &mut [libc::input_event]) -> io::Result<usize> {
         let cap = std::mem::size_of_val(out);
         // SAFETY: out is a valid buffer of `cap` bytes; read writes at most `cap`.
-        let n = unsafe { libc::read(self.fd.as_raw_fd(), out.as_mut_ptr() as *mut libc::c_void, cap) };
+        let n = unsafe {
+            libc::read(
+                self.fd.as_raw_fd(),
+                out.as_mut_ptr() as *mut libc::c_void,
+                cap,
+            )
+        };
         if n < 0 {
             let e = io::Error::last_os_error();
             if e.raw_os_error() == Some(libc::EAGAIN) {
                 return Ok(0);
             }
             return Err(e);
+        }
+        if n == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "evdev source reached EOF",
+            ));
+        }
+        if n as usize % std::mem::size_of::<libc::input_event>() != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "partial evdev event",
+            ));
         }
         Ok(n as usize / std::mem::size_of::<libc::input_event>())
     }

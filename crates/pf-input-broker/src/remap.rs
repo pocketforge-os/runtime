@@ -86,7 +86,7 @@ const ABS_CODES: &[(&str, u16)] = &[
 const CANONICAL_BY_ID: &[(&str, u16)] = &[
     ("south", 0x130),
     ("east", 0x131),
-    ("west", 0x134),  // canonical BTN_WEST — even though the driver emits BTN_X (0x133) here
+    ("west", 0x134), // canonical BTN_WEST — even though the driver emits BTN_X (0x133) here
     ("north", 0x133), // canonical BTN_NORTH — even though the driver emits BTN_Y (0x134) here
     ("l1", 0x136),
     ("r1", 0x137),
@@ -141,7 +141,12 @@ fn parse_sdl_guid(guid: &str) -> Option<(u16, u16, u16, u16)> {
 
 fn axis_for(inp: &Input, code_name: &str) -> AbsInfo {
     if code_name.starts_with("ABS_HAT") {
-        return AbsInfo { min: -1, max: 1, fuzz: 0, flat: 0 };
+        return AbsInfo {
+            min: -1,
+            max: 1,
+            fuzz: 0,
+            flat: 0,
+        };
     }
     let ax = if inp.kind == "stick" {
         let codes: Vec<&str> = inp.code.split(',').map(|s| s.trim()).collect();
@@ -154,8 +159,18 @@ fn axis_for(inp: &Input, code_name: &str) -> AbsInfo {
         inp.range
     };
     match ax {
-        Some(a) => AbsInfo { min: a.min, max: a.max, fuzz: a.fuzz, flat: a.flat },
-        None => AbsInfo { min: 0, max: 0, fuzz: 0, flat: 0 },
+        Some(a) => AbsInfo {
+            min: a.min,
+            max: a.max,
+            fuzz: a.fuzz,
+            flat: a.flat,
+        },
+        None => AbsInfo {
+            min: 0,
+            max: 0,
+            fuzz: 0,
+            flat: 0,
+        },
     }
 }
 
@@ -195,6 +210,8 @@ pub struct Remap {
     /// Live pressed/released state per binary-trigger ABS code (starts released) — the hysteresis
     /// latch, so an intermediate value holds the last state and a threshold cross toggles once.
     binary_state: HashMap<u16, bool>,
+    source_keys: Vec<u16>,
+    source_abs: Vec<u16>,
 }
 
 impl Remap {
@@ -208,6 +225,8 @@ impl Remap {
         let mut abs: Vec<(u16, AbsInfo)> = Vec::new();
         let mut key_map: HashMap<u16, u16> = HashMap::new();
         let mut binary: HashMap<u16, BinaryTrigger> = HashMap::new();
+        let mut source_keys = Vec::new();
+        let mut source_abs = Vec::new();
 
         for inp in &d.inputs {
             // SYSTEM controls (class="system", e.g. VOL±) are NOT part of the virtual gamepad
@@ -217,14 +236,23 @@ impl Remap {
             if inp.is_system() {
                 continue;
             }
-            let names: Vec<&str> = inp.code.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+            let names: Vec<&str> = inp
+                .code
+                .split(',')
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .collect();
             match inp.ev_type.as_str() {
                 "EV_KEY" => {
                     let src_name = names.first().copied().unwrap_or("");
-                    let src = lookup(KEY_CODES, src_name)
-                        .ok_or_else(|| RemapError(format!("input '{}': unknown key code {src_name}", inp.id)))?;
+                    let src = lookup(KEY_CODES, src_name).ok_or_else(|| {
+                        RemapError(format!("input '{}': unknown key code {src_name}", inp.id))
+                    })?;
                     // Canonical positional code for this id (fallback: keep the source code).
                     let canonical = lookup(CANONICAL_BY_ID, &inp.id).unwrap_or(src);
+                    if !source_keys.contains(&src) {
+                        source_keys.push(src);
+                    }
                     key_map.insert(src, canonical);
                     if !keys.contains(&canonical) {
                         keys.push(canonical);
@@ -236,8 +264,12 @@ impl Remap {
                     // and do NOT advertise the ABS axis (it would be a dead, never-moving axis).
                     let is_binary = inp.semantics.as_deref() == Some("binary");
                     for name in &names {
-                        let code = lookup(ABS_CODES, name)
-                            .ok_or_else(|| RemapError(format!("input '{}': unknown abs code {name}", inp.id)))?;
+                        let code = lookup(ABS_CODES, name).ok_or_else(|| {
+                            RemapError(format!("input '{}': unknown abs code {name}", inp.id))
+                        })?;
+                        if !source_abs.contains(&code) {
+                            source_abs.push(code);
+                        }
                         if is_binary {
                             let btn = lookup(BINARY_TRIGGER_BTN, name).ok_or_else(|| {
                                 RemapError(format!(
@@ -269,14 +301,32 @@ impl Remap {
                     }
                 }
                 other => {
-                    return Err(RemapError(format!("input '{}': unsupported ev_type {other}", inp.id)));
+                    return Err(RemapError(format!(
+                        "input '{}': unsupported ev_type {other}",
+                        inp.id
+                    )));
                 }
             }
         }
 
         let name = format!("PocketForge Input ({})", d.identity.id);
-        let spec = UinputSpec { name, bus, vendor, product, version, keys, abs };
-        Ok(Remap { spec, key_map, binary, binary_state: HashMap::new() })
+        let spec = UinputSpec {
+            name,
+            bus,
+            vendor,
+            product,
+            version,
+            keys,
+            abs,
+        };
+        Ok(Remap {
+            spec,
+            key_map,
+            binary,
+            binary_state: HashMap::new(),
+            source_keys,
+            source_abs,
+        })
     }
 
     /// The virtual-device spec the broker instantiates.
@@ -284,9 +334,19 @@ impl Remap {
         &self.spec
     }
 
+    pub(crate) fn required_source_keys(&self) -> &[u16] {
+        &self.source_keys
+    }
+    pub(crate) fn required_source_abs(&self) -> &[u16] {
+        &self.source_abs
+    }
+
     /// Translate a source key code to its canonical positional code (identity if not normalized).
     pub fn remap_key(&self, source_code: u16) -> u16 {
-        self.key_map.get(&source_code).copied().unwrap_or(source_code)
+        self.key_map
+            .get(&source_code)
+            .copied()
+            .unwrap_or(source_code)
     }
 
     /// Classify one source `EV_ABS` event. A normal analog axis is [`AbsAction::Passthrough`]; a
@@ -311,7 +371,31 @@ impl Remap {
             return AbsAction::None;
         }
         self.binary_state.insert(abs_code, now_pressed);
-        AbsAction::Button { code: bt.btn, value: now_pressed as i32 }
+        AbsAction::Button {
+            code: bt.btn,
+            value: now_pressed as i32,
+        }
+    }
+
+    /// Convert an authoritative post-SYN_DROPPED axis value to virtual state. Unlike normal
+    /// event classification this always returns a binary trigger's current logical value.
+    pub(crate) fn resync_abs(&mut self, abs_code: u16, value: i32) -> AbsAction {
+        let Some(bt) = self.binary.get(&abs_code).copied() else {
+            return AbsAction::Passthrough;
+        };
+        let was_pressed = self.binary_state.get(&abs_code).copied().unwrap_or(false);
+        let pressed = if value >= bt.high {
+            true
+        } else if value <= bt.low {
+            false
+        } else {
+            was_pressed
+        };
+        self.binary_state.insert(abs_code, pressed);
+        AbsAction::Button {
+            code: bt.btn,
+            value: pressed as i32,
+        }
     }
 }
 
@@ -328,7 +412,10 @@ mod tests {
     #[test]
     fn sdl_guid_parses_the_xbox360_identity() {
         // 030000005e0400008e02000010010000 → bus 0x0003, vendor 0x045e, product 0x028e, ver 0x0110.
-        assert_eq!(parse_sdl_guid("030000005e0400008e02000010010000"), Some((0x0003, 0x045e, 0x028e, 0x0110)));
+        assert_eq!(
+            parse_sdl_guid("030000005e0400008e02000010010000"),
+            Some((0x0003, 0x045e, 0x028e, 0x0110))
+        );
     }
 
     /// The D→C invariant, asserted against the CHECKED-OUT descriptor rather than against a
@@ -380,7 +467,11 @@ mod tests {
         // per-row assertion above for the row that was changed.
         canonical_seen.sort_unstable();
         canonical_seen.dedup();
-        assert_eq!(canonical_seen, vec![0x130, 0x131, 0x133, 0x134], "face remap is a bijection");
+        assert_eq!(
+            canonical_seen,
+            vec![0x130, 0x131, 0x133, 0x134],
+            "face remap is a bijection"
+        );
     }
 
     /// The SWAP mechanism itself, on an explicitly synthetic quirky-driver descriptor.
@@ -443,14 +534,29 @@ code = "BTN_Y"
         assert!(s.keys.contains(&0x133), "BTN_NORTH advertised");
         // Analog axes advertised: sticks (X/Y/RX/RY), hat (HAT0X/Y).
         for code in [0x00, 0x01, 0x03, 0x04, 0x10, 0x11] {
-            assert!(s.abs.iter().any(|(c, _)| *c == code), "abs {code:#x} advertised");
+            assert!(
+                s.abs.iter().any(|(c, _)| *c == code),
+                "abs {code:#x} advertised"
+            );
         }
         // The ltrig/rtrig are semantics="binary" → advertised as BUTTONS (BTN_TL2/BTN_TR2),
         // NOT as ABS_Z/ABS_RZ axes (a dead axis would mislead the app).
-        assert!(s.keys.contains(&0x138), "BTN_TL2 (ltrig) advertised as a button");
-        assert!(s.keys.contains(&0x139), "BTN_TR2 (rtrig) advertised as a button");
-        assert!(!s.abs.iter().any(|(c, _)| *c == 0x02), "ABS_Z not advertised (binary trigger)");
-        assert!(!s.abs.iter().any(|(c, _)| *c == 0x05), "ABS_RZ not advertised (binary trigger)");
+        assert!(
+            s.keys.contains(&0x138),
+            "BTN_TL2 (ltrig) advertised as a button"
+        );
+        assert!(
+            s.keys.contains(&0x139),
+            "BTN_TR2 (rtrig) advertised as a button"
+        );
+        assert!(
+            !s.abs.iter().any(|(c, _)| *c == 0x02),
+            "ABS_Z not advertised (binary trigger)"
+        );
+        assert!(
+            !s.abs.iter().any(|(c, _)| *c == 0x05),
+            "ABS_RZ not advertised (binary trigger)"
+        );
     }
 
     #[test]
@@ -459,28 +565,65 @@ code = "BTN_Y"
         let mut r = Remap::from_descriptor(&desc("a133")).unwrap();
         // Thresholds derived from range 0..255: press ≥ 191, release ≤ 63.
         // Sweep 0 → max: nothing until we cross high, then exactly one press.
-        assert_eq!(r.classify_abs(0x02, 0), AbsAction::None, "at rest → no event");
-        assert_eq!(r.classify_abs(0x02, 100), AbsAction::None, "dead band → no event, NO raw ABS");
-        assert_eq!(r.classify_abs(0x02, 190), AbsAction::None, "just below high → still no press");
+        assert_eq!(
+            r.classify_abs(0x02, 0),
+            AbsAction::None,
+            "at rest → no event"
+        );
+        assert_eq!(
+            r.classify_abs(0x02, 100),
+            AbsAction::None,
+            "dead band → no event, NO raw ABS"
+        );
+        assert_eq!(
+            r.classify_abs(0x02, 190),
+            AbsAction::None,
+            "just below high → still no press"
+        );
         assert_eq!(
             r.classify_abs(0x02, 191),
-            AbsAction::Button { code: 0x138, value: 1 },
+            AbsAction::Button {
+                code: 0x138,
+                value: 1
+            },
             "cross high → BTN_TL2 press"
         );
-        assert_eq!(r.classify_abs(0x02, 255), AbsAction::None, "held pressed → no repeat");
+        assert_eq!(
+            r.classify_abs(0x02, 255),
+            AbsAction::None,
+            "held pressed → no repeat"
+        );
         // Sweep back down: hysteresis holds pressed through the dead band, releases only ≤ low.
-        assert_eq!(r.classify_abs(0x02, 100), AbsAction::None, "dead band on the way down → hold");
-        assert_eq!(r.classify_abs(0x02, 64), AbsAction::None, "just above low → still pressed");
+        assert_eq!(
+            r.classify_abs(0x02, 100),
+            AbsAction::None,
+            "dead band on the way down → hold"
+        );
+        assert_eq!(
+            r.classify_abs(0x02, 64),
+            AbsAction::None,
+            "just above low → still pressed"
+        );
         assert_eq!(
             r.classify_abs(0x02, 63),
-            AbsAction::Button { code: 0x138, value: 0 },
+            AbsAction::Button {
+                code: 0x138,
+                value: 0
+            },
             "cross low → BTN_TL2 release"
         );
-        assert_eq!(r.classify_abs(0x02, 0), AbsAction::None, "released → no repeat");
+        assert_eq!(
+            r.classify_abs(0x02, 0),
+            AbsAction::None,
+            "released → no repeat"
+        );
         // The a133 rtrig (ABS_RZ) is an independent binary trigger → BTN_TR2.
         assert_eq!(
             r.classify_abs(0x05, 255),
-            AbsAction::Button { code: 0x139, value: 1 },
+            AbsAction::Button {
+                code: 0x139,
+                value: 1
+            },
             "rtrig cross high → BTN_TR2 press"
         );
     }
@@ -491,7 +634,11 @@ code = "BTN_Y"
         // through — the binary reclassification must not touch analog axes.
         let mut r = Remap::from_descriptor(&desc("a133")).unwrap();
         for v in [-32768, 0, 128, 32767] {
-            assert_eq!(r.classify_abs(0x00, v), AbsAction::Passthrough, "ABS_X analog passthrough");
+            assert_eq!(
+                r.classify_abs(0x00, v),
+                AbsAction::Passthrough,
+                "ABS_X analog passthrough"
+            );
         }
         // And a whole device with NO binary rows classifies every trigger axis as passthrough.
         // This half used to run on the a523 — but platform now describes BOTH shipping devices'
@@ -500,9 +647,18 @@ code = "BTN_Y"
         // vendored copy. The shape is real for other hardware, so it gets an honestly SYNTHETIC
         // device rather than a device pretending to have travel it does not (tsp-ozbp.16).
         let mut analog =
-            Remap::from_descriptor(&pocketforge::test_support::analog_trigger_descriptor()).unwrap();
-        assert_eq!(analog.classify_abs(0x02, 255), AbsAction::Passthrough, "analog ABS_Z");
-        assert_eq!(analog.classify_abs(0x05, 255), AbsAction::Passthrough, "analog ABS_RZ");
+            Remap::from_descriptor(&pocketforge::test_support::analog_trigger_descriptor())
+                .unwrap();
+        assert_eq!(
+            analog.classify_abs(0x02, 255),
+            AbsAction::Passthrough,
+            "analog ABS_Z"
+        );
+        assert_eq!(
+            analog.classify_abs(0x05, 255),
+            AbsAction::Passthrough,
+            "analog ABS_RZ"
+        );
     }
 
     #[test]
@@ -512,7 +668,10 @@ code = "BTN_Y"
         // a523 adds home (KEY_HOMEPAGE=172) + L3/R3 (BTN_THUMBL/R) — pure descriptor data.
         assert!(!a133.spec().keys.contains(&172), "a133 has no home");
         assert!(a523.spec().keys.contains(&172), "a523 home present");
-        assert!(a523.spec().keys.contains(&0x13d) && a523.spec().keys.contains(&0x13e), "a523 L3/R3");
+        assert!(
+            a523.spec().keys.contains(&0x13d) && a523.spec().keys.contains(&0x13e),
+            "a523 L3/R3"
+        );
     }
 
     /// SYSTEM controls are excluded from the virtual gamepad (tsp-bwrg.16, owner ruling pt 1/3):
@@ -555,13 +714,20 @@ source = "sunxi-keyboard"
         .unwrap();
         let r = Remap::from_descriptor(&d).unwrap();
         let keys = &r.spec().keys;
-        assert!(keys.contains(&0x130), "the real gamepad button (BTN_A/south) IS advertised");
+        assert!(
+            keys.contains(&0x130),
+            "the real gamepad button (BTN_A/south) IS advertised"
+        );
         // KEY_VOLUMEUP=115(0x73), KEY_VOLUMEDOWN=114(0x72) must NOT be synthesized as gamepad keys.
         assert!(
             !keys.contains(&0x73) && !keys.contains(&0x72),
             "system VOL± must NOT leak into the virtual gamepad keys: {keys:?}"
         );
-        assert_eq!(keys.len(), 1, "only the one non-system button is advertised: {keys:?}");
+        assert_eq!(
+            keys.len(),
+            1,
+            "only the one non-system button is advertised: {keys:?}"
+        );
         // A system code is never remapped into the pad (identity fallthrough, never a mapping entry).
         assert_eq!(r.remap_key(0x73), 0x73, "VOL+ has no gamepad remap entry");
     }

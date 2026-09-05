@@ -16,6 +16,8 @@ pub const EV_KEY: u16 = 0x01;
 pub const EV_ABS: u16 = 0x03;
 /// `SYN_REPORT` — commit the current event report.
 pub const SYN_REPORT: u16 = 0x00;
+/// `SYN_DROPPED` — the evdev client lost events and must resynchronize state.
+pub const SYN_DROPPED: u16 = 0x03;
 
 const IOC_NONE: u64 = 0;
 const IOC_WRITE: u64 = 1;
@@ -48,7 +50,12 @@ pub const EVIOCREVOKE: c_ulong = ioc(IOC_WRITE, EV, 0x91, 4);
 
 /// `EVIOCGID` — read the `struct input_id` (bus/vendor/product/version).
 pub fn eviocgid() -> c_ulong {
-    ioc(IOC_READ, EV, 0x02, std::mem::size_of::<libc::input_id>() as u64)
+    ioc(
+        IOC_READ,
+        EV,
+        0x02,
+        std::mem::size_of::<libc::input_id>() as u64,
+    )
 }
 
 /// `EVIOCGNAME(len)` — read the device name into a `len`-byte buffer.
@@ -62,9 +69,19 @@ pub fn eviocgbit(ev: u16, len: usize) -> c_ulong {
     ioc(IOC_READ, EV, 0x20 + ev as u64, len as u64)
 }
 
+/// `EVIOCGKEY(len)` — read the device's current key-state bitmap.
+pub fn eviocgkey(len: usize) -> c_ulong {
+    ioc(IOC_READ, EV, 0x18, len as u64)
+}
+
 /// `EVIOCGABS(abs)` — read the `struct input_absinfo` for an absolute axis.
 pub fn eviocgabs(abs: u16) -> c_ulong {
-    ioc(IOC_READ, EV, 0x40 + abs as u64, std::mem::size_of::<libc::input_absinfo>() as u64)
+    ioc(
+        IOC_READ,
+        EV,
+        0x40 + abs as u64,
+        std::mem::size_of::<libc::input_absinfo>() as u64,
+    )
 }
 
 // --- uinput ('U' = 0x55) --------------------------------------------------------------------
@@ -94,12 +111,24 @@ mod tests {
     #[test]
     fn fixed_codes_match_canonical_linux_values() {
         assert_eq!(EVIOCGRAB, 0x40044590, "EVIOCGRAB = _IOW('E', 0x90, int)");
-        assert_eq!(EVIOCREVOKE, 0x40044591, "EVIOCREVOKE = _IOW('E', 0x91, int)");
+        assert_eq!(
+            EVIOCREVOKE, 0x40044591,
+            "EVIOCREVOKE = _IOW('E', 0x91, int)"
+        );
         assert_eq!(UI_DEV_CREATE, 0x5501, "UI_DEV_CREATE = _IO('U', 1)");
         assert_eq!(UI_DEV_DESTROY, 0x5502, "UI_DEV_DESTROY = _IO('U', 2)");
-        assert_eq!(UI_SET_EVBIT, 0x40045564, "UI_SET_EVBIT = _IOW('U', 100, int)");
-        assert_eq!(UI_SET_KEYBIT, 0x40045565, "UI_SET_KEYBIT = _IOW('U', 101, int)");
-        assert_eq!(UI_SET_ABSBIT, 0x40045567, "UI_SET_ABSBIT = _IOW('U', 103, int)");
+        assert_eq!(
+            UI_SET_EVBIT, 0x40045564,
+            "UI_SET_EVBIT = _IOW('U', 100, int)"
+        );
+        assert_eq!(
+            UI_SET_KEYBIT, 0x40045565,
+            "UI_SET_KEYBIT = _IOW('U', 101, int)"
+        );
+        assert_eq!(
+            UI_SET_ABSBIT, 0x40045567,
+            "UI_SET_ABSBIT = _IOW('U', 103, int)"
+        );
     }
 
     #[test]
@@ -108,5 +137,7 @@ mod tests {
         assert_eq!(eviocgname(16), 0x80104506);
         // EVIOCGBIT(0, 8) = _IOC(READ,'E',0x20,8).
         assert_eq!(eviocgbit(0, 8), 0x80084520);
+        // EVIOCGKEY(8) = _IOC(READ,'E',0x18,8).
+        assert_eq!(eviocgkey(8), 0x80084518);
     }
 }
