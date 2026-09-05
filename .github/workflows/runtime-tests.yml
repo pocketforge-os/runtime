@@ -61,6 +61,10 @@ on:
       - 'wire/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
+      - 'vendor/**'
+      - 'scripts/check-vendor.sh'
+      - 'scripts/test-check-vendor.sh'
+      - 'scripts/build-sdk.sh'
       - '.cargo/config.toml'
       - '.github/workflows/runtime-tests.yml'
   push:
@@ -113,11 +117,12 @@ jobs:
       # requested explicitly. Without `--component clippy` the clippy step fails with
       # "no such command: clippy" — which reads as tooling breakage rather than a lint
       # failure, so name it here where the toolchain is assembled.
-      - name: Install stable Rust toolchain + aarch64-musl target
+      - name: Install stable Rust toolchain + AArch64 targets
         run: |
           rustup toolchain install stable --profile minimal --no-self-update --component clippy
           rustup default stable
           rustup target add aarch64-unknown-linux-musl
+          rustup target add aarch64-unknown-linux-gnu
           rustc --version
           cargo --version
           cargo clippy --version
@@ -148,7 +153,9 @@ jobs:
       - name: cargo metadata — lockfile is up to date (--locked)
         working-directory: runtime
         run: |
-          cargo metadata --locked --format-version 1 > /dev/null
+          scripts/check-vendor.sh
+          scripts/test-check-vendor.sh
+          cargo metadata --offline --locked --format-version 1 > /dev/null
 
       # PF_PLATFORM_DIR points at the sibling checkout. The tests fall back
       # to a `../platform` sibling discovery too (see
@@ -163,12 +170,12 @@ jobs:
           PF_PLATFORM_DIR: ${{ github.workspace }}/platform
         working-directory: runtime
         run: |
-          cargo test --locked --workspace --no-fail-fast -- --nocapture
+          cargo test --locked --workspace --offline --no-fail-fast -- --nocapture
 
       - name: cargo test — Wayland desktop keyboard feature
         working-directory: runtime
         run: |
-          cargo test --locked -p pf-framehost-wayland --features keyboard
+          cargo test --offline --locked -p pf-framehost-wayland --features keyboard
 
       # The point of the cross-build step: prove a plain `cargo build
       # --target aarch64-unknown-linux-musl` links with NO per-invocation
@@ -179,12 +186,17 @@ jobs:
       - name: cargo build — aarch64-unknown-linux-musl (no RUSTFLAGS)
         working-directory: runtime
         run: |
-          cargo build --locked --target aarch64-unknown-linux-musl \
+          cargo build --offline --locked --target aarch64-unknown-linux-musl \
             -p pf-input-collect --bin pf-input-collect
-          cargo build --locked --target aarch64-unknown-linux-musl \
+          cargo build --offline --locked --target aarch64-unknown-linux-musl \
             -p pf-collect-ui --bin pf-collect-ui
-          cargo build --locked --target aarch64-unknown-linux-musl \
+          cargo build --offline --locked --target aarch64-unknown-linux-musl \
             -p pf-framehost-wayland
+
+      - name: GNU AArch64 staticlib SDK link smoke
+        working-directory: runtime
+        run: |
+          SOURCE_DATE_EPOCH="$(git show -s --format=%ct HEAD)" ctest/run-aarch64.sh
 
       # LINT GATE (tsp-7rts). Until this step existed, no workflow in this repo ran
       # clippy at all — so lint failures accumulated in the tree with nothing able to
@@ -211,6 +223,6 @@ jobs:
       - name: cargo clippy — whole workspace, warnings are errors
         working-directory: runtime
         run: |
-          cargo clippy --locked --workspace --all-targets -- -D warnings
-          cargo clippy --locked -p pf-framehost-wayland --all-targets \
+          cargo clippy --locked --workspace --offline --all-targets -- -D warnings
+          cargo clippy --locked --offline -p pf-framehost-wayland --all-targets \
             --features keyboard -- -D warnings

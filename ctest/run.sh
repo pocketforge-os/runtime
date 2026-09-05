@@ -20,7 +20,7 @@ desc="${1:-$platform/devices/a133/capabilities.toml}"
 }
 
 echo "ctest: building libpocketforge staticlib (release)..."
-cargo build --release -p libpocketforge >/dev/null
+cargo build --offline --locked --release -p libpocketforge >/dev/null
 
 lib="$root/target/release/libpocketforge.a"
 [ -f "$lib" ] || { echo "ctest: missing $lib" >&2; exit 1; }
