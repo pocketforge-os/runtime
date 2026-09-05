@@ -5,7 +5,7 @@
 //! the input hot path (SPIKE-1 / `.1`); PFW1 carries only its acquisition (wire §4.1).
 //!
 //! Usage:
-//!   pf-input-broker --descriptor <caps.toml> [--acquire-sock <path>]
+//!   pf-input-broker --descriptor <caps.toml> [--source <event-node>] [--acquire-sock <path>]
 //!
 //! `--no-grab` is the R-C blessed-binary path (Steam Link): re-emit + hand the fd WITHOUT the
 //! exclusive grab (so a `uinput`-producing consumer is not broken).
@@ -39,17 +39,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let grab = !args.iter().any(|a| a == "--no-grab");
 
     let descriptor = Descriptor::load(&desc_path)?;
-    #[cfg(debug_assertions)]
     let source = match arg(&args, "--source") {
         Some(path) => std::path::PathBuf::from(path),
         None => discover_with_timeout(&descriptor)?,
-    };
-    #[cfg(not(debug_assertions))]
-    let source = {
-        if arg(&args, "--source").is_some() {
-            return Err("--source is available only in test/debug builds".into());
-        }
-        discover_with_timeout(&descriptor)?
     };
     let mut broker = InputBroker::start_with(&source, &descriptor, grab)?;
     let node = broker
@@ -206,6 +198,15 @@ fn send_ready(socket: &str) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_source_override_is_accepted() {
+        let args = vec!["--source".to_owned(), "/dev/input/event-test".to_owned()];
+        assert_eq!(
+            arg(&args, "--source").as_deref(),
+            Some("/dev/input/event-test")
+        );
+    }
 
     #[test]
     fn readiness_notification_is_ready_one_datagram() {
