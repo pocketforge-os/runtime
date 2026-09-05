@@ -1,10 +1,10 @@
 //! Broker-side input **policy** — the rate limiter the pump applies before re-emitting. A token
-//! bucket bounds the event rate a (cooperative or hostile) source can push through the grab, so a
+//! bucket bounds the complete-report rate a (cooperative or hostile) source can push through the grab, so a
 //! flooding device cannot wedge the consumer. Pure + explicit-time so it is deterministically
 //! testable; the pump feeds it the monotonic elapsed seconds. The default cap is generous (it
 //! never trips on normal gameplay); it exists to bound abuse, not to shape input.
 
-/// A simple token bucket: `capacity` tokens, refilled at `refill_per_sec`, one token per event.
+/// A simple token bucket: `capacity` tokens, refilled at `refill_per_sec`, one token per report.
 #[derive(Debug, Clone)]
 pub struct TokenBucket {
     capacity: f64,
@@ -16,16 +16,21 @@ pub struct TokenBucket {
 impl TokenBucket {
     /// A bucket holding `capacity` events, refilling at `refill_per_sec`. Starts full.
     pub fn new(capacity: f64, refill_per_sec: f64) -> TokenBucket {
-        TokenBucket { capacity, refill_per_sec, tokens: capacity, last_secs: 0.0 }
+        TokenBucket {
+            capacity,
+            refill_per_sec,
+            tokens: capacity,
+            last_secs: 0.0,
+        }
     }
 
-    /// The broker default: 4000 events buffered, 4000/sec sustained — far above a 60 Hz gamepad's
-    /// handful of events/frame, so normal input is never dropped; a runaway flood is.
+    /// The broker default: 4000 reports buffered, 4000/sec sustained — far above a 60 Hz gamepad,
+    /// so normal input is never dropped; a runaway flood is.
     pub fn default_broker() -> TokenBucket {
         TokenBucket::new(4000.0, 4000.0)
     }
 
-    /// Account one event at monotonic time `now_secs`. Returns `true` if a token was available
+    /// Account one complete report at monotonic time `now_secs`. Returns `true` if a token was available
     /// (emit), `false` if the bucket is empty (drop). Monotonic input assumed (`now ≥ last`).
     pub fn allow(&mut self, now_secs: f64) -> bool {
         let dt = (now_secs - self.last_secs).max(0.0);

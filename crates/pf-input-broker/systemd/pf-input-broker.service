@@ -1,0 +1,19 @@
+[Unit]
+Description=PocketForge input capability broker
+Documentation=https://github.com/pocketforge-os/runtime
+After=local-fs.target dev-uinput.device pf-input-decode.service
+Requires=dev-uinput.device pf-input-decode.service
+BindsTo=pf-input-decode.service
+ConditionPathExists=/dev/uinput
+
+[Service]
+Type=notify
+ExecStart=/usr/bin/pf-input-broker --descriptor /usr/share/pocketforge/devices/a133/capabilities.toml --acquire-sock /run/pocketforge/input-broker.sock
+RuntimeDirectory=pocketforge
+Restart=on-failure
+RestartSec=2
+KillSignal=SIGTERM
+TimeoutStopSec=5
+
+[Install]
+WantedBy=multi-user.target

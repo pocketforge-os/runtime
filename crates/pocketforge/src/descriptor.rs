@@ -38,6 +38,17 @@ pub struct Identity {
     #[serde(default)]
     pub codename: Option<String>,
     pub sdl_guid: String,
+    /// Exact identity of the primary evdev source. Unknown match fields remain forward-compatible.
+    #[serde(default)]
+    pub r#match: Option<InputIdentityMatch>,
+}
+
+/// Descriptor-owned identity used to discover the primary input device.
+#[derive(Debug, Clone, Deserialize)]
+pub struct InputIdentityMatch {
+    pub evdev_name: String,
+    pub vid: String,
+    pub pid: String,
 }
 
 /// One `[[inputs]]` row — a drawable, bindable physical control.

@@ -3,10 +3,11 @@
 //! policy into a uinput re-emit device the app reads. The app gets the re-emit read fd via
 //! `Acquire("input")` over a Unix socket (`SCM_RIGHTS`); it can no longer reach the real node.
 
+use std::collections::HashSet;
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use pf_wire::{recv_request, send_response, Op, Request, Response, Status};
@@ -47,12 +48,81 @@ pub struct InputBroker {
     remap: Remap,
     bucket: TokenBucket,
     start: std::time::Instant,
+    pending_report: Vec<(u16, u16, i32)>,
+    pressed: HashSet<u16>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExpectedIdentity {
+    pub name: String,
+    pub bus: u16,
+    pub vendor: u16,
+    pub product: u16,
+    pub version: u16,
+}
+
+impl ExpectedIdentity {
+    pub fn from_descriptor(descriptor: &Descriptor) -> io::Result<Self> {
+        let m = descriptor.identity.r#match.as_ref().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "descriptor identity.match is required",
+            )
+        })?;
+        let hex = |s: &str| {
+            u16::from_str_radix(s.trim_start_matches("0x"), 16).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("invalid identity hex {s:?}"),
+                )
+            })
+        };
+        let word = |offset: usize| -> io::Result<u16> {
+            let guid = descriptor.identity.sdl_guid.as_bytes();
+            if guid.len() != 32 || !guid.is_ascii() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid SDL GUID",
+                ));
+            }
+            let byte = |at: usize| {
+                std::str::from_utf8(&guid[at..at + 2])
+                    .ok()
+                    .and_then(|s| u8::from_str_radix(s, 16).ok())
+                    .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid SDL GUID"))
+            };
+            let lo = byte(offset)
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid SDL GUID"))?;
+            let hi = byte(offset + 2)
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid SDL GUID"))?;
+            Ok(lo as u16 | (hi as u16) << 8)
+        };
+        Ok(Self {
+            name: m.evdev_name.clone(),
+            bus: word(0)?,
+            vendor: hex(&m.vid)?,
+            product: hex(&m.pid)?,
+            version: word(24)?,
+        })
+    }
+
+    pub fn matches(&self, name: &str, id: (u16, u16, u16, u16)) -> bool {
+        name == self.name
+            && id.0 == self.bus
+            && id.1 == self.vendor
+            && id.2 == self.product
+            && id.3 == self.version
+            && !name.starts_with("PocketForge Input (")
+    }
 }
 
 impl InputBroker {
     /// Open `source_path`, grab it (the enforcing default), and stand up the descriptor-derived
     /// re-emit device.
-    pub fn start(source_path: impl AsRef<Path>, descriptor: &Descriptor) -> io::Result<InputBroker> {
+    pub fn start(
+        source_path: impl AsRef<Path>,
+        descriptor: &Descriptor,
+    ) -> io::Result<InputBroker> {
         InputBroker::start_with(source_path, descriptor, true)
     }
 
@@ -66,12 +136,84 @@ impl InputBroker {
     ) -> io::Result<InputBroker> {
         let remap = Remap::from_descriptor(descriptor)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-        let sink = Uinput::create(remap.spec())?;
-        let mut source = Evdev::open(source_path)?;
-        if grab {
-            source.grab()?; // EXCLUSIVE — the app cannot bypass to the raw node (enforcement).
+        let (source, sink) = acquire_then_create(
+            || {
+                let mut source = Evdev::open(source_path)?;
+                Self::validate_source(&source, descriptor, &remap)?;
+                if grab {
+                    source.grab()?;
+                }
+                Ok(source)
+            },
+            |_| Uinput::create(remap.spec()),
+        )?;
+        Ok(InputBroker {
+            source,
+            sink,
+            remap,
+            bucket: TokenBucket::default_broker(),
+            start: std::time::Instant::now(),
+            pending_report: Vec::new(),
+            pressed: HashSet::new(),
+        })
+    }
+
+    fn validate_source(source: &Evdev, descriptor: &Descriptor, remap: &Remap) -> io::Result<()> {
+        let expected = ExpectedIdentity::from_descriptor(descriptor)?;
+        if !expected.matches(&source.name()?, source.id()?) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "opened source identity mismatch",
+            ));
         }
-        Ok(InputBroker { source, sink, remap, bucket: TokenBucket::default_broker(), start: std::time::Instant::now() })
+        if !source.supports(ioc::EV_KEY, remap.required_source_keys())?
+            || !source.supports(ioc::EV_ABS, remap.required_source_abs())?
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "opened source lacks descriptor-required capabilities",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Discover exactly one descriptor-matching event node. Every candidate is identified from
+    /// its opened fd; `start` opens and validates the winner again before grabbing it.
+    pub fn discover(descriptor: &Descriptor) -> io::Result<PathBuf> {
+        let expected = ExpectedIdentity::from_descriptor(descriptor)?;
+        let remap = Remap::from_descriptor(descriptor)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+        let mut matches = Vec::new();
+        for entry in std::fs::read_dir("/dev/input")? {
+            let path = entry?.path();
+            if !path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("event"))
+            {
+                continue;
+            }
+            let Ok(dev) = Evdev::open(&path) else {
+                continue;
+            };
+            if expected.matches(&dev.name()?, dev.id()?)
+                && dev.supports(ioc::EV_KEY, remap.required_source_keys())?
+                && dev.supports(ioc::EV_ABS, remap.required_source_abs())?
+            {
+                matches.push(path);
+            }
+        }
+        match matches.len() {
+            1 => Ok(matches.remove(0)),
+            0 => Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "no input device matches descriptor identity and capabilities",
+            )),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("multiple input devices match descriptor: {matches:?}"),
+            )),
+        }
     }
 
     /// The re-emit `/dev/input/eventN` node path (what the app reads / the fd handed over points at).
@@ -92,35 +234,41 @@ impl InputBroker {
         let mut emitted = 0usize;
         for ev in &buf[..n] {
             let t = ev.type_;
-            if t == ioc::EV_SYN {
-                self.sink.emit(t, ev.code, ev.value)?;
-                emitted += 1;
-            } else if t == ioc::EV_KEY && self.bucket.allow(now) {
-                self.sink.emit(t, self.remap.remap_key(ev.code), ev.value)?;
-                emitted += 1;
-            } else if t == ioc::EV_ABS && self.bucket.allow(now) {
+            if t == ioc::EV_SYN && ev.code == ioc::SYN_REPORT {
+                let allowed = self.bucket.allow(now);
+                let out = finish_report(&mut self.pending_report, &mut self.pressed, allowed);
+                for (ty, code, value) in out {
+                    self.sink.emit(ty, code, value)?;
+                    emitted += 1;
+                }
+            } else if t == ioc::EV_KEY {
+                self.pending_report
+                    .push((t, self.remap.remap_key(ev.code), ev.value));
+            } else if t == ioc::EV_ABS {
                 // Analog axes pass through; a physically-binary trigger (semantics="binary") is
                 // reclassified to an EV_KEY press/release on its canonical button (descriptor-driven).
                 match self.remap.classify_abs(ev.code, ev.value) {
                     AbsAction::Passthrough => {
-                        self.sink.emit(t, ev.code, ev.value)?;
-                        emitted += 1;
+                        self.pending_report.push((t, ev.code, ev.value));
                     }
                     AbsAction::Button { code, value } => {
-                        self.sink.emit(ioc::EV_KEY, code, value)?;
-                        emitted += 1;
+                        self.pending_report.push((ioc::EV_KEY, code, value));
                     }
                     AbsAction::None => {} // inside the hysteresis band / no state change — drop
                 }
             }
-            // EV_KEY/EV_ABS over the rate-limit budget, and other types (FF, MSC, …), are dropped.
+            // Other event types are outside the descriptor-controlled input surface.
         }
         Ok(emitted)
     }
 
     /// Block up to `timeout_ms` for the source to become readable. `true` if events are pending.
     pub fn wait_readable(&self, timeout_ms: i32) -> io::Result<bool> {
-        let mut pfd = libc::pollfd { fd: self.source.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+        let mut pfd = libc::pollfd {
+            fd: self.source.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
         // SAFETY: single valid pollfd.
         let rc = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
         if rc < 0 {
@@ -129,6 +277,12 @@ impl InputBroker {
                 return Ok(false);
             }
             return Err(e);
+        }
+        if rc > 0 && (pfd.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL)) != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "upstream input device disconnected",
+            ));
         }
         Ok(rc > 0 && (pfd.revents & libc::POLLIN) != 0)
     }
@@ -152,12 +306,55 @@ impl InputBroker {
     }
 }
 
+fn finish_report(
+    pending: &mut Vec<(u16, u16, i32)>,
+    pressed: &mut HashSet<u16>,
+    allowed: bool,
+) -> Vec<(u16, u16, i32)> {
+    let mut out = Vec::new();
+    if allowed {
+        for &(ty, code, value) in pending.iter() {
+            if ty == ioc::EV_KEY {
+                if value == 0 {
+                    pressed.remove(&code);
+                } else {
+                    pressed.insert(code);
+                }
+            }
+            out.push((ty, code, value));
+        }
+    } else {
+        // A suppressed report may contain the release for any currently-visible press. Release
+        // every visible key: this fail-safe direction cannot strand a button down.
+        let mut releases: Vec<_> = pressed.drain().collect();
+        releases.sort_unstable();
+        out.extend(releases.into_iter().map(|code| (ioc::EV_KEY, code, 0)));
+    }
+    pending.clear();
+    out.push((ioc::EV_SYN, ioc::SYN_REPORT, 0));
+    out
+}
+
+fn acquire_then_create<A, B>(
+    acquire: impl FnOnce() -> io::Result<A>,
+    create: impl FnOnce(&A) -> io::Result<B>,
+) -> io::Result<(A, B)> {
+    let acquired = acquire()?;
+    let created = create(&acquired)?;
+    Ok((acquired, created))
+}
+
 /// Open a node read-only, non-blocking, close-on-exec (the consumer's read fd shape).
 pub fn open_read_fd(path: impl AsRef<Path>) -> io::Result<OwnedFd> {
     let c = std::ffi::CString::new(path.as_ref().as_os_str().as_encoded_bytes())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path has NUL"))?;
     // SAFETY: valid C string.
-    let raw = unsafe { libc::open(c.as_ptr(), libc::O_RDONLY | libc::O_NONBLOCK | libc::O_CLOEXEC) };
+    let raw = unsafe {
+        libc::open(
+            c.as_ptr(),
+            libc::O_RDONLY | libc::O_NONBLOCK | libc::O_CLOEXEC,
+        )
+    };
     if raw < 0 {
         return Err(io::Error::last_os_error());
     }
@@ -169,7 +366,11 @@ pub fn open_read_fd(path: impl AsRef<Path>) -> io::Result<OwnedFd> {
 
 /// Serve `Acquire("input")` on `listener`, handing the re-emit read fd over `SCM_RIGHTS`. Each
 /// connection gets ONE acquisition then closes. Runs until `stop` is set.
-pub fn serve_acquire(listener: &UnixListener, app_fd_path: &str, stop: &AtomicBool) -> io::Result<()> {
+pub fn serve_acquire(
+    listener: &UnixListener,
+    app_fd_path: &str,
+    stop: &AtomicBool,
+) -> io::Result<()> {
     listener.set_nonblocking(true)?;
     while !stop.load(Ordering::Acquire) {
         match listener.accept() {
@@ -219,7 +420,82 @@ pub fn acquire_input_fd(sock_path: impl AsRef<Path>) -> io::Result<(Response, Ow
     let resp = recv_response(&mut cur).map_err(wire_err)?;
     match fd {
         Some(fd) if resp.status == Status::Ok => Ok((resp, fd)),
-        Some(_) => Err(io::Error::new(io::ErrorKind::PermissionDenied, "broker refused input")),
-        None => Err(io::Error::new(io::ErrorKind::InvalidData, "broker sent no fd")),
+        Some(_) => Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "broker refused input",
+        )),
+        None => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "broker sent no fd",
+        )),
+    }
+}
+
+#[cfg(test)]
+mod readiness_tests {
+    use super::*;
+
+    #[test]
+    fn identity_match_rejects_wrong_name_or_id() {
+        let e = ExpectedIdentity {
+            name: "TRIMUI Player1".into(),
+            bus: 3,
+            vendor: 0x045e,
+            product: 0x028e,
+            version: 0x0110,
+        };
+        assert!(e.matches("TRIMUI Player1", (3, 0x045e, 0x028e, 0x0110)));
+        assert!(!e.matches("event-gamepad", (3, 0x045e, 0x028e, 0x0110)));
+        assert!(!e.matches("TRIMUI Player1", (3, 0x1234, 0x028e, 0x0110)));
+        assert!(!e.matches("TRIMUI Player1", (5, 0x045e, 0x028e, 0x0110)));
+    }
+
+    #[test]
+    fn suppressed_report_synthesizes_release_for_visible_press() {
+        let mut pressed = HashSet::from([0x130]);
+        let mut report = vec![(ioc::EV_KEY, 0x130, 0)];
+        assert_eq!(
+            finish_report(&mut report, &mut pressed, false),
+            vec![(ioc::EV_KEY, 0x130, 0), (ioc::EV_SYN, ioc::SYN_REPORT, 0)]
+        );
+        assert!(pressed.is_empty());
+    }
+
+    #[test]
+    fn allowed_report_keeps_all_payload_with_its_syn_report() {
+        let mut pressed = HashSet::new();
+        let mut report = vec![(ioc::EV_KEY, 0x130, 1), (ioc::EV_ABS, 0, 17)];
+        assert_eq!(
+            finish_report(&mut report, &mut pressed, true),
+            vec![
+                (ioc::EV_KEY, 0x130, 1),
+                (ioc::EV_ABS, 0, 17),
+                (ioc::EV_SYN, ioc::SYN_REPORT, 0)
+            ]
+        );
+        assert!(pressed.contains(&0x130));
+    }
+
+    #[test]
+    fn grab_failure_never_creates_sink() {
+        use std::cell::Cell;
+        let created = Cell::new(false);
+        let result: io::Result<((), ())> = acquire_then_create(
+            || {
+                Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "grab failed",
+                ))
+            },
+            |_| {
+                created.set(true);
+                Ok(())
+            },
+        );
+        assert!(result.is_err());
+        assert!(
+            !created.get(),
+            "sink factory must not run before successful acquisition"
+        );
     }
 }
