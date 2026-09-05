@@ -53,6 +53,7 @@ pub struct InputBroker {
     start: std::time::Instant,
     pending_report: Vec<(u16, u16, i32)>,
     pending_report_oversized: bool,
+    resynchronizing: bool,
     pressed: HashSet<u16>,
 }
 
@@ -159,6 +160,7 @@ impl InputBroker {
             start: std::time::Instant::now(),
             pending_report: Vec::new(),
             pending_report_oversized: false,
+            resynchronizing: false,
             pressed: HashSet::new(),
         })
     }
@@ -188,7 +190,7 @@ impl InputBroker {
         let expected = ExpectedIdentity::from_descriptor(descriptor)?;
         let remap = Remap::from_descriptor(descriptor)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-        let mut matches = Vec::new();
+        let mut candidates = Vec::new();
         for entry in std::fs::read_dir("/dev/input")? {
             let path = entry?.path();
             if !path
@@ -198,16 +200,17 @@ impl InputBroker {
             {
                 continue;
             }
-            let Ok(dev) = Evdev::open(&path) else {
-                continue;
-            };
-            if expected.matches(&dev.name()?, dev.id()?)
-                && dev.supports(ioc::EV_KEY, remap.required_source_keys())?
-                && dev.supports(ioc::EV_ABS, remap.required_source_abs())?
-            {
-                matches.push(path);
-            }
+            candidates.push(path);
         }
+        discover_candidates(candidates, |path| {
+            let dev = Evdev::open(path)?;
+            Ok(expected.matches(&dev.name()?, dev.id()?)
+                && dev.supports(ioc::EV_KEY, remap.required_source_keys())?
+                && dev.supports(ioc::EV_ABS, remap.required_source_abs())?)
+        })
+    }
+
+    fn resolve_matches(mut matches: Vec<PathBuf>) -> io::Result<PathBuf> {
         match matches.len() {
             1 => Ok(matches.remove(0)),
             0 => Err(io::Error::new(
@@ -239,7 +242,22 @@ impl InputBroker {
         let mut emitted = 0usize;
         for ev in &buf[..n] {
             let t = ev.type_;
-            if t == ioc::EV_SYN && ev.code == ioc::SYN_REPORT {
+            if t == ioc::EV_SYN && ev.code == ioc::SYN_DROPPED {
+                let out = resynchronize_after_drop(
+                    &mut self.pending_report,
+                    &mut self.pending_report_oversized,
+                    &mut self.pressed,
+                );
+                for (ty, code, value) in out {
+                    self.sink.emit(ty, code, value)?;
+                    emitted += 1;
+                }
+                self.resynchronizing = true;
+            } else if discard_dropped_tail(&mut self.resynchronizing, t, ev.code) {
+                // Events following SYN_DROPPED belong to the unreliable tail of the overrun.
+                // Resume only after its boundary; the next report starts from a clean state.
+                continue;
+            } else if t == ioc::EV_SYN && ev.code == ioc::SYN_REPORT {
                 let allowed = self.bucket.allow(now);
                 let out = finish_report(
                     &mut self.pending_report,
@@ -327,6 +345,19 @@ impl InputBroker {
     }
 }
 
+fn discover_candidates(
+    candidates: impl IntoIterator<Item = PathBuf>,
+    mut probe: impl FnMut(&Path) -> io::Result<bool>,
+) -> io::Result<PathBuf> {
+    let matches = candidates
+        .into_iter()
+        // A disappearing or non-evdev candidate is not a discovery-wide failure. The next
+        // candidate may still be the descriptor-selected controller.
+        .filter(|path| matches!(probe(path), Ok(true)))
+        .collect();
+    InputBroker::resolve_matches(matches)
+}
+
 fn finish_report(
     pending: &mut Vec<(u16, u16, i32)>,
     oversized: &mut bool,
@@ -361,6 +392,37 @@ fn finish_report(
         out.push((ioc::EV_SYN, ioc::SYN_REPORT, 0));
     }
     out
+}
+
+fn resynchronize_after_drop(
+    pending: &mut Vec<(u16, u16, i32)>,
+    oversized: &mut bool,
+    pressed: &mut HashSet<u16>,
+) -> Vec<(u16, u16, i32)> {
+    pending.clear();
+    *oversized = false;
+    // State may have changed in the events the kernel discarded. Releasing every key that we
+    // exposed is the safe resynchronization available without trusting that lost transition.
+    let mut releases: Vec<_> = pressed.drain().collect();
+    releases.sort_unstable();
+    let mut out: Vec<_> = releases
+        .into_iter()
+        .map(|code| (ioc::EV_KEY, code, 0))
+        .collect();
+    if !out.is_empty() {
+        out.push((ioc::EV_SYN, ioc::SYN_REPORT, 0));
+    }
+    out
+}
+
+fn discard_dropped_tail(resynchronizing: &mut bool, event_type: u16, code: u16) -> bool {
+    if !*resynchronizing {
+        return false;
+    }
+    if event_type == ioc::EV_SYN && code == ioc::SYN_REPORT {
+        *resynchronizing = false;
+    }
+    true
 }
 
 fn push_report_event(
@@ -494,6 +556,64 @@ mod readiness_tests {
         assert!(!e.matches("event-gamepad", (3, 0x045e, 0x028e, 0x0110)));
         assert!(!e.matches("TRIMUI Player1", (3, 0x1234, 0x028e, 0x0110)));
         assert!(!e.matches("TRIMUI Player1", (5, 0x045e, 0x028e, 0x0110)));
+    }
+
+    #[test]
+    fn discovery_skips_failing_candidate_before_valid_match() {
+        let bad = PathBuf::from("/dev/input/event0");
+        let good = PathBuf::from("/dev/input/event1");
+        let found = discover_candidates(vec![bad.clone(), good.clone()], |path| {
+            if path == bad {
+                Err(io::Error::new(io::ErrorKind::NotFound, "unplugged"))
+            } else {
+                Ok(true)
+            }
+        })
+        .unwrap();
+        assert_eq!(found, good);
+    }
+
+    #[test]
+    fn syn_dropped_discards_partial_report_and_releases_visible_keys() {
+        let mut pressed = HashSet::from([0x130, 0x131]);
+        let mut oversized = true;
+        let mut report = vec![(ioc::EV_KEY, 0x132, 1), (ioc::EV_ABS, 0, 99)];
+        assert_eq!(
+            resynchronize_after_drop(&mut report, &mut oversized, &mut pressed),
+            vec![
+                (ioc::EV_KEY, 0x130, 0),
+                (ioc::EV_KEY, 0x131, 0),
+                (ioc::EV_SYN, ioc::SYN_REPORT, 0),
+            ]
+        );
+        assert!(report.is_empty());
+        assert!(!oversized);
+        assert!(pressed.is_empty());
+
+        let mut resynchronizing = true;
+        assert!(discard_dropped_tail(
+            &mut resynchronizing,
+            ioc::EV_KEY,
+            0x132
+        ));
+        assert!(resynchronizing);
+        assert!(discard_dropped_tail(
+            &mut resynchronizing,
+            ioc::EV_SYN,
+            ioc::SYN_REPORT
+        ));
+        assert!(!resynchronizing);
+        assert!(!discard_dropped_tail(
+            &mut resynchronizing,
+            ioc::EV_KEY,
+            0x132
+        ));
+
+        push_report_event(&mut report, &mut oversized, (ioc::EV_KEY, 0x132, 1));
+        assert_eq!(
+            finish_report(&mut report, &mut oversized, &mut pressed, true),
+            vec![(ioc::EV_KEY, 0x132, 1), (ioc::EV_SYN, ioc::SYN_REPORT, 0)]
+        );
     }
 
     #[test]

@@ -16,6 +16,8 @@ pub const EV_KEY: u16 = 0x01;
 pub const EV_ABS: u16 = 0x03;
 /// `SYN_REPORT` — commit the current event report.
 pub const SYN_REPORT: u16 = 0x00;
+/// `SYN_DROPPED` — the evdev client lost events and must resynchronize state.
+pub const SYN_DROPPED: u16 = 0x03;
 
 const IOC_NONE: u64 = 0;
 const IOC_WRITE: u64 = 1;
