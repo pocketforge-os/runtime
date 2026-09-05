@@ -2,8 +2,6 @@
 Description=PocketForge input capability broker
 Documentation=https://github.com/pocketforge-os/runtime
 After=local-fs.target dev-uinput.device pf-input-decode.service
-Requires=dev-uinput.device pf-input-decode.service
-BindsTo=pf-input-decode.service
 ConditionPathExists=/dev/uinput
 
 [Service]

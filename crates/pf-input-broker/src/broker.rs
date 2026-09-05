@@ -593,6 +593,23 @@ mod readiness_tests {
     use super::*;
 
     #[test]
+    fn systemd_decoder_restart_is_recovered_by_broker_failure_restart() {
+        let unit = include_str!("../systemd/pf-input-broker.service");
+        assert!(unit.lines().any(|line| {
+            line == "After=local-fs.target dev-uinput.device pf-input-decode.service"
+        }));
+        assert!(unit.lines().any(|line| line == "Restart=on-failure"));
+        assert!(
+            !unit.lines().any(|line| {
+                line.starts_with("BindsTo=")
+                    || (line.starts_with("Requires=")
+                        && line.contains("pf-input-decode.service"))
+            }),
+            "decoder lifetime must not stop the broker cleanly: fd loss must fail the pump, restart the broker, rediscover the decoder, and take a fresh grab"
+        );
+    }
+
+    #[test]
     fn identity_match_rejects_wrong_name_or_id() {
         let e = ExpectedIdentity {
             name: "TRIMUI Player1".into(),
