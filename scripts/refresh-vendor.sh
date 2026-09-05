@@ -6,14 +6,32 @@ root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$root"
 
 test -f Cargo.lock || { echo "refresh-vendor: Cargo.lock is missing" >&2; exit 1; }
-test -z "$(git status --porcelain)" || {
-  echo "refresh-vendor: worktree must be clean before refresh" >&2
-  exit 1
-}
+
+# A dependency refresh normally starts with dirty Cargo manifests and Cargo.lock,
+# and may be repeated with a partially refreshed vendor tree. Reject everything
+# else so replacing vendor cannot accidentally hide unrelated in-progress work.
+while IFS= read -r -d '' entry; do
+  path="${entry:3}"
+  case "$path" in
+    Cargo.lock|Cargo.toml|*/Cargo.toml|vendor|vendor/*) ;;
+    *)
+      echo "refresh-vendor: unrelated dirty path: $path" >&2
+      exit 1
+      ;;
+  esac
+done < <(git status --porcelain=v1 -z --untracked-files=all)
 
 tmp="$(mktemp -d "${TMPDIR:-/tmp}/pocketforge-vendor.XXXXXX")"
 trap 'rm -rf "$tmp"' EXIT
-cargo vendor --locked --versioned-dirs "$tmp/vendor" >/dev/null
+
+# Run outside the repository so Cargo does not discover .cargo/config.toml's
+# deliberately offline crates-io replacement. Refresh is the sole networked
+# operation; validation and all production builds below remain offline.
+(
+  cd "$tmp"
+  CARGO_NET_OFFLINE=false cargo vendor --locked --versioned-dirs \
+    --manifest-path "$root/Cargo.toml" "$tmp/vendor" >/dev/null
+)
 
 # Cargo must resolve through the committed relative source replacement, never an
 # absolute path printed by cargo vendor for this temporary destination.

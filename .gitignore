@@ -1,6 +1,10 @@
 # Rust build outputs (.2+ Cargo workspace)
 /target/
 **/target/
+# Vendored crates may contain source directories named `target` (cc does).
+# Their checksum manifests require those files to remain committed.
+!vendor/**/target/
+!vendor/**/target/**
 # NOTE: Cargo.lock IS committed (this workspace ships daemons/binaries + the C ABI;
 # pinned deps are part of the "own the substrate, reproducible from pinned sources"
 # ethos). It is intentionally NOT ignored.
