@@ -196,8 +196,19 @@ jobs:
             -p pf-framehost-wayland
 
       - name: GNU AArch64 staticlib SDK link smoke
+        env:
+          # Ubuntu packages use aarch64-linux-gnu-*; the owned build container
+          # keeps its pinned aarch64-none-linux-gnu-* defaults.
+          PF_AARCH64_GNU_CC: aarch64-linux-gnu-gcc
+          PF_AARCH64_GNU_READELF: aarch64-linux-gnu-readelf
         working-directory: runtime
         run: |
+          if ! command -v "$PF_AARCH64_GNU_CC" >/dev/null 2>&1 || \
+             ! command -v "$PF_AARCH64_GNU_READELF" >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends \
+              gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu
+          fi
           SOURCE_DATE_EPOCH="$(git show -s --format=%ct HEAD)" ctest/run-aarch64.sh
 
       # LINT GATE (tsp-7rts). Until this step existed, no workflow in this repo ran
