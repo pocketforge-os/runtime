@@ -118,6 +118,47 @@ impl Evdev {
             .all(|code| bits[*code as usize / 8] & (1 << (*code % 8)) != 0))
     }
 
+    /// Return the requested source key codes that are physically down now.
+    pub fn pressed_keys(&self, codes: &[u16]) -> io::Result<Vec<u16>> {
+        if codes.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut bits = vec![0u8; (codes.iter().copied().max().unwrap() as usize / 8) + 1];
+        // SAFETY: bits is writable for the request's encoded length and fd is live.
+        let rc = unsafe {
+            libc::ioctl(
+                self.fd.as_raw_fd(),
+                ioc::eviocgkey(bits.len()),
+                bits.as_mut_ptr(),
+            )
+        };
+        if rc < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(codes
+            .iter()
+            .copied()
+            .filter(|code| bits[*code as usize / 8] & (1 << (*code % 8)) != 0)
+            .collect())
+    }
+
+    /// Read the current value of one absolute axis.
+    pub fn abs_value(&self, code: u16) -> io::Result<i32> {
+        let mut info: libc::input_absinfo = unsafe { std::mem::zeroed() };
+        // SAFETY: info is a valid input_absinfo-sized output buffer and fd is live.
+        let rc = unsafe {
+            libc::ioctl(
+                self.fd.as_raw_fd(),
+                ioc::eviocgabs(code),
+                &mut info as *mut libc::input_absinfo,
+            )
+        };
+        if rc < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(info.value)
+    }
+
     /// Read up to `out.len()` pending events into `out`; returns the count read (0 on `EAGAIN`,
     /// i.e. nothing pending right now — the device is non-blocking).
     pub fn read_events(&self, out: &mut [libc::input_event]) -> io::Result<usize> {

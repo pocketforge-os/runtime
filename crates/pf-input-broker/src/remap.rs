@@ -376,6 +376,27 @@ impl Remap {
             value: now_pressed as i32,
         }
     }
+
+    /// Convert an authoritative post-SYN_DROPPED axis value to virtual state. Unlike normal
+    /// event classification this always returns a binary trigger's current logical value.
+    pub(crate) fn resync_abs(&mut self, abs_code: u16, value: i32) -> AbsAction {
+        let Some(bt) = self.binary.get(&abs_code).copied() else {
+            return AbsAction::Passthrough;
+        };
+        let was_pressed = self.binary_state.get(&abs_code).copied().unwrap_or(false);
+        let pressed = if value >= bt.high {
+            true
+        } else if value <= bt.low {
+            false
+        } else {
+            was_pressed
+        };
+        self.binary_state.insert(abs_code, pressed);
+        AbsAction::Button {
+            code: bt.btn,
+            value: pressed as i32,
+        }
+    }
 }
 
 #[cfg(test)]

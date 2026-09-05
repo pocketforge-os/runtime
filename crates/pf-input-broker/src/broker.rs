@@ -3,7 +3,7 @@
 //! policy into a uinput re-emit device the app reads. The app gets the re-emit read fd via
 //! `Acquire("input")` over a Unix socket (`SCM_RIGHTS`); it can no longer reach the real node.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -55,6 +55,7 @@ pub struct InputBroker {
     pending_report_oversized: bool,
     resynchronizing: bool,
     pressed: HashSet<u16>,
+    abs_state: HashMap<u16, i32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -152,6 +153,13 @@ impl InputBroker {
             },
             |_| Uinput::create(remap.spec()),
         )?;
+        // The legacy uinput setup initializes every advertised ABS value to zero.
+        let abs_state = remap
+            .spec()
+            .abs
+            .iter()
+            .map(|(code, _)| (*code, 0))
+            .collect();
         Ok(InputBroker {
             source,
             sink,
@@ -162,6 +170,7 @@ impl InputBroker {
             pending_report_oversized: false,
             resynchronizing: false,
             pressed: HashSet::new(),
+            abs_state,
         })
     }
 
@@ -243,20 +252,20 @@ impl InputBroker {
         for ev in &buf[..n] {
             let t = ev.type_;
             if t == ioc::EV_SYN && ev.code == ioc::SYN_DROPPED {
-                let out = resynchronize_after_drop(
-                    &mut self.pending_report,
-                    &mut self.pending_report_oversized,
-                    &mut self.pressed,
-                );
-                for (ty, code, value) in out {
-                    self.sink.emit(ty, code, value)?;
-                    emitted += 1;
-                }
+                self.pending_report.clear();
+                self.pending_report_oversized = false;
                 self.resynchronizing = true;
-            } else if discard_dropped_tail(&mut self.resynchronizing, t, ev.code) {
+            } else if self.resynchronizing {
                 // Events following SYN_DROPPED belong to the unreliable tail of the overrun.
-                // Resume only after its boundary; the next report starts from a clean state.
-                continue;
+                // Once its boundary arrives, query authoritative state before accepting reports.
+                if t == ioc::EV_SYN && ev.code == ioc::SYN_REPORT {
+                    let out = self.resynchronize_source_state()?;
+                    for (ty, code, value) in out {
+                        self.sink.emit(ty, code, value)?;
+                        emitted += 1;
+                    }
+                    self.resynchronizing = false;
+                }
             } else if t == ioc::EV_SYN && ev.code == ioc::SYN_REPORT {
                 let allowed = self.bucket.allow(now);
                 let out = finish_report(
@@ -267,6 +276,9 @@ impl InputBroker {
                 );
                 for (ty, code, value) in out {
                     self.sink.emit(ty, code, value)?;
+                    if ty == ioc::EV_ABS {
+                        self.abs_state.insert(code, value);
+                    }
                     emitted += 1;
                 }
             } else if t == ioc::EV_KEY {
@@ -299,6 +311,38 @@ impl InputBroker {
             // Other event types are outside the descriptor-controlled input surface.
         }
         Ok(emitted)
+    }
+
+    fn resynchronize_source_state(&mut self) -> io::Result<Vec<(u16, u16, i32)>> {
+        let actual_pressed: HashSet<u16> = self
+            .source
+            .pressed_keys(self.remap.required_source_keys())?
+            .into_iter()
+            .map(|code| self.remap.remap_key(code))
+            .collect();
+        let abs_values = self
+            .remap
+            .required_source_abs()
+            .iter()
+            .copied()
+            .map(|code| self.source.abs_value(code).map(|value| (code, value)))
+            .collect::<io::Result<Vec<_>>>()?;
+        let mut actual_abs = Vec::new();
+        let mut actual_binary = Vec::new();
+        for (code, value) in abs_values {
+            match self.remap.resync_abs(code, value) {
+                AbsAction::Passthrough => actual_abs.push((code, value)),
+                AbsAction::Button { code, value } => actual_binary.push((code, value != 0)),
+                AbsAction::None => unreachable!("resync_abs always yields authoritative state"),
+            }
+        }
+        Ok(diff_resynchronized_state(
+            &mut self.pressed,
+            &mut self.abs_state,
+            actual_pressed,
+            actual_abs,
+            actual_binary,
+        ))
     }
 
     /// Block up to `timeout_ms` for the source to become readable. `true` if events are pending.
@@ -394,35 +438,40 @@ fn finish_report(
     out
 }
 
-fn resynchronize_after_drop(
-    pending: &mut Vec<(u16, u16, i32)>,
-    oversized: &mut bool,
+fn diff_resynchronized_state(
     pressed: &mut HashSet<u16>,
+    abs_state: &mut HashMap<u16, i32>,
+    mut actual_pressed: HashSet<u16>,
+    actual_abs: Vec<(u16, i32)>,
+    actual_binary: Vec<(u16, bool)>,
 ) -> Vec<(u16, u16, i32)> {
-    pending.clear();
-    *oversized = false;
-    // State may have changed in the events the kernel discarded. Releasing every key that we
-    // exposed is the safe resynchronization available without trusting that lost transition.
-    let mut releases: Vec<_> = pressed.drain().collect();
-    releases.sort_unstable();
-    let mut out: Vec<_> = releases
-        .into_iter()
-        .map(|code| (ioc::EV_KEY, code, 0))
+    for (code, down) in actual_binary {
+        if down {
+            actual_pressed.insert(code);
+        } else {
+            actual_pressed.remove(&code);
+        }
+    }
+    let mut changed_keys: Vec<_> = pressed
+        .symmetric_difference(&actual_pressed)
+        .copied()
         .collect();
+    changed_keys.sort_unstable();
+    let mut out: Vec<_> = changed_keys
+        .into_iter()
+        .map(|code| (ioc::EV_KEY, code, i32::from(actual_pressed.contains(&code))))
+        .collect();
+    *pressed = actual_pressed;
+    for (code, value) in actual_abs {
+        if abs_state.get(&code) != Some(&value) {
+            out.push((ioc::EV_ABS, code, value));
+            abs_state.insert(code, value);
+        }
+    }
     if !out.is_empty() {
         out.push((ioc::EV_SYN, ioc::SYN_REPORT, 0));
     }
     out
-}
-
-fn discard_dropped_tail(resynchronizing: &mut bool, event_type: u16, code: u16) -> bool {
-    if !*resynchronizing {
-        return false;
-    }
-    if event_type == ioc::EV_SYN && code == ioc::SYN_REPORT {
-        *resynchronizing = false;
-    }
-    true
 }
 
 fn push_report_event(
@@ -574,45 +623,49 @@ mod readiness_tests {
     }
 
     #[test]
-    fn syn_dropped_discards_partial_report_and_releases_visible_keys() {
+    fn syn_dropped_resyncs_actual_keys_and_axes_without_stale_state() {
         let mut pressed = HashSet::from([0x130, 0x131]);
-        let mut oversized = true;
-        let mut report = vec![(ioc::EV_KEY, 0x132, 1), (ioc::EV_ABS, 0, 99)];
+        let mut abs = HashMap::from([(0, 10), (1, 20)]);
         assert_eq!(
-            resynchronize_after_drop(&mut report, &mut oversized, &mut pressed),
+            diff_resynchronized_state(
+                &mut pressed,
+                &mut abs,
+                HashSet::from([0x130, 0x132]),
+                vec![(0, 10), (1, 99)],
+                vec![],
+            ),
             vec![
-                (ioc::EV_KEY, 0x130, 0),
                 (ioc::EV_KEY, 0x131, 0),
+                (ioc::EV_KEY, 0x132, 1),
+                (ioc::EV_ABS, 1, 99),
                 (ioc::EV_SYN, ioc::SYN_REPORT, 0),
             ]
         );
-        assert!(report.is_empty());
-        assert!(!oversized);
-        assert!(pressed.is_empty());
+        assert_eq!(pressed, HashSet::from([0x130, 0x132]));
+        assert_eq!(abs, HashMap::from([(0, 10), (1, 99)]));
+    }
 
-        let mut resynchronizing = true;
-        assert!(discard_dropped_tail(
-            &mut resynchronizing,
-            ioc::EV_KEY,
-            0x132
-        ));
-        assert!(resynchronizing);
-        assert!(discard_dropped_tail(
-            &mut resynchronizing,
-            ioc::EV_SYN,
-            ioc::SYN_REPORT
-        ));
-        assert!(!resynchronizing);
-        assert!(!discard_dropped_tail(
-            &mut resynchronizing,
-            ioc::EV_KEY,
-            0x132
-        ));
-
-        push_report_event(&mut report, &mut oversized, (ioc::EV_KEY, 0x132, 1));
+    #[test]
+    fn syn_dropped_keeps_key_pressed_across_overrun_and_releases_actual_up_key() {
+        let mut pressed = HashSet::from([0x130, 0x131]);
+        let mut abs = HashMap::new();
         assert_eq!(
-            finish_report(&mut report, &mut oversized, &mut pressed, true),
-            vec![(ioc::EV_KEY, 0x132, 1), (ioc::EV_SYN, ioc::SYN_REPORT, 0)]
+            diff_resynchronized_state(
+                &mut pressed,
+                &mut abs,
+                HashSet::from([0x130]),
+                vec![],
+                vec![],
+            ),
+            vec![(ioc::EV_KEY, 0x131, 0), (ioc::EV_SYN, ioc::SYN_REPORT, 0)]
+        );
+        assert!(
+            pressed.contains(&0x130),
+            "held-across-drop key stays pressed"
+        );
+        assert!(
+            !pressed.contains(&0x131),
+            "key released in dropped tail converges up"
         );
     }
 
