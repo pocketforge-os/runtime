@@ -63,6 +63,7 @@ on:
       - 'Cargo.lock'
       - 'vendor/**'
       - 'scripts/check-vendor.sh'
+      - 'scripts/refresh-vendor.sh'
       - 'scripts/test-check-vendor.sh'
       - 'scripts/build-sdk.sh'
       - '.cargo/config.toml'

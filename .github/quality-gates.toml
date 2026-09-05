@@ -106,7 +106,7 @@ workflow = ".github/workflows/runtime-tests.yml"
 job = "test"
 allow_if = "github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository"
 required_tokens = ["scripts/check-vendor.sh", "scripts/test-check-vendor.sh"]
-guards_paths = ["crates/**", "Cargo.toml", "Cargo.lock", "vendor/**", "scripts/check-vendor.sh"]
+guards_paths = ["crates/**", "Cargo.toml", "Cargo.lock", "vendor/**", "scripts/check-vendor.sh", "scripts/refresh-vendor.sh"]
 should_be_required_check = true
 origin = "tsp-h5ed.6"
 
