@@ -20,6 +20,9 @@ use crate::remap::{AbsAction, Remap};
 use crate::scm;
 use crate::uinput::Uinput;
 
+const MAX_REPORT_EVENTS: usize = 256;
+const ACQUIRE_CLIENT_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
+
 fn wire_err(e: pf_wire::WireError) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, e.to_string())
 }
@@ -49,6 +52,7 @@ pub struct InputBroker {
     bucket: TokenBucket,
     start: std::time::Instant,
     pending_report: Vec<(u16, u16, i32)>,
+    pending_report_oversized: bool,
     pressed: HashSet<u16>,
 }
 
@@ -154,6 +158,7 @@ impl InputBroker {
             bucket: TokenBucket::default_broker(),
             start: std::time::Instant::now(),
             pending_report: Vec::new(),
+            pending_report_oversized: false,
             pressed: HashSet::new(),
         })
     }
@@ -236,23 +241,39 @@ impl InputBroker {
             let t = ev.type_;
             if t == ioc::EV_SYN && ev.code == ioc::SYN_REPORT {
                 let allowed = self.bucket.allow(now);
-                let out = finish_report(&mut self.pending_report, &mut self.pressed, allowed);
+                let out = finish_report(
+                    &mut self.pending_report,
+                    &mut self.pending_report_oversized,
+                    &mut self.pressed,
+                    allowed,
+                );
                 for (ty, code, value) in out {
                     self.sink.emit(ty, code, value)?;
                     emitted += 1;
                 }
             } else if t == ioc::EV_KEY {
-                self.pending_report
-                    .push((t, self.remap.remap_key(ev.code), ev.value));
+                push_report_event(
+                    &mut self.pending_report,
+                    &mut self.pending_report_oversized,
+                    (t, self.remap.remap_key(ev.code), ev.value),
+                );
             } else if t == ioc::EV_ABS {
                 // Analog axes pass through; a physically-binary trigger (semantics="binary") is
                 // reclassified to an EV_KEY press/release on its canonical button (descriptor-driven).
                 match self.remap.classify_abs(ev.code, ev.value) {
                     AbsAction::Passthrough => {
-                        self.pending_report.push((t, ev.code, ev.value));
+                        push_report_event(
+                            &mut self.pending_report,
+                            &mut self.pending_report_oversized,
+                            (t, ev.code, ev.value),
+                        );
                     }
                     AbsAction::Button { code, value } => {
-                        self.pending_report.push((ioc::EV_KEY, code, value));
+                        push_report_event(
+                            &mut self.pending_report,
+                            &mut self.pending_report_oversized,
+                            (ioc::EV_KEY, code, value),
+                        );
                     }
                     AbsAction::None => {} // inside the hysteresis band / no state change — drop
                 }
@@ -308,11 +329,12 @@ impl InputBroker {
 
 fn finish_report(
     pending: &mut Vec<(u16, u16, i32)>,
+    oversized: &mut bool,
     pressed: &mut HashSet<u16>,
     allowed: bool,
 ) -> Vec<(u16, u16, i32)> {
     let mut out = Vec::new();
-    if allowed {
+    if allowed && !*oversized {
         for &(ty, code, value) in pending.iter() {
             if ty == ioc::EV_KEY {
                 if value == 0 {
@@ -331,8 +353,30 @@ fn finish_report(
         out.extend(releases.into_iter().map(|code| (ioc::EV_KEY, code, 0)));
     }
     pending.clear();
-    out.push((ioc::EV_SYN, ioc::SYN_REPORT, 0));
+    *oversized = false;
+    // A rejected report produces no sink write at all unless releases are needed. In that case
+    // the boundary commits those releases atomically. An admitted report always retains its
+    // boundary, including an otherwise-empty report.
+    if allowed || !out.is_empty() {
+        out.push((ioc::EV_SYN, ioc::SYN_REPORT, 0));
+    }
     out
+}
+
+fn push_report_event(
+    pending: &mut Vec<(u16, u16, i32)>,
+    oversized: &mut bool,
+    event: (u16, u16, i32),
+) {
+    if *oversized {
+        return;
+    }
+    if pending.len() == MAX_REPORT_EVENTS {
+        pending.clear();
+        *oversized = true;
+        return;
+    }
+    pending.push(event);
 }
 
 fn acquire_then_create<A, B>(
@@ -389,6 +433,8 @@ pub fn serve_acquire(
 /// Handle one acquisition connection: reply to `Acquire("input")` with `Ok` + the fd; anything
 /// else gets a typed error (this socket only vends input).
 pub fn handle_acquire(mut stream: UnixStream, app_fd_path: &str) -> io::Result<()> {
+    stream.set_read_timeout(Some(ACQUIRE_CLIENT_TIMEOUT))?;
+    stream.set_write_timeout(Some(ACQUIRE_CLIENT_TIMEOUT))?;
     stream.set_nonblocking(false)?;
     let req = match recv_request(&mut stream) {
         Ok(r) => r,
@@ -455,7 +501,7 @@ mod readiness_tests {
         let mut pressed = HashSet::from([0x130]);
         let mut report = vec![(ioc::EV_KEY, 0x130, 0)];
         assert_eq!(
-            finish_report(&mut report, &mut pressed, false),
+            finish_report(&mut report, &mut false, &mut pressed, false),
             vec![(ioc::EV_KEY, 0x130, 0), (ioc::EV_SYN, ioc::SYN_REPORT, 0)]
         );
         assert!(pressed.is_empty());
@@ -466,7 +512,7 @@ mod readiness_tests {
         let mut pressed = HashSet::new();
         let mut report = vec![(ioc::EV_KEY, 0x130, 1), (ioc::EV_ABS, 0, 17)];
         assert_eq!(
-            finish_report(&mut report, &mut pressed, true),
+            finish_report(&mut report, &mut false, &mut pressed, true),
             vec![
                 (ioc::EV_KEY, 0x130, 1),
                 (ioc::EV_ABS, 0, 17),
@@ -474,6 +520,50 @@ mod readiness_tests {
             ]
         );
         assert!(pressed.contains(&0x130));
+    }
+
+    #[test]
+    fn rejected_reports_emit_nothing_after_required_release_commit() {
+        let mut pressed = HashSet::from([0x130]);
+        let mut oversized = false;
+        let mut report = vec![(ioc::EV_KEY, 0x130, 1)];
+        assert_eq!(
+            finish_report(&mut report, &mut oversized, &mut pressed, false),
+            vec![(ioc::EV_KEY, 0x130, 0), (ioc::EV_SYN, ioc::SYN_REPORT, 0)]
+        );
+        for _ in 0..1_000 {
+            report.push((ioc::EV_ABS, 0, 1));
+            assert!(finish_report(&mut report, &mut oversized, &mut pressed, false).is_empty());
+        }
+    }
+
+    #[test]
+    fn oversized_report_is_bounded_released_and_resynchronizes() {
+        let mut pressed = HashSet::from([0x130]);
+        let mut oversized = false;
+        let mut report = Vec::new();
+        for _ in 0..MAX_REPORT_EVENTS + 10_000 {
+            push_report_event(&mut report, &mut oversized, (ioc::EV_ABS, 0, 1));
+        }
+        assert!(oversized);
+        assert!(report.len() <= MAX_REPORT_EVENTS);
+        assert_eq!(
+            finish_report(&mut report, &mut oversized, &mut pressed, true),
+            vec![(ioc::EV_KEY, 0x130, 0), (ioc::EV_SYN, ioc::SYN_REPORT, 0)]
+        );
+        push_report_event(&mut report, &mut oversized, (ioc::EV_KEY, 0x131, 1));
+        assert_eq!(
+            finish_report(&mut report, &mut oversized, &mut pressed, true),
+            vec![(ioc::EV_KEY, 0x131, 1), (ioc::EV_SYN, ioc::SYN_REPORT, 0)]
+        );
+    }
+
+    #[test]
+    fn stalled_acquire_client_is_deadline_bounded() {
+        let (server, _silent_client) = UnixStream::pair().unwrap();
+        let started = std::time::Instant::now();
+        handle_acquire(server, "/unused").unwrap();
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
     }
 
     #[test]

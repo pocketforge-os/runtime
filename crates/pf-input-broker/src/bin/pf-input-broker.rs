@@ -98,25 +98,41 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let _ = pump_tx.send(broker.run(&STOP));
     });
 
-    let result = loop {
-        if let Ok(result) = pump_rx.try_recv() {
-            break result;
-        }
-        if STOP.load(Ordering::Acquire) {
-            break Ok(());
-        }
-        if let Some(listener) = listener.as_ref() {
-            match listener.accept() {
-                Ok((stream, _)) => handle_acquire(stream, &node)?,
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-                Err(e) => break Err(e),
-            }
-        }
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    };
+    let result = supervise(listener.as_ref(), &node, &pump_rx, &STOP);
     STOP.store(true, Ordering::Release);
     let _ = pump.join();
     result.map_err(Into::into)
+}
+
+fn supervise(
+    listener: Option<&UnixListener>,
+    node: &str,
+    pump_rx: &std::sync::mpsc::Receiver<std::io::Result<()>>,
+    stop: &AtomicBool,
+) -> std::io::Result<()> {
+    loop {
+        if let Ok(result) = pump_rx.try_recv() {
+            return result;
+        }
+        if stop.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        if let Some(listener) = listener {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    let node = node.to_owned();
+                    // A silent acquisition client must never hold up pump-failure or signal
+                    // observation. The handler also carries a finite I/O deadline.
+                    std::thread::spawn(move || {
+                        let _ = handle_acquire(stream, &node);
+                    });
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(e) => return Err(e),
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
 }
 
 fn discover_with_timeout(descriptor: &Descriptor) -> std::io::Result<std::path::PathBuf> {
@@ -202,6 +218,50 @@ mod tests {
         let n = receiver.recv(&mut buf).unwrap();
         assert_eq!(&buf[..n], b"READY=1");
         drop(receiver);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn stalled_client_does_not_hide_pump_failure() {
+        let path =
+            std::env::temp_dir().join(format!("pf-input-broker-acquire-{}", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let listener = UnixListener::bind(&path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let _silent_client = std::os::unix::net::UnixStream::connect(&path).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(Err(std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "pump failed",
+        )))
+        .unwrap();
+        let stop = AtomicBool::new(false);
+        let started = std::time::Instant::now();
+        assert_eq!(
+            supervise(Some(&listener), "/unused", &rx, &stop)
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::BrokenPipe
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn stalled_client_does_not_delay_stop_cleanup() {
+        let path = std::env::temp_dir().join(format!(
+            "pf-input-broker-acquire-stop-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let listener = UnixListener::bind(&path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let _silent_client = std::os::unix::net::UnixStream::connect(&path).unwrap();
+        let (_tx, rx) = std::sync::mpsc::channel();
+        let stop = AtomicBool::new(true);
+        let started = std::time::Instant::now();
+        supervise(Some(&listener), "/unused", &rx, &stop).unwrap();
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
         std::fs::remove_file(path).unwrap();
     }
 }
