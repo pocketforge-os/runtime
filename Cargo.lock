@@ -506,6 +506,7 @@ version = "0.0.1"
 dependencies = [
  "cosmic-text",
  "pf-scene",
+ "pf-text-raster",
  "pf-theme",
  "png 0.17.16",
  "serde_json",
@@ -551,6 +552,14 @@ dependencies = [
  "pf-prefsd",
  "pocketforge",
  "serde_json",
+]
+
+[[package]]
+name = "pf-text-raster"
+version = "0.0.1"
+dependencies = [
+ "cosmic-text",
+ "tiny-skia",
 ]
 
 [[package]]

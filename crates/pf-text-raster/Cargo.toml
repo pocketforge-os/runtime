@@ -1,0 +1,17 @@
+[package]
+name = "pf-text-raster"
+description = "Framework-neutral deterministic text measurement and rasterization"
+version.workspace = true
+edition.workspace = true
+rust-version = "1.85"
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[features]
+default = []
+default-fonts = []
+
+[dependencies]
+cosmic-text-tracking = { package = "cosmic-text", version = "0.15", default-features = false, features = ["std", "swash"] }
+tiny-skia = "0.12"
