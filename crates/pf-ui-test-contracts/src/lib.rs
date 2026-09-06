@@ -296,10 +296,10 @@ pub fn assert_weight_ink_monotonicity<S: TextSubstrate>(
             (0.0, 0.0, max_width, 512.0),
         )
         .ink();
-    (heavy_ink >= light_ink).then_some(()).ok_or_else(|| {
+    (heavy_ink > light_ink).then_some(()).ok_or_else(|| {
         ContractError::new(
             "weight_ink_monotonicity",
-            format!("heavy ink {heavy_ink} < light ink {light_ink}"),
+            format!("heavy ink {heavy_ink} not strictly greater than light ink {light_ink}"),
         )
     })
 }
