@@ -55,20 +55,19 @@ pub mod test_support;
 
 use std::sync::Arc;
 
-pub use backend::{Backend, Pose, PoseDelta, PrefValue, RumbleStatus};
+pub use backend::{Appearance, Backend, Pose, PoseDelta, PrefValue, RumbleStatus};
 pub use capability::{
     Accelerometer, Audio, AudioHandle, Capability, CapabilityPresence, Entropy, EntropyHandle,
     Gyroscope, Imu, Input, InputHandle, Leds, LedsHandle, Location, LocationHandle, Magnetometer,
-    Settings, SettingsHandle, SensorHandle, Vibration, VibrationHandle,
+    SensorHandle, Settings, SettingsHandle, Vibration, VibrationHandle,
 };
 pub use descriptor::Descriptor;
 pub use error::{CapError, ConnectError, PermissionState};
 pub use input::{InputAction, InputMap};
 pub use managers::{
     AudioManager, AudioSink, DescriptorTrustProbe, EgressManager, EgressReceipt, EntropyManager,
-    OutputMix,
-    Fix, HardwareProbe, InputManager, LiveProbe, LocationManager, QuotaLedger, SensorManager,
-    SettingsManager, VibrationManager,
+    Fix, HardwareProbe, InputManager, LiveProbe, LocationManager, OutputMix, QuotaLedger,
+    SensorManager, SettingsManager, VibrationManager,
 };
 
 // Re-export the wire crate so reimplementors + the C ABI crate share one definition.
@@ -128,7 +127,8 @@ impl Pf {
         descriptor: Arc<Descriptor>,
         sock_path: impl AsRef<std::path::Path>,
     ) -> Result<Pf, ConnectError> {
-        let backend = backends::BrokerClientBackend::connect(sock_path).map_err(ConnectError::Broker)?;
+        let backend =
+            backends::BrokerClientBackend::connect(sock_path).map_err(ConnectError::Broker)?;
         Ok(Pf::from_parts(descriptor, Arc::new(backend)))
     }
 
@@ -150,6 +150,11 @@ impl Pf {
     /// A shared clone of the backend (handles + managers hold this to call back).
     pub fn backend_arc(&self) -> Arc<dyn Backend> {
         self.backend.clone()
+    }
+
+    /// Read the effective platform appearance.
+    pub fn appearance(&self) -> Appearance {
+        self.backend.appearance()
     }
 
     /// A shared clone of the hardware-probe seam (managers hold this to reconcile presence).
@@ -187,7 +192,10 @@ impl Pf {
 
     /// Two-stage detection: API-present (the type is compiled in) vs hardware-present.
     pub fn has_capability<C: Capability>(&self) -> CapabilityPresence {
-        CapabilityPresence { api: true, hardware: self.backend.is_present(C::NAME) }
+        CapabilityPresence {
+            api: true,
+            hardware: self.backend.is_present(C::NAME),
+        }
     }
 
     /// Convenience: is this capability currently granted (present AND policy-allowed)?
@@ -278,7 +286,10 @@ fn load_descriptor_from_env() -> Result<Descriptor, ConnectError> {
     if let Some(path) = std::env::var_os("PF_DESCRIPTOR") {
         return Descriptor::load(path).map_err(ConnectError::from);
     }
-    if let (Some(id), Some(root)) = (std::env::var_os("PF_DEVICE_ID"), std::env::var_os("PF_PLATFORM")) {
+    if let (Some(id), Some(root)) = (
+        std::env::var_os("PF_DEVICE_ID"),
+        std::env::var_os("PF_PLATFORM"),
+    ) {
         let mut p = std::path::PathBuf::from(root);
         p.push("devices");
         p.push(id);

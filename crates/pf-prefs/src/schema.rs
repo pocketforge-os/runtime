@@ -130,6 +130,14 @@ pub const SCHEMA_VERSION: u64 = 2;
 /// no `/sys/class/backlight`; the apply leg is a hardware-gated follow-on).
 pub const SCHEMA: &[PrefSpec] = &[
     PrefSpec {
+        key: "appearance",
+        kind: PrefKind::Enum {
+            variants: &["light", "dark"],
+        },
+        default: PrefValue::Enum("dark"),
+        doc: "Choose the platform's light or dark presentation.",
+    },
+    PrefSpec {
         key: "textScale",
         kind: PrefKind::Enum {
             variants: &["100%", "125%", "150%", "175%", "200%"],
@@ -286,6 +294,7 @@ mod tests {
 
     #[test]
     fn schema_defaults_match_the_contract() {
+        assert_eq!(spec("appearance").unwrap().default, PrefValue::Enum("dark"));
         assert_eq!(spec("textScale").unwrap().default, PrefValue::Enum("100%"));
         assert_eq!(
             spec("highContrast").unwrap().default,
@@ -316,6 +325,17 @@ mod tests {
             );
         }
         assert!(parse_value("textScale", "110%").is_err());
+    }
+
+    #[test]
+    fn appearance_is_a_closed_light_dark_enum() {
+        for value in ["light", "dark"] {
+            assert_eq!(
+                parse_value("appearance", value).unwrap(),
+                PrefValue::Enum(value)
+            );
+        }
+        assert!(parse_value("appearance", "high-contrast").is_err());
     }
 
     #[test]

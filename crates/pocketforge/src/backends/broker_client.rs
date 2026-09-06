@@ -20,7 +20,7 @@ use std::sync::Mutex;
 
 use pf_wire::{recv_response, send_request, Op, PreferenceKind, Request, Response, RumbleStatus};
 
-use crate::backend::{Backend, Pose};
+use crate::backend::{Appearance, Backend, Pose};
 use crate::backends::scm;
 use crate::error::{CapError, PermissionState};
 
@@ -60,6 +60,17 @@ impl BrokerClientBackend {
 }
 
 impl Backend for BrokerClientBackend {
+    fn appearance(&self) -> Appearance {
+        self.call(&Request::new(Op::GetAppearance, ""))
+            .and_then(|response| match response.flag {
+                0 => Some(Appearance::Light),
+                1 => Some(Appearance::Dark),
+                2 => Some(Appearance::HighContrast),
+                _ => None,
+            })
+            .unwrap_or(Appearance::Dark)
+    }
+
     fn is_present(&self, name: &str) -> bool {
         self.call(&Request::new(Op::IsPresent, name))
             .map(|r| r.flag != 0)

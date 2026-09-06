@@ -117,6 +117,8 @@ pub enum Op {
     SetPose = 9,
     /// Read one system preference by `pref_key`. -> typed preference fields.
     GetPreference = 10,
+    /// Read the effective platform appearance. -> `flag` = light(0), dark(1), contrast(2).
+    GetAppearance = 11,
 }
 
 impl Op {
@@ -132,6 +134,7 @@ impl Op {
             8 => Op::GetPose,
             9 => Op::SetPose,
             10 => Op::GetPreference,
+            11 => Op::GetAppearance,
             _ => {
                 return Err(WireError::BadEnum {
                     field: "op",

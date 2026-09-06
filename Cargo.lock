@@ -602,6 +602,7 @@ dependencies = [
  "libc",
  "pf-prefs",
  "pf-prefsd",
+ "pf-theme",
  "pf-wire",
  "serde",
  "serde_json",

@@ -24,6 +24,25 @@ pub use pf_wire::RumbleStatus;
 // `pf_prefs` directly through the facade.
 pub use pf_prefs::PrefValue;
 
+/// Effective platform appearance exposed to applications.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum Appearance {
+    Light = 0,
+    Dark = 1,
+    HighContrast = 2,
+}
+
+impl From<pf_theme::Base> for Appearance {
+    fn from(base: pf_theme::Base) -> Self {
+        match base {
+            pf_theme::Base::Day => Self::Light,
+            pf_theme::Base::Dusk => Self::Dark,
+            pf_theme::Base::HighContrast => Self::HighContrast,
+        }
+    }
+}
+
 /// A rigid-body pose in human/UI units (degrees, deg/s) — the shape `set_pose`/`get_pose`
 /// exchange. (The full integrating physical model from the sim's `physical_model.py` lands in
 /// `.4`; v0 carries the latest set values, which is enough to prove the contract + the
@@ -121,6 +140,9 @@ pub struct PoseDelta {
 /// identity) are NOT here — those come from the descriptor the client holds directly; the
 /// backend only arbitrates *access, permission, and actuation*.
 pub trait Backend: Send + Sync {
+    /// Read the effective user-selected platform appearance. This is platform state, not a
+    /// grantable capability, and always has the dark schema default available.
+    fn appearance(&self) -> Appearance;
     /// Is the capability present (descriptor + live probe)? Side-effect-free.
     fn is_present(&self, name: &str) -> bool;
     /// Present AND policy-allowed (no consent prompt outstanding). Side-effect-free.

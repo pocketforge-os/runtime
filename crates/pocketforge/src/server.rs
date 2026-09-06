@@ -72,6 +72,10 @@ pub fn handle_request(backend: &dyn Backend, req: &Request) -> Response {
             None => Response::err(Status::Unsupported),
         },
         Op::GetPreference => get_preference(&req.pref_key),
+        Op::GetAppearance => Response {
+            flag: backend.appearance() as u64,
+            ..Response::ok()
+        },
     }
 }
 

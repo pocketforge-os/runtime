@@ -37,7 +37,8 @@ preference half.
 | key              | type            | default | notes                                                        |
 |------------------|-----------------|---------|--------------------------------------------------------------|
 | `textScale`      | enum steps through `200%` | `100%` | Requested shell text scale. |
-| `highContrast`   | bool            | `false` | Requested high-contrast shell presentation. |
+| `appearance`     | enum            | `dark`  | Platform light/dark presentation (`light`, `dark`). |
+| `highContrast`   | bool            | `false` | Requested high-contrast overlay (wins over appearance). |
 | `reduceMotion`   | bool            | `false` | Suppress non-essential cosmetic motion.                      |
 | `reduceFlashing` | bool            | `false` | Suppress non-essential flashing effects. |
 | `hapticsEnabled` | bool            | `true`  | Allow haptics; off ⇒ rumble is a silent no-op at the primitive. Matches the merged in-memory default. |

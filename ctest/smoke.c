@@ -33,6 +33,9 @@ int main(int argc, char **argv) {
     CHECK(pf != NULL, "pf_connect_descriptor(a133) succeeds");
     if (!pf) return 1;
 
+    CHECK(pf_appearance(pf) == PF_APPEARANCE_DARK,
+          "fresh in-process session uses dark platform appearance");
+
     /* input is always present */
     CHECK(pf_is_present(pf, "input") == 1, "input present");
 

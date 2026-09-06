@@ -4,6 +4,13 @@ use serde_json::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+#[test]
+fn appearance_keys_are_public_and_stable() {
+    assert_eq!(Base::Day.key(), "light");
+    assert_eq!(Base::Dusk.key(), "dark");
+    assert_eq!(Base::HighContrast.key(), "high-contrast");
+}
+
 fn crate_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }

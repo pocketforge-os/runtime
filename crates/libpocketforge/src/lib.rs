@@ -57,6 +57,15 @@ pub const PF_RUMBLE_NOOP_ABSENT: i32 = 1;
 /// `pf_rumble_pulse`: motor present but haptics suppressed.
 pub const PF_RUMBLE_NOOP_SUPPRESSED: i32 = 2;
 
+/// Effective platform appearance (matches `PfAppearance` in the public header).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
+pub enum PfAppearance {
+    Light = 0,
+    Dark = 1,
+    HighContrast = 2,
+}
+
 fn cap_err_code(e: pf::CapError) -> i32 {
     e.code() as i32
 }
@@ -266,6 +275,23 @@ pub unsafe extern "C" fn pf_preference_scalar(
     }
 }
 
+/// Read the effective platform appearance. A NULL session safely resolves to dark.
+/// Applications poll this at startup and again on resume, foreground, or settings exit.
+///
+/// # Safety
+/// `s` must be NULL or a pointer from `pf_connect*` that has not been freed.
+#[no_mangle]
+pub unsafe extern "C" fn pf_appearance(s: *const PfSession) -> PfAppearance {
+    let Some(sess) = s.as_ref() else {
+        return PfAppearance::Dark;
+    };
+    match sess.pf.appearance() {
+        pf::Appearance::Light => PfAppearance::Light,
+        pf::Appearance::Dark => PfAppearance::Dark,
+        pf::Appearance::HighContrast => PfAppearance::HighContrast,
+    }
+}
+
 /// Fill `buf[0..len]` with CSPRNG bytes (ungated entropy). Returns 0 on success, -1 on error.
 ///
 /// # Safety
@@ -304,4 +330,69 @@ pub extern "C" fn pf_strerror(status: i32) -> *const c_char {
         _ => c"unknown",
     };
     s.as_ptr()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::net::UnixStream;
+    use std::sync::Arc;
+
+    use pf::backends::{BrokerClientBackend, InProcessBackend};
+    use pf::{Backend, PrefValue};
+
+    fn descriptor() -> Arc<Descriptor> {
+        Arc::new(
+            Descriptor::from_toml(
+                r#"
+[identity]
+id = "c-appearance-test"
+manufacturer = "PocketForge"
+model = "Test"
+sdl_guid = "00000000000000000000000000000000"
+"#,
+            )
+            .unwrap(),
+        )
+    }
+
+    fn assert_c_values(backend: &InProcessBackend, session: &PfSession) {
+        unsafe {
+            assert_eq!(pf_appearance(session), PfAppearance::Dark);
+            backend.set_preference("appearance", PrefValue::Enum("light"));
+            assert_eq!(pf_appearance(session), PfAppearance::Light);
+            backend.set_preference_bool("highContrast", true);
+            assert_eq!(pf_appearance(session), PfAppearance::HighContrast);
+        }
+    }
+
+    #[test]
+    fn c_appearance_covers_all_values_in_process_and_broker() {
+        let inproc = InProcessBackend::shared(descriptor());
+        let session = PfSession {
+            pf: Pf::over_in_process(inproc.clone()),
+        };
+        assert_c_values(&inproc, &session);
+
+        let broker_source = InProcessBackend::shared(descriptor());
+        let (client, server_stream) = UnixStream::pair().unwrap();
+        let server_backend = broker_source.clone();
+        let server = std::thread::spawn(move || {
+            pf::server::serve_connection(&*server_backend, server_stream).unwrap()
+        });
+        let session = PfSession {
+            pf: Pf::with_backend(
+                descriptor(),
+                Arc::new(BrokerClientBackend::from_stream(client)),
+            ),
+        };
+        assert_c_values(&broker_source, &session);
+        drop(session);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn c_appearance_null_session_defaults_dark() {
+        assert_eq!(unsafe { pf_appearance(ptr::null()) }, PfAppearance::Dark);
+    }
 }

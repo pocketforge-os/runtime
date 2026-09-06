@@ -209,7 +209,8 @@ impl ResolvedStyleSnapshot {
     }
 }
 impl Base {
-    fn key(self) -> &'static str {
+    /// Stable platform-appearance key used by the preference/facade boundary.
+    pub fn key(self) -> &'static str {
         match self {
             Self::Dusk => "dark",
             Self::Day => "light",

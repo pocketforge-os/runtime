@@ -30,6 +30,7 @@ fn op_discriminants_are_frozen() {
     assert_eq!(Op::GetPose as u8, 8);
     assert_eq!(Op::SetPose as u8, 9);
     assert_eq!(Op::GetPreference as u8, 10);
+    assert_eq!(Op::GetAppearance as u8, 11);
 }
 
 #[test]
@@ -114,6 +115,14 @@ fn canonical_message_encodings_are_frozen() {
         "0000000e080a2a0a6272696768746e657373"
     );
     assert_eq!(hex(&enc_resp(&pref_resp)), "00000006080028023849");
+
+    let appearance_req = Request::new(Op::GetAppearance, "");
+    let appearance_resp = Response {
+        flag: 2,
+        ..Response::ok()
+    };
+    assert_eq!(hex(&enc_req(&appearance_req)), "00000002080b");
+    assert_eq!(hex(&enc_resp(&appearance_resp)), "0000000408001802");
 }
 
 // Written as a fold + `write!` rather than `.map(|x| format!(..)).collect()` so it does not trip

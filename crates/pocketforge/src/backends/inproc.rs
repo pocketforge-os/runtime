@@ -18,7 +18,9 @@ use std::sync::{Arc, Mutex};
 
 use pf_prefs::{PrefValue, Prefs, PrefsStore, SCHEMA};
 
-use crate::backend::{acquire_decision, query_decision, Backend, Pose, PoseDelta, RumbleStatus};
+use crate::backend::{
+    acquire_decision, query_decision, Appearance, Backend, Pose, PoseDelta, RumbleStatus,
+};
 use crate::backends::scm;
 use crate::descriptor::Descriptor;
 use crate::error::{CapError, PermissionState};
@@ -94,14 +96,20 @@ impl InProcessBackend {
         // Tolerant load: a bad/corrupt store must not sink the session — fall back to defaults and
         // report on stderr (the CLI is the surface that shows a typed load error).
         let prefs = store.load().unwrap_or_else(|e| {
-            let _ = writeln!(std::io::stderr(), "pocketforge: prefs load failed ({e}); using defaults");
+            let _ = writeln!(
+                std::io::stderr(),
+                "pocketforge: prefs load failed ({e}); using defaults"
+            );
             Prefs::defaults()
         });
         InProcessBackend {
             descriptor,
             prefs_store: Some(store),
             input_node: None,
-            state: Mutex::new(State { prefs, ..State::default() }),
+            state: Mutex::new(State {
+                prefs,
+                ..State::default()
+            }),
         }
     }
 
@@ -142,7 +150,13 @@ impl InProcessBackend {
     pub fn subscribe(&self, name: &str) -> Receiver<PermissionState> {
         let (tx, rx) = channel();
         let key = name.to_ascii_lowercase();
-        self.state.lock().unwrap().subscribers.entry(key).or_default().push(tx);
+        self.state
+            .lock()
+            .unwrap()
+            .subscribers
+            .entry(key)
+            .or_default()
+            .push(tx);
         rx
     }
 
@@ -155,7 +169,13 @@ impl InProcessBackend {
     /// `brightness`) — NOT lowercased, unlike capability names, so they match the store 1:1.
     pub fn subscribe_preference(&self, name: &str) -> Receiver<PrefValue> {
         let (tx, rx) = channel();
-        self.state.lock().unwrap().pref_subscribers.entry(name.to_string()).or_default().push(tx);
+        self.state
+            .lock()
+            .unwrap()
+            .pref_subscribers
+            .entry(name.to_string())
+            .or_default()
+            .push(tx);
         rx
     }
 
@@ -171,13 +191,19 @@ impl InProcessBackend {
         let change = match st.prefs.set(name, value) {
             Ok(change) => change,
             Err(e) => {
-                let _ = writeln!(std::io::stderr(), "pocketforge: set_preference({name}) rejected: {e}");
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "pocketforge: set_preference({name}) rejected: {e}"
+                );
                 return;
             }
         };
         if let Some(store) = &self.prefs_store {
             if let Err(e) = store.apply(name, value) {
-                let _ = writeln!(std::io::stderr(), "pocketforge: pref persist of {name} failed: {e}");
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "pocketforge: pref persist of {name} failed: {e}"
+                );
             }
         }
         if let Some(change) = change {
@@ -191,7 +217,9 @@ impl InProcessBackend {
     /// observers. It is the honest v0 stand-in for a supervisor file-watch/inotify signal: the
     /// host calls it when it learns the store changed. A store-less backend is a no-op.
     pub fn reload_prefs(&self) {
-        let Some(store) = &self.prefs_store else { return };
+        let Some(store) = &self.prefs_store else {
+            return;
+        };
         let fresh = match store.load() {
             Ok(p) => p,
             Err(e) => {
@@ -233,6 +261,22 @@ fn notify_pref(st: &mut State, key: &str, value: PrefValue) {
 }
 
 impl Backend for InProcessBackend {
+    fn appearance(&self) -> Appearance {
+        let prefs = &self.state.lock().unwrap().prefs;
+        let base = if prefs.get_bool("highContrast").unwrap_or(false) {
+            pf_theme::Base::HighContrast
+        } else if prefs
+            .get_enum("appearance")
+            .unwrap_or(pf_theme::Base::Dusk.key())
+            == pf_theme::Base::Day.key()
+        {
+            pf_theme::Base::Day
+        } else {
+            pf_theme::Base::Dusk
+        };
+        base.into()
+    }
+
     fn is_present(&self, name: &str) -> bool {
         self.present(name)
     }
@@ -327,13 +371,24 @@ impl Backend for InProcessBackend {
     fn get_capability(&self, name: &str) -> Result<Vec<u8>, CapError> {
         self.acquire(name)?;
         let key = name.to_ascii_lowercase();
-        Ok(self.state.lock().unwrap().stored.get(&key).cloned().unwrap_or_default())
+        Ok(self
+            .state
+            .lock()
+            .unwrap()
+            .stored
+            .get(&key)
+            .cloned()
+            .unwrap_or_default())
     }
 
     fn set_capability(&self, name: &str, value: &[u8]) -> Result<(), CapError> {
         self.acquire(name)?;
         let key = name.to_ascii_lowercase();
-        self.state.lock().unwrap().stored.insert(key, value.to_vec());
+        self.state
+            .lock()
+            .unwrap()
+            .stored
+            .insert(key, value.to_vec());
         Ok(())
     }
 
@@ -341,7 +396,12 @@ impl Backend for InProcessBackend {
         // A schema key resolves through the store/schema (stored value, else schema default); an
         // unknown key (not a real preference) falls back to the caller's default — preserving the
         // pre-store trait contract "return default if unset" for names outside the schema.
-        self.state.lock().unwrap().prefs.get_bool(name).unwrap_or(default)
+        self.state
+            .lock()
+            .unwrap()
+            .prefs
+            .get_bool(name)
+            .unwrap_or(default)
     }
 
     fn set_preference_bool(&self, name: &str, value: bool) {
@@ -351,7 +411,12 @@ impl Backend for InProcessBackend {
     fn preference_scalar(&self, name: &str, default: i64) -> i64 {
         // Same resolution as `preference_bool`: a schema scalar (`brightness`) reads through the
         // store/schema; any other name falls back to the caller's default.
-        self.state.lock().unwrap().prefs.get_scalar(name).unwrap_or(default)
+        self.state
+            .lock()
+            .unwrap()
+            .prefs
+            .get_scalar(name)
+            .unwrap_or(default)
     }
 
     fn subscribe_preference(&self, name: &str) -> Option<Receiver<PrefValue>> {

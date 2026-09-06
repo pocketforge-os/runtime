@@ -21,3 +21,4 @@ pf_strerror
 pf_wire_version
 pf_preference_bool
 pf_preference_scalar
+pf_appearance
