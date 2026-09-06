@@ -19,7 +19,8 @@ use std::sync::{Arc, Mutex};
 use pf_prefs::{PrefValue, Prefs, PrefsStore, SCHEMA};
 
 use crate::backend::{
-    acquire_decision, query_decision, Appearance, Backend, Pose, PoseDelta, RumbleStatus,
+    acquire_decision, query_decision, Appearance, AppearanceSource, Backend, Pose, PoseDelta,
+    RumbleStatus,
 };
 use crate::backends::scm;
 use crate::descriptor::Descriptor;
@@ -275,6 +276,14 @@ impl Backend for InProcessBackend {
             pf_theme::Base::Dusk
         };
         base.into()
+    }
+
+    fn appearance_source(&self) -> AppearanceSource {
+        if self.state.lock().unwrap().prefs.is_explicit("appearance") {
+            AppearanceSource::User
+        } else {
+            AppearanceSource::Default
+        }
     }
 
     fn is_present(&self, name: &str) -> bool {

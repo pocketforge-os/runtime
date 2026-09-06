@@ -80,6 +80,11 @@ impl Prefs {
         }
     }
 
+    /// Whether a known key was explicitly stored rather than resolved from its schema default.
+    pub fn is_explicit(&self, key: &str) -> bool {
+        self.stored.contains_key(key)
+    }
+
     /// Typed bool read. Errors if the key is unknown or is not a bool preference.
     pub fn get_bool(&self, key: &str) -> Result<bool, PrefError> {
         match self.value(key)? {
@@ -194,6 +199,7 @@ mod tests {
         assert!(!p.mono_audio());
         assert_eq!(p.brightness(), 100);
         assert_eq!(p.source("hapticsEnabled"), Source::Default);
+        assert!(!p.is_explicit("hapticsEnabled"));
     }
 
     #[test]
@@ -210,6 +216,7 @@ mod tests {
         );
         assert!(!p.haptics_enabled());
         assert_eq!(p.source("hapticsEnabled"), Source::Stored);
+        assert!(p.is_explicit("hapticsEnabled"));
     }
 
     #[test]

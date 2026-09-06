@@ -93,6 +93,7 @@ encode(v): while true { b = v & 0x7f; v >>= 7; if v != 0 { b |= 0x80 }; emit(b);
 | 9     | `SetPose`       | `payload` = pose; → `status`, `payload` = new pose |
 | 10    | `GetPreference` | typed preference fields; `NotFound` if unavailable |
 | 11    | `GetAppearance` | `status=Ok`, `flag` = light(0)/dark(1)/high-contrast(2) |
+| 12    | `GetAppearanceSource` | `status=Ok`, `flag` = default(0)/user(1) |
 
 Pose payload is **9 IEEE-754 `binary64` little-endian** values in order
 `yaw, pitch, roll, x, y, z, wx, wy, wz` (orientation in degrees, angular velocity in deg/s,
@@ -108,6 +109,11 @@ subscribe operation in v1, so clients that need freshness should poll on resume.
 `GetAppearance` returns the effective platform presentation, including the winning
 `highContrast` accessibility overlay. It is platform state, not a capability or permission.
 Clients should poll it at startup and on resume, foreground, or return from settings.
+
+`GetAppearanceSource` reports whether the `appearance` key itself is explicitly stored. It is
+independent of the `highContrast` overlay: absent `appearance` returns default(0), while an
+explicit light or dark value returns user(1). An unavailable preference authority degrades to
+default(0).
 
 > **Acquiring INPUT** (added by `.6`): `Acquire` with `name="input"` returns the shared
 > `uinput` device fd out-of-band via `SCM_RIGHTS` on the same socket. The fd, not RPC, is the

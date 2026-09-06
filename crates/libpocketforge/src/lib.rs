@@ -66,6 +66,14 @@ pub enum PfAppearance {
     HighContrast = 2,
 }
 
+/// Whether appearance is defaulted or explicitly selected (matches the public header).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
+pub enum PfAppearanceSource {
+    Default = 0,
+    User = 1,
+}
+
 fn cap_err_code(e: pf::CapError) -> i32 {
     e.code() as i32
 }
@@ -292,6 +300,22 @@ pub unsafe extern "C" fn pf_appearance(s: *const PfSession) -> PfAppearance {
     }
 }
 
+/// Report whether the appearance key is defaulted or explicitly user-selected.
+/// A NULL session safely resolves to the conservative default source.
+///
+/// # Safety
+/// `s` must be NULL or a pointer from `pf_connect*` that has not been freed.
+#[no_mangle]
+pub unsafe extern "C" fn pf_appearance_source(s: *const PfSession) -> PfAppearanceSource {
+    let Some(sess) = s.as_ref() else {
+        return PfAppearanceSource::Default;
+    };
+    match sess.pf.appearance_source() {
+        pf::AppearanceSource::Default => PfAppearanceSource::Default,
+        pf::AppearanceSource::User => PfAppearanceSource::User,
+    }
+}
+
 /// Fill `buf[0..len]` with CSPRNG bytes (ungated entropy). Returns 0 on success, -1 on error.
 ///
 /// # Safety
@@ -361,10 +385,16 @@ sdl_guid = "00000000000000000000000000000000"
     fn assert_c_values(backend: &InProcessBackend, session: &PfSession) {
         unsafe {
             assert_eq!(pf_appearance(session), PfAppearance::Dark);
+            assert_eq!(
+                pf_appearance_source(session),
+                PfAppearanceSource::Default
+            );
             backend.set_preference("appearance", PrefValue::Enum("light"));
             assert_eq!(pf_appearance(session), PfAppearance::Light);
+            assert_eq!(pf_appearance_source(session), PfAppearanceSource::User);
             backend.set_preference_bool("highContrast", true);
             assert_eq!(pf_appearance(session), PfAppearance::HighContrast);
+            assert_eq!(pf_appearance_source(session), PfAppearanceSource::User);
         }
     }
 
@@ -396,6 +426,10 @@ sdl_guid = "00000000000000000000000000000000"
     #[test]
     fn c_appearance_null_session_defaults_dark() {
         assert_eq!(unsafe { pf_appearance(ptr::null()) }, PfAppearance::Dark);
+        assert_eq!(
+            unsafe { pf_appearance_source(ptr::null()) },
+            PfAppearanceSource::Default
+        );
     }
 
     fn wait_for_socket(path: &std::path::Path, child: &mut Child) {

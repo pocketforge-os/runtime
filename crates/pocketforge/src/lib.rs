@@ -55,7 +55,9 @@ pub mod test_support;
 
 use std::sync::Arc;
 
-pub use backend::{Appearance, Backend, Pose, PoseDelta, PrefValue, RumbleStatus};
+pub use backend::{
+    Appearance, AppearanceSource, Backend, Pose, PoseDelta, PrefValue, RumbleStatus,
+};
 pub use capability::{
     Accelerometer, Audio, AudioHandle, Capability, CapabilityPresence, Entropy, EntropyHandle,
     Gyroscope, Imu, Input, InputHandle, Leds, LedsHandle, Location, LocationHandle, Magnetometer,
@@ -155,6 +157,11 @@ impl Pf {
     /// Read the effective platform appearance.
     pub fn appearance(&self) -> Appearance {
         self.backend.appearance()
+    }
+
+    /// Report whether the appearance preference is defaulted or explicitly user-selected.
+    pub fn appearance_source(&self) -> AppearanceSource {
+        self.backend.appearance_source()
     }
 
     /// A shared clone of the hardware-probe seam (managers hold this to reconcile presence).
