@@ -9,12 +9,15 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
-cosmic-text-tracking = { package = "cosmic-text", version = "0.15", default-features = false, features = ["std", "swash"] }
 pf-scene = { workspace = true }
 pf-theme = { workspace = true }
+pf-text-raster = { workspace = true, features = ["default-fonts"] }
 png = "0.17"
 tiny-skia = "0.12"
 serde_json = "1"
 
 [build-dependencies]
 serde_json = "1"
+
+[dev-dependencies]
+cosmic-text-tracking = { package = "cosmic-text", version = "0.15", default-features = false, features = ["std", "swash"] }
