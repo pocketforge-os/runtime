@@ -208,3 +208,15 @@ fn wrap_clip_containment() {
     )
     .unwrap();
 }
+
+#[test]
+fn wrap_clip_containment_fractional_clip() {
+    assert_wrap_clip_containment(
+        &mut Provider::new(),
+        &style(),
+        "many words must wrap and remain clipped",
+        96.0,
+        (3.5, 4.5, 79.25, 54.25),
+    )
+    .unwrap();
+}

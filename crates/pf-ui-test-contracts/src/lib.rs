@@ -382,10 +382,14 @@ pub fn assert_wrap_clip_containment<S: TextSubstrate>(
         ));
     }
     if let Some((x0, y0, x1, y1)) = raster.ink_bounds() {
-        if x0 as f32 + EPSILON < clip.0
-            || y0 as f32 + EPSILON < clip.1
-            || x1 as f32 > clip.0 + clip.2 + EPSILON
-            || y1 as f32 > clip.1 + clip.3 + EPSILON
+        let clip_left = clip.0.floor() as i32;
+        let clip_top = clip.1.floor() as i32;
+        let clip_right = (clip.0 + clip.2).ceil() as i32;
+        let clip_bottom = (clip.1 + clip.3).ceil() as i32;
+        if (x0 as i32) < clip_left
+            || (y0 as i32) < clip_top
+            || ((x1 - 1) as i32) >= clip_right
+            || ((y1 - 1) as i32) >= clip_bottom
         {
             return Err(ContractError::new(
                 "wrap_clip_containment",
