@@ -21,6 +21,7 @@ members = [
     "crates/pf-input-map",
     "crates/pf-render",
     "crates/pf-text-raster",
+    "crates/pf-ui-test-contracts",
     "crates/pf-framehost",
     "crates/pf-framehost-wayland",
     "crates/pf-session-authority",
@@ -47,6 +48,7 @@ pf-scene = { path = "crates/pf-scene", version = "0.0.1" }
 pf-input-map = { path = "crates/pf-input-map", version = "0.0.1" }
 pf-render = { path = "crates/pf-render", version = "0.0.1" }
 pf-text-raster = { path = "crates/pf-text-raster", version = "0.0.1" }
+pf-ui-test-contracts = { path = "crates/pf-ui-test-contracts", version = "0.0.1" }
 pf-theme = { path = "crates/pf-theme", version = "0.0.1" }
 pf-framehost-wayland = { path = "crates/pf-framehost-wayland", version = "0.0.1" }
 pf-session-authority = { path = "crates/pf-session-authority", version = "0.0.1" }
