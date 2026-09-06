@@ -315,10 +315,15 @@ pub fn assert_glyph_cache_key_completeness<S: TextSubstrate>(
     }
     for i in 0..keys.len() {
         for j in i + 1..keys.len() {
-            if keys[i] == keys[j] {
+            let bitmap_differs = styles[i].family != styles[j].family
+                || styles[i].size_px != styles[j].size_px
+                || styles[i].weight != styles[j].weight;
+            if bitmap_differs && keys[i] == keys[j] {
                 return Err(ContractError::new(
                     "glyph_cache_key_completeness",
-                    format!("styles {i} and {j} alias"),
+                    format!(
+                        "bitmap-affecting styles {i} and {j} share a glyph-cache key (under-keyed)"
+                    ),
                 ));
             }
         }

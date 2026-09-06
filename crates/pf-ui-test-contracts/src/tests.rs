@@ -190,6 +190,73 @@ fn glyph_cache_key_completeness() {
     c.size_px = 24.0;
     assert_glyph_cache_key_completeness(&mut Provider::new(), &[a, b, c], 'A').unwrap();
 }
+
+#[test]
+fn glyph_cache_key_completeness_allows_layout_only_aliases() {
+    let a = style();
+    let mut line_height = a.clone();
+    line_height.line_height = 1.65;
+    let mut tracking = a.clone();
+    tracking.tracking_em = 0.08;
+
+    let mut provider = Provider::new();
+    let keys = [
+        provider.glyph_cache_key(&a, 'A'),
+        provider.glyph_cache_key(&line_height, 'A'),
+        provider.glyph_cache_key(&tracking, 'A'),
+    ];
+    assert_eq!(keys[0], keys[1]);
+    assert_eq!(keys[0], keys[2]);
+    assert_glyph_cache_key_completeness(&mut provider, &[a, line_height, tracking], 'A').unwrap();
+}
+
+struct UnderKeyedProvider;
+
+impl TextSubstrate for UnderKeyedProvider {
+    fn fresh(&self) -> Self {
+        Self
+    }
+
+    fn measure(
+        &mut self,
+        _style: &TextStyle,
+        _text: &str,
+        _scale: TextScale,
+        _max_width: Option<f32>,
+    ) -> (f32, f32) {
+        unreachable!()
+    }
+
+    fn rasterize(
+        &mut self,
+        _style: &TextStyle,
+        _text: &str,
+        _scale: TextScale,
+        _max_width: f32,
+        _align: TextAlign,
+        _clip: (f32, f32, f32, f32),
+    ) -> Raster {
+        unreachable!()
+    }
+
+    fn glyph_cache_key(&mut self, _style: &TextStyle, glyph: char) -> Vec<u8> {
+        glyph.to_string().into_bytes()
+    }
+}
+
+#[test]
+fn glyph_cache_key_completeness_rejects_bitmap_under_keying() {
+    let a = style();
+    let mut b = a.clone();
+    b.weight = 700;
+
+    let error = assert_glyph_cache_key_completeness(&mut UnderKeyedProvider, &[a, b], 'A')
+        .expect_err("weight differences must select distinct glyph-cache keys");
+    assert_eq!(error.contract(), "glyph_cache_key_completeness");
+    assert!(error
+        .to_string()
+        .contains("bitmap-affecting styles 0 and 1 share a glyph-cache key (under-keyed)"));
+}
 #[test]
 fn tracking_additivity() {
     let a = style();
