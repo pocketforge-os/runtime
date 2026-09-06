@@ -1,0 +1,14 @@
+[package]
+name = "pf-ui-test-contracts"
+description = "Framework-neutral conformance contracts for text substrates"
+version.workspace = true
+edition.workspace = true
+rust-version = "1.85"
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dev-dependencies]
+cosmic-text-tracking = { package = "cosmic-text", version = "0.15", default-features = false, features = ["std", "swash"] }
+pf-text-raster = { workspace = true, features = ["default-fonts"] }
+tiny-skia = "0.12"

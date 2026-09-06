@@ -573,6 +573,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "pf-ui-test-contracts"
+version = "0.0.1"
+dependencies = [
+ "cosmic-text",
+ "pf-text-raster",
+ "tiny-skia",
+]
+
+[[package]]
 name = "pf-wire"
 version = "0.0.1"
 
