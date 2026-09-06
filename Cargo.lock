@@ -310,7 +310,11 @@ checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
 name = "libpocketforge"
 version = "0.0.1"
 dependencies = [
+ "libc",
+ "pf-prefs",
+ "pf-prefsd",
  "pocketforge",
+ "serde_json",
 ]
 
 [[package]]
@@ -602,6 +606,7 @@ dependencies = [
  "libc",
  "pf-prefs",
  "pf-prefsd",
+ "pf-theme",
  "pf-wire",
  "serde",
  "serde_json",

@@ -17,3 +17,9 @@ crate-type = ["staticlib", "cdylib"]
 [dependencies]
 # Renamed so the dep is `pf::` even though this crate's own lib name is also `pocketforge`.
 pf = { package = "pocketforge", path = "../pocketforge" }
+
+[dev-dependencies]
+libc = { workspace = true }
+pf-prefs = { workspace = true }
+pf-prefsd = { workspace = true }
+serde_json = { workspace = true }

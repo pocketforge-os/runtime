@@ -92,8 +92,16 @@ impl EnforcingBackend {
         manifest: &ValidatedManifest,
         quotas: Arc<QuotaLedger>,
     ) -> EnforcingBackend {
-        let allowed = manifest.allowed_caps().map(|c| c.to_ascii_lowercase()).collect();
-        EnforcingBackend { inner, allowed, quotas, portal: None }
+        let allowed = manifest
+            .allowed_caps()
+            .map(|c| c.to_ascii_lowercase())
+            .collect();
+        EnforcingBackend {
+            inner,
+            allowed,
+            quotas,
+            portal: None,
+        }
     }
 
     /// Wrap `inner` with the ceiling + quota ledger AND wire the `.3` consent portal: on a
@@ -111,7 +119,10 @@ impl EnforcingBackend {
         supervisor: Arc<dyn SupervisorAsk>,
         app_name: impl Into<String>,
     ) -> EnforcingBackend {
-        let allowed = manifest.allowed_caps().map(|c| c.to_ascii_lowercase()).collect();
+        let allowed = manifest
+            .allowed_caps()
+            .map(|c| c.to_ascii_lowercase())
+            .collect();
         let portal = ConsentPortal {
             consent_seam: inner.clone(),
             appops,
@@ -210,7 +221,10 @@ impl EnforcingBackend {
                 return Ok(());
             }
             GrantCheck::OnceAvailable => {
-                portal.appops.consume_once(&key).map_err(|_| CapError::ConsentDenied)?;
+                portal
+                    .appops
+                    .consume_once(&key)
+                    .map_err(|_| CapError::ConsentDenied)?;
                 Self::apply_consent_if_changed(portal, &cap_lc, PermissionState::Granted);
                 return Ok(());
             }
@@ -288,6 +302,10 @@ impl EnforcingBackend {
 }
 
 impl Backend for EnforcingBackend {
+    fn appearance(&self) -> pocketforge::Appearance {
+        self.inner.appearance()
+    }
+
     fn is_present(&self, name: &str) -> bool {
         // Honest hardware presence (two-stage hasCapability needs it); presence is not authority.
         self.inner.is_present(name)

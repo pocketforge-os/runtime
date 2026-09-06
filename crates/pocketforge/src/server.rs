@@ -72,6 +72,10 @@ pub fn handle_request(backend: &dyn Backend, req: &Request) -> Response {
             None => Response::err(Status::Unsupported),
         },
         Op::GetPreference => get_preference(&req.pref_key),
+        // Production preference reads are owned by prefsd, not by the broker's capability
+        // backend. Resolve both keys through the same live authority as GetPreference so a
+        // long-running broker observes pf-settings changes on every app poll.
+        Op::GetAppearance => get_appearance(backend),
     }
 }
 
@@ -84,6 +88,47 @@ fn get_preference(key: &str) -> Response {
     get_preference_at(&socket, key)
 }
 
+fn get_appearance(backend: &dyn Backend) -> Response {
+    let Some(socket) = std::env::var_os("PF_PREFSD_SOCK") else {
+        return Response {
+            flag: backend.appearance() as u64,
+            ..Response::ok()
+        };
+    };
+    get_appearance_at(socket)
+}
+
+fn get_appearance_at(socket: impl AsRef<std::path::Path>) -> Response {
+    let values = call_prefsd(
+        socket.as_ref(),
+        &PrefsRequest::GetAll,
+        PREFSD_ROUND_TRIP_TIMEOUT,
+    )
+    .ok()
+    .and_then(|response| match response {
+        PrefsResponse::Values { values } => Some(values),
+        _ => None,
+    })
+    .unwrap_or_default();
+    let flag = if values
+        .get("highContrast")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+    {
+        crate::Appearance::HighContrast as u64
+    } else if values.get("appearance").and_then(serde_json::Value::as_str)
+        == Some(pf_theme::Base::Day.key())
+    {
+        crate::Appearance::Light as u64
+    } else {
+        crate::Appearance::Dark as u64
+    };
+    Response {
+        flag,
+        ..Response::ok()
+    }
+}
+
 fn get_preference_at(socket: impl AsRef<std::path::Path>, key: &str) -> Response {
     get_preference_at_with_timeout(socket, key, PREFSD_ROUND_TRIP_TIMEOUT)
 }
@@ -93,17 +138,10 @@ fn get_preference_at_with_timeout(
     key: &str,
     timeout: Duration,
 ) -> Response {
-    let result = (|| -> Result<PrefsResponse, Box<dyn std::error::Error>> {
-        let mut stream = UnixStream::connect(socket)?;
-        stream.set_read_timeout(Some(timeout))?;
-        stream.set_write_timeout(Some(timeout))?;
-        let body = serde_json::to_vec(&PrefsRequest::Get {
-            key: key.to_owned(),
-        })?;
-        pf_wire::write_frame(&mut stream, &body)?;
-        let body = pf_wire::read_frame(&mut stream)?;
-        Ok(serde_json::from_slice(&body)?)
-    })();
+    let request = PrefsRequest::Get {
+        key: key.to_owned(),
+    };
+    let result = call_prefsd(socket.as_ref(), &request, timeout);
     let mut response = Response::ok();
     if let Ok(PrefsResponse::Value { value }) = result {
         if let Some(value) = value.as_bool() {
@@ -119,6 +157,22 @@ fn get_preference_at_with_timeout(
     }
     // No apply-acknowledgement exists in v1; Response::ok() keeps applied=false.
     response
+}
+
+fn call_prefsd(
+    socket: &std::path::Path,
+    request: &PrefsRequest,
+    timeout: Duration,
+) -> Result<PrefsResponse, Box<dyn std::error::Error>> {
+    (|| {
+        let mut stream = UnixStream::connect(socket)?;
+        stream.set_read_timeout(Some(timeout))?;
+        stream.set_write_timeout(Some(timeout))?;
+        let body = serde_json::to_vec(request)?;
+        pf_wire::write_frame(&mut stream, &body)?;
+        let body = pf_wire::read_frame(&mut stream)?;
+        Ok(serde_json::from_slice(&body)?)
+    })()
 }
 
 /// Serve one connection: a request/response loop until EOF or a protocol error.
@@ -198,6 +252,33 @@ mod tests {
         assert_eq!(brightness.preference_kind, PreferenceKind::Integer);
         assert_eq!(brightness.preference_integer, 73);
         assert!(!brightness.applied);
+        server.join().unwrap();
+        let _ = std::fs::remove_file(socket);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn appearance_is_resolved_from_live_prefsd_values() {
+        let dir = scratch("appearance-forward");
+        let socket = dir.with_extension("sock");
+        let store = PrefsStore::at(&dir);
+        let server = serve_n(&socket, store.clone(), 3);
+
+        assert_eq!(
+            get_appearance_at(&socket).flag,
+            crate::Appearance::Dark as u64
+        );
+        store.apply("appearance", PrefValue::Enum("light")).unwrap();
+        assert_eq!(
+            get_appearance_at(&socket).flag,
+            crate::Appearance::Light as u64
+        );
+        store.apply("highContrast", PrefValue::Bool(true)).unwrap();
+        assert_eq!(
+            get_appearance_at(&socket).flag,
+            crate::Appearance::HighContrast as u64
+        );
+
         server.join().unwrap();
         let _ = std::fs::remove_file(socket);
         let _ = std::fs::remove_dir_all(dir);

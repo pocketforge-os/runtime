@@ -57,6 +57,15 @@ pub const PF_RUMBLE_NOOP_ABSENT: i32 = 1;
 /// `pf_rumble_pulse`: motor present but haptics suppressed.
 pub const PF_RUMBLE_NOOP_SUPPRESSED: i32 = 2;
 
+/// Effective platform appearance (matches `PfAppearance` in the public header).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
+pub enum PfAppearance {
+    Light = 0,
+    Dark = 1,
+    HighContrast = 2,
+}
+
 fn cap_err_code(e: pf::CapError) -> i32 {
     e.code() as i32
 }
@@ -266,6 +275,23 @@ pub unsafe extern "C" fn pf_preference_scalar(
     }
 }
 
+/// Read the effective platform appearance. A NULL session safely resolves to dark.
+/// Applications poll this at startup and again on resume, foreground, or settings exit.
+///
+/// # Safety
+/// `s` must be NULL or a pointer from `pf_connect*` that has not been freed.
+#[no_mangle]
+pub unsafe extern "C" fn pf_appearance(s: *const PfSession) -> PfAppearance {
+    let Some(sess) = s.as_ref() else {
+        return PfAppearance::Dark;
+    };
+    match sess.pf.appearance() {
+        pf::Appearance::Light => PfAppearance::Light,
+        pf::Appearance::Dark => PfAppearance::Dark,
+        pf::Appearance::HighContrast => PfAppearance::HighContrast,
+    }
+}
+
 /// Fill `buf[0..len]` with CSPRNG bytes (ungated entropy). Returns 0 on success, -1 on error.
 ///
 /// # Safety
@@ -304,4 +330,170 @@ pub extern "C" fn pf_strerror(status: i32) -> *const c_char {
         _ => c"unknown",
     };
     s.as_ptr()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::net::{UnixListener, UnixStream};
+    use std::process::{Child, Command, Stdio};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use pf::backends::{BrokerClientBackend, InProcessBackend};
+    use pf::{Backend, PrefValue};
+
+    fn descriptor() -> Arc<Descriptor> {
+        Arc::new(
+            Descriptor::from_toml(
+                r#"
+[identity]
+id = "c-appearance-test"
+manufacturer = "PocketForge"
+model = "Test"
+sdl_guid = "00000000000000000000000000000000"
+"#,
+            )
+            .unwrap(),
+        )
+    }
+
+    fn assert_c_values(backend: &InProcessBackend, session: &PfSession) {
+        unsafe {
+            assert_eq!(pf_appearance(session), PfAppearance::Dark);
+            backend.set_preference("appearance", PrefValue::Enum("light"));
+            assert_eq!(pf_appearance(session), PfAppearance::Light);
+            backend.set_preference_bool("highContrast", true);
+            assert_eq!(pf_appearance(session), PfAppearance::HighContrast);
+        }
+    }
+
+    #[test]
+    fn c_appearance_covers_all_values_in_process_and_broker() {
+        let inproc = InProcessBackend::shared(descriptor());
+        let session = PfSession {
+            pf: Pf::over_in_process(inproc.clone()),
+        };
+        assert_c_values(&inproc, &session);
+
+        let broker_source = InProcessBackend::shared(descriptor());
+        let (client, server_stream) = UnixStream::pair().unwrap();
+        let server_backend = broker_source.clone();
+        let server = std::thread::spawn(move || {
+            pf::server::serve_connection(&*server_backend, server_stream).unwrap()
+        });
+        let session = PfSession {
+            pf: Pf::with_backend(
+                descriptor(),
+                Arc::new(BrokerClientBackend::from_stream(client)),
+            ),
+        };
+        assert_c_values(&broker_source, &session);
+        drop(session);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn c_appearance_null_session_defaults_dark() {
+        assert_eq!(unsafe { pf_appearance(ptr::null()) }, PfAppearance::Dark);
+    }
+
+    fn wait_for_socket(path: &std::path::Path, child: &mut Child) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            assert!(
+                child.try_wait().unwrap().is_none(),
+                "daemon helper exited early"
+            );
+            if path.exists() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("timed out waiting for {}", path.display());
+    }
+
+    fn helper(role: &str, socket: &std::path::Path, state: &std::path::Path) -> Child {
+        Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                &format!("tests::subprocess_{role}_helper"),
+            ])
+            .env("PF_TEST_SOCKET", socket)
+            .env("PF_TEST_STATE", state)
+            .env("PF_PREFSD_SOCK", state.with_extension("prefsd.sock"))
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap()
+    }
+
+    #[test]
+    #[ignore]
+    fn subprocess_prefsd_helper() {
+        let socket = std::path::PathBuf::from(std::env::var_os("PF_TEST_SOCKET").unwrap());
+        let state = std::path::PathBuf::from(std::env::var_os("PF_TEST_STATE").unwrap());
+        let listener = UnixListener::bind(socket).unwrap();
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        pf_prefsd::serve_until(
+            listener,
+            &pf_prefs::PrefsStore::at(state),
+            unsafe { libc::geteuid() },
+            &stop,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    #[ignore]
+    fn subprocess_broker_helper() {
+        let socket = std::path::PathBuf::from(std::env::var_os("PF_TEST_SOCKET").unwrap());
+        let listener = UnixListener::bind(socket).unwrap();
+        let backend: Arc<dyn Backend> = InProcessBackend::shared(descriptor());
+        pf::server::serve(listener, backend).unwrap();
+    }
+
+    #[test]
+    fn c_appearance_tracks_authority_through_out_of_process_broker() {
+        let root = std::env::temp_dir().join(format!(
+            "libpocketforge-appearance-oop-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let state = root.join("state");
+        let prefs_socket = state.with_extension("prefsd.sock");
+        let broker_socket = root.join("broker.sock");
+
+        let mut prefsd = helper("prefsd", &prefs_socket, &state);
+        wait_for_socket(&prefs_socket, &mut prefsd);
+        let mut broker = helper("broker", &broker_socket, &state);
+        wait_for_socket(&broker_socket, &mut broker);
+
+        let session = PfSession {
+            pf: Pf::with_backend(
+                descriptor(),
+                Arc::new(BrokerClientBackend::connect(&broker_socket).unwrap()),
+            ),
+        };
+        let authority = pf_prefsd::Client::new(&prefs_socket);
+        unsafe {
+            assert_eq!(pf_appearance(&session), PfAppearance::Dark);
+            authority
+                .set("appearance", serde_json::Value::String("light".into()))
+                .unwrap();
+            assert_eq!(pf_appearance(&session), PfAppearance::Light);
+            authority
+                .set("highContrast", serde_json::Value::Bool(true))
+                .unwrap();
+            assert_eq!(pf_appearance(&session), PfAppearance::HighContrast);
+        }
+
+        broker.kill().unwrap();
+        prefsd.kill().unwrap();
+        let _ = broker.wait();
+        let _ = prefsd.wait();
+        let _ = std::fs::remove_dir_all(root);
+    }
 }

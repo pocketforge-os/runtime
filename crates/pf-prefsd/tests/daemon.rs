@@ -185,7 +185,8 @@ fn defaults_set_get_all_and_persistence_use_schema_v2() {
     else {
         panic!("get_all did not return values");
     };
-    assert_eq!(values.len(), 7);
+    assert_eq!(values.len(), 8);
+    assert_eq!(values["appearance"], serde_json::json!("dark"));
     assert_eq!(values["hapticsEnabled"], serde_json::json!(true));
 
     let document: serde_json::Value =

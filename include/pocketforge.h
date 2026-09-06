@@ -21,6 +21,12 @@ extern "C" {
 /* Opaque capability session. */
 typedef struct PfSession PfSession;
 
+typedef enum {
+    PF_APPEARANCE_LIGHT = 0,
+    PF_APPEARANCE_DARK = 1,
+    PF_APPEARANCE_HIGH_CONTRAST = 2
+} PfAppearance;
+
 /* Two-stage capability detection (API present vs hardware present). */
 typedef struct {
     int api;       /* 1 if the capability type exists in this build */
@@ -75,6 +81,12 @@ int  pf_entropy_fill(const PfSession *s, uint8_t *buf, size_t len); /* 0 ok, -1 
  */
 int     pf_preference_bool(const PfSession *s, const char *name, int default_value);
 int64_t pf_preference_scalar(const PfSession *s, const char *name, int64_t default_value);
+
+/*
+ * Effective platform appearance. Poll at startup and again on resume, foreground, or return
+ * from settings; ABI v1 intentionally has no appearance change-event channel.
+ */
+PfAppearance pf_appearance(const PfSession *s);
 
 /* Misc. */
 uint32_t    pf_wire_version(void);
