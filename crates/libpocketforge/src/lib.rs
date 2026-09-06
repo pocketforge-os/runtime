@@ -335,8 +335,10 @@ pub extern "C" fn pf_strerror(status: i32) -> *const c_char {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::net::UnixStream;
+    use std::os::unix::net::{UnixListener, UnixStream};
+    use std::process::{Child, Command, Stdio};
     use std::sync::Arc;
+    use std::time::{Duration, Instant};
 
     use pf::backends::{BrokerClientBackend, InProcessBackend};
     use pf::{Backend, PrefValue};
@@ -394,5 +396,104 @@ sdl_guid = "00000000000000000000000000000000"
     #[test]
     fn c_appearance_null_session_defaults_dark() {
         assert_eq!(unsafe { pf_appearance(ptr::null()) }, PfAppearance::Dark);
+    }
+
+    fn wait_for_socket(path: &std::path::Path, child: &mut Child) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            assert!(
+                child.try_wait().unwrap().is_none(),
+                "daemon helper exited early"
+            );
+            if path.exists() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("timed out waiting for {}", path.display());
+    }
+
+    fn helper(role: &str, socket: &std::path::Path, state: &std::path::Path) -> Child {
+        Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                &format!("tests::subprocess_{role}_helper"),
+            ])
+            .env("PF_TEST_SOCKET", socket)
+            .env("PF_TEST_STATE", state)
+            .env("PF_PREFSD_SOCK", state.with_extension("prefsd.sock"))
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap()
+    }
+
+    #[test]
+    #[ignore]
+    fn subprocess_prefsd_helper() {
+        let socket = std::path::PathBuf::from(std::env::var_os("PF_TEST_SOCKET").unwrap());
+        let state = std::path::PathBuf::from(std::env::var_os("PF_TEST_STATE").unwrap());
+        let listener = UnixListener::bind(socket).unwrap();
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        pf_prefsd::serve_until(
+            listener,
+            &pf_prefs::PrefsStore::at(state),
+            unsafe { libc::geteuid() },
+            &stop,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    #[ignore]
+    fn subprocess_broker_helper() {
+        let socket = std::path::PathBuf::from(std::env::var_os("PF_TEST_SOCKET").unwrap());
+        let listener = UnixListener::bind(socket).unwrap();
+        let backend: Arc<dyn Backend> = InProcessBackend::shared(descriptor());
+        pf::server::serve(listener, backend).unwrap();
+    }
+
+    #[test]
+    fn c_appearance_tracks_authority_through_out_of_process_broker() {
+        let root = std::env::temp_dir().join(format!(
+            "libpocketforge-appearance-oop-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let state = root.join("state");
+        let prefs_socket = state.with_extension("prefsd.sock");
+        let broker_socket = root.join("broker.sock");
+
+        let mut prefsd = helper("prefsd", &prefs_socket, &state);
+        wait_for_socket(&prefs_socket, &mut prefsd);
+        let mut broker = helper("broker", &broker_socket, &state);
+        wait_for_socket(&broker_socket, &mut broker);
+
+        let session = PfSession {
+            pf: Pf::with_backend(
+                descriptor(),
+                Arc::new(BrokerClientBackend::connect(&broker_socket).unwrap()),
+            ),
+        };
+        let authority = pf_prefsd::Client::new(&prefs_socket);
+        unsafe {
+            assert_eq!(pf_appearance(&session), PfAppearance::Dark);
+            authority
+                .set("appearance", serde_json::Value::String("light".into()))
+                .unwrap();
+            assert_eq!(pf_appearance(&session), PfAppearance::Light);
+            authority
+                .set("highContrast", serde_json::Value::Bool(true))
+                .unwrap();
+            assert_eq!(pf_appearance(&session), PfAppearance::HighContrast);
+        }
+
+        broker.kill().unwrap();
+        prefsd.kill().unwrap();
+        let _ = broker.wait();
+        let _ = prefsd.wait();
+        let _ = std::fs::remove_dir_all(root);
     }
 }

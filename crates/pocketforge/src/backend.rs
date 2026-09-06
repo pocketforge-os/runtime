@@ -142,7 +142,9 @@ pub struct PoseDelta {
 pub trait Backend: Send + Sync {
     /// Read the effective user-selected platform appearance. This is platform state, not a
     /// grantable capability, and always has the dark schema default available.
-    fn appearance(&self) -> Appearance;
+    fn appearance(&self) -> Appearance {
+        Appearance::Dark
+    }
     /// Is the capability present (descriptor + live probe)? Side-effect-free.
     fn is_present(&self, name: &str) -> bool;
     /// Present AND policy-allowed (no consent prompt outstanding). Side-effect-free.
