@@ -119,6 +119,8 @@ pub enum Op {
     GetPreference = 10,
     /// Read the effective platform appearance. -> `flag` = light(0), dark(1), contrast(2).
     GetAppearance = 11,
+    /// Read whether the appearance preference was explicitly set. -> `flag` = 0/1.
+    GetAppearanceSource = 12,
 }
 
 impl Op {
@@ -135,6 +137,7 @@ impl Op {
             9 => Op::SetPose,
             10 => Op::GetPreference,
             11 => Op::GetAppearance,
+            12 => Op::GetAppearanceSource,
             _ => {
                 return Err(WireError::BadEnum {
                     field: "op",

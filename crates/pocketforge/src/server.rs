@@ -76,6 +76,37 @@ pub fn handle_request(backend: &dyn Backend, req: &Request) -> Response {
         // backend. Resolve both keys through the same live authority as GetPreference so a
         // long-running broker observes pf-settings changes on every app poll.
         Op::GetAppearance => get_appearance(backend),
+        Op::GetAppearanceSource => get_appearance_source(backend),
+    }
+}
+
+fn get_appearance_source(backend: &dyn Backend) -> Response {
+    let Some(socket) = std::env::var_os("PF_PREFSD_SOCK") else {
+        return Response {
+            flag: backend.appearance_source() as u64,
+            ..Response::ok()
+        };
+    };
+    get_appearance_source_at(socket)
+}
+
+fn get_appearance_source_at(socket: impl AsRef<std::path::Path>) -> Response {
+    let flag = call_prefsd(
+        socket.as_ref(),
+        &PrefsRequest::IsExplicit {
+            key: "appearance".into(),
+        },
+        PREFSD_ROUND_TRIP_TIMEOUT,
+    )
+    .ok()
+    .and_then(|response| match response {
+        PrefsResponse::Explicit { explicit } => Some(explicit as u64),
+        _ => None,
+    })
+    .unwrap_or(0);
+    Response {
+        flag,
+        ..Response::ok()
     }
 }
 
@@ -278,6 +309,24 @@ mod tests {
             get_appearance_at(&socket).flag,
             crate::Appearance::HighContrast as u64
         );
+
+        server.join().unwrap();
+        let _ = std::fs::remove_file(socket);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn appearance_source_tracks_only_explicit_appearance_in_live_prefsd() {
+        let dir = scratch("appearance-source-forward");
+        let socket = dir.with_extension("sock");
+        let store = PrefsStore::at(&dir);
+        let server = serve_n(&socket, store.clone(), 3);
+
+        assert_eq!(get_appearance_source_at(&socket).flag, 0);
+        store.apply("appearance", PrefValue::Enum("dark")).unwrap();
+        assert_eq!(get_appearance_source_at(&socket).flag, 1);
+        store.apply("highContrast", PrefValue::Bool(true)).unwrap();
+        assert_eq!(get_appearance_source_at(&socket).flag, 1);
 
         server.join().unwrap();
         let _ = std::fs::remove_file(socket);

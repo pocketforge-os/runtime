@@ -20,6 +20,7 @@ pub const CONNECTION_TIMEOUT: Duration = Duration::from_secs(3);
 pub enum RpcRequest {
     Get { key: String },
     GetAll,
+    IsExplicit { key: String },
     Set { key: String, value: Value },
 }
 
@@ -32,6 +33,9 @@ pub enum RpcResponse {
     },
     Values {
         values: BTreeMap<String, Value>,
+    },
+    Explicit {
+        explicit: bool,
     },
     Ok,
     Error {
@@ -106,6 +110,13 @@ impl Client {
     pub fn get_all(&self) -> Result<BTreeMap<String, Value>, ClientError> {
         match self.call(&RpcRequest::GetAll)? {
             RpcResponse::Values { values } => Ok(values),
+            response => Err(unexpected_response(response)),
+        }
+    }
+
+    pub fn is_explicit(&self, key: &str) -> Result<bool, ClientError> {
+        match self.call(&RpcRequest::IsExplicit { key: key.into() })? {
+            RpcResponse::Explicit { explicit } => Ok(explicit),
             response => Err(unexpected_response(response)),
         }
     }
@@ -313,6 +324,12 @@ fn handle_rpc(store: &PrefsStore, request: RpcRequest) -> RpcResponse {
             .map(|value| RpcResponse::Value {
                 value: value_to_json(value),
             }),
+        RpcRequest::IsExplicit { key } => store
+            .load()
+            .map(|prefs| RpcResponse::Explicit {
+                explicit: prefs.is_explicit(&key),
+            })
+            .map_err(|error| (classify_pref_error(&error), error)),
     };
     result.unwrap_or_else(|(kind, error)| RpcResponse::Error {
         message: error.to_string(),

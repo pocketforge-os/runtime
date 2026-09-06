@@ -33,6 +33,14 @@ pub enum Appearance {
     HighContrast = 2,
 }
 
+/// Whether the appearance key is defaulted or reflects an explicit user choice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum AppearanceSource {
+    Default = 0,
+    User = 1,
+}
+
 impl From<pf_theme::Base> for Appearance {
     fn from(base: pf_theme::Base) -> Self {
         match base {
@@ -144,6 +152,9 @@ pub trait Backend: Send + Sync {
     /// grantable capability, and always has the dark schema default available.
     fn appearance(&self) -> Appearance {
         Appearance::Dark
+    }
+    fn appearance_source(&self) -> AppearanceSource {
+        AppearanceSource::Default
     }
     /// Is the capability present (descriptor + live probe)? Side-effect-free.
     fn is_present(&self, name: &str) -> bool;

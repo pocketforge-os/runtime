@@ -306,6 +306,10 @@ impl Backend for EnforcingBackend {
         self.inner.appearance()
     }
 
+    fn appearance_source(&self) -> pocketforge::AppearanceSource {
+        self.inner.appearance_source()
+    }
+
     fn is_present(&self, name: &str) -> bool {
         // Honest hardware presence (two-stage hasCapability needs it); presence is not authority.
         self.inner.is_present(name)

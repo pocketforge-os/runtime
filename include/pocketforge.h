@@ -27,6 +27,11 @@ typedef enum {
     PF_APPEARANCE_HIGH_CONTRAST = 2
 } PfAppearance;
 
+typedef enum {
+    PF_APPEARANCE_SOURCE_DEFAULT = 0,
+    PF_APPEARANCE_SOURCE_USER = 1
+} PfAppearanceSource;
+
 /* Two-stage capability detection (API present vs hardware present). */
 typedef struct {
     int api;       /* 1 if the capability type exists in this build */
@@ -87,6 +92,9 @@ int64_t pf_preference_scalar(const PfSession *s, const char *name, int64_t defau
  * from settings; ABI v1 intentionally has no appearance change-event channel.
  */
 PfAppearance pf_appearance(const PfSession *s);
+
+/* Whether `appearance` was explicitly selected; conservatively DEFAULT if unavailable. */
+PfAppearanceSource pf_appearance_source(const PfSession *s);
 
 /* Misc. */
 uint32_t    pf_wire_version(void);

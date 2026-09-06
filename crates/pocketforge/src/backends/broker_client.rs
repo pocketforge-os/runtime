@@ -20,7 +20,7 @@ use std::sync::Mutex;
 
 use pf_wire::{recv_response, send_request, Op, PreferenceKind, Request, Response, RumbleStatus};
 
-use crate::backend::{Appearance, Backend, Pose};
+use crate::backend::{Appearance, AppearanceSource, Backend, Pose};
 use crate::backends::scm;
 use crate::error::{CapError, PermissionState};
 
@@ -69,6 +69,16 @@ impl Backend for BrokerClientBackend {
                 _ => None,
             })
             .unwrap_or(Appearance::Dark)
+    }
+
+    fn appearance_source(&self) -> AppearanceSource {
+        self.call(&Request::new(Op::GetAppearanceSource, ""))
+            .and_then(|response| match (response.status, response.flag) {
+                (pf_wire::Status::Ok, 0) => Some(AppearanceSource::Default),
+                (pf_wire::Status::Ok, 1) => Some(AppearanceSource::User),
+                _ => None,
+            })
+            .unwrap_or(AppearanceSource::Default)
     }
 
     fn is_present(&self, name: &str) -> bool {
@@ -252,6 +262,21 @@ mod tests {
 
         let backend = BrokerClientBackend::from_stream(client);
         assert_eq!(backend.appearance(), Appearance::Dark);
+        srv.join().unwrap();
+    }
+
+    #[test]
+    fn appearance_source_defaults_when_broker_rejects_operation() {
+        let (client, server) = UnixStream::pair().unwrap();
+        let srv = std::thread::spawn(move || {
+            let mut server = server;
+            let request = recv_request(&mut server).unwrap();
+            assert_eq!(request.op, Op::GetAppearanceSource);
+            send_response(&mut server, &Response::err(pf_wire::Status::Unsupported)).unwrap();
+        });
+
+        let backend = BrokerClientBackend::from_stream(client);
+        assert_eq!(backend.appearance_source(), AppearanceSource::Default);
         srv.join().unwrap();
     }
 
