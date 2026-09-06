@@ -62,10 +62,10 @@ impl BrokerClientBackend {
 impl Backend for BrokerClientBackend {
     fn appearance(&self) -> Appearance {
         self.call(&Request::new(Op::GetAppearance, ""))
-            .and_then(|response| match response.flag {
-                0 => Some(Appearance::Light),
-                1 => Some(Appearance::Dark),
-                2 => Some(Appearance::HighContrast),
+            .and_then(|response| match (response.status, response.flag) {
+                (pf_wire::Status::Ok, 0) => Some(Appearance::Light),
+                (pf_wire::Status::Ok, 1) => Some(Appearance::Dark),
+                (pf_wire::Status::Ok, 2) => Some(Appearance::HighContrast),
                 _ => None,
             })
             .unwrap_or(Appearance::Dark)
@@ -238,6 +238,21 @@ mod tests {
             send_response(&mut server, &response).unwrap();
         });
         BrokerClientBackend::from_stream(client)
+    }
+
+    #[test]
+    fn appearance_defaults_to_dark_when_broker_rejects_operation() {
+        let (client, server) = UnixStream::pair().unwrap();
+        let srv = std::thread::spawn(move || {
+            let mut server = server;
+            let request = recv_request(&mut server).unwrap();
+            assert_eq!(request.op, Op::GetAppearance);
+            send_response(&mut server, &Response::err(pf_wire::Status::Unsupported)).unwrap();
+        });
+
+        let backend = BrokerClientBackend::from_stream(client);
+        assert_eq!(backend.appearance(), Appearance::Dark);
+        srv.join().unwrap();
     }
 
     #[test]
