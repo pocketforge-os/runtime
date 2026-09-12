@@ -36,6 +36,7 @@ import yaml  # noqa: E402
 
 RUNTIME_TESTS = ".github/workflows/runtime-tests.yml"
 PREFS_E2E = ".github/workflows/prefs-e2e.yml"
+PAYLOAD = "scripts/ci-container.sh"
 
 
 # --------------------------------------------------------------------------- #
@@ -50,7 +51,14 @@ def _dump(root: Path, rel: str, data) -> None:
 
 
 def _test_job(wf):
-    return wf["jobs"]["test"]
+    return wf["jobs"]["rust"]
+
+
+def _payload_replace(root, old, new):
+    path = root / PAYLOAD
+    text = path.read_text()
+    assert old in text, old
+    path.write_text(text.replace(old, new))
 
 
 def _find_step(job, needle):
@@ -70,36 +78,23 @@ def _on(wf):
 # mutations: each returns None and edits the tree in place                    #
 # --------------------------------------------------------------------------- #
 def m_delete_clippy_step(root):
-    wf = _load(root, RUNTIME_TESTS)
-    job = _test_job(wf)
-    i, _ = _find_step(job, "cargo clippy --locked")
-    del job["steps"][i]
-    _dump(root, RUNTIME_TESTS, wf)
+    path = root / PAYLOAD
+    path.write_text("\n".join(l for l in path.read_text().splitlines() if not l.startswith("cargo clippy")))
 
 
 def m_strip_locked_from_metadata(root):
-    wf = _load(root, RUNTIME_TESTS)
-    job = _test_job(wf)
-    i, step = _find_step(job, "cargo metadata")
-    step["run"] = step["run"].replace(" --locked", "")
-    job["steps"][i] = step
-    _dump(root, RUNTIME_TESTS, wf)
+    _payload_replace(root, "cargo metadata --offline --locked", "cargo metadata --offline")
 
 
 def m_continue_on_error_clippy(root):
     wf = _load(root, RUNTIME_TESTS)
     job = _test_job(wf)
-    i, step = _find_step(job, "cargo clippy --locked")
-    step["continue-on-error"] = True
+    job["continue-on-error"] = True
     _dump(root, RUNTIME_TESTS, wf)
 
 
 def m_or_true_clippy(root):
-    wf = _load(root, RUNTIME_TESTS)
-    job = _test_job(wf)
-    i, step = _find_step(job, "cargo clippy --locked")
-    step["run"] = step["run"].rstrip() + " || true\n"
-    _dump(root, RUNTIME_TESTS, wf)
+    _payload_replace(root, "-- -D warnings", "-- -D warnings || true")
 
 
 def m_path_exclude_crates(root):
@@ -110,11 +105,7 @@ def m_path_exclude_crates(root):
 
 
 def m_if_skip_clippy(root):
-    wf = _load(root, RUNTIME_TESTS)
-    job = _test_job(wf)
-    i, step = _find_step(job, "cargo clippy --locked")
-    step["if"] = "${{ false }}"
-    _dump(root, RUNTIME_TESTS, wf)
+    _payload_replace(root, "cargo clippy --locked", "if false; then cargo clippy --locked")
 
 
 def m_change_approved_job_if(root):
@@ -138,11 +129,7 @@ def m_reformat_approved_job_if(root):
 
 
 def m_weaken_clippy_flags(root):
-    wf = _load(root, RUNTIME_TESTS)
-    job = _test_job(wf)
-    i, step = _find_step(job, "cargo clippy --locked")
-    step["run"] = step["run"].replace(" -- -D warnings", "")
-    _dump(root, RUNTIME_TESTS, wf)
+    _payload_replace(root, " -- -D warnings", "")
 
 
 def m_drop_matrix_row(root):
@@ -152,25 +139,47 @@ def m_drop_matrix_row(root):
 
 
 def m_strip_platform_env(root):
-    wf = _load(root, RUNTIME_TESTS)
-    job = _test_job(wf)
-    i, step = _find_step(job, "cargo test --locked --workspace")
-    step.get("env", {}).pop("PF_PLATFORM_DIR", None)
-    if not step.get("env"):
-        step.pop("env", None)
-    _dump(root, RUNTIME_TESTS, wf)
+    _payload_replace(root, '${PF_PLATFORM_DIR:?', '${UNSET_PLATFORM_DIR:?')
 
 
 def m_remove_platform_checkout(root):
     wf = _load(root, RUNTIME_TESTS)
-    job = _test_job(wf)
-    job["steps"] = [
-        s for s in job["steps"]
-        if not (isinstance(s.get("uses"), str)
-                and s["uses"].startswith("actions/checkout")
-                and (s.get("with") or {}).get("repository") == "pocketforge-os/platform")
-    ]
+    # Checkout is owned by the immutable callee: changing it requires changing
+    # its pin, which must invalidate the approved fixture/environment contract.
+    _test_job(wf)["uses"] = _test_job(wf)["uses"].split("@")[0] + "@" + "0" * 40
     _dump(root, RUNTIME_TESTS, wf)
+
+
+def m_mismatch_helper(root):
+    wf = _load(root, RUNTIME_TESTS)
+    _test_job(wf)["with"]["workflow-sha"] = "0" * 40
+    _dump(root, RUNTIME_TESTS, wf)
+
+
+def m_unpinned_image(root):
+    wf = _load(root, RUNTIME_TESTS)
+    _test_job(wf)["with"]["image"] = "ci-rust:latest"
+    _dump(root, RUNTIME_TESTS, wf)
+
+
+def m_bypass_result(root):
+    wf = _load(root, RUNTIME_TESTS)
+    wf["jobs"]["test"]["steps"][0]["run"] = "true"
+    _dump(root, RUNTIME_TESTS, wf)
+
+
+def m_early_success(root):
+    _payload_replace(root, "set -euo pipefail", "set -euo pipefail\nexit 0")
+
+
+def m_script_redirect(root):
+    wf = _load(root, RUNTIME_TESTS)
+    _test_job(wf)["with"]["script"] = "scripts/empty.sh"
+    _dump(root, RUNTIME_TESTS, wf)
+
+
+def m_remove_format(root):
+    _payload_replace(root, "cargo fmt --all -- --check", "echo formatter removed")
 
 
 def m_delete_whole_workflow(root):
@@ -192,6 +201,12 @@ CASES = [
     (m_strip_platform_env,       "[workspace-tests]",             "PF_PLATFORM_DIR unset (VACUOUS skip)"),
     (m_remove_platform_checkout, "[workspace-tests]",             "platform checkout removed (VACUOUS skip)"),
     (m_delete_whole_workflow,    "does not exist",                "whole runtime-tests.yml deleted (EXCLUDED JOB)"),
+    (m_mismatch_helper,          "inputs differ",                  "helper pin differs from approved callee"),
+    (m_unpinned_image,           "inputs differ",                  "mutable image tag substituted"),
+    (m_bypass_result,            "result gate",                    "required-name result gate masks failure"),
+    (m_early_success,            "conditionally skippable",        "payload exits successfully before any tests"),
+    (m_script_redirect,          "inputs differ",                  "caller redirects execution to empty script"),
+    (m_remove_format,            "[format-workspace]",             "whole-workspace format check removed"),
 ]
 
 PASS_CASES = [
@@ -201,6 +216,8 @@ PASS_CASES = [
 
 def _copy_tree(src_root: Path, dst_root: Path):
     shutil.copytree(src_root / ".github", dst_root / ".github")
+    (dst_root / "scripts").mkdir()
+    shutil.copyfile(src_root / PAYLOAD, dst_root / PAYLOAD)
 
 
 def main(argv=None):
