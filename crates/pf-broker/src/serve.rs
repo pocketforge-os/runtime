@@ -40,7 +40,11 @@ pub fn peer_cred(stream: &UnixStream) -> io::Result<PeerCred> {
     if rc < 0 {
         return Err(io::Error::last_os_error());
     }
-    Ok(PeerCred { pid: cred.pid, uid: cred.uid, gid: cred.gid })
+    Ok(PeerCred {
+        pid: cred.pid,
+        uid: cred.uid,
+        gid: cred.gid,
+    })
 }
 
 /// Serve `backend` on `listener` forever (one thread per connection), refusing any peer whose
@@ -99,7 +103,10 @@ fn admit(stream: &UnixStream, allowed_uid: Option<u32>) -> bool {
     let cred = match peer_cred(stream) {
         Ok(c) => c,
         Err(e) => {
-            let _ = writeln!(std::io::stderr(), "pf-broker: SO_PEERCRED failed, refusing: {e}");
+            let _ = writeln!(
+                std::io::stderr(),
+                "pf-broker: SO_PEERCRED failed, refusing: {e}"
+            );
             return false;
         }
     };
@@ -108,7 +115,8 @@ fn admit(stream: &UnixStream, allowed_uid: Option<u32>) -> bool {
             let _ = writeln!(
                 std::io::stderr(),
                 "pf-broker: REFUSED peer pid={} uid={} (expected uid={uid})",
-                cred.pid, cred.uid
+                cred.pid,
+                cred.uid
             );
             return false;
         }

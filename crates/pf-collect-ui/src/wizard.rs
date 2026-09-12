@@ -107,8 +107,8 @@ impl Timing {
             poll_step: engine.poll_step,
             quiet_polls: engine.quiet_polls,
             idle_skip_polls: engine.idle_skip_polls,
-            max_polls: engine.max_polls,                    // runaway guard only
-            control_timeout: control_timeout_from_env(45),  // 45s default; err long
+            max_polls: engine.max_polls, // runaway guard only
+            control_timeout: control_timeout_from_env(45), // 45s default; err long
             drain_polls: engine.drain_polls,
             pre_dwell: Duration::ZERO,
             post_dwell: Duration::ZERO,
@@ -150,7 +150,13 @@ struct StepView<'a> {
 }
 
 /// Render + present one frame from the collector's current state.
-fn present<K: Sink>(sink: &mut K, canvas: &mut Canvas, skin: &SkinSet, collector: &Collector, v: StepView) {
+fn present<K: Sink>(
+    sink: &mut K,
+    canvas: &mut Canvas,
+    skin: &SkinSet,
+    collector: &Collector,
+    v: StepView,
+) {
     let (i, n) = collector.position();
     let st = FrameState {
         title: TITLE,
@@ -174,9 +180,13 @@ fn reprompt_hint(spec: &plan::ControlSpec) -> String {
     // ASCII only — the 5x7 bitmap font has no em-dash (it renders the fallback hollow box, which the
     // owner saw on pass #5). Use a plain hyphen.
     match spec.kind {
-        plan::Kind::Stick => "Almost - roll the stick ONE full circle, touching every edge".to_string(),
+        plan::Kind::Stick => {
+            "Almost - roll the stick ONE full circle, touching every edge".to_string()
+        }
         plan::Kind::HatDir => "Press that D-PAD direction firmly".to_string(),
-        plan::Kind::Hat => "Press the OTHER directions too - I need UP/DOWN and LEFT/RIGHT".to_string(),
+        plan::Kind::Hat => {
+            "Press the OTHER directions too - I need UP/DOWN and LEFT/RIGHT".to_string()
+        }
         _ => format!("Didn't catch that - {}", spec.prompt),
     }
 }
@@ -238,10 +248,29 @@ pub fn drive_live<S: EventSource, K: Sink>(
         let outcome: CommitOutcome;
         loop {
             attempt += 1;
-            let base = if attempt == 1 { spec.prompt.clone() } else { reprompt_hint(&spec) };
+            let base = if attempt == 1 {
+                spec.prompt.clone()
+            } else {
+                reprompt_hint(&spec)
+            };
             let prompt_text = labeled_prompt(base, skin, &spec.id);
-            let status = if attempt == 1 { "PRESS THE HIGHLIGHTED CONTROL" } else { "LET'S TRY THAT ONE AGAIN" };
-            present(sink, &mut canvas, skin, &collector, StepView { active_id: Some(&spec.id), prompt: &prompt_text, status, done: false });
+            let status = if attempt == 1 {
+                "PRESS THE HIGHLIGHTED CONTROL"
+            } else {
+                "LET'S TRY THAT ONE AGAIN"
+            };
+            present(
+                sink,
+                &mut canvas,
+                skin,
+                &collector,
+                StepView {
+                    active_id: Some(&spec.id),
+                    prompt: &prompt_text,
+                    status,
+                    done: false,
+                },
+            );
 
             // The ONE completion policy, CONSUMED from the engine — never a second copy here
             // (tsp-bwrg.12). This loop owns rendering and nothing else about when a control is done:
@@ -263,16 +292,40 @@ pub fn drive_live<S: EventSource, K: Sink>(
             let keepalive = std::time::Duration::from_millis(1500);
             while Instant::now() < deadline && iters < timing.max_polls {
                 iters += 1;
-                let evs = src.poll(timing.poll_step).map_err(|e| CollectError::AbsInfo { code: 0, source: e })?;
+                let evs = src
+                    .poll(timing.poll_step)
+                    .map_err(|e| CollectError::AbsInfo { code: 0, source: e })?;
                 let actuated_now = window.observe(&evs, src);
                 if actuated_now && !showed_capturing {
-                    present(sink, &mut canvas, skin, &collector, StepView { active_id: Some(&spec.id), prompt: &prompt_text, status: "CAPTURING...", done: false });
+                    present(
+                        sink,
+                        &mut canvas,
+                        skin,
+                        &collector,
+                        StepView {
+                            active_id: Some(&spec.id),
+                            prompt: &prompt_text,
+                            status: "CAPTURING...",
+                            done: false,
+                        },
+                    );
                     showed_capturing = true;
                     last_present = Instant::now();
                 }
                 // Keep-alive re-present of the idle prompt (see `last_present`/`keepalive` above).
                 if !showed_capturing && last_present.elapsed() >= keepalive {
-                    present(sink, &mut canvas, skin, &collector, StepView { active_id: Some(&spec.id), prompt: &prompt_text, status, done: false });
+                    present(
+                        sink,
+                        &mut canvas,
+                        skin,
+                        &collector,
+                        StepView {
+                            active_id: Some(&spec.id),
+                            prompt: &prompt_text,
+                            status,
+                            done: false,
+                        },
+                    );
                     last_present = Instant::now();
                 }
                 match window.verdict(&cfg) {
@@ -316,12 +369,34 @@ pub fn drive_live<S: EventSource, K: Sink>(
             CommitOutcome::Captured(_) => {
                 let status = ack_status(skin, &spec.id);
                 let ack_prompt = labeled_prompt(spec.prompt.clone(), skin, &spec.id);
-                present(sink, &mut canvas, skin, &collector, StepView { active_id: Some(&spec.id), prompt: &ack_prompt, status: &status, done: collector.is_done() });
+                present(
+                    sink,
+                    &mut canvas,
+                    skin,
+                    &collector,
+                    StepView {
+                        active_id: Some(&spec.id),
+                        prompt: &ack_prompt,
+                        status: &status,
+                        done: collector.is_done(),
+                    },
+                );
             }
             // An optional control that produced nothing is an OMISSION, not a capture — no positive
             // ack (there is nothing "recognized"). Keep the prior neutral advance frame.
             CommitOutcome::Skipped => {
-                present(sink, &mut canvas, skin, &collector, StepView { active_id: None, prompt: &spec.prompt, status: "PRESS THE HIGHLIGHTED CONTROL", done: collector.is_done() });
+                present(
+                    sink,
+                    &mut canvas,
+                    skin,
+                    &collector,
+                    StepView {
+                        active_id: None,
+                        prompt: &spec.prompt,
+                        status: "PRESS THE HIGHLIGHTED CONTROL",
+                        done: collector.is_done(),
+                    },
+                );
             }
         }
         if !timing.post_dwell.is_zero() {
@@ -339,7 +414,18 @@ pub fn drive_live<S: EventSource, K: Sink>(
         }
     }
 
-    present(sink, &mut canvas, skin, &collector, StepView { active_id: None, prompt: "COLLECTION COMPLETE", status: "EMITTING CANDIDATE CAPABILITIES.TOML", done: true });
+    present(
+        sink,
+        &mut canvas,
+        skin,
+        &collector,
+        StepView {
+            active_id: None,
+            prompt: "COLLECTION COMPLETE",
+            status: "EMITTING CANDIDATE CAPABILITIES.TOML",
+            done: true,
+        },
+    );
     collector.emit(src, meta)
 }
 
@@ -356,14 +442,36 @@ pub fn drive_demo<K: Sink>(
     let mut canvas = Canvas::new(CANVAS_W as usize, CANVAS_H as usize);
 
     while let Some(spec) = collector.current().cloned() {
-        present(sink, &mut canvas, skin, &collector, StepView { active_id: Some(&spec.id), prompt: &spec.prompt, status: "GUIDED COLLECTION (DEMO) - AUTO-ADVANCING", done: false });
+        present(
+            sink,
+            &mut canvas,
+            skin,
+            &collector,
+            StepView {
+                active_id: Some(&spec.id),
+                prompt: &spec.prompt,
+                status: "GUIDED COLLECTION (DEMO) - AUTO-ADVANCING",
+                done: false,
+            },
+        );
         if !timing.pre_dwell.is_zero() {
             std::thread::sleep(timing.pre_dwell);
         }
 
         let evs = synth_events_for(&spec.id);
         if !evs.is_empty() {
-            present(sink, &mut canvas, skin, &collector, StepView { active_id: Some(&spec.id), prompt: &spec.prompt, status: "CAPTURING...", done: false });
+            present(
+                sink,
+                &mut canvas,
+                skin,
+                &collector,
+                StepView {
+                    active_id: Some(&spec.id),
+                    prompt: &spec.prompt,
+                    status: "CAPTURING...",
+                    done: false,
+                },
+            );
             collector.record(&evs);
         }
         let outcome = collector.commit_current(src)?;
@@ -374,10 +482,32 @@ pub fn drive_demo<K: Sink>(
         match outcome {
             CommitOutcome::Captured(_) => {
                 let status = ack_status(skin, &spec.id);
-                present(sink, &mut canvas, skin, &collector, StepView { active_id: Some(&spec.id), prompt: &spec.prompt, status: &status, done: collector.is_done() });
+                present(
+                    sink,
+                    &mut canvas,
+                    skin,
+                    &collector,
+                    StepView {
+                        active_id: Some(&spec.id),
+                        prompt: &spec.prompt,
+                        status: &status,
+                        done: collector.is_done(),
+                    },
+                );
             }
             CommitOutcome::Skipped => {
-                present(sink, &mut canvas, skin, &collector, StepView { active_id: None, prompt: &spec.prompt, status: "GUIDED COLLECTION (DEMO) - AUTO-ADVANCING", done: collector.is_done() });
+                present(
+                    sink,
+                    &mut canvas,
+                    skin,
+                    &collector,
+                    StepView {
+                        active_id: None,
+                        prompt: &spec.prompt,
+                        status: "GUIDED COLLECTION (DEMO) - AUTO-ADVANCING",
+                        done: collector.is_done(),
+                    },
+                );
             }
         }
         if !timing.post_dwell.is_zero() {
@@ -385,17 +515,52 @@ pub fn drive_demo<K: Sink>(
         }
     }
 
-    present(sink, &mut canvas, skin, &collector, StepView { active_id: None, prompt: "COLLECTION COMPLETE", status: "EMITTING CANDIDATE CAPABILITIES.TOML", done: true });
+    present(
+        sink,
+        &mut canvas,
+        skin,
+        &collector,
+        StepView {
+            active_id: None,
+            prompt: "COLLECTION COMPLETE",
+            status: "EMITTING CANDIDATE CAPABILITIES.TOML",
+            done: true,
+        },
+    );
     collector.emit(src, meta)
 }
 
 /// A scripted source shaped like a canonical gamepad — identity + the declared axis ranges the
 /// demo's stick/trigger captures need for `EVIOCGABS`. Used only by the demo/dump paths.
 pub fn demo_source() -> ScriptedSource {
-    let ident = Identity { name: "PocketForge Demo Pad".into(), bus: 0x03, vid: 0x1209, pid: 0xb163, version: 0x0100 };
-    let stick = AbsInfo { min: 0, max: 4095, fuzz: 16, flat: 128, resolution: 0 };
-    let trig = AbsInfo { min: 0, max: 255, fuzz: 0, flat: 0, resolution: 0 };
-    let hat = AbsInfo { min: -1, max: 1, fuzz: 0, flat: 0, resolution: 0 };
+    let ident = Identity {
+        name: "PocketForge Demo Pad".into(),
+        bus: 0x03,
+        vid: 0x1209,
+        pid: 0xb163,
+        version: 0x0100,
+    };
+    let stick = AbsInfo {
+        min: 0,
+        max: 4095,
+        fuzz: 16,
+        flat: 128,
+        resolution: 0,
+    };
+    let trig = AbsInfo {
+        min: 0,
+        max: 255,
+        fuzz: 0,
+        flat: 0,
+        resolution: 0,
+    };
+    let hat = AbsInfo {
+        min: -1,
+        max: 1,
+        fuzz: 0,
+        flat: 0,
+        resolution: 0,
+    };
     ScriptedSource::new(ident)
         .with_abs(0x0, stick) // ABS_X
         .with_abs(0x1, stick) // ABS_Y
@@ -410,7 +575,12 @@ pub fn demo_source() -> ScriptedSource {
 /// The synthetic events a demo press produces for a plan id. Optional controls left with no
 /// hardware (`guide`, `l3`, `r3`) return empty → the engine records them as Skipped (row omitted).
 fn synth_events_for(id: &str) -> Vec<RawEvent> {
-    let btn = |code: u16| vec![RawEvent::new(EV_KEY, code, 1), RawEvent::new(EV_KEY, code, 0)];
+    let btn = |code: u16| {
+        vec![
+            RawEvent::new(EV_KEY, code, 1),
+            RawEvent::new(EV_KEY, code, 0),
+        ]
+    };
     let stick = |xc: u16, yc: u16| {
         let mut v = Vec::new();
         for &val in &[2048, 4095, 2048, 0, 2048] {
@@ -432,10 +602,22 @@ fn synth_events_for(id: &str) -> Vec<RawEvent> {
         "r1" => btn(0x137),
         // Four atomic dpad directions (each a single hat-axis actuation): up/down -> HAT0Y (0x11),
         // left/right -> HAT0X (0x10). They merge to one hat row at emit.
-        "dpad_up" => vec![RawEvent::new(EV_ABS, 0x11, -1), RawEvent::new(EV_ABS, 0x11, 0)],
-        "dpad_down" => vec![RawEvent::new(EV_ABS, 0x11, 1), RawEvent::new(EV_ABS, 0x11, 0)],
-        "dpad_left" => vec![RawEvent::new(EV_ABS, 0x10, -1), RawEvent::new(EV_ABS, 0x10, 0)],
-        "dpad_right" => vec![RawEvent::new(EV_ABS, 0x10, 1), RawEvent::new(EV_ABS, 0x10, 0)],
+        "dpad_up" => vec![
+            RawEvent::new(EV_ABS, 0x11, -1),
+            RawEvent::new(EV_ABS, 0x11, 0),
+        ],
+        "dpad_down" => vec![
+            RawEvent::new(EV_ABS, 0x11, 1),
+            RawEvent::new(EV_ABS, 0x11, 0),
+        ],
+        "dpad_left" => vec![
+            RawEvent::new(EV_ABS, 0x10, -1),
+            RawEvent::new(EV_ABS, 0x10, 0),
+        ],
+        "dpad_right" => vec![
+            RawEvent::new(EV_ABS, 0x10, 1),
+            RawEvent::new(EV_ABS, 0x10, 0),
+        ],
         "lstick" => stick(0x0, 0x1),
         "rstick" => stick(0x3, 0x4),
         // Left trigger realized as a binary BUTTON — the real a133 L2/R2 shape (the MCU reports it
@@ -463,20 +645,43 @@ mod tests {
     // A tiny synthetic skin covering every a133 engine id so compose() never no-ops in the drive.
     fn demo_skin() -> SkinSet {
         let ids = [
-            ("south", "btn_south"), ("east", "btn_east"), ("west", "btn_west"), ("north", "btn_north"),
-            ("select", "btn_select"), ("start", "btn_start"), ("guide", "btn_guide"), ("l1", "btn_l1"),
-            ("r1", "btn_r1"), ("dpad", "dpad"), ("lstick", "stick_l"), ("rstick", "stick_r"),
-            ("ltrig", "trig_l"), ("rtrig", "trig_r"),
+            ("south", "btn_south"),
+            ("east", "btn_east"),
+            ("west", "btn_west"),
+            ("north", "btn_north"),
+            ("select", "btn_select"),
+            ("start", "btn_start"),
+            ("guide", "btn_guide"),
+            ("l1", "btn_l1"),
+            ("r1", "btn_r1"),
+            ("dpad", "dpad"),
+            ("lstick", "stick_l"),
+            ("rstick", "stick_r"),
+            ("ltrig", "trig_l"),
+            ("rtrig", "trig_r"),
         ];
         let body = Rgb::new(60, 30, crate::canvas::rgb(248, 248, 248));
         let lit = Rgb::new(60, 30, crate::canvas::rgb(210, 0, 0));
         let mut parts = HashMap::new();
         let mut map = HashMap::new();
         for (i, (id, part)) in ids.iter().enumerate() {
-            parts.insert(part.to_string(), Rect { x: (i as i64) * 2, y: 0, w: 2, h: 2 });
+            parts.insert(
+                part.to_string(),
+                Rect {
+                    x: (i as i64) * 2,
+                    y: 0,
+                    w: 2,
+                    h: 2,
+                },
+            );
             map.insert(id.to_string(), part.to_string());
         }
-        SkinSet::from_parts(map, View { body, lit, parts }, None, crate::canvas::rgb(248, 248, 248))
+        SkinSet::from_parts(
+            map,
+            View { body, lit, parts },
+            None,
+            crate::canvas::rgb(248, 248, 248),
+        )
     }
 
     #[test]
@@ -489,10 +694,19 @@ mod tests {
         labels.insert("south".to_string(), "B".to_string());
         labels.insert("east".to_string(), "A".to_string());
         let skin = demo_skin().with_labels(labels);
-        assert_eq!(labeled_prompt("Press the BOTTOM face button".into(), &skin, "south"), "Press the BOTTOM face button (B)");
-        assert_eq!(labeled_prompt("Press the RIGHT face button".into(), &skin, "east"), "Press the RIGHT face button (A)");
+        assert_eq!(
+            labeled_prompt("Press the BOTTOM face button".into(), &skin, "south"),
+            "Press the BOTTOM face button (B)"
+        );
+        assert_eq!(
+            labeled_prompt("Press the RIGHT face button".into(), &skin, "east"),
+            "Press the RIGHT face button (A)"
+        );
         // A control the descriptor gives no label keeps its positional prompt unchanged.
-        assert_eq!(labeled_prompt("Press SELECT".into(), &skin, "select"), "Press SELECT");
+        assert_eq!(
+            labeled_prompt("Press SELECT".into(), &skin, "select"),
+            "Press SELECT"
+        );
     }
 
     #[test]
@@ -500,17 +714,42 @@ mod tests {
         let mut src = demo_source();
         let mut sink = CountingSink::default();
         let skin = demo_skin();
-        let meta = DeviceMeta { id: "demopad".into(), manufacturer: "PocketForge".into(), model: "Demo Pad".into() };
-        let timing = Timing { pre_dwell: Duration::ZERO, post_dwell: Duration::ZERO, ..Timing::demo() };
-        let caps = drive_demo(&mut src, &mut sink, &skin, &meta, &timing).expect("demo should emit");
+        let meta = DeviceMeta {
+            id: "demopad".into(),
+            manufacturer: "PocketForge".into(),
+            model: "Demo Pad".into(),
+        };
+        let timing = Timing {
+            pre_dwell: Duration::ZERO,
+            post_dwell: Duration::ZERO,
+            ..Timing::demo()
+        };
+        let caps =
+            drive_demo(&mut src, &mut sink, &skin, &meta, &timing).expect("demo should emit");
 
-        assert!(sink.frames >= 14, "expected a frame per control, got {}", sink.frames);
+        assert!(
+            sink.frames >= 14,
+            "expected a frame per control, got {}",
+            sink.frames
+        );
         let toml = caps.to_toml();
-        assert!(toml.contains("id = \"south\""), "candidate missing south:\n{toml}");
+        assert!(
+            toml.contains("id = \"south\""),
+            "candidate missing south:\n{toml}"
+        );
         assert!(toml.contains("id = \"ltrig\""));
-        assert!(toml.contains("semantics = \"binary\""), "left trigger should classify binary:\n{toml}");
-        assert!(toml.contains("semantics = \"analog\""), "right trigger should classify analog:\n{toml}");
-        assert!(toml.contains("id = \"guide\""), "the MENU button (guide) must be captured, not skipped:\n{toml}");
+        assert!(
+            toml.contains("semantics = \"binary\""),
+            "left trigger should classify binary:\n{toml}"
+        );
+        assert!(
+            toml.contains("semantics = \"analog\""),
+            "right trigger should classify analog:\n{toml}"
+        );
+        assert!(
+            toml.contains("id = \"guide\""),
+            "the MENU button (guide) must be captured, not skipped:\n{toml}"
+        );
     }
 
     /// The re-prompt fix (tsp-bwrg.6): a control that does not capture on the first try (here SOUTH,
@@ -537,25 +776,65 @@ mod tests {
         };
         const EV_ABS: u16 = 0x03;
         const QUIET: usize = 12; // per-control trailing quiet: the settle, THEN the fixed drain
-        let stick = AbsInfo { min: 0, max: 4095, fuzz: 0, flat: 0, resolution: 0 };
-        let hat = AbsInfo { min: -1, max: 1, fuzz: 0, flat: 0, resolution: 0 };
-        let ident = Identity { name: "a133".into(), bus: 3, vid: 0x045e, pid: 0x028e, version: 0x0110 };
+        let stick = AbsInfo {
+            min: 0,
+            max: 4095,
+            fuzz: 0,
+            flat: 0,
+            resolution: 0,
+        };
+        let hat = AbsInfo {
+            min: -1,
+            max: 1,
+            fuzz: 0,
+            flat: 0,
+            resolution: 0,
+        };
+        let ident = Identity {
+            name: "a133".into(),
+            bus: 3,
+            vid: 0x045e,
+            pid: 0x028e,
+            version: 0x0110,
+        };
         let mut src = ScriptedSource::new(ident)
-            .with_abs(0x0, stick).with_abs(0x1, stick).with_abs(0x3, stick).with_abs(0x4, stick)
-            .with_abs(0x10, hat).with_abs(0x11, hat);
-        let press = |code: u16| vec![RawEvent::new(EV_KEY, code, 1), RawEvent::new(EV_KEY, code, 0)];
-        let hatdir = |code: u16, v: i32| vec![RawEvent::new(EV_ABS, code, v), RawEvent::new(EV_ABS, code, 0)];
-        let abs2 = |ca: u16, cb: u16, v: i32| vec![RawEvent::new(EV_ABS, ca, v), RawEvent::new(EV_ABS, cb, v)];
+            .with_abs(0x0, stick)
+            .with_abs(0x1, stick)
+            .with_abs(0x3, stick)
+            .with_abs(0x4, stick)
+            .with_abs(0x10, hat)
+            .with_abs(0x11, hat);
+        let press = |code: u16| {
+            vec![
+                RawEvent::new(EV_KEY, code, 1),
+                RawEvent::new(EV_KEY, code, 0),
+            ]
+        };
+        let hatdir = |code: u16, v: i32| {
+            vec![
+                RawEvent::new(EV_ABS, code, v),
+                RawEvent::new(EV_ABS, code, 0),
+            ]
+        };
+        let abs2 = |ca: u16, cb: u16, v: i32| {
+            vec![RawEvent::new(EV_ABS, ca, v), RawEvent::new(EV_ABS, cb, v)]
+        };
         // max_polls bounds each attempt's window; the FUMBLE is that many quiet polls with no press.
         const MAX_POLLS: usize = 8;
-        let quiet = |s: &mut ScriptedSource, n: usize| { for _ in 0..n { s.push_batch(vec![]); } };
+        let quiet = |s: &mut ScriptedSource, n: usize| {
+            for _ in 0..n {
+                s.push_batch(vec![]);
+            }
+        };
 
         // south — FUMBLE: the window elapses with no activity, forcing NoActivity -> re-prompt ...
         quiet(&mut src, MAX_POLLS);
         // ... then the press lands on the retry.
         src.push_batch(press(BTN_SOUTH));
         quiet(&mut src, QUIET);
-        for code in [BTN_EAST, BTN_WEST, BTN_NORTH, BTN_SELECT, BTN_START, BTN_MODE, BTN_TL, BTN_TR] {
+        for code in [
+            BTN_EAST, BTN_WEST, BTN_NORTH, BTN_SELECT, BTN_START, BTN_MODE, BTN_TL, BTN_TR,
+        ] {
             src.push_batch(press(code));
             quiet(&mut src, QUIET);
         }
@@ -579,21 +858,40 @@ mod tests {
 
         let mut sink = CountingSink::default();
         let skin = demo_skin();
-        let meta = DeviceMeta { id: "a133".into(), manufacturer: "TrimUI".into(), model: "Smart Pro".into() };
+        let meta = DeviceMeta {
+            id: "a133".into(),
+            manufacturer: "TrimUI".into(),
+            model: "Smart Pro".into(),
+        };
         // control_timeout kept short so a mis-fed control fails fast in-test rather than idling 45s.
-        let timing = Timing { max_polls: MAX_POLLS, idle_skip_polls: 1, quiet_polls: 1, post_dwell: Duration::ZERO, control_timeout: Duration::from_secs(2), ..Timing::live() };
+        let timing = Timing {
+            max_polls: MAX_POLLS,
+            idle_skip_polls: 1,
+            quiet_polls: 1,
+            post_dwell: Duration::ZERO,
+            control_timeout: Duration::from_secs(2),
+            ..Timing::live()
+        };
 
         let caps = drive_live(&mut src, &mut sink, &skin, &meta, &timing)
             .expect("a fumbled control must re-prompt and the run must complete, not abort");
         let ids: Vec<&str> = caps.inputs.iter().map(|i| i.id.as_str()).collect();
         // The fumbled south survived the re-prompt, and the MENU/guide button was captured.
-        for want in ["south", "east", "west", "north", "select", "start", "guide", "l1", "r1",
-            "dpad", "lstick", "rstick", "ltrig", "rtrig"]
-        {
-            assert!(ids.contains(&want), "control {want} missing from the completed run: {ids:?}");
+        for want in [
+            "south", "east", "west", "north", "select", "start", "guide", "l1", "r1", "dpad",
+            "lstick", "rstick", "ltrig", "rtrig",
+        ] {
+            assert!(
+                ids.contains(&want),
+                "control {want} missing from the completed run: {ids:?}"
+            );
         }
         // The dpad merged to the two HAT axes — not a stick axis picked up as a direction.
-        let dpad = caps.inputs.iter().find(|i| i.id == "dpad").expect("dpad row");
+        let dpad = caps
+            .inputs
+            .iter()
+            .find(|i| i.id == "dpad")
+            .expect("dpad row");
         assert_eq!(dpad.code, "ABS_HAT0X,ABS_HAT0Y");
     }
 
@@ -626,27 +924,74 @@ mod tests {
     ///    assertion rather than a type-mismatch re-prompt hang (a Button window fed a hat event).
     ///  - `pad`: trailing (press, quiet) pairs so a shifted rtrig still finds a press (the run
     ///    COMPLETES and fails on a wrong code, instead of starving the last control into a hang).
-    fn scripted_a133(fumble_south: bool, quiet_gap: usize, ltrig_gap: usize, fumble_polls: usize, pad: usize) -> ScriptedSource {
+    fn scripted_a133(
+        fumble_south: bool,
+        quiet_gap: usize,
+        ltrig_gap: usize,
+        fumble_polls: usize,
+        pad: usize,
+    ) -> ScriptedSource {
         use pf_input_decode::codes::{
             BTN_EAST, BTN_MODE, BTN_NORTH, BTN_SELECT, BTN_SOUTH, BTN_START, BTN_TL, BTN_TL2,
             BTN_TR, BTN_TR2, BTN_WEST,
         };
         const EV_ABS: u16 = 0x03;
-        let stick = AbsInfo { min: 0, max: 4095, fuzz: 0, flat: 0, resolution: 0 };
-        let hat = AbsInfo { min: -1, max: 1, fuzz: 0, flat: 0, resolution: 0 };
-        let ident = Identity { name: "a133".into(), bus: 3, vid: 0x045e, pid: 0x028e, version: 0x0110 };
+        let stick = AbsInfo {
+            min: 0,
+            max: 4095,
+            fuzz: 0,
+            flat: 0,
+            resolution: 0,
+        };
+        let hat = AbsInfo {
+            min: -1,
+            max: 1,
+            fuzz: 0,
+            flat: 0,
+            resolution: 0,
+        };
+        let ident = Identity {
+            name: "a133".into(),
+            bus: 3,
+            vid: 0x045e,
+            pid: 0x028e,
+            version: 0x0110,
+        };
         let mut src = ScriptedSource::new(ident)
-            .with_abs(0x0, stick).with_abs(0x1, stick).with_abs(0x3, stick).with_abs(0x4, stick)
-            .with_abs(0x10, hat).with_abs(0x11, hat);
-        let press = |code: u16| vec![RawEvent::new(EV_KEY, code, 1), RawEvent::new(EV_KEY, code, 0)];
-        let hatdir = |code: u16, v: i32| vec![RawEvent::new(EV_ABS, code, v), RawEvent::new(EV_ABS, code, 0)];
-        let abs2 = |ca: u16, cb: u16, v: i32| vec![RawEvent::new(EV_ABS, ca, v), RawEvent::new(EV_ABS, cb, v)];
-        let quiet = |s: &mut ScriptedSource, n: usize| { for _ in 0..n { s.push_batch(vec![]); } };
+            .with_abs(0x0, stick)
+            .with_abs(0x1, stick)
+            .with_abs(0x3, stick)
+            .with_abs(0x4, stick)
+            .with_abs(0x10, hat)
+            .with_abs(0x11, hat);
+        let press = |code: u16| {
+            vec![
+                RawEvent::new(EV_KEY, code, 1),
+                RawEvent::new(EV_KEY, code, 0),
+            ]
+        };
+        let hatdir = |code: u16, v: i32| {
+            vec![
+                RawEvent::new(EV_ABS, code, v),
+                RawEvent::new(EV_ABS, code, 0),
+            ]
+        };
+        let abs2 = |ca: u16, cb: u16, v: i32| {
+            vec![RawEvent::new(EV_ABS, ca, v), RawEvent::new(EV_ABS, cb, v)]
+        };
+        let quiet = |s: &mut ScriptedSource, n: usize| {
+            for _ in 0..n {
+                s.push_batch(vec![]);
+            }
+        };
 
         if fumble_south {
             quiet(&mut src, fumble_polls); // south's first window elapses -> re-prompt
         }
-        for code in [BTN_SOUTH, BTN_EAST, BTN_WEST, BTN_NORTH, BTN_SELECT, BTN_START, BTN_MODE, BTN_TL, BTN_TR] {
+        for code in [
+            BTN_SOUTH, BTN_EAST, BTN_WEST, BTN_NORTH, BTN_SELECT, BTN_START, BTN_MODE, BTN_TL,
+            BTN_TR,
+        ] {
             src.push_batch(press(code));
             quiet(&mut src, quiet_gap);
         }
@@ -675,7 +1020,14 @@ mod tests {
     /// so a mis-fed control fails fast in-test rather than idling 45s. `drain_polls` comes from
     /// `Timing::live()` (the engine default, 8) — the value the fixtures are gapped against.
     fn fast_test_timing() -> Timing {
-        Timing { max_polls: 8, idle_skip_polls: 1, quiet_polls: 1, post_dwell: Duration::ZERO, control_timeout: Duration::from_secs(2), ..Timing::live() }
+        Timing {
+            max_polls: 8,
+            idle_skip_polls: 1,
+            quiet_polls: 1,
+            post_dwell: Duration::ZERO,
+            control_timeout: Duration::from_secs(2),
+            ..Timing::live()
+        }
     }
 
     /// tsp-bwrg.15 acceptance #3 — the positive ack is shown ON a successful capture and NOT on the
@@ -700,14 +1052,29 @@ mod tests {
         let mut src = scripted_a133(true, QUIET, QUIET, MAX_POLLS, 0);
         let mut sink = RecordingSink::default();
         let skin = demo_skin(); // no faceplate labels -> the ack falls back to the positional id
-        let meta = DeviceMeta { id: "a133".into(), manufacturer: "TrimUI".into(), model: "Smart Pro".into() };
-        let timing = Timing { max_polls: MAX_POLLS, ..fast_test_timing() };
+        let meta = DeviceMeta {
+            id: "a133".into(),
+            manufacturer: "TrimUI".into(),
+            model: "Smart Pro".into(),
+        };
+        let timing = Timing {
+            max_polls: MAX_POLLS,
+            ..fast_test_timing()
+        };
 
         let caps = drive_live(&mut src, &mut sink, &skin, &meta, &timing)
             .expect("the fumbled south must re-prompt and the run must complete");
-        assert_eq!(caps.inputs.len(), 14, "all 17 prompts collapse to 14 rows (4 dpad dirs merge)"); // sanity
+        assert_eq!(
+            caps.inputs.len(),
+            14,
+            "all 17 prompts collapse to 14 rows (4 dpad dirs merge)"
+        ); // sanity
 
-        let recognized: Vec<&String> = sink.statuses.iter().filter(|s| s.starts_with("RECOGNIZED")).collect();
+        let recognized: Vec<&String> = sink
+            .statuses
+            .iter()
+            .filter(|s| s.starts_with("RECOGNIZED"))
+            .collect();
         assert!(
             !recognized.is_empty(),
             "the wizard emitted NO 'RECOGNIZED' status — success is still silent (pre-change behaviour); \
@@ -721,17 +1088,32 @@ mod tests {
              leaked onto the fumbled south's re-prompt path. acks: {recognized:?}"
         );
         // The re-prompt path was actually exercised (so 'not 18' is a real signal, not luck).
-        let reprompt_at = sink.statuses.iter().position(|s| s == "LET'S TRY THAT ONE AGAIN")
+        let reprompt_at = sink
+            .statuses
+            .iter()
+            .position(|s| s == "LET'S TRY THAT ONE AGAIN")
             .expect("south should have fumbled and shown the re-prompt");
-        let first_ack_at = sink.statuses.iter().position(|s| s.starts_with("RECOGNIZED")).unwrap();
+        let first_ack_at = sink
+            .statuses
+            .iter()
+            .position(|s| s.starts_with("RECOGNIZED"))
+            .unwrap();
         assert!(
             first_ack_at > reprompt_at,
             "the first ack (idx {first_ack_at}) must come AFTER south's re-prompt (idx {reprompt_at}) — \
              it is produced by the CAPTURE, never by the re-prompt"
         );
         // The ack NAMES the control it recognized (acceptance #1).
-        assert!(sink.statuses.iter().any(|s| s == "RECOGNIZED: SOUTH"), "ack should name south: {:?}", recognized);
-        assert!(sink.statuses.iter().any(|s| s == "RECOGNIZED: LSTICK"), "ack should name the left stick: {:?}", recognized);
+        assert!(
+            sink.statuses.iter().any(|s| s == "RECOGNIZED: SOUTH"),
+            "ack should name south: {:?}",
+            recognized
+        );
+        assert!(
+            sink.statuses.iter().any(|s| s == "RECOGNIZED: LSTICK"),
+            "ack should name the left stick: {:?}",
+            recognized
+        );
     }
 
     /// tsp-bwrg.15 acceptance #4 — the REGRESSION THAT MATTERS: no event is lost across the ack.
@@ -763,14 +1145,27 @@ mod tests {
         let mut src = scripted_a133(false, QUIET, drain, 0, 4);
         let mut sink = CountingSink::default();
         let skin = demo_skin();
-        let meta = DeviceMeta { id: "a133".into(), manufacturer: "TrimUI".into(), model: "Smart Pro".into() };
+        let meta = DeviceMeta {
+            id: "a133".into(),
+            manufacturer: "TrimUI".into(),
+            model: "Smart Pro".into(),
+        };
 
-        let caps = drive_live(&mut src, &mut sink, &skin, &meta, &timing)
-            .expect("the run must complete");
+        let caps =
+            drive_live(&mut src, &mut sink, &skin, &meta, &timing).expect("the run must complete");
 
-        let code_of = |id: &str| caps.inputs.iter().find(|i| i.id == id).map(|i| i.code.clone());
+        let code_of = |id: &str| {
+            caps.inputs
+                .iter()
+                .find(|i| i.id == id)
+                .map(|i| i.code.clone())
+        };
         // Every control landed (the ack lost nobody's event) and both trigger rows are present.
-        assert_eq!(caps.inputs.len(), 14, "all 17 prompts collapse to 14 rows (4 dpad dirs merge)");
+        assert_eq!(
+            caps.inputs.len(),
+            14,
+            "all 17 prompts collapse to 14 rows (4 dpad dirs merge)"
+        );
         // ltrig recorded its own press...
         assert_eq!(
             code_of("ltrig").as_deref(),

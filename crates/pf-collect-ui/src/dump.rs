@@ -97,8 +97,17 @@ mod tests {
     fn tiny_skin() -> SkinSet {
         let body = Rgb::new(60, 30, crate::canvas::rgb(248, 248, 248));
         let lit = Rgb::new(60, 30, crate::canvas::rgb(210, 0, 0));
-        let view = View { body, lit, parts: HashMap::new() };
-        SkinSet::from_parts(HashMap::new(), view, None, crate::canvas::rgb(248, 248, 248))
+        let view = View {
+            body,
+            lit,
+            parts: HashMap::new(),
+        };
+        SkinSet::from_parts(
+            HashMap::new(),
+            view,
+            None,
+            crate::canvas::rgb(248, 248, 248),
+        )
     }
 
     /// The dump renders a PROMPT frame AND a RECOGNIZED (positive-ack) frame per control, plus one
@@ -112,7 +121,8 @@ mod tests {
     #[test]
     fn dump_frames_renders_prompt_and_ack_per_control() {
         let n = plan::a133_gamepad_plan().len();
-        let dir = std::env::temp_dir().join(format!("pf-collect-ui-dump-test-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("pf-collect-ui-dump-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let written = dump_frames(&dir, &tiny_skin()).expect("dump_frames should write the PPMs");
 
@@ -124,10 +134,22 @@ mod tests {
             written.len(),
         );
         // Every control contributes a positive-ack frame — the new state is actually in the dump.
-        let recognized = written.iter().filter(|p| p.to_string_lossy().ends_with("-recognized.ppm")).count();
-        assert_eq!(recognized, n, "expected one -recognized.ppm per control, got {recognized}");
-        let prompts = written.iter().filter(|p| p.to_string_lossy().ends_with("-prompt.ppm")).count();
-        assert_eq!(prompts, n, "expected one -prompt.ppm per control, got {prompts}");
+        let recognized = written
+            .iter()
+            .filter(|p| p.to_string_lossy().ends_with("-recognized.ppm"))
+            .count();
+        assert_eq!(
+            recognized, n,
+            "expected one -recognized.ppm per control, got {recognized}"
+        );
+        let prompts = written
+            .iter()
+            .filter(|p| p.to_string_lossy().ends_with("-prompt.ppm"))
+            .count();
+        assert_eq!(
+            prompts, n,
+            "expected one -prompt.ppm per control, got {prompts}"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -92,7 +92,10 @@ impl EgressManager {
     /// declared-host allowlist; every accounted `send` AND every refused undeclared send lands
     /// in the persistent [`EgressLog`] under `<app_id>.log`. Backward-compat helper name
     /// intentionally distinct from [`new`](Self::new).
-    pub fn with_accounting(quotas: Arc<QuotaLedger>, accounting: EgressAccounting) -> EgressManager {
+    pub fn with_accounting(
+        quotas: Arc<QuotaLedger>,
+        accounting: EgressAccounting,
+    ) -> EgressManager {
         EgressManager {
             quotas,
             log: Mutex::new(Vec::new()),
@@ -159,7 +162,9 @@ impl EgressManager {
         if !self.quotas.try_consume("egress", 1) {
             if let Some(a) = &self.accounting {
                 let remaining = self.quotas.remaining("egress");
-                let _ = a.log.record_refused(&a.app_id, host, "egress op quota exhausted", remaining);
+                let _ =
+                    a.log
+                        .record_refused(&a.app_id, host, "egress op quota exhausted", remaining);
             }
             return Err(CapError::PolicyBlocked);
         }

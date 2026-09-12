@@ -34,7 +34,11 @@ impl SensorManager {
         probe: Arc<dyn HardwareProbe>,
     ) -> SensorManager {
         let mount = descriptor.imu_mount_matrix();
-        SensorManager { backend, probe, mount }
+        SensorManager {
+            backend,
+            probe,
+            mount,
+        }
     }
 
     /// Is the IMU present (descriptor advertises accel+gyro AND the live probe does not demote it)?
@@ -67,7 +71,10 @@ impl SensorManager {
     /// the pose by the single physical model. Flat ⇒ `(0, 0, +g)`.
     pub fn read_accel(&self) -> Result<[f64; 3], CapError> {
         let p = self.read_pose()?;
-        Ok(physical_model::accel_device(p.roll.to_radians(), p.pitch.to_radians()))
+        Ok(physical_model::accel_device(
+            p.roll.to_radians(),
+            p.pitch.to_radians(),
+        ))
     }
 
     /// The gyroscope reading in the **device frame** (rad/s) — the body angular velocity (the pose

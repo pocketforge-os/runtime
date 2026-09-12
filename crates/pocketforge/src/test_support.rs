@@ -115,7 +115,8 @@ pub fn descriptor(id: &str) -> Descriptor {
 /// [`descriptor`] as a `Result` — for callers that want to assert on the failure itself.
 pub fn try_descriptor(id: &str) -> Result<Descriptor, String> {
     let path = try_descriptor_path(id)?;
-    Descriptor::load(&path).map_err(|e| format!("load platform descriptor {}: {e:?}", path.display()))
+    Descriptor::load(&path)
+        .map_err(|e| format!("load platform descriptor {}: {e:?}", path.display()))
 }
 
 // --- SYNTHETIC descriptors -------------------------------------------------------------------
@@ -257,10 +258,19 @@ mod tests {
     fn a_directory_that_is_not_a_platform_checkout_resolves_to_nothing() {
         // Deep enough that none of SIBLING_CANDIDATES can climb out into a real checkout — CI runs
         // with `platform` mounted at well-known paths and the search must not accidentally hit it.
-        let empty = std::env::temp_dir().join(format!("pf-no-platform-{}/a/b/c/d", std::process::id()));
+        let empty =
+            std::env::temp_dir().join(format!("pf-no-platform-{}/a/b/c/d", std::process::id()));
         std::fs::create_dir_all(&empty).unwrap();
-        assert_eq!(resolve_platform_root(Some(&empty), &empty), None, "explicit non-platform dir");
-        assert_eq!(resolve_platform_root(None, &empty), None, "no sibling platform checkout");
+        assert_eq!(
+            resolve_platform_root(Some(&empty), &empty),
+            None,
+            "explicit non-platform dir"
+        );
+        assert_eq!(
+            resolve_platform_root(None, &empty),
+            None,
+            "no sibling platform checkout"
+        );
         let _ = std::fs::remove_dir_all(
             std::env::temp_dir().join(format!("pf-no-platform-{}", std::process::id())),
         );
@@ -273,8 +283,14 @@ mod tests {
     fn the_absent_checkout_error_names_the_fix() {
         let msg = missing_platform_error();
         assert!(msg.contains(PLATFORM_DIR_ENV), "names the env var: {msg}");
-        assert!(msg.contains("pocketforge-os/platform"), "names what to clone: {msg}");
-        assert!(msg.contains("no vendored copy"), "explains why there is nothing to fall back to");
+        assert!(
+            msg.contains("pocketforge-os/platform"),
+            "names what to clone: {msg}"
+        );
+        assert!(
+            msg.contains("no vendored copy"),
+            "explains why there is nothing to fall back to"
+        );
     }
 
     /// A pointed-at checkout wins over any sibling search.

@@ -25,7 +25,11 @@ fn set_then_get_round_trips() {
     let dir = scratch("roundtrip");
 
     let set = run(&dir, &["set", "hapticsEnabled", "false"]);
-    assert!(set.status.success(), "set failed: {}", String::from_utf8_lossy(&set.stderr));
+    assert!(
+        set.status.success(),
+        "set failed: {}",
+        String::from_utf8_lossy(&set.stderr)
+    );
 
     let get = run(&dir, &["get", "hapticsEnabled"]);
     assert!(get.status.success());

@@ -44,7 +44,10 @@ fn a523_sensors_hardware_absent_qmi8658_is_dt_present_but_unbound() {
     // and stayed green only because the vendored copy still carried the removed row (tsp-ozbp.16).
     let pf = Pf::in_process(common::descriptor("a523"));
     let s = pf.sensors();
-    assert!(!s.present(), "a523 advertises no bound IMU (qmi8658 DT-present, driver unbound)");
+    assert!(
+        !s.present(),
+        "a523 advertises no bound IMU (qmi8658 DT-present, driver unbound)"
+    );
     assert_eq!(s.read_pose().err(), Some(CapError::HardwareAbsent));
     assert_eq!(s.read_accel().err(), Some(CapError::HardwareAbsent));
     // Rumble is a SEPARATE actuator row the Pro S really does carry — absence is per-capability,
@@ -64,7 +67,11 @@ fn imu_pose_roundtrips_through_the_physical_model() {
 
     // Tilt the top fully away (pitch 90°): gravity reaction rotates onto +Y; spin about Z.
     backend
-        .set_pose(Pose { pitch: 90.0, wz: 30.0, ..Pose::default() })
+        .set_pose(Pose {
+            pitch: 90.0,
+            wz: 30.0,
+            ..Pose::default()
+        })
         .expect("the rig accepts a pose");
 
     close(&s.read_accel().unwrap(), &[0.0, G, 0.0]);
@@ -74,7 +81,10 @@ fn imu_pose_roundtrips_through_the_physical_model() {
     // The mount-matrix pipeline round-trips (the rig mount is identity): chip → device recovers accel.
     let chip = s.read_chip_accel().unwrap();
     close(&s.device_from_chip(&chip), &s.read_accel().unwrap());
-    assert_eq!(s.mount_matrix(), &pocketforge::physical_model::IDENTITY_MOUNT);
+    assert_eq!(
+        s.mount_matrix(),
+        &pocketforge::physical_model::IDENTITY_MOUNT
+    );
 }
 
 // --- vibration: the unified no-op shape + the E4 enforcement point ---------------------------
@@ -141,12 +151,20 @@ fn location_read_and_egress_send_account_into_separate_buckets() {
     let receipt = eg.send("steampowered.com", 1500).expect("egress accounted");
     assert_eq!(receipt.host, "steampowered.com");
     assert_eq!(eg.remaining(), EGRESS_QUOTA - 1);
-    assert_eq!(loc.reads_remaining(), LOCATION_READ_QUOTA, "egress send leaked into location");
+    assert_eq!(
+        loc.reads_remaining(),
+        LOCATION_READ_QUOTA,
+        "egress send leaked into location"
+    );
 
     // A location READ consumes the location bucket and NEVER the egress bucket.
     loc.read_fix().expect("granted location read");
     assert_eq!(loc.reads_remaining(), LOCATION_READ_QUOTA - 1);
-    assert_eq!(eg.remaining(), EGRESS_QUOTA - 1, "location read leaked into egress");
+    assert_eq!(
+        eg.remaining(),
+        EGRESS_QUOTA - 1,
+        "location read leaked into egress"
+    );
 
     // The audit log records the send (the AppOps-style trail).
     assert_eq!(eg.audit_log().len(), 1);
@@ -159,7 +177,10 @@ fn egress_quota_exhaustion_is_policy_blocked() {
     pf.quotas().set_remaining("egress", 1);
     let eg = pf.egress();
     assert!(eg.send("host.example", 1).is_ok());
-    assert_eq!(eg.send("host.example", 1).err(), Some(CapError::PolicyBlocked));
+    assert_eq!(
+        eg.send("host.example", 1).err(),
+        Some(CapError::PolicyBlocked)
+    );
 }
 
 // --- input: zero-per-device action map ------------------------------------------------------
@@ -175,8 +196,14 @@ fn input_manager_is_pure_descriptor_data() {
     assert_eq!(m133.resolve("cancel"), Some("east"));
     // a523-only controls appear by DATA, no per-device code.
     assert!(m133.by_id("home").is_none(), "base Pro has no home button");
-    assert!(m523.by_id("home").is_some(), "Pro S adds a home button (descriptor row)");
-    assert!(m523.by_id("l3").is_some(), "Pro S adds clickable left stick");
+    assert!(
+        m523.by_id("home").is_some(),
+        "Pro S adds a home button (descriptor row)"
+    );
+    assert!(
+        m523.by_id("l3").is_some(),
+        "Pro S adds clickable left stick"
+    );
     for id in ["south", "east", "west", "north", "dpad", "lstick", "ltrig"] {
         assert!(m133.by_id(id).is_some(), "a133 missing {id}");
         assert!(m523.by_id(id).is_some(), "a523 missing {id}");
@@ -189,7 +216,11 @@ fn input_manager_is_pure_descriptor_data() {
 fn audio_routes_cooperatively() {
     let pf = Pf::in_process(common::descriptor("a523"));
     let a = pf.audio();
-    assert_eq!(a.current(), AudioSink::Speaker, "default route is the speaker");
+    assert_eq!(
+        a.current(),
+        AudioSink::Speaker,
+        "default route is the speaker"
+    );
     a.route(AudioSink::Headphone).expect("route to headphone");
     assert_eq!(a.current(), AudioSink::Headphone);
 }
@@ -217,7 +248,10 @@ fn live_probe_demotes_an_unbound_imu_to_hardware_absent() {
     // gone vacuously green rather than red: a silent second instance of the very failure class
     // tsp-ozbp.16 is about. The synthetic rig keeps the demotion observable.
     let rig = common::imu_descriptor();
-    assert!(rig.cap_present("imu"), "precondition: the rig advertises an IMU to demote");
+    assert!(
+        rig.cap_present("imu"),
+        "precondition: the rig advertises an IMU to demote"
+    );
     let pf = Pf::in_process(rig).with_probe(Arc::new(ImuUnboundProbe));
     let s = pf.sensors();
     assert!(!s.present(), "probe demotes the descriptor-advertised IMU");

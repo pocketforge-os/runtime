@@ -102,8 +102,12 @@ impl SkinSet {
     /// descriptor's relative skin paths (`skins/<dev>/body.png`) resolve against.
     pub fn load(descriptor_path: &Path, skin_root: &Path) -> io::Result<SkinSet> {
         let text = std::fs::read_to_string(descriptor_path)?;
-        let desc: Descriptor = toml::from_str(&text)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("parsing {}: {e}", descriptor_path.display())))?;
+        let desc: Descriptor = toml::from_str(&text).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("parsing {}: {e}", descriptor_path.display()),
+            )
+        })?;
 
         let mut front = View {
             body: load_png(&skin_root.join(&desc.skin.body))?,
@@ -115,10 +119,42 @@ impl SkinSet {
         // (tsp-bwrg.6 pass #5: "any way to just highlight the top/left/right/bottom?").
         if let Some(&d) = front.parts.get("dpad") {
             let (w2, h2, w3, h3) = (d.w / 2, d.h / 2, d.w / 3, d.h / 3);
-            front.parts.insert("dpad_up".into(), Rect { x: d.x + w3, y: d.y, w: w3, h: h2 });
-            front.parts.insert("dpad_down".into(), Rect { x: d.x + w3, y: d.y + h2, w: w3, h: d.h - h2 });
-            front.parts.insert("dpad_left".into(), Rect { x: d.x, y: d.y + h3, w: w2, h: h3 });
-            front.parts.insert("dpad_right".into(), Rect { x: d.x + w2, y: d.y + h3, w: d.w - w2, h: h3 });
+            front.parts.insert(
+                "dpad_up".into(),
+                Rect {
+                    x: d.x + w3,
+                    y: d.y,
+                    w: w3,
+                    h: h2,
+                },
+            );
+            front.parts.insert(
+                "dpad_down".into(),
+                Rect {
+                    x: d.x + w3,
+                    y: d.y + h2,
+                    w: w3,
+                    h: d.h - h2,
+                },
+            );
+            front.parts.insert(
+                "dpad_left".into(),
+                Rect {
+                    x: d.x,
+                    y: d.y + h3,
+                    w: w2,
+                    h: h3,
+                },
+            );
+            front.parts.insert(
+                "dpad_right".into(),
+                Rect {
+                    x: d.x + w2,
+                    y: d.y + h3,
+                    w: d.w - w2,
+                    h: h3,
+                },
+            );
         }
         let top = match desc.skin.views.get("top") {
             Some(v) => Some(View {
@@ -139,13 +175,30 @@ impl SkinSet {
                 input_to_label.insert(r.id, l);
             }
         }
-        Ok(SkinSet { input_to_part, input_to_label, front, top, bg })
+        Ok(SkinSet {
+            input_to_part,
+            input_to_label,
+            front,
+            top,
+            bg,
+        })
     }
 
     /// In-memory constructor for tests (no disk / PNG decode). Labels default empty; add them with
     /// [`with_labels`](Self::with_labels).
-    pub fn from_parts(input_to_part: HashMap<String, String>, front: View, top: Option<View>, bg: Color) -> SkinSet {
-        SkinSet { input_to_part, input_to_label: HashMap::new(), front, top, bg }
+    pub fn from_parts(
+        input_to_part: HashMap<String, String>,
+        front: View,
+        top: Option<View>,
+        bg: Color,
+    ) -> SkinSet {
+        SkinSet {
+            input_to_part,
+            input_to_label: HashMap::new(),
+            front,
+            top,
+            bg,
+        }
     }
 
     /// Attach an engine-id -> faceplate-label map (test builder / overlay).
@@ -225,8 +278,24 @@ mod tests {
             }
         }
         let mut front_parts = HashMap::new();
-        front_parts.insert("btn_south".to_string(), Rect { x: 5, y: 5, w: 4, h: 3 });
-        front_parts.insert("trig_l".to_string(), Rect { x: 1, y: 1, w: 2, h: 1 }); // present front too, but top wins
+        front_parts.insert(
+            "btn_south".to_string(),
+            Rect {
+                x: 5,
+                y: 5,
+                w: 4,
+                h: 3,
+            },
+        );
+        front_parts.insert(
+            "trig_l".to_string(),
+            Rect {
+                x: 1,
+                y: 1,
+                w: 2,
+                h: 1,
+            },
+        ); // present front too, but top wins
 
         let mut top_lit = Rgb::new(20, 10, rgb(4, 4, 5));
         for y in 2..4 {
@@ -235,7 +304,15 @@ mod tests {
             }
         }
         let mut top_parts = HashMap::new();
-        top_parts.insert("trig_l".to_string(), Rect { x: 2, y: 2, w: 4, h: 2 });
+        top_parts.insert(
+            "trig_l".to_string(),
+            Rect {
+                x: 2,
+                y: 2,
+                w: 4,
+                h: 2,
+            },
+        );
 
         let mut map = HashMap::new();
         map.insert("south".to_string(), "btn_south".to_string());
@@ -243,8 +320,16 @@ mod tests {
 
         SkinSet::from_parts(
             map,
-            View { body: front_body, lit: front_lit, parts: front_parts },
-            Some(View { body: Rgb::new(20, 10, rgb(4, 4, 5)), lit: top_lit, parts: top_parts }),
+            View {
+                body: front_body,
+                lit: front_lit,
+                parts: front_parts,
+            },
+            Some(View {
+                body: Rgb::new(20, 10, rgb(4, 4, 5)),
+                lit: top_lit,
+                parts: top_parts,
+            }),
             rgb(248, 248, 248),
         )
     }
@@ -268,15 +353,31 @@ mod tests {
         map.insert("south".to_string(), "btn_south".to_string());
         let s = SkinSet::from_parts(
             map,
-            View { body: Rgb::new(4, 4, rgb(0, 0, 0)), lit: Rgb::new(4, 4, rgb(0, 0, 0)), parts: HashMap::new() },
+            View {
+                body: Rgb::new(4, 4, rgb(0, 0, 0)),
+                lit: Rgb::new(4, 4, rgb(0, 0, 0)),
+                parts: HashMap::new(),
+            },
             None,
             rgb(0, 0, 0),
         );
         for dir in ["dpad_up", "dpad_down", "dpad_left", "dpad_right"] {
-            assert_eq!(s.part_for(dir), Some("dpad"), "{dir} must highlight the dpad part");
+            assert_eq!(
+                s.part_for(dir),
+                Some("dpad"),
+                "{dir} must highlight the dpad part"
+            );
         }
-        assert_eq!(s.part_for("south"), Some("btn_south"), "a directly-mapped id still resolves");
-        assert_eq!(s.part_for("nonexistent"), None, "an unrelated unknown id resolves to nothing");
+        assert_eq!(
+            s.part_for("south"),
+            Some("btn_south"),
+            "a directly-mapped id still resolves"
+        );
+        assert_eq!(
+            s.part_for("nonexistent"),
+            None,
+            "an unrelated unknown id resolves to nothing"
+        );
     }
 
     #[test]
@@ -284,35 +385,97 @@ mod tests {
         // With a per-direction sub-rect present (synthesized from the whole `dpad` in load()), a
         // direction highlights its OWN arm; a direction without a sub-rect falls back to whole dpad.
         let mut parts = HashMap::new();
-        parts.insert("dpad_up".to_string(), Rect { x: 0, y: 0, w: 2, h: 2 });
+        parts.insert(
+            "dpad_up".to_string(),
+            Rect {
+                x: 0,
+                y: 0,
+                w: 2,
+                h: 2,
+            },
+        );
         let mut map = HashMap::new();
         map.insert("dpad".to_string(), "dpad".to_string());
         let s = SkinSet::from_parts(
             map,
-            View { body: Rgb::new(4, 4, rgb(0, 0, 0)), lit: Rgb::new(4, 4, rgb(0, 0, 0)), parts },
+            View {
+                body: Rgb::new(4, 4, rgb(0, 0, 0)),
+                lit: Rgb::new(4, 4, rgb(0, 0, 0)),
+                parts,
+            },
             None,
             rgb(0, 0, 0),
         );
-        assert_eq!(s.part_for("dpad_up"), Some("dpad_up"), "a synthesized per-direction sub-rect wins");
-        assert_eq!(s.part_for("dpad_down"), Some("dpad"), "a direction with no sub-rect falls back to whole dpad");
+        assert_eq!(
+            s.part_for("dpad_up"),
+            Some("dpad_up"),
+            "a synthesized per-direction sub-rect wins"
+        );
+        assert_eq!(
+            s.part_for("dpad_down"),
+            Some("dpad"),
+            "a direction with no sub-rect falls back to whole dpad"
+        );
     }
 
     #[test]
     fn load_synthesizes_four_dpad_direction_subrects_inside_the_dpad_rect() {
         // Pure geometry check on the synthesis: four direction rects, each inside the parent dpad.
         let mut parts = HashMap::new();
-        parts.insert("dpad".to_string(), Rect { x: 100, y: 200, w: 144, h: 142 });
+        parts.insert(
+            "dpad".to_string(),
+            Rect {
+                x: 100,
+                y: 200,
+                w: 144,
+                h: 142,
+            },
+        );
         // Re-run the same synthesis load() does (kept in sync with the load() body).
         let d = parts["dpad"];
         let (w2, h2, w3, h3) = (d.w / 2, d.h / 2, d.w / 3, d.h / 3);
-        parts.insert("dpad_up".into(), Rect { x: d.x + w3, y: d.y, w: w3, h: h2 });
-        parts.insert("dpad_down".into(), Rect { x: d.x + w3, y: d.y + h2, w: w3, h: d.h - h2 });
-        parts.insert("dpad_left".into(), Rect { x: d.x, y: d.y + h3, w: w2, h: h3 });
-        parts.insert("dpad_right".into(), Rect { x: d.x + w2, y: d.y + h3, w: d.w - w2, h: h3 });
+        parts.insert(
+            "dpad_up".into(),
+            Rect {
+                x: d.x + w3,
+                y: d.y,
+                w: w3,
+                h: h2,
+            },
+        );
+        parts.insert(
+            "dpad_down".into(),
+            Rect {
+                x: d.x + w3,
+                y: d.y + h2,
+                w: w3,
+                h: d.h - h2,
+            },
+        );
+        parts.insert(
+            "dpad_left".into(),
+            Rect {
+                x: d.x,
+                y: d.y + h3,
+                w: w2,
+                h: h3,
+            },
+        );
+        parts.insert(
+            "dpad_right".into(),
+            Rect {
+                x: d.x + w2,
+                y: d.y + h3,
+                w: d.w - w2,
+                h: h3,
+            },
+        );
         for dir in ["dpad_up", "dpad_down", "dpad_left", "dpad_right"] {
             let r = parts[dir];
-            assert!(r.x >= d.x && r.y >= d.y && r.x + r.w <= d.x + d.w && r.y + r.h <= d.y + d.h,
-                "{dir} rect {r:?} must lie inside the parent dpad {d:?}");
+            assert!(
+                r.x >= d.x && r.y >= d.y && r.x + r.w <= d.x + d.w && r.y + r.h <= d.y + d.h,
+                "{dir} rect {r:?} must lie inside the parent dpad {d:?}"
+            );
             assert!(r.w > 0 && r.h > 0, "{dir} must be non-empty");
         }
     }

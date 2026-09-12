@@ -201,7 +201,11 @@ pub struct PreparedAnswer {
 
 impl PreparedAnswer {
     /// A convenience: "user pressed A on Allow Once" for `(app, cap, modifier)`.
-    pub fn allow_once(app_id: impl Into<String>, cap: impl Into<String>, modifier: Option<&str>) -> PreparedAnswer {
+    pub fn allow_once(
+        app_id: impl Into<String>,
+        cap: impl Into<String>,
+        modifier: Option<&str>,
+    ) -> PreparedAnswer {
         PreparedAnswer {
             app_id: app_id.into(),
             cap: cap.into(),
@@ -213,7 +217,11 @@ impl PreparedAnswer {
         }
     }
     /// A convenience: "user pressed A on Allow Always" for `(app, cap, modifier)`.
-    pub fn allow_always(app_id: impl Into<String>, cap: impl Into<String>, modifier: Option<&str>) -> PreparedAnswer {
+    pub fn allow_always(
+        app_id: impl Into<String>,
+        cap: impl Into<String>,
+        modifier: Option<&str>,
+    ) -> PreparedAnswer {
         PreparedAnswer {
             app_id: app_id.into(),
             cap: cap.into(),
@@ -225,7 +233,11 @@ impl PreparedAnswer {
         }
     }
     /// A convenience: "user pressed A on Deny" for `(app, cap, modifier)`.
-    pub fn deny(app_id: impl Into<String>, cap: impl Into<String>, modifier: Option<&str>) -> PreparedAnswer {
+    pub fn deny(
+        app_id: impl Into<String>,
+        cap: impl Into<String>,
+        modifier: Option<&str>,
+    ) -> PreparedAnswer {
         PreparedAnswer {
             app_id: app_id.into(),
             cap: cap.into(),
@@ -295,7 +307,10 @@ impl SupervisorAsk for SimulatedSupervisor {
             };
         }
         if let Some(d) = self.default.lock().unwrap().clone() {
-            return AskResponse { ask_id: req.ask_id, ..d };
+            return AskResponse {
+                ask_id: req.ask_id,
+                ..d
+            };
         }
         panic!(
             "SimulatedSupervisor: no prepared answer for ask_id={} app={} cap={} modifier={:?}",
@@ -328,7 +343,12 @@ mod tests {
 
     #[test]
     fn ask_input_round_trip() {
-        for v in [AskInput::AOnDeny, AskInput::AOnAllowOnce, AskInput::AOnAllowAlways, AskInput::BCancel] {
+        for v in [
+            AskInput::AOnDeny,
+            AskInput::AOnAllowOnce,
+            AskInput::AOnAllowAlways,
+            AskInput::BCancel,
+        ] {
             assert_eq!(AskInput::parse(v.as_str()), Some(v));
         }
         assert_eq!(AskInput::parse("garbage"), None);
@@ -339,30 +359,63 @@ mod tests {
         assert_eq!(AskInput::AOnDeny.decision(), AskDecision::Deny);
         assert_eq!(AskInput::BCancel.decision(), AskDecision::Deny);
         assert_eq!(AskInput::AOnAllowOnce.decision(), AskDecision::AllowOnce);
-        assert_eq!(AskInput::AOnAllowAlways.decision(), AskDecision::AllowAlways);
+        assert_eq!(
+            AskInput::AOnAllowAlways.decision(),
+            AskDecision::AllowAlways
+        );
     }
 
     #[test]
     fn simulated_supervisor_matches_by_triple_and_fifo() {
         let sup = SimulatedSupervisor::new();
-        sup.prepare(PreparedAnswer::allow_once("com.a.b", "location", Some("approximate")));
-        sup.prepare(PreparedAnswer::deny("com.a.b", "egress", Some("api.example")));
+        sup.prepare(PreparedAnswer::allow_once(
+            "com.a.b",
+            "location",
+            Some("approximate"),
+        ));
+        sup.prepare(PreparedAnswer::deny(
+            "com.a.b",
+            "egress",
+            Some("api.example"),
+        ));
 
         // Location ask ⇒ allow_once.
-        let r1 = sup.ask(AskRequest::v0(1, "com.a.b", "AB", "location", Some("approximate".into()), AskContext::Launch));
+        let r1 = sup.ask(AskRequest::v0(
+            1,
+            "com.a.b",
+            "AB",
+            "location",
+            Some("approximate".into()),
+            AskContext::Launch,
+        ));
         assert_eq!(r1.decision, AskDecision::AllowOnce);
         // Egress ask (different (cap, mod)) still finds its answer even though it wasn't first.
-        let r2 = sup.ask(AskRequest::v0(2, "com.a.b", "AB", "egress", Some("api.example".into()), AskContext::Launch));
+        let r2 = sup.ask(AskRequest::v0(
+            2,
+            "com.a.b",
+            "AB",
+            "egress",
+            Some("api.example".into()),
+            AskContext::Launch,
+        ));
         assert_eq!(r2.decision, AskDecision::Deny);
     }
 
     #[test]
     fn simulated_supervisor_defaults_when_unmatched() {
         let sup = SimulatedSupervisor::new();
-        let mut d = AskResponse::deny_for(&AskRequest::v0(0, "x", "X", "y", None, AskContext::Launch));
+        let mut d =
+            AskResponse::deny_for(&AskRequest::v0(0, "x", "X", "y", None, AskContext::Launch));
         d.supervisor_note = Some("fallback".into());
         sup.set_default(d);
-        let r = sup.ask(AskRequest::v0(9, "any.app", "Any", "location", None, AskContext::Launch));
+        let r = sup.ask(AskRequest::v0(
+            9,
+            "any.app",
+            "Any",
+            "location",
+            None,
+            AskContext::Launch,
+        ));
         assert_eq!(r.decision, AskDecision::Deny);
         assert_eq!(r.supervisor_note.as_deref(), Some("fallback"));
         assert_eq!(r.ask_id, 9);
@@ -371,7 +424,14 @@ mod tests {
     #[test]
     fn null_supervisor_denies() {
         let sup = NullSupervisor;
-        let r = sup.ask(AskRequest::v0(1, "x", "X", "location", None, AskContext::Launch));
+        let r = sup.ask(AskRequest::v0(
+            1,
+            "x",
+            "X",
+            "location",
+            None,
+            AskContext::Launch,
+        ));
         assert_eq!(r.decision, AskDecision::Deny);
         assert_eq!(r.input, AskInput::AOnDeny);
     }

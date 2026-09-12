@@ -23,8 +23,12 @@ fn start_ref_broker_for(
     label: &str,
 ) -> (std::path::PathBuf, Arc<InProcessBackend>) {
     let n = SOCK_SEQ.fetch_add(1, Ordering::Relaxed);
-    let sock =
-        std::env::temp_dir().join(format!("pf-swap-{}-{}-{}.sock", label, std::process::id(), n));
+    let sock = std::env::temp_dir().join(format!(
+        "pf-swap-{}-{}-{}.sock",
+        label,
+        std::process::id(),
+        n
+    ));
     let _ = std::fs::remove_file(&sock);
 
     let backend = InProcessBackend::shared(Arc::new(descriptor));
@@ -80,7 +84,10 @@ fn broker_reports_a133_missing_hardware_like_in_process() {
         Some(pocketforge::CapError::HardwareAbsent),
         "broker: acquire(imu) hardware-absent over the wire"
     );
-    assert_eq!(pf.backend().rumble_pulse(40), pocketforge::RumbleStatus::NoopAbsent);
+    assert_eq!(
+        pf.backend().rumble_pulse(40),
+        pocketforge::RumbleStatus::NoopAbsent
+    );
     let _ = std::fs::remove_file(&sock);
 }
 
@@ -92,7 +99,17 @@ fn broker_pose_round_trips_over_the_wire() {
     // It named the a523 until tsp-ozbp.16, which only held against the stale vendored copy.
     let (sock, _b) = start_ref_broker_for(common::imu_descriptor(), "synthimu");
     let pf = broker_pf_for(common::imu_descriptor(), &sock);
-    let want = Pose { yaw: 12.5, pitch: -3.0, roll: 90.0, x: 1.0, y: 2.0, z: 3.0, wx: 0.1, wy: 0.2, wz: 0.3 };
+    let want = Pose {
+        yaw: 12.5,
+        pitch: -3.0,
+        roll: 90.0,
+        x: 1.0,
+        y: 2.0,
+        z: 3.0,
+        wx: 0.1,
+        wy: 0.2,
+        wz: 0.3,
+    };
     let set = pf.backend().set_pose(want).expect("set_pose over wire");
     assert_eq!(set, want);
     let got = pf.backend().get_pose().expect("get_pose over wire");
@@ -105,8 +122,13 @@ fn broker_cooperative_set_get_capability_round_trips() {
     // a523 settings (granted) — set a value through the broker, read it back.
     let (sock, _b) = start_ref_broker("a523");
     let pf = broker_pf("a523", &sock);
-    pf.backend().set_capability("settings", b"brightness=42").expect("set over wire");
-    let v = pf.backend().get_capability("settings").expect("get over wire");
+    pf.backend()
+        .set_capability("settings", b"brightness=42")
+        .expect("set over wire");
+    let v = pf
+        .backend()
+        .get_capability("settings")
+        .expect("get over wire");
     assert_eq!(v, b"brightness=42");
     let _ = std::fs::remove_file(&sock);
 }

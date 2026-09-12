@@ -9,8 +9,8 @@ use pocketforge::backends::InProcessBackend;
 use pocketforge::{Backend, CapError, Descriptor, PermissionState, Pf, QuotaLedger};
 
 use pf_broker::{
-    peer_cred, serve_enforcing_until, AppManifest, BlessedRegistration, EnforcingBackend, LaunchTrust,
-    Violation,
+    peer_cred, serve_enforcing_until, AppManifest, BlessedRegistration, EnforcingBackend,
+    LaunchTrust, Violation,
 };
 
 /// The REAL device descriptor from the `platform` checkout — this repo vendors no copy
@@ -22,7 +22,10 @@ fn descriptor(id: &str) -> Descriptor {
 fn manifest(uses: &[&str]) -> AppManifest {
     let toml = format!(
         "[app]\nid = \"com.test.app\"\nuse = [{}]\n",
-        uses.iter().map(|u| format!("\"{u}\"")).collect::<Vec<_>>().join(", ")
+        uses.iter()
+            .map(|u| format!("\"{u}\""))
+            .collect::<Vec<_>>()
+            .join(", ")
     );
     AppManifest::from_toml(&toml).expect("parse app.toml")
 }
@@ -48,16 +51,22 @@ fn launch_validator_rejects_over_broad_and_accepts_well_formed() {
     // SPIKE-0 2026-07-11), so it only held against the stale vendored descriptor copy. The rule
     // under test is device-agnostic, so it runs on the synthetic bound-IMU rig.
     let imu_rig = pocketforge::test_support::imu_descriptor();
-    assert!(manifest(&["input", "vibration", "imu", "entropy"]).validate(&imu_rig).is_ok());
+    assert!(manifest(&["input", "vibration", "imu", "entropy"])
+        .validate(&imu_rig)
+        .is_ok());
     // a523 itself backs rumble but NOT a bound imu — required imu is over-broad there too.
-    assert!(manifest(&["input", "vibration", "entropy"]).validate(&descriptor("a523")).is_ok());
+    assert!(manifest(&["input", "vibration", "entropy"])
+        .validate(&descriptor("a523"))
+        .is_ok());
     assert!(manifest(&["imu"]).validate(&descriptor("a523")).is_err());
     // a133 has no IMU: a REQUIRED imu is an over-broad route → rejected.
     assert!(manifest(&["imu"]).validate(&descriptor("a133")).is_err());
     // …but OPTIONAL imu? is allowed (graceful absence at runtime).
     assert!(manifest(&["imu?"]).validate(&descriptor("a133")).is_ok());
     // an unknown capability is rejected.
-    assert!(manifest(&["telepathy"]).validate(&descriptor("a523")).is_err());
+    assert!(manifest(&["telepathy"])
+        .validate(&descriptor("a523"))
+        .is_err());
 }
 
 // --- E3 protection tiers: signature-tier launch gate + blessed-binary exemption (tsp-ht0p.2) --
@@ -65,7 +74,10 @@ fn launch_validator_rejects_over_broad_and_accepts_well_formed() {
 fn manifest_for(app_id: &str, uses: &[&str]) -> AppManifest {
     let toml = format!(
         "[app]\nid = \"{app_id}\"\nuse = [{}]\n",
-        uses.iter().map(|u| format!("\"{u}\"")).collect::<Vec<_>>().join(", ")
+        uses.iter()
+            .map(|u| format!("\"{u}\""))
+            .collect::<Vec<_>>()
+            .join(", ")
     );
     AppManifest::from_toml(&toml).expect("parse app.toml")
 }
@@ -90,10 +102,17 @@ fn step1_well_formed_manifest_passes_launch_validation() {
     // location:approximate(dangerous, backed by gnss) + egress:<specific-host>(dangerous, declared)
     // — ALL pass launch validation for an untrusted app (dangerous ≠ signature; no trust needed).
     let desc = desc_gnss_and_rumble();
-    let v = manifest(&["entropy", "vibration", "location:approximate", "egress:tile.example"])
-        .validate(&desc)
-        .expect("well-formed manifest validates");
-    assert!(v.allows("entropy") && v.allows("vibration") && v.allows("location") && v.allows("egress"));
+    let v = manifest(&[
+        "entropy",
+        "vibration",
+        "location:approximate",
+        "egress:tile.example",
+    ])
+    .validate(&desc)
+    .expect("well-formed manifest validates");
+    assert!(
+        v.allows("entropy") && v.allows("vibration") && v.allows("location") && v.allows("egress")
+    );
     assert_eq!(v.egress_hosts().collect::<Vec<_>>(), ["tile.example"]);
 }
 
@@ -101,8 +120,15 @@ fn step1_well_formed_manifest_passes_launch_validation() {
 fn step1_broad_egress_from_untrusted_app_is_signature_tier_reject() {
     // Bead STEP-1 (reject): raw/arbitrary egress (0.0.0.0/0) from a NON-first-party app is a TYPED
     // signature-tier launch REJECT — not an unknown-cap / over-broad-route reason.
-    let err = manifest(&["egress:0.0.0.0/0"]).validate(&descriptor("a133")).unwrap_err();
-    assert_eq!(err, vec![Violation::SignatureTierRequiresTrust { token: "egress:0.0.0.0/0".into() }]);
+    let err = manifest(&["egress:0.0.0.0/0"])
+        .validate(&descriptor("a133"))
+        .unwrap_err();
+    assert_eq!(
+        err,
+        vec![Violation::SignatureTierRequiresTrust {
+            token: "egress:0.0.0.0/0".into()
+        }]
+    );
 }
 
 #[test]
@@ -127,30 +153,40 @@ fn blessed_binary_exemption_clears_signature_tier_only_when_enumerated() {
     let steamlink = manifest_for("com.valve.steamlink", &["egress:0.0.0.0/0"]);
 
     // Positive: blessed + enumerated + matching app_id ⇒ passes ONLY via the exemption path.
-    assert!(steamlink.validate_with_trust(&descriptor("a133"), &LaunchTrust::blessed(&reg)).is_ok());
+    assert!(steamlink
+        .validate_with_trust(&descriptor("a133"), &LaunchTrust::blessed(&reg))
+        .is_ok());
 
     // Negative 1 — the SAME grant WITHOUT the blessed registration (untrusted) ⇒ reject.
     assert_eq!(
         steamlink.validate(&descriptor("a133")).unwrap_err(),
-        vec![Violation::SignatureTierRequiresTrust { token: "egress:0.0.0.0/0".into() }]
+        vec![Violation::SignatureTierRequiresTrust {
+            token: "egress:0.0.0.0/0".into()
+        }]
     );
     // Negative 2 — a blessed registration for a DIFFERENT app does not carry over.
     let copycat = manifest_for("com.evil.copycat", &["egress:0.0.0.0/0"]);
-    assert!(copycat.validate_with_trust(&descriptor("a133"), &LaunchTrust::blessed(&reg)).is_err());
+    assert!(copycat
+        .validate_with_trust(&descriptor("a133"), &LaunchTrust::blessed(&reg))
+        .is_err());
     // Negative 3 — blessed for the right app but the grant is NOT enumerated ⇒ reject.
     let narrow = BlessedRegistration {
         app_id: "com.valve.steamlink".into(),
         sha256: "deadbeefcafe".into(),
         grants: vec!["egress:tile.example".into()],
     };
-    assert!(steamlink.validate_with_trust(&descriptor("a133"), &LaunchTrust::blessed(&narrow)).is_err());
+    assert!(steamlink
+        .validate_with_trust(&descriptor("a133"), &LaunchTrust::blessed(&narrow))
+        .is_err());
 }
 
 #[test]
 fn specific_host_egress_is_dangerous_not_signature() {
     // egress:<specific-host> is Dangerous (declared; runtime consent/default-deny lands via .3's
     // generic dangerous-tier flow), NOT signature — an untrusted app may DECLARE it at launch.
-    let v = manifest(&["egress:steampowered.com"]).validate(&descriptor("a133")).expect("declared host ok");
+    let v = manifest(&["egress:steampowered.com"])
+        .validate(&descriptor("a133"))
+        .expect("declared host ok");
     assert!(v.allows("egress"));
 }
 
@@ -161,20 +197,37 @@ fn undeclared_capability_is_policy_blocked() {
     // Declares only input; vibration/imu are OUTSIDE the ceiling.
     let (eb, _inner) = enforcing("a523", &["input"]);
     assert!(eb.acquire("input").is_ok(), "declared cap acquires");
-    assert_eq!(eb.acquire("imu").err(), Some(CapError::PolicyBlocked), "undeclared imu is policy-blocked");
-    assert_eq!(eb.query("imu"), PermissionState::Denied, "undeclared cap reads Denied (no leak)");
+    assert_eq!(
+        eb.acquire("imu").err(),
+        Some(CapError::PolicyBlocked),
+        "undeclared imu is policy-blocked"
+    );
+    assert_eq!(
+        eb.query("imu"),
+        PermissionState::Denied,
+        "undeclared cap reads Denied (no leak)"
+    );
     // Undeclared haptics is suppressed (cosmetic no-op, never an error).
-    assert_eq!(eb.rumble_pulse(40), pocketforge::RumbleStatus::NoopSuppressed);
+    assert_eq!(
+        eb.rumble_pulse(40),
+        pocketforge::RumbleStatus::NoopSuppressed
+    );
 }
 
 #[test]
 fn declared_present_capability_passes_through_to_inner() {
     // Needs a device that HAS the declared hardware; no shipping device has a bound IMU today
     // (tsp-ozbp.16), so this runs on the synthetic rig — which also carries a rumble motor.
-    let (eb, _inner) =
-        enforcing_on(pocketforge::test_support::imu_descriptor(), &["input", "vibration", "imu"]);
+    let (eb, _inner) = enforcing_on(
+        pocketforge::test_support::imu_descriptor(),
+        &["input", "vibration", "imu"],
+    );
     assert!(eb.acquire("imu").is_ok(), "declared + present imu acquires");
-    assert_eq!(eb.rumble_pulse(40), pocketforge::RumbleStatus::Fired, "declared rumble fires (the rig has a motor)");
+    assert_eq!(
+        eb.rumble_pulse(40),
+        pocketforge::RumbleStatus::Fired,
+        "declared rumble fires (the rig has a motor)"
+    );
 }
 
 #[test]
@@ -188,7 +241,10 @@ fn declared_but_hardware_absent_still_degrades_not_crashes() {
 fn entropy_is_the_ungated_exception() {
     // Entropy auto-grants even when NOT declared (non-exhaustible CSPRNG).
     let (eb, _inner) = enforcing("a133", &["input"]);
-    assert!(eb.acquire("entropy").is_ok(), "entropy ungated even undeclared");
+    assert!(
+        eb.acquire("entropy").is_ok(),
+        "entropy ungated even undeclared"
+    );
     assert_eq!(eb.query("entropy"), PermissionState::Granted);
 }
 
@@ -208,7 +264,10 @@ fn default_deny_is_preserved_under_the_ceiling() {
     assert_eq!(eb.acquire("location").err(), Some(CapError::ConsentDenied));
     // Granting consent (E3 overlay) then acquiring consumes the location quota.
     inner.set_consent("location", PermissionState::Granted);
-    assert!(eb.acquire("location").is_ok(), "consent granted ⇒ acquire ok");
+    assert!(
+        eb.acquire("location").is_ok(),
+        "consent granted ⇒ acquire ok"
+    );
 }
 
 #[test]
@@ -227,7 +286,11 @@ fn dangerous_capability_quota_is_enforced() {
     let eb = EnforcingBackend::with_quotas(inner.clone(), &validated, quotas);
     assert!(eb.acquire("location").is_ok());
     assert!(eb.acquire("location").is_ok());
-    assert_eq!(eb.acquire("location").err(), Some(CapError::PolicyBlocked), "quota exhausted");
+    assert_eq!(
+        eb.acquire("location").err(),
+        Some(CapError::PolicyBlocked),
+        "quota exhausted"
+    );
 }
 
 // --- the OUT-OF-PROCESS backend swap over the .2 wire (with enforcement) ---------------------
@@ -256,9 +319,15 @@ fn out_of_process_client_hits_the_enforced_semantics() {
 
     // The SAME client an app uses (Pf::via_broker) — no app-source change vs the in-process path.
     let pf = Pf::via_broker(desc.clone(), &sock).expect("connect broker");
-    assert!(pf.acquire::<pocketforge::Input>().is_ok(), "declared input acquires over the wire");
+    assert!(
+        pf.acquire::<pocketforge::Input>().is_ok(),
+        "declared input acquires over the wire"
+    );
     // imu is outside the ceiling → PolicyBlocked, observed over the socket.
-    assert_eq!(pf.acquire::<pocketforge::Imu>().err(), Some(CapError::PolicyBlocked));
+    assert_eq!(
+        pf.acquire::<pocketforge::Imu>().err(),
+        Some(CapError::PolicyBlocked)
+    );
     // entropy ungated even over the wire + undeclared.
     assert!(pf.acquire::<pocketforge::Entropy>().is_ok());
 
@@ -275,5 +344,9 @@ fn out_of_process_client_hits_the_enforced_semantics() {
 fn peer_cred_reports_our_own_uid() {
     let (a, _b) = std::os::unix::net::UnixStream::pair().unwrap();
     let cred = peer_cred(&a).expect("SO_PEERCRED on a socketpair");
-    assert_eq!(cred.uid, unsafe { libc::getuid() }, "peer of a socketpair is us");
+    assert_eq!(
+        cred.uid,
+        unsafe { libc::getuid() },
+        "peer of a socketpair is us"
+    );
 }

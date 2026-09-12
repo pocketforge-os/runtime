@@ -75,8 +75,17 @@ mod tests {
 
     #[test]
     fn steam_link_is_the_blessed_no_grab_exemption() {
-        assert_eq!(AcquireMode::for_consumer("steamlink"), AcquireMode::BlessedNoGrab);
-        assert_eq!(AcquireMode::for_consumer("steam-link"), AcquireMode::BlessedNoGrab);
-        assert_eq!(AcquireMode::for_consumer("pf-hwprobe"), AcquireMode::Grabbed);
+        assert_eq!(
+            AcquireMode::for_consumer("steamlink"),
+            AcquireMode::BlessedNoGrab
+        );
+        assert_eq!(
+            AcquireMode::for_consumer("steam-link"),
+            AcquireMode::BlessedNoGrab
+        );
+        assert_eq!(
+            AcquireMode::for_consumer("pf-hwprobe"),
+            AcquireMode::Grabbed
+        );
     }
 }

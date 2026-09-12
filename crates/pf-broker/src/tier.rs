@@ -100,9 +100,24 @@ mod tests {
 
     #[test]
     fn normal_tier_covers_the_auto_grant_vocabulary() {
-        for c in ["input", "vibration", "rumble", "leds", "audio", "settings", "entropy",
-                  "imu", "accelerometer", "gyroscope", "magnetometer"] {
-            assert_eq!(tier_of(c, None), Tier::Normal, "{c} should be Normal (auto-grant)");
+        for c in [
+            "input",
+            "vibration",
+            "rumble",
+            "leds",
+            "audio",
+            "settings",
+            "entropy",
+            "imu",
+            "accelerometer",
+            "gyroscope",
+            "magnetometer",
+        ] {
+            assert_eq!(
+                tier_of(c, None),
+                Tier::Normal,
+                "{c} should be Normal (auto-grant)"
+            );
         }
     }
 

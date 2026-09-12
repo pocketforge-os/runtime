@@ -16,7 +16,9 @@ use std::process::ExitCode;
 
 use pf_input_collect::{
     collect::{self, DeviceMeta, RunConfig},
-    plan, source::EvdevSource, Collector,
+    plan,
+    source::EvdevSource,
+    Collector,
 };
 
 fn usage() -> &'static str {
@@ -48,34 +50,77 @@ fn main() -> ExitCode {
             }
         };
         match a.as_str() {
-            "--source" => match val(&mut args, "--source") { Some(v) => source = Some(v), None => return ExitCode::from(2) },
-            "--id" => match val(&mut args, "--id") { Some(v) => id = Some(v), None => return ExitCode::from(2) },
-            "--manufacturer" => match val(&mut args, "--manufacturer") { Some(v) => manufacturer = Some(v), None => return ExitCode::from(2) },
-            "--model" => match val(&mut args, "--model") { Some(v) => model = Some(v), None => return ExitCode::from(2) },
-            "--out" => match val(&mut args, "--out") { Some(v) => out = Some(v), None => return ExitCode::from(2) },
-            "-h" | "--help" => { print!("{}", usage()); return ExitCode::SUCCESS; }
-            other => { eprintln!("error: unknown argument '{other}'\n\n{}", usage()); return ExitCode::from(2); }
+            "--source" => match val(&mut args, "--source") {
+                Some(v) => source = Some(v),
+                None => return ExitCode::from(2),
+            },
+            "--id" => match val(&mut args, "--id") {
+                Some(v) => id = Some(v),
+                None => return ExitCode::from(2),
+            },
+            "--manufacturer" => match val(&mut args, "--manufacturer") {
+                Some(v) => manufacturer = Some(v),
+                None => return ExitCode::from(2),
+            },
+            "--model" => match val(&mut args, "--model") {
+                Some(v) => model = Some(v),
+                None => return ExitCode::from(2),
+            },
+            "--out" => match val(&mut args, "--out") {
+                Some(v) => out = Some(v),
+                None => return ExitCode::from(2),
+            },
+            "-h" | "--help" => {
+                print!("{}", usage());
+                return ExitCode::SUCCESS;
+            }
+            other => {
+                eprintln!("error: unknown argument '{other}'\n\n{}", usage());
+                return ExitCode::from(2);
+            }
         }
     }
 
     let (source, id, manufacturer, model) = match (source, id, manufacturer, model) {
         (Some(s), Some(i), Some(m), Some(md)) => (s, i, m, md),
-        _ => { eprintln!("error: --source, --id, --manufacturer, --model are all required\n\n{}", usage()); return ExitCode::from(2); }
+        _ => {
+            eprintln!(
+                "error: --source, --id, --manufacturer, --model are all required\n\n{}",
+                usage()
+            );
+            return ExitCode::from(2);
+        }
     };
 
     let mut src = match EvdevSource::open(&source) {
         Ok(s) => s,
-        Err(e) => { eprintln!("error: cannot open evdev source '{source}': {e}"); return ExitCode::FAILURE; }
+        Err(e) => {
+            eprintln!("error: cannot open evdev source '{source}': {e}");
+            return ExitCode::FAILURE;
+        }
     };
 
-    let meta = DeviceMeta { id, manufacturer, model };
+    let meta = DeviceMeta {
+        id,
+        manufacturer,
+        model,
+    };
     let mut collector = Collector::new(plan::default_gamepad_plan());
     let mut stderr = std::io::stderr();
 
     // Prompts go to stderr so stdout carries only the emitted TOML when --out is unset.
-    let caps = match collect::run(&mut collector, &mut src, &meta, &RunConfig::default(), &mut stderr) {
+    let caps = match collect::run(
+        &mut collector,
+        &mut src,
+        &meta,
+        &RunConfig::default(),
+        &mut stderr,
+    ) {
         Ok(c) => c,
-        Err(e) => { eprintln!("error: collection failed: {e}"); return ExitCode::FAILURE; }
+        Err(e) => {
+            eprintln!("error: collection failed: {e}");
+            return ExitCode::FAILURE;
+        }
     };
 
     let toml = caps.to_toml();

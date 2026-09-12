@@ -12,12 +12,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use pocketforge::backends::InProcessBackend;
-use pocketforge::{Backend, CapError, Descriptor, Entropy, Location, PermissionState, Pf, QuotaLedger};
+use pocketforge::{
+    Backend, CapError, Descriptor, Entropy, Location, PermissionState, Pf, QuotaLedger,
+};
 
 use pf_broker::appops::{AppOpsLedger, GrantCheck, GrantKey, Scope};
 use pf_broker::consent::{
-    AskInput, NullSupervisor, PreparedAnswer, SimulatedSupervisor,
-    SupervisorAsk,
+    AskInput, NullSupervisor, PreparedAnswer, SimulatedSupervisor, SupervisorAsk,
 };
 use pf_broker::{AppManifest, EnforcingBackend, ValidatedManifest};
 
@@ -54,9 +55,15 @@ kind = "gnss"
 fn validate(uses: &[&str], desc: &Descriptor, app_id: &str) -> ValidatedManifest {
     let toml = format!(
         "[app]\nid = \"{app_id}\"\nuse = [{}]\n",
-        uses.iter().map(|u| format!("\"{u}\"")).collect::<Vec<_>>().join(", ")
+        uses.iter()
+            .map(|u| format!("\"{u}\""))
+            .collect::<Vec<_>>()
+            .join(", ")
     );
-    AppManifest::from_toml(&toml).unwrap().validate(desc).unwrap()
+    AppManifest::from_toml(&toml)
+        .unwrap()
+        .validate(desc)
+        .unwrap()
 }
 
 fn tmp_dir(tag: &str) -> std::path::PathBuf {
@@ -119,7 +126,8 @@ fn step2_location_default_deny_prompt_allow_once_ledger_revoke_change_event() {
 
     // (2) Acquire fires the portal: supervisor asks, "Allow once" → ledger records + inner set
     // to Granted + change event fires + Ok.
-    pf.acquire::<Location>().expect("Allow-once grants THIS acquire");
+    pf.acquire::<Location>()
+        .expect("Allow-once grants THIS acquire");
 
     // (3) The supervisor saw exactly one ask (bead STEP-2: "exactly one op").
     assert_eq!(sup.asks_seen().len(), 1, "supervisor asked exactly once");
@@ -129,19 +137,35 @@ fn step2_location_default_deny_prompt_allow_once_ledger_revoke_change_event() {
     assert_eq!(ask.app_name, APP_NAME);
 
     // (4) The change event fired (Granted) as a direct result of the grant applying.
-    let evt = rx.recv_timeout(Duration::from_secs(1)).expect("change event on grant");
+    let evt = rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("change event on grant");
     assert_eq!(evt, PermissionState::Granted);
 
     // (5) The ledger records the once-scope grant, now consumed (STEP-2: "exactly one op").
     let key = GrantKey::new(APP_ID, "location", None);
-    assert_eq!(ledger.check(&key), GrantCheck::OnceUsed, "once-grant consumed by that acquire");
+    assert_eq!(
+        ledger.check(&key),
+        GrantCheck::OnceUsed,
+        "once-grant consumed by that acquire"
+    );
 
     // (6) The NEXT acquire, with the once-grant used and no fresh grant: standing-Denied.
     let err = pf.acquire::<Location>().err().unwrap();
-    assert_eq!(err, CapError::ConsentDenied, "consumed once-grant → the next acquire is Denied");
-    let evt = rx.recv_timeout(Duration::from_secs(1)).expect("change event on standing-deny");
+    assert_eq!(
+        err,
+        CapError::ConsentDenied,
+        "consumed once-grant → the next acquire is Denied"
+    );
+    let evt = rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("change event on standing-deny");
     assert_eq!(evt, PermissionState::Denied);
-    assert_eq!(sup.asks_seen().len(), 1, "supervisor is not re-asked (v1 revoke semantics)");
+    assert_eq!(
+        sup.asks_seen().len(),
+        1,
+        "supervisor is not re-asked (v1 revoke semantics)"
+    );
 
     // (7) Revoke fires the change event too — the CLI shape: writes ledger row + calls set_consent
     // on the shared inner backend. A revoke from a fresh state (nothing to revoke) is a no-op
@@ -151,7 +175,10 @@ fn step2_location_default_deny_prompt_allow_once_ledger_revoke_change_event() {
     ledger.record_revoke(&key).unwrap();
     inner.set_consent("location", PermissionState::Denied);
     // Third acquire post-revoke stays Denied (STEP-2: "next acquire → Denied").
-    assert_eq!(pf.acquire::<Location>().err().unwrap(), CapError::ConsentDenied);
+    assert_eq!(
+        pf.acquire::<Location>().err().unwrap(),
+        CapError::ConsentDenied
+    );
     // No spurious re-prompt.
     assert_eq!(sup.asks_seen().len(), 1);
 }
@@ -186,8 +213,12 @@ fn allow_always_grant_survives_process_restart() {
             GrantCheck::Always,
             "Always survives a fresh open (proxy for process restart)"
         );
-        eb.acquire("location").expect("Always grant carries — no re-Prompt");
-        assert!(sup.asks_seen().is_empty(), "no supervisor ask on a persisted Always grant");
+        eb.acquire("location")
+            .expect("Always grant carries — no re-Prompt");
+        assert!(
+            sup.asks_seen().is_empty(),
+            "no supervisor ask on a persisted Always grant"
+        );
     }
 }
 
@@ -206,7 +237,8 @@ fn entropy_ungated_no_prompt_no_quota_no_supervisor_ask() {
     // Rust-side Pf front (proves the Entropy typed capability path too).
     let pf = Pf::with_backend(_inner.descriptor().clone(), eb.clone() as _);
     // acquire::<Entropy> should Just Work — no prompt, no quota-burn, no supervisor ask.
-    pf.acquire::<Entropy>().expect("entropy is ungated (Q2 ruling)");
+    pf.acquire::<Entropy>()
+        .expect("entropy is ungated (Q2 ruling)");
     // Query shape: Granted (ungated).
     assert_eq!(pf.query::<Entropy>(), PermissionState::Granted);
     // Quota: fetch a lot of entropy — never quota-blocked.
@@ -230,7 +262,10 @@ fn null_supervisor_deny_does_not_touch_ledger() {
     let err = eb.acquire("location").unwrap_err();
     assert_eq!(err, CapError::ConsentDenied);
     // NOT a standing revoke — a NullSupervisor absence-of-user is NOT a user choice.
-    assert!(ledger.snapshot().is_empty(), "NullSupervisor must never write a ledger row");
+    assert!(
+        ledger.snapshot().is_empty(),
+        "NullSupervisor must never write a ledger row"
+    );
     let key = GrantKey::new(APP_ID, "location", None);
     assert_eq!(
         ledger.check(&key),
@@ -250,7 +285,15 @@ fn ledger_refuses_grant_outside_manifest_ceiling() {
     // Manifest declares ONLY location — the ledger must refuse any other cap.
     let (_inner, _eb, ledger, manifest) = rig(&dir, APP_ID, &["location:approximate"], sup);
     let err = ledger
-        .record_grant(&manifest, "vibration", None, Scope::Always, 42, AskInput::AOnAllowAlways, None)
+        .record_grant(
+            &manifest,
+            "vibration",
+            None,
+            Scope::Always,
+            42,
+            AskInput::AOnAllowAlways,
+            None,
+        )
         .unwrap_err();
     match err {
         pf_broker::appops::LedgerError::OutsideCeiling { cap, .. } => assert_eq!(cap, "vibration"),
@@ -276,7 +319,10 @@ fn app_side_set_consent_cannot_bypass_manifest_ceiling() {
     // app's side to begin with; this is a structural guarantee, but we prove the runtime shape).
     inner.set_consent("location", PermissionState::Granted);
     assert_eq!(eb.acquire("location").unwrap_err(), CapError::PolicyBlocked);
-    assert!(ledger.snapshot().is_empty(), "app-side set_consent cannot manufacture a ledger row");
+    assert!(
+        ledger.snapshot().is_empty(),
+        "app-side set_consent cannot manufacture a ledger row"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -294,7 +340,10 @@ fn user_deny_denies_without_writing_ledger_row() {
     assert_eq!(sup.asks_seen().len(), 1, "supervisor was asked once");
     // The v1 shape: an active user-Deny does NOT write a persistent ledger row (the settings UI
     // path writes standing denies out-of-band, matching how a fresh Prompt can still fire later).
-    assert!(ledger.snapshot().is_empty(), "user Deny does not persist to ledger in v1");
+    assert!(
+        ledger.snapshot().is_empty(),
+        "user Deny does not persist to ledger in v1"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -309,9 +358,14 @@ fn scoped_egress_prompts_via_the_same_generic_dangerous_path() {
     let sup = Arc::new(SimulatedSupervisor::new());
     // The tsp-ht0p.2 ruling: egress:<specific-host> is Dangerous — prompts via the same generic
     // path as location. The prepared answer is keyed on cap=egress with modifier=api.tile.example.
-    sup.prepare(PreparedAnswer::allow_always(APP_ID, "egress", Some("api.tile.example")));
+    sup.prepare(PreparedAnswer::allow_always(
+        APP_ID,
+        "egress",
+        Some("api.tile.example"),
+    ));
     let (_inner, eb, ledger, _m) = rig(&dir, APP_ID, &["egress:api.tile.example"], sup.clone());
-    eb.acquire("egress").expect("scoped egress allowed via generic dangerous portal");
+    eb.acquire("egress")
+        .expect("scoped egress allowed via generic dangerous portal");
     assert_eq!(sup.asks_seen().len(), 1);
     let ask = &sup.asks_seen()[0];
     assert_eq!(ask.resource, "egress");
@@ -342,7 +396,11 @@ fn pf_permissions_revoke_shape_flips_next_acquire_to_denied() {
     ledger.record_revoke(&key).unwrap();
     inner.set_consent("location", PermissionState::Denied);
     let evt = rx.recv_timeout(Duration::from_secs(1)).unwrap();
-    assert_eq!(evt, PermissionState::Denied, "revoke fires the change event");
+    assert_eq!(
+        evt,
+        PermissionState::Denied,
+        "revoke fires the change event"
+    );
 
     // Next acquire = Denied.
     assert_eq!(eb.acquire("location").unwrap_err(), CapError::ConsentDenied);
@@ -365,7 +423,11 @@ fn revoke_orphans_prevents_resurrection_on_re_widened_ceiling() {
     let dir = tmp_dir("orphan-fix");
     let sup1 = Arc::new(SimulatedSupervisor::new());
     sup1.prepare(PreparedAnswer::allow_always(APP_ID, "location", None));
-    sup1.prepare(PreparedAnswer::allow_always(APP_ID, "egress", Some("api.tile.example")));
+    sup1.prepare(PreparedAnswer::allow_always(
+        APP_ID,
+        "egress",
+        Some("api.tile.example"),
+    ));
     let (_i1, eb1, ledger, wide) = rig(
         &dir,
         APP_ID,
@@ -395,7 +457,10 @@ fn revoke_orphans_prevents_resurrection_on_re_widened_ceiling() {
     assert_eq!(revoked.len(), 1);
     assert_eq!(revoked[0].cap, "egress");
     assert_eq!(ledger.check(&egress_key), GrantCheck::Revoked);
-    assert!(ledger.orphaned_grants(&narrow).is_empty(), "revoke_orphans clears the orphan set");
+    assert!(
+        ledger.orphaned_grants(&narrow).is_empty(),
+        "revoke_orphans clears the orphan set"
+    );
 
     // Ceiling RE-WIDENS to include egress. The old Always grant does NOT resurrect — the revoke
     // is the durable last-wins record.

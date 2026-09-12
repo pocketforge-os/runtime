@@ -75,14 +75,17 @@ impl AudioManager {
     /// The currently-selected sink (defaults to `Speaker` when unset).
     pub fn current(&self) -> AudioSink {
         match self.backend.get_capability("audio") {
-            Ok(v) => AudioSink::from_str(&String::from_utf8_lossy(&v)).unwrap_or(AudioSink::Speaker),
+            Ok(v) => {
+                AudioSink::from_str(&String::from_utf8_lossy(&v)).unwrap_or(AudioSink::Speaker)
+            }
             Err(_) => AudioSink::Speaker,
         }
     }
 
     /// Route output to `sink` (cooperative; the real mixer change is hardware-gated).
     pub fn route(&self, sink: AudioSink) -> Result<(), CapError> {
-        self.backend.set_capability("audio", sink.as_str().as_bytes())
+        self.backend
+            .set_capability("audio", sink.as_str().as_bytes())
     }
 
     /// Whether the `monoAudio` accessibility preference (E4) is enabled — read at the primitive

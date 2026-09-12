@@ -51,9 +51,27 @@ fn abs(code: u16, val: i32) -> RawEvent {
     RawEvent::new(EV_ABS, code, val)
 }
 
-const STICK: AbsInfo = AbsInfo { min: -32768, max: 32767, fuzz: 16, flat: 128, resolution: 0 };
-const TRIG: AbsInfo = AbsInfo { min: 0, max: 255, fuzz: 0, flat: 0, resolution: 0 };
-const HAT: AbsInfo = AbsInfo { min: -1, max: 1, fuzz: 0, flat: 0, resolution: 0 };
+const STICK: AbsInfo = AbsInfo {
+    min: -32768,
+    max: 32767,
+    fuzz: 16,
+    flat: 128,
+    resolution: 0,
+};
+const TRIG: AbsInfo = AbsInfo {
+    min: 0,
+    max: 255,
+    fuzz: 0,
+    flat: 0,
+    resolution: 0,
+};
+const HAT: AbsInfo = AbsInfo {
+    min: -1,
+    max: 1,
+    fuzz: 0,
+    flat: 0,
+    resolution: 0,
+};
 
 /// A human INTER-CONTROL gap, in polls. It must outlast BOTH the settle that closes a control's
 /// window AND the inter-control drain that follows it (tsp-bwrg.12) — a person letting go, reading
@@ -95,29 +113,47 @@ fn a133_source() -> ScriptedSource {
         .with_abs(ABS_HAT0Y, HAT);
 
     // Buttons complete on key-down; each press is followed by a human gap before the next control.
-    for code in [BTN_A, BTN_B, BTN_X, BTN_Y, BTN_SELECT, BTN_START, BTN_MODE, BTN_TL, BTN_TR] {
+    for code in [
+        BTN_A, BTN_B, BTN_X, BTN_Y, BTN_SELECT, BTN_START, BTN_MODE, BTN_TL, BTN_TR,
+    ] {
         s.push_batch(vec![key(code, 1), key(code, 0)]);
         gap(&mut s);
     }
 
     // dpad hat — both axes actuated; then the settle + inter-control gap.
     s.push_batch(vec![
-        abs(ABS_HAT0X, -1), abs(ABS_HAT0X, 0), abs(ABS_HAT0X, 1), abs(ABS_HAT0X, 0),
-        abs(ABS_HAT0Y, -1), abs(ABS_HAT0Y, 0), abs(ABS_HAT0Y, 1), abs(ABS_HAT0Y, 0),
+        abs(ABS_HAT0X, -1),
+        abs(ABS_HAT0X, 0),
+        abs(ABS_HAT0X, 1),
+        abs(ABS_HAT0X, 0),
+        abs(ABS_HAT0Y, -1),
+        abs(ABS_HAT0Y, 0),
+        abs(ABS_HAT0Y, 1),
+        abs(ABS_HAT0Y, 0),
     ]);
     gap(&mut s);
 
     // left stick sweep — full swing both axes; settle.
     s.push_batch(vec![
-        abs(ABS_X, -32768), abs(ABS_X, 0), abs(ABS_X, 32767), abs(ABS_X, 0),
-        abs(ABS_Y, -32768), abs(ABS_Y, 0), abs(ABS_Y, 32767), abs(ABS_Y, 0),
+        abs(ABS_X, -32768),
+        abs(ABS_X, 0),
+        abs(ABS_X, 32767),
+        abs(ABS_X, 0),
+        abs(ABS_Y, -32768),
+        abs(ABS_Y, 0),
+        abs(ABS_Y, 32767),
+        abs(ABS_Y, 0),
     ]);
     gap(&mut s);
 
     // right stick sweep; settle.
     s.push_batch(vec![
-        abs(ABS_RX, -32768), abs(ABS_RX, 32767), abs(ABS_RX, 0),
-        abs(ABS_RY, -32768), abs(ABS_RY, 32767), abs(ABS_RY, 0),
+        abs(ABS_RX, -32768),
+        abs(ABS_RX, 32767),
+        abs(ABS_RX, 0),
+        abs(ABS_RY, -32768),
+        abs(ABS_RY, 32767),
+        abs(ABS_RY, 0),
     ]);
     gap(&mut s);
 
@@ -173,7 +209,10 @@ fn emitted_inputs_match_the_a133_ground_truth_code_map() {
     let (caps, transcript) = run_a133();
     // Print the transcript so `cargo test -- --nocapture` yields the PR-attachable run log.
     println!("\n--- guided-collection run transcript (synthetic a133) ---\n{transcript}");
-    println!("--- emitted candidate capabilities.toml ---\n{}", caps.to_toml());
+    println!(
+        "--- emitted candidate capabilities.toml ---\n{}",
+        caps.to_toml()
+    );
 
     // The a133 ground-truth map (id -> (kind, ev_type, code[, semantics])) from
     // platform/devices/a133/capabilities.toml (the tsp-ozbp.2 decode).
@@ -203,23 +242,41 @@ fn emitted_inputs_match_the_a133_ground_truth_code_map() {
         .map(|i| {
             (
                 i.id.clone(),
-                (i.kind.clone(), i.ev_type.clone(), i.code.clone(), i.semantics.clone()),
+                (
+                    i.kind.clone(),
+                    i.ev_type.clone(),
+                    i.code.clone(),
+                    i.semantics.clone(),
+                ),
             )
         })
         .collect();
 
     // Every expected control present with the exact kind/ev_type/code/semantics.
     for (id, (kind, ev, code, sem)) in &expected {
-        let g = got.get(*id).unwrap_or_else(|| panic!("emitted candidate missing input '{id}'"));
+        let g = got
+            .get(*id)
+            .unwrap_or_else(|| panic!("emitted candidate missing input '{id}'"));
         assert_eq!(&g.0, kind, "{id}: kind");
         assert_eq!(&g.1, ev, "{id}: ev_type");
         assert_eq!(&g.2, code, "{id}: code");
         assert_eq!(g.3.as_deref(), *sem, "{id}: semantics");
     }
     // No spurious rows (l3/r3 were correctly omitted, not fabricated).
-    assert_eq!(got.len(), expected.len(), "row count differs: got ids {:?}", got.keys().collect::<Vec<_>>());
-    assert!(!got.contains_key("l3"), "absent stick-click l3 must be omitted, not fabricated");
-    assert!(!got.contains_key("r3"), "absent stick-click r3 must be omitted, not fabricated");
+    assert_eq!(
+        got.len(),
+        expected.len(),
+        "row count differs: got ids {:?}",
+        got.keys().collect::<Vec<_>>()
+    );
+    assert!(
+        !got.contains_key("l3"),
+        "absent stick-click l3 must be omitted, not fabricated"
+    );
+    assert!(
+        !got.contains_key("r3"),
+        "absent stick-click r3 must be omitted, not fabricated"
+    );
 }
 
 #[test]
@@ -244,7 +301,10 @@ fn identity_sdl_guid_and_stick_ranges_are_correct() {
     let ltrig = caps.inputs.iter().find(|i| i.id == "ltrig").unwrap();
     assert_eq!(ltrig.ev_type, "EV_KEY");
     assert_eq!(ltrig.code, "BTN_TL2");
-    assert!(ltrig.range.is_none(), "a button-realized trigger has no analog range");
+    assert!(
+        ltrig.range.is_none(),
+        "a button-realized trigger has no analog range"
+    );
     assert_eq!(ltrig.semantics.as_deref(), Some("binary"));
 }
 
@@ -271,7 +331,11 @@ fn analog_trigger_is_classified_analog() {
     src.push_batch((0..=255).step_by(5).map(|v| abs(ABS_Z, v)).collect());
     src.push_batch(vec![]);
     src.push_batch(vec![]);
-    let meta = DeviceMeta { id: "gen".into(), manufacturer: "G".into(), model: "Pad".into() };
+    let meta = DeviceMeta {
+        id: "gen".into(),
+        manufacturer: "G".into(),
+        model: "Pad".into(),
+    };
     let mut log = Vec::new();
     let caps = collect::run(&mut collector, &mut src, &meta, &test_cfg(), &mut log).unwrap();
     assert_eq!(caps.inputs[0].semantics.as_deref(), Some("analog"));
@@ -309,7 +373,11 @@ fn candidate_passes_real_caps_py_validate_when_platform_available() {
             return;
         }
     };
-    if std::process::Command::new("python3").arg("--version").output().is_err() {
+    if std::process::Command::new("python3")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
         eprintln!("SKIP: python3 not available");
         return;
     }
@@ -333,7 +401,11 @@ fn candidate_passes_real_caps_py_validate_when_platform_available() {
     .unwrap();
     std::fs::write(tmp.join("devices/a133/capabilities.toml"), &toml).unwrap();
     // Minimal sibling profile.toml so the device.id join passes (a real device grows one later).
-    std::fs::write(tmp.join("devices/a133/profile.toml"), "[device]\nid = \"a133\"\n").unwrap();
+    std::fs::write(
+        tmp.join("devices/a133/profile.toml"),
+        "[device]\nid = \"a133\"\n",
+    )
+    .unwrap();
 
     let out = std::process::Command::new("python3")
         .arg(tmp.join("core/caps.py"))
@@ -351,5 +423,8 @@ fn candidate_passes_real_caps_py_validate_when_platform_available() {
         "caps.py validate FAILED (exit {:?}):\n{stdout}{stderr}",
         out.status.code()
     );
-    assert!(stdout.contains("OK    a133"), "expected 'OK a133' from caps.py, got:\n{stdout}");
+    assert!(
+        stdout.contains("OK    a133"),
+        "expected 'OK a133' from caps.py, got:\n{stdout}"
+    );
 }

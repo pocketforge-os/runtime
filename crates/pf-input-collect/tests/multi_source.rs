@@ -23,11 +23,23 @@ fn key(code: u16, v: i32) -> RawEvent {
 }
 
 fn gamepad_ident() -> Identity {
-    Identity { name: "TRIMUI Player1".into(), bus: 3, vid: 0x045e, pid: 0x028e, version: 0x0110 }
+    Identity {
+        name: "TRIMUI Player1".into(),
+        bus: 3,
+        vid: 0x045e,
+        pid: 0x028e,
+        version: 0x0110,
+    }
 }
 fn kbd_ident() -> Identity {
     // The LRADC node advertises no vid/pid of interest; identity() is only ever taken from PRIMARY.
-    Identity { name: "sunxi-keyboard".into(), bus: 0x19, vid: 0x0001, pid: 0x0001, version: 0 }
+    Identity {
+        name: "sunxi-keyboard".into(),
+        bus: 0x19,
+        vid: 0x0001,
+        pid: 0x0001,
+        version: 0,
+    }
 }
 
 fn cfg() -> RunConfig {
@@ -41,7 +53,11 @@ fn cfg() -> RunConfig {
 }
 
 fn meta() -> DeviceMeta {
-    DeviceMeta { id: "a133".into(), manufacturer: "TrimUI".into(), model: "Smart Pro".into() }
+    DeviceMeta {
+        id: "a133".into(),
+        manufacturer: "TrimUI".into(),
+        model: "Smart Pro".into(),
+    }
 }
 
 /// Two controls: `south` on the primary gamepad node, `vol_up` pinned to the `sunxi-keyboard` node.
@@ -129,10 +145,16 @@ fn unknown_source_node_falls_back_to_primary_and_flags_the_miss() {
     let mut src = MultiSource::new("TRIMUI Player1", Box::new(pad));
 
     src.set_active_source(Some("audiocodec sunxi Audio Jack")); // never registered
-    assert!(src.last_route_missed(), "an unregistered node must be flagged as a routing miss");
+    assert!(
+        src.last_route_missed(),
+        "an unregistered node must be flagged as a routing miss"
+    );
 
     src.set_active_source(Some("TRIMUI Player1"));
-    assert!(!src.last_route_missed(), "the primary node is registered — no miss");
+    assert!(
+        !src.last_route_missed(),
+        "the primary node is registered — no miss"
+    );
 
     src.set_active_source(None);
     assert!(!src.last_route_missed(), "None routes to primary — no miss");

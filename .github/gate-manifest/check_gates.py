@@ -37,6 +37,7 @@ import argparse
 import fnmatch
 import sys
 import re
+import shlex
 from pathlib import Path
 
 # Fail-closed on a missing dep: a meta-gate that cannot run is not a pass.
@@ -257,6 +258,89 @@ def _job_checks_out(job: dict, repo: str) -> bool:
     return False
 
 
+def _payload_command(line):
+    """Accept one simple shell command, never a prefix of compound shell code.
+
+    shlex preserves quoted banners as single words but separates unquoted shell
+    operators even without spaces. Expansion/substitution and compound/control
+    flow are deliberately not interpreted by this bounded meta-check.
+    """
+    if "$(" in line or "`" in line:
+        raise ValueError(f"unsupported compound shell substitution: {line!r}")
+    lexer = shlex.shlex(line, posix=True, punctuation_chars=";&|()<>")
+    lexer.whitespace_split = True
+    argv = list(lexer)
+    if argv[:2] == ["cargo", "metadata"] and argv[-2:] == [">", "/dev/null"]:
+        argv = argv[:-2]  # The one supported non-control-flow redirect.
+    if not argv or argv[0] not in {"set", ":", "test", "echo", "cargo", "bash", "sccache"}:
+        raise ValueError("payload is conditionally skippable or has unsupported control flow")
+    if any(word and all(c in ";&|()<>" for c in word) for word in argv):
+        raise ValueError(f"unsupported compound shell control flow: {line!r}")
+    if argv[0] == "set" and argv != ["set", "-euo", "pipefail"]:
+        raise ValueError("payload lost fail-closed shell mode")
+    if argv[0] == "bash" and (len(argv) != 2 or not re.fullmatch(r"scripts/[\w./-]+\.sh|ctest/[\w./-]+\.sh", argv[1])):
+        raise ValueError("unsupported compound shell script invocation")
+    return argv
+
+
+def _invocation_matches(line, required):
+    """Flags must belong to the named invocation, not another command or prose."""
+    argv = shlex.split(line, comments=True)
+    for token in required:
+        parts = shlex.split(token)
+        if parts[:1] == ["cargo"] and (argv[:len(parts)] != parts or "--help" in argv or "--version" in argv):
+            return False
+        if not any(argv[i:i + len(parts)] == parts for i in range(len(argv))):
+            return False
+    return True
+
+
+def _expand_reusable(job, wf, rel, root, contracts):
+    """Model only the explicitly pinned, CI-verified public container contract.
+
+    No network lookup/floating callee or decorative YAML copy: the approved SHA
+    owns fixture checkout/env and script execution. Inspect the REAL committed
+    payload, and fail closed if the call or simple top-level shell shape changes.
+    """
+    if "uses" not in job:
+        return job
+    contract = next((c for c in contracts if c["workflow"] == rel), None)
+    if not contract or job["uses"] != contract["uses"]:
+        raise ValueError("unapproved reusable workflow pin")
+    inputs = job.get("with", {})
+    expected = {"source-sha": "${{ github.sha }}", "workflow-sha": contract["uses"].split("@")[-1],
+                "script": contract["script"], "image": contract["image"]}
+    if inputs != expected:
+        raise ValueError("reusable source/helper/script/image inputs differ from approved contract")
+    gate = wf.get("jobs", {}).get("test", {})
+    if (gate.get("needs") != "rust" or gate.get("name") != "cargo test + musl cross-build + clippy"
+            or gate.get("continue-on-error") or len(gate.get("steps", [])) != 1):
+        raise ValueError("required result gate is absent or bypassed")
+    result_step = gate["steps"][0]
+    if (result_step.get("run") != 'test "$RESULT" = success'
+            or result_step.get("env") != {"RESULT": "${{ needs.rust.result }}"}
+            or _step_neutered(gate, result_step)[0]
+            or _normalize_if(gate.get("if", "")) != _normalize_if(
+                "always() && (github.event_name != 'pull_request' || "
+                "github.event.pull_request.head.repo.full_name == github.repository)")):
+        raise ValueError("required result gate can mask a failed/skipped container")
+    payload = (root / contract["script"]).read_text()
+    lines = _iter_lock_lines(payload)
+    if "set -euo pipefail" not in lines:
+        raise ValueError("payload lost fail-closed shell mode")
+    parsed = [(line, _payload_command(line)) for line in lines]
+    # The pinned callee supplies platform; the payload must demand it as well.
+    env = {"PF_PLATFORM_DIR": "/work/platform"} if '${PF_PLATFORM_DIR:?' in payload else {}
+    # One modeled step per actual invocation: never borrow --workspace or lint
+    # flags from the keyboard test, formatter, or another Cargo subcommand.
+    commands = [{"run": line, "env": env} for line, argv in parsed
+                if argv[0] in {"cargo", "bash", "sccache"}]
+    return {**job, "steps": [
+        {"uses": "actions/checkout", "with": {"repository": "pocketforge-os/platform"}},
+        *commands,
+    ]}
+
+
 def evaluate(manifest_path: str, repo_root: str):
     """Return a list of human-readable failure reasons. Empty list = all gates
     present and reachable. Never raises for a gate failure — raises only if the
@@ -295,6 +379,13 @@ def evaluate(manifest_path: str, repo_root: str):
                     failures.append(f"[universal:no-unlocked-cargo] {wf_file.name}: parse error {exc}")
                     continue
                 for job_id, job in (wf.get("jobs") or {}).items():
+                    if "uses" in job:
+                        try:
+                            job = _expand_reusable(job, wf, str(wf_file.relative_to(repo_root)),
+                                                   repo_root, manifest.get("reusable", []))
+                        except (ValueError, OSError) as exc:
+                            failures.append(f"[universal:no-unlocked-cargo] {exc}")
+                            continue
                     for step in (job.get("steps") or []):
                         for line in _iter_lock_lines(_run_of(step)):
                             m = re.search(r"\bcargo\s+(\w[\w-]*)", line)
@@ -323,6 +414,13 @@ def evaluate(manifest_path: str, repo_root: str):
         if job is None:
             failures.append(f"[{gid}] job {gate['job']!r} not found in {rel}")
             continue
+
+        if "uses" in job:
+            try:
+                job = _expand_reusable(job, wf, rel, repo_root, manifest.get("reusable", []))
+            except (ValueError, OSError) as exc:
+                failures.append(f"[{gid}] {exc}")
+                continue
 
         allow_if = gate.get("allow_if")
         reachable, why = _job_reachable(wf, rel, job, gate, defaults, allow_if)
@@ -391,8 +489,7 @@ def evaluate(manifest_path: str, repo_root: str):
                 if not run_text:
                     continue
                 # strip shell-comment lines before matching (decorative-match guard)
-                body = "\n".join(_iter_lock_lines(run_text))
-                if all(t in body for t in tokens):
+                if any(_invocation_matches(line, tokens) for line in _iter_lock_lines(run_text)):
                     neutered, nreason = _step_neutered(job, step)
                     if neutered:
                         neuter_reasons.append(nreason)

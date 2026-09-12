@@ -174,3 +174,28 @@ is the point. If you intentionally *remove* a gate, remove its manifest block in
 the same PR and say why; the reviewer sees the manifest change and the tsp-i9xs /
 precedent context, so a removal is a conscious, reviewable act rather than a silent
 absence.
+# Container migration (tsp-hqm1p.18)
+
+Runtime's gates now execute from `scripts/ci-container.sh` through the public
+SHA-pinned shared workflow. The manifest declares the exact approved reusable
+contract (callee/helper SHA, image digest, script, synthetic source identity).
+The checker inspects that real payload's top-level commands for the same flags
+and neutering, rather than treating a job-level `uses` as absence or accepting
+decorative duplicated `run:` text. Fixture checkout/env are capabilities of that
+specific immutable callee, verified on real CI; an unknown pin or different
+helper/input invalidates the contract. No network/floating-code lookup occurs.
+
+The original required check name is verified as a fail-closed dependent result
+gate. Added negative controls cover mismatched helper/image/script, an early
+successful exit and a result gate that masks failures. Existing deleted/neutered
+clippy, unlocked metadata, path/fork/matrix and platform anti-vacuity mutations
+now target the real payload/caller surface. Shell parsing remains deliberately
+bounded to simple top-level commands; new control flow must be modelled explicitly.
+
+Each modeled payload step is one actual invocation. Cargo subcommand/flags must
+match that invocation's argv; workspace coverage cannot come from another test,
+formatter or clippy command. The vendor guard and its negative control are two
+explicitly required invocations. Quote-aware shell tokenization rejects compound
+operators/substitutions instead of accepting a safe-looking `echo` prefix. The
+selftest executes the `echo banner; exit 0` evasion and verifies that its zero
+exit without tests is rejected by the meta-gate.

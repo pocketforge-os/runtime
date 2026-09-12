@@ -42,7 +42,10 @@ impl InputMap {
                 label: i.label.clone(),
             })
             .collect();
-        InputMap { actions, accept_default: d.accept_default.clone() }
+        InputMap {
+            actions,
+            accept_default: d.accept_default.clone(),
+        }
     }
 
     /// Every bindable control on this device.

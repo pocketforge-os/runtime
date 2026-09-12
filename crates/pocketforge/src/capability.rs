@@ -270,7 +270,9 @@ impl Capability for Leds {
     type Handle = LedsHandle;
     fn acquire(pf: &Pf) -> Result<LedsHandle, CapError> {
         // Cosmetic no-op tier: ALWAYS Ok; a 0 count is the degraded handle.
-        Ok(LedsHandle { count: pf.descriptor().led_count() })
+        Ok(LedsHandle {
+            count: pf.descriptor().led_count(),
+        })
     }
 }
 

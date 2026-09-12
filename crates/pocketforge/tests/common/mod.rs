@@ -3,9 +3,7 @@
 
 #![allow(dead_code)]
 
-use pocketforge::{
-    CapError, Descriptor, PermissionState, Pf, RumbleStatus,
-};
+use pocketforge::{CapError, Descriptor, PermissionState, Pf, RumbleStatus};
 
 /// Load a REAL device descriptor (`"a133"` / `"a523"`) straight from the `platform` checkout.
 ///
@@ -81,7 +79,10 @@ pub fn snapshot(pf: &Pf) -> String {
             "{cap}: present={present} granted={granted} query={query} acquire={acquire}\n"
         ));
     }
-    out.push_str(&format!("rumble.pulse(40)={}\n", rumble_str(pf.backend().rumble_pulse(40))));
+    out.push_str(&format!(
+        "rumble.pulse(40)={}\n",
+        rumble_str(pf.backend().rumble_pulse(40))
+    ));
     out.push_str(&format!(
         "imu.get_pose={}\n",
         match pf.backend().get_pose() {

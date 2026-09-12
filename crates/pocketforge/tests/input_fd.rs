@@ -44,7 +44,13 @@ fn make_fifo(tag: &str) -> PathBuf {
     let _ = std::fs::remove_file(&p);
     let c = std::ffi::CString::new(p.as_os_str().as_encoded_bytes()).unwrap();
     let rc = unsafe { libc::mkfifo(c.as_ptr(), 0o600) };
-    assert_eq!(rc, 0, "mkfifo({}) failed: {}", p.display(), std::io::Error::last_os_error());
+    assert_eq!(
+        rc,
+        0,
+        "mkfifo({}) failed: {}",
+        p.display(),
+        std::io::Error::last_os_error()
+    );
     p
 }
 
@@ -69,7 +75,8 @@ fn read_exact_nonblock(fd: i32, want: usize) -> Vec<u8> {
 /// the one env-touching assertion is sequential (no cross-test `PF_INPUT_NODE` race).
 #[test]
 fn in_process_input_fd_reads_injected_events() {
-    let desc = Arc::new(Descriptor::load(a133_descriptor()).expect("load the a133 platform descriptor"));
+    let desc =
+        Arc::new(Descriptor::load(a133_descriptor()).expect("load the a133 platform descriptor"));
 
     // --- (1) hardware-absent when no node is provided (input IS present, but nothing to open) ---
     std::env::remove_var("PF_INPUT_NODE");
@@ -98,9 +105,14 @@ fn in_process_input_fd_reads_injected_events() {
     let pf = Pf::over_in_process(be);
 
     // The read fd (O_NONBLOCK) opens without a writer present.
-    let fd = pf.acquire_input_fd().expect("acquire_input_fd returns an fd");
+    let fd = pf
+        .acquire_input_fd()
+        .expect("acquire_input_fd returns an fd");
     // Open the write end and inject a BTN_SOUTH press + SYN report.
-    let mut w = std::fs::OpenOptions::new().write(true).open(&fifo).expect("open FIFO writer");
+    let mut w = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&fifo)
+        .expect("open FIFO writer");
     let press = event_bytes(EV_KEY, BTN_SOUTH, 1);
     let syn = event_bytes(EV_SYN, SYN_REPORT, 0);
     w.write_all(&press).unwrap();
@@ -109,8 +121,16 @@ fn in_process_input_fd_reads_injected_events() {
 
     let got = read_exact_nonblock(fd.as_raw_fd(), 48);
     assert_eq!(got.len(), 48, "read back both 24-byte records");
-    assert_eq!(&got[0..24], &press, "first record is the BTN_SOUTH press verbatim");
-    assert_eq!(&got[24..48], &syn, "second record is the SYN report verbatim");
+    assert_eq!(
+        &got[0..24],
+        &press,
+        "first record is the BTN_SOUTH press verbatim"
+    );
+    assert_eq!(
+        &got[24..48],
+        &syn,
+        "second record is the SYN report verbatim"
+    );
     drop(w);
     drop(fd);
     let _ = std::fs::remove_file(&fifo);
@@ -123,8 +143,9 @@ fn in_process_input_fd_reads_injected_events() {
         .expect("parse empty descriptor"),
     );
     let fifo2 = make_fifo("empty");
-    let empty_pf =
-        Pf::over_in_process(Arc::new(InProcessBackend::new(empty).with_input_node(&fifo2)));
+    let empty_pf = Pf::over_in_process(Arc::new(
+        InProcessBackend::new(empty).with_input_node(&fifo2),
+    ));
     assert_eq!(
         empty_pf.acquire_input_fd().err(),
         Some(CapError::HardwareAbsent),
@@ -138,20 +159,27 @@ fn in_process_input_fd_reads_injected_events() {
 /// never touches `PF_INPUT_NODE` and is parallel-safe alongside the env-touching test above.
 #[test]
 fn input_handle_acquire_fd_matches_facade() {
-    let desc = Arc::new(Descriptor::load(a133_descriptor()).expect("load the a133 platform descriptor"));
+    let desc =
+        Arc::new(Descriptor::load(a133_descriptor()).expect("load the a133 platform descriptor"));
     let fifo = make_fifo("handle");
     let pf = Pf::over_in_process(Arc::new(InProcessBackend::new(desc).with_input_node(&fifo)));
 
     let handle = pf.acquire::<Input>().expect("acquire the Input handle");
     let fd = handle.acquire_fd().expect("handle vends the input fd");
 
-    let mut w = std::fs::OpenOptions::new().write(true).open(&fifo).expect("open FIFO writer");
+    let mut w = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&fifo)
+        .expect("open FIFO writer");
     let ev = event_bytes(EV_KEY, BTN_SOUTH, 1);
     w.write_all(&ev).unwrap();
     w.flush().unwrap();
 
     let got = read_exact_nonblock(fd.as_raw_fd(), 24);
-    assert_eq!(got, ev, "reading the handle's fd yields the injected record");
+    assert_eq!(
+        got, ev,
+        "reading the handle's fd yields the injected record"
+    );
     drop(w);
     let _ = std::fs::remove_file(&fifo);
 }

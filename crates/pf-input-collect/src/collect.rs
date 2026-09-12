@@ -40,24 +40,44 @@ impl Semantics {
 /// What was recorded for one control.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Recorded {
-    Button { code: u16 },
-    Hat { x_code: u16, y_code: u16 },
+    Button {
+        code: u16,
+    },
+    Hat {
+        x_code: u16,
+        y_code: u16,
+    },
     /// `x`/`y` carry the driver-declared `AbsInfo` (for fuzz/flat/resolution); `x_cal`/`y_cal`
     /// carry the OBSERVED `(min, max, centre)` measured from the live sweep — the real per-axis
     /// calibration envelope emitted into the axis row (`min`/`max` = observed travel, `value` = rest).
-    Stick { x_code: u16, x: AbsInfo, y_code: u16, y: AbsInfo, x_cal: (i32, i32, i32), y_cal: (i32, i32, i32) },
-    Trigger { code: u16, abs: AbsInfo, semantics: Semantics },
+    Stick {
+        x_code: u16,
+        x: AbsInfo,
+        y_code: u16,
+        y: AbsInfo,
+        x_cal: (i32, i32, i32),
+        y_cal: (i32, i32, i32),
+    },
+    Trigger {
+        code: u16,
+        abs: AbsInfo,
+        semantics: Semantics,
+    },
     /// A trigger that manifests as a single EV_KEY button — a binary switch on the wire, never an
     /// analog axis (the a133 L2/R2: the MCU reports them as a bit in the button bitmask, and the
     /// decoder emits `BTN_TL2`/`BTN_TR2`, per `tsp-ozbp.2` + the owner-verified decoder output).
     /// It is a `trigger` by intent but a button on the wire, so it emits an `EV_KEY` row carrying
     /// `semantics="binary"` (the exact `kind=trigger` + button-code shape caps.py already maps to
     /// SDL `lefttrigger`/`righttrigger`).
-    TriggerButton { code: u16 },
+    TriggerButton {
+        code: u16,
+    },
     /// One D-PAD direction's captured hat axis (`HAT0X`/`HAT0Y`). INTERNAL — the four direction
     /// captures are MERGED at emit into the single `hat` row (`ABS_HAT0X,ABS_HAT0Y`); a `HatAxis`
     /// is never emitted directly, so the collected map is unchanged by the four-step prompt UX.
-    HatAxis { code: u16 },
+    HatAxis {
+        code: u16,
+    },
 }
 
 /// The result of committing the current control.
@@ -87,11 +107,20 @@ pub enum CollectError {
 impl std::fmt::Display for CollectError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            CollectError::NoActivity { id } => write!(f, "no activity recorded for required control '{id}'"),
-            CollectError::Incomplete { id, reason } => write!(f, "incomplete capture for '{id}': {reason}"),
-            CollectError::AbsInfo { code, source } => write!(f, "EVIOCGABS(0x{code:x}) failed: {source}"),
+            CollectError::NoActivity { id } => {
+                write!(f, "no activity recorded for required control '{id}'")
+            }
+            CollectError::Incomplete { id, reason } => {
+                write!(f, "incomplete capture for '{id}': {reason}")
+            }
+            CollectError::AbsInfo { code, source } => {
+                write!(f, "EVIOCGABS(0x{code:x}) failed: {source}")
+            }
             CollectError::UnknownCode { ev_type, code } => {
-                write!(f, "observed code (ev_type=0x{ev_type:x}, code=0x{code:x}) has no schema name")
+                write!(
+                    f,
+                    "observed code (ev_type=0x{ev_type:x}, code=0x{code:x}) has no schema name"
+                )
             }
             CollectError::Empty => write!(f, "nothing captured yet"),
         }
@@ -129,9 +158,17 @@ impl Collector {
     pub fn new(plan: Vec<ControlSpec>) -> Collector {
         let slots = plan
             .into_iter()
-            .map(|spec| Slot { spec, recorded: None, skipped: false })
+            .map(|spec| Slot {
+                spec,
+                recorded: None,
+                skipped: false,
+            })
             .collect();
-        Collector { slots, idx: 0, working: Vec::new() }
+        Collector {
+            slots,
+            idx: 0,
+            working: Vec::new(),
+        }
     }
 
     /// The control the engine is currently prompting for (`None` once past the end).
@@ -212,12 +249,21 @@ impl Collector {
 
     /// The recorded capture for a control id, if any (for a UI to render progress).
     pub fn recorded(&self, id: &str) -> Option<&Recorded> {
-        self.slots.iter().find(|s| s.spec.id == id).and_then(|s| s.recorded.as_ref())
+        self.slots
+            .iter()
+            .find(|s| s.spec.id == id)
+            .and_then(|s| s.recorded.as_ref())
     }
 
     /// Build the candidate descriptor from everything captured so far.
-    pub fn emit(&self, src: &mut dyn EventSource, meta: &DeviceMeta) -> Result<Capabilities, CollectError> {
-        let ident: Identity = src.identity().map_err(|e| CollectError::AbsInfo { code: 0, source: e })?;
+    pub fn emit(
+        &self,
+        src: &mut dyn EventSource,
+        meta: &DeviceMeta,
+    ) -> Result<Capabilities, CollectError> {
+        let ident: Identity = src
+            .identity()
+            .map_err(|e| CollectError::AbsInfo { code: 0, source: e })?;
         let mut inputs = Vec::new();
         let mut has_south = false;
 
@@ -276,7 +322,14 @@ impl Collector {
 
 /// Convert a source `AbsInfo` into an emit `Axis`.
 fn to_axis(a: &AbsInfo) -> Axis {
-    Axis { min: a.min, max: a.max, fuzz: a.fuzz, flat: a.flat, resolution: a.resolution, value: None }
+    Axis {
+        min: a.min,
+        max: a.max,
+        fuzz: a.fuzz,
+        flat: a.flat,
+        resolution: a.resolution,
+        value: None,
+    }
 }
 
 /// Build an axis row from the driver-declared `AbsInfo` (for fuzz/flat/resolution) overlaid with an
@@ -284,7 +337,14 @@ fn to_axis(a: &AbsInfo) -> Axis {
 /// `value` records the measured rest/centre.
 fn measured_axis(a: &AbsInfo, cal: (i32, i32, i32)) -> Axis {
     let (min, max, centre) = cal;
-    Axis { min, max, fuzz: a.fuzz, flat: a.flat, resolution: a.resolution, value: Some(centre) }
+    Axis {
+        min,
+        max,
+        fuzz: a.fuzz,
+        flat: a.flat,
+        resolution: a.resolution,
+        value: Some(centre),
+    }
 }
 
 /// The `ABS_HAT*` axis codes (`ABS_HAT0X`=0x10 … `ABS_HAT3Y`=0x17) — the kernel's D-PAD convention.
@@ -338,7 +398,11 @@ fn axis_calibration(events: &[RawEvent], code: u16, declared: &AbsInfo) -> (i32,
         .map(|e| e.value)
         .collect();
     if vals.is_empty() {
-        return (declared.min, declared.max, (declared.min + declared.max) / 2);
+        return (
+            declared.min,
+            declared.max,
+            (declared.min + declared.max) / 2,
+        );
     }
     let min = *vals.iter().min().unwrap();
     let max = *vals.iter().max().unwrap();
@@ -349,8 +413,14 @@ fn axis_calibration(events: &[RawEvent], code: u16, declared: &AbsInfo) -> (i32,
 
 /// Build one `[[inputs]]` row from a recorded capture.
 fn input_row(spec: &ControlSpec, rec: &Recorded) -> Result<emit::Input, CollectError> {
-    let unknown_key = |c: u16| CollectError::UnknownCode { ev_type: EV_KEY, code: c };
-    let unknown_abs = |c: u16| CollectError::UnknownCode { ev_type: EV_ABS, code: c };
+    let unknown_key = |c: u16| CollectError::UnknownCode {
+        ev_type: EV_KEY,
+        code: c,
+    };
+    let unknown_abs = |c: u16| CollectError::UnknownCode {
+        ev_type: EV_ABS,
+        code: c,
+    };
     Ok(match rec {
         Recorded::Button { code } => emit::Input {
             id: spec.id.clone(),
@@ -441,8 +511,14 @@ fn merged_dpad_row(axes: &std::collections::BTreeSet<u16>) -> Result<emit::Input
         ev_type: "EV_ABS".to_string(),
         code: format!(
             "{},{}",
-            codes::abs_name(x_code).ok_or(CollectError::UnknownCode { ev_type: EV_ABS, code: x_code })?,
-            codes::abs_name(y_code).ok_or(CollectError::UnknownCode { ev_type: EV_ABS, code: y_code })?
+            codes::abs_name(x_code).ok_or(CollectError::UnknownCode {
+                ev_type: EV_ABS,
+                code: x_code
+            })?,
+            codes::abs_name(y_code).ok_or(CollectError::UnknownCode {
+                ev_type: EV_ABS,
+                code: y_code
+            })?
         ),
         semantics: None,
         range: None,
@@ -482,7 +558,10 @@ fn observe_axis(values: &[i32], declared: &AbsInfo) -> AxisObs {
             visited_intermediate = true;
         }
     }
-    AxisObs { max: hi, visited_intermediate }
+    AxisObs {
+        max: hi,
+        visited_intermediate,
+    }
 }
 
 /// Turn a control's working events into a `Recorded` (or a `NoActivity`/`Incomplete` error).
@@ -498,15 +577,21 @@ fn finalize(
                 .iter()
                 .find(|e| e.ev_type == EV_KEY && e.value == 1)
                 .map(|e| e.code)
-                .ok_or_else(|| CollectError::NoActivity { id: spec.id.clone() })?;
+                .ok_or_else(|| CollectError::NoActivity {
+                    id: spec.id.clone(),
+                })?;
             Ok(Recorded::Button { code })
         }
         Kind::Hat => {
             // A hat records HAT axes only — a swept thumbstick is not a D-PAD (tsp-bwrg.12).
-            let axes: Vec<u16> =
-                active_abs_codes(events, src).into_iter().filter(|&c| is_hat_axis(c)).collect();
+            let axes: Vec<u16> = active_abs_codes(events, src)
+                .into_iter()
+                .filter(|&c| is_hat_axis(c))
+                .collect();
             if axes.is_empty() {
-                return Err(CollectError::NoActivity { id: spec.id.clone() });
+                return Err(CollectError::NoActivity {
+                    id: spec.id.clone(),
+                });
             }
             if axes.len() < 2 {
                 return Err(CollectError::Incomplete {
@@ -518,7 +603,10 @@ fn finalize(
                 });
             }
             // Lowest code is the X axis (HAT0X=0x10 < HAT0Y=0x11), highest is Y.
-            Ok(Recorded::Hat { x_code: axes[0], y_code: axes[1] })
+            Ok(Recorded::Hat {
+                x_code: axes[0],
+                y_code: axes[1],
+            })
         }
         Kind::HatDir => {
             // ONE dpad direction: a single HAT axis actuated. Record WHICH hat axis (merged into the
@@ -530,19 +618,27 @@ fn finalize(
             // D-PAD row (tsp-bwrg.12). When no hat axis actuated there is nothing honest to record:
             // report `NoActivity` so the wizard re-prompts, rather than fabricate a row. Same
             // never-fabricate bar as the ambient-rest-stream case (tsp-bwrg.6).
-            let code = active_abs_codes(events, src).into_iter().find(|&c| is_hat_axis(c));
+            let code = active_abs_codes(events, src)
+                .into_iter()
+                .find(|&c| is_hat_axis(c));
             match code {
                 Some(code) => Ok(Recorded::HatAxis { code }),
-                None => Err(CollectError::NoActivity { id: spec.id.clone() }),
+                None => Err(CollectError::NoActivity {
+                    id: spec.id.clone(),
+                }),
             }
         }
         Kind::Stick => {
             // A stick records PROPORTIONAL axes only — a set of D-PAD presses drives both hat axes
             // to both extremes and would otherwise rank as a stick (tsp-bwrg.12).
-            let axes: Vec<u16> =
-                active_abs_codes(events, src).into_iter().filter(|&c| !is_hat_axis(c)).collect();
+            let axes: Vec<u16> = active_abs_codes(events, src)
+                .into_iter()
+                .filter(|&c| !is_hat_axis(c))
+                .collect();
             if axes.is_empty() {
-                return Err(CollectError::NoActivity { id: spec.id.clone() });
+                return Err(CollectError::NoActivity {
+                    id: spec.id.clone(),
+                });
             }
             if axes.len() < 2 {
                 return Err(CollectError::Incomplete {
@@ -555,11 +651,24 @@ fn finalize(
             ranked.truncate(2);
             ranked.sort_unstable();
             let (x_code, y_code) = (ranked[0], ranked[1]);
-            let x = src.absinfo(x_code).map_err(|e| CollectError::AbsInfo { code: x_code, source: e })?;
-            let y = src.absinfo(y_code).map_err(|e| CollectError::AbsInfo { code: y_code, source: e })?;
+            let x = src.absinfo(x_code).map_err(|e| CollectError::AbsInfo {
+                code: x_code,
+                source: e,
+            })?;
+            let y = src.absinfo(y_code).map_err(|e| CollectError::AbsInfo {
+                code: y_code,
+                source: e,
+            })?;
             let x_cal = axis_calibration(events, x_code, &x);
             let y_cal = axis_calibration(events, y_code, &y);
-            Ok(Recorded::Stick { x_code, x, y_code, y, x_cal, y_cal })
+            Ok(Recorded::Stick {
+                x_code,
+                x,
+                y_code,
+                y,
+                x_cal,
+                y_cal,
+            })
         }
         Kind::Trigger => {
             // A trigger manifests one of two ways, and the a133 is the second:
@@ -577,20 +686,34 @@ fn finalize(
                 .find(|e| e.ev_type == EV_KEY && e.value == 1)
                 .map(|e| e.code);
             // Proportional axes only: a D-PAD press caught in the window is not a trigger axis.
-            let axes: Vec<u16> =
-                active_abs_codes(events, src).into_iter().filter(|&c| !is_hat_axis(c)).collect();
+            let axes: Vec<u16> = active_abs_codes(events, src)
+                .into_iter()
+                .filter(|&c| !is_hat_axis(c))
+                .collect();
             if !axes.is_empty() {
                 let code = rank_axes_by_span(events, &axes)[0];
-                let abs = src.absinfo(code).map_err(|e| CollectError::AbsInfo { code, source: e })?;
-                let vals: Vec<i32> =
-                    events.iter().filter(|e| e.ev_type == EV_ABS && e.code == code).map(|e| e.value).collect();
+                let abs = src
+                    .absinfo(code)
+                    .map_err(|e| CollectError::AbsInfo { code, source: e })?;
+                let vals: Vec<i32> = events
+                    .iter()
+                    .filter(|e| e.ev_type == EV_ABS && e.code == code)
+                    .map(|e| e.value)
+                    .collect();
                 let obs = observe_axis(&vals, &abs);
                 let span = (abs.max - abs.min).max(1);
                 let reached_press = obs.max >= abs.max - (span / 16).max(1);
                 if reached_press {
-                    let semantics =
-                        if obs.visited_intermediate { Semantics::Analog } else { Semantics::Binary };
-                    return Ok(Recorded::Trigger { code, abs, semantics });
+                    let semantics = if obs.visited_intermediate {
+                        Semantics::Analog
+                    } else {
+                        Semantics::Binary
+                    };
+                    return Ok(Recorded::Trigger {
+                        code,
+                        abs,
+                        semantics,
+                    });
                 }
                 // Axis activity but no real press → not the trigger axis (crosstalk). Fall through.
             }
@@ -599,7 +722,9 @@ fn finalize(
                 return Ok(Recorded::TriggerButton { code });
             }
             if axes.is_empty() {
-                return Err(CollectError::NoActivity { id: spec.id.clone() });
+                return Err(CollectError::NoActivity {
+                    id: spec.id.clone(),
+                });
             }
             Err(CollectError::Incomplete {
                 id: spec.id.clone(),
@@ -640,7 +765,11 @@ fn abs_is_active(code: u16, events: &[RawEvent], ai: &AbsInfo) -> bool {
 /// sorted ascending. Reads each candidate axis's `EVIOCGABS` range via `src`; a resting
 /// continuously-streaming stick is correctly excluded. Replaces the old `value != 0` filter.
 fn active_abs_codes(events: &[RawEvent], src: &mut dyn EventSource) -> Vec<u16> {
-    let mut codes: Vec<u16> = events.iter().filter(|e| e.ev_type == EV_ABS).map(|e| e.code).collect();
+    let mut codes: Vec<u16> = events
+        .iter()
+        .filter(|e| e.ev_type == EV_ABS)
+        .map(|e| e.code)
+        .collect();
     codes.sort_unstable();
     codes.dedup();
     codes
@@ -716,7 +845,11 @@ impl Default for RunConfig {
 /// Read (and cache) an axis's driver-declared `EVIOCGABS` range. A code the source cannot describe
 /// degrades to an all-zero range, which the significance test then reads as "never active" — the
 /// safe direction (an undescribable axis cannot complete a control).
-fn declared_abs(cache: &mut HashMap<u16, AbsInfo>, code: u16, src: &mut dyn EventSource) -> AbsInfo {
+fn declared_abs(
+    cache: &mut HashMap<u16, AbsInfo>,
+    code: u16,
+    src: &mut dyn EventSource,
+) -> AbsInfo {
     if let Some(a) = cache.get(&code) {
         return *a;
     }
@@ -881,7 +1014,11 @@ impl Window {
         match self.kind {
             // A press is discrete: the key-down IS the whole actuation.
             Kind::Button | Kind::StickClick => {
-                if self.key_down { Coverage::Complete } else { Coverage::None }
+                if self.key_down {
+                    Coverage::Complete
+                } else {
+                    Coverage::None
+                }
             }
             // Two shapes on the wire. A binary trigger realized as a BUTTON (the a133 L2/R2, which
             // the MCU reports as a bit and the decoder emits as `BTN_TL2`/`BTN_TR2`) is discrete. A
@@ -909,13 +1046,21 @@ impl Window {
             }
             // A lumped hat: BOTH hat axes swept to both extremes.
             Kind::Hat => {
-                if self.class_axes_fully_swept(true, 2) { Coverage::Settling } else { Coverage::None }
+                if self.class_axes_fully_swept(true, 2) {
+                    Coverage::Settling
+                } else {
+                    Coverage::None
+                }
             }
             // A stick: BOTH proportional axes swept to both extremes — a real full circle, not a
             // quarter-roll (tsp-bwrg.6). Hat axes are excluded so a set of D-PAD presses, which
             // drives both hat axes to both extremes, cannot satisfy a stick prompt.
             Kind::Stick => {
-                if self.class_axes_fully_swept(false, 2) { Coverage::Settling } else { Coverage::None }
+                if self.class_axes_fully_swept(false, 2) {
+                    Coverage::Settling
+                } else {
+                    Coverage::None
+                }
             }
         }
     }
@@ -923,8 +1068,12 @@ impl Window {
     /// Whether `need` axes OF THIS CLASS (hat vs proportional) have each been swept to within 30%
     /// of both declared extremes. Shares [`axes_fully_swept`]'s sweep maths — one implementation.
     fn class_axes_fully_swept(&self, hat: bool, need: usize) -> bool {
-        let axes: std::collections::HashSet<u16> =
-            self.actuated.iter().copied().filter(|&c| is_hat_axis(c) == hat).collect();
+        let axes: std::collections::HashSet<u16> = self
+            .actuated
+            .iter()
+            .copied()
+            .filter(|&c| is_hat_axis(c) == hat)
+            .collect();
         axes.len() >= need && axes_fully_swept(&axes, &self.span, &self.declared, need)
     }
 
@@ -997,7 +1146,11 @@ fn poll_event_active(
                 Some(a) => *a,
                 None => {
                     let a = src.absinfo(e.code).unwrap_or(AbsInfo {
-                        min: 0, max: 0, fuzz: 0, flat: 0, resolution: 0,
+                        min: 0,
+                        max: 0,
+                        fuzz: 0,
+                        flat: 0,
+                        resolution: 0,
                     });
                     cache.insert(e.code, a);
                     a
@@ -1014,7 +1167,11 @@ fn poll_event_active(
 ///
 /// The completion RULES live entirely in [`Window`] (the one policy both pumps share); this loop
 /// only supplies polls and honours the verdict.
-fn pump<S: EventSource>(src: &mut S, spec: &ControlSpec, cfg: &RunConfig) -> io::Result<Vec<RawEvent>> {
+fn pump<S: EventSource>(
+    src: &mut S,
+    spec: &ControlSpec,
+    cfg: &RunConfig,
+) -> io::Result<Vec<RawEvent>> {
     let mut window = Window::new(spec);
     let deadline = Instant::now() + cfg.control_timeout;
     let mut iters = 0usize;
@@ -1047,7 +1204,8 @@ pub fn run<S: EventSource, W: Write>(
         // gamepad node (tsp-bwrg.16). A single-node source ignores this (default no-op), so
         // single-source runs are unchanged; a MultiSource switches nodes here.
         src.set_active_source(spec.source.as_deref());
-        let evs = pump(src, &spec, cfg).map_err(|e| CollectError::AbsInfo { code: 0, source: e })?;
+        let evs =
+            pump(src, &spec, cfg).map_err(|e| CollectError::AbsInfo { code: 0, source: e })?;
         collector.record(&evs);
         match collector.commit_current(src)? {
             CommitOutcome::Captured(rec) => writeln!(out, "    recorded: {}", describe(&rec)).ok(),
@@ -1073,19 +1231,41 @@ fn describe(rec: &Recorded) -> String {
             codes::abs_name(*x_code).unwrap_or("?"),
             codes::abs_name(*y_code).unwrap_or("?")
         ),
-        Recorded::Stick { x_code, y_code, x_cal, y_cal, .. } => format!(
+        Recorded::Stick {
+            x_code,
+            y_code,
+            x_cal,
+            y_cal,
+            ..
+        } => format!(
             "stick {}[{}..{} @{}],{}[{}..{} @{}]",
-            codes::abs_name(*x_code).unwrap_or("?"), x_cal.0, x_cal.1, x_cal.2,
-            codes::abs_name(*y_code).unwrap_or("?"), y_cal.0, y_cal.1, y_cal.2
+            codes::abs_name(*x_code).unwrap_or("?"),
+            x_cal.0,
+            x_cal.1,
+            x_cal.2,
+            codes::abs_name(*y_code).unwrap_or("?"),
+            y_cal.0,
+            y_cal.1,
+            y_cal.2
         ),
-        Recorded::Trigger { code, abs, semantics } => format!(
+        Recorded::Trigger {
+            code,
+            abs,
+            semantics,
+        } => format!(
             "trigger {} [{}..{}] semantics={}",
-            codes::abs_name(*code).unwrap_or("?"), abs.min, abs.max, semantics.as_str()
+            codes::abs_name(*code).unwrap_or("?"),
+            abs.min,
+            abs.max,
+            semantics.as_str()
         ),
         Recorded::TriggerButton { code } => format!(
             "trigger {} (button, semantics=binary)",
             codes::key_name(*code).unwrap_or("?")
         ),
-        Recorded::HatAxis { code } => format!("dpad direction {} (merges into the hat row)", codes::abs_name(*code).unwrap_or("?")),
+        Recorded::HatAxis { code } => format!(
+            "dpad direction {} (merges into the hat row)",
+            codes::abs_name(*code).unwrap_or("?")
+        ),
     }
 }

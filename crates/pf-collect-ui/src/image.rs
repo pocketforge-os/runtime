@@ -17,7 +17,11 @@ pub struct Rgb {
 
 impl Rgb {
     pub fn new(w: usize, h: usize, fill: Color) -> Rgb {
-        Rgb { w, h, px: vec![fill; w * h] }
+        Rgb {
+            w,
+            h,
+            px: vec![fill; w * h],
+        }
     }
 
     #[inline]
@@ -36,7 +40,11 @@ impl Rgb {
     pub fn blit_region_from(&mut self, src: &Rgb, sx: i64, sy: i64, sw: i64, sh: i64) {
         for yy in sy..sy + sh {
             for xx in sx..sx + sw {
-                if xx >= 0 && yy >= 0 && (xx as usize) < self.w.min(src.w) && (yy as usize) < self.h.min(src.h) {
+                if xx >= 0
+                    && yy >= 0
+                    && (xx as usize) < self.w.min(src.w)
+                    && (yy as usize) < self.h.min(src.h)
+                {
                     let (x, y) = (xx as usize, yy as usize);
                     self.set(x, y, src.get(x, y));
                 }
@@ -63,7 +71,11 @@ pub fn load_png(path: &Path) -> io::Result<Rgb> {
     if info.bit_depth != png::BitDepth::Eight {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("unsupported PNG bit depth {:?} for {}", info.bit_depth, path.display()),
+            format!(
+                "unsupported PNG bit depth {:?} for {}",
+                info.bit_depth,
+                path.display()
+            ),
         ));
     }
 
@@ -92,14 +104,23 @@ pub fn load_png(path: &Path) -> io::Result<Rgb> {
         other => {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("unsupported PNG color type {other:?} for {}", path.display()),
+                format!(
+                    "unsupported PNG color type {other:?} for {}",
+                    path.display()
+                ),
             ));
         }
     }
     if px.len() != w * h {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("decoded {} px, expected {}x{} for {}", px.len(), w, h, path.display()),
+            format!(
+                "decoded {} px, expected {}x{} for {}",
+                px.len(),
+                w,
+                h,
+                path.display()
+            ),
         ));
     }
     Ok(Rgb { w, h, px })

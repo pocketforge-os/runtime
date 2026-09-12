@@ -25,6 +25,8 @@
 from __future__ import annotations
 
 import shutil
+import os
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -36,6 +38,7 @@ import yaml  # noqa: E402
 
 RUNTIME_TESTS = ".github/workflows/runtime-tests.yml"
 PREFS_E2E = ".github/workflows/prefs-e2e.yml"
+PAYLOAD = "scripts/ci-container.sh"
 
 
 # --------------------------------------------------------------------------- #
@@ -50,7 +53,14 @@ def _dump(root: Path, rel: str, data) -> None:
 
 
 def _test_job(wf):
-    return wf["jobs"]["test"]
+    return wf["jobs"]["rust"]
+
+
+def _payload_replace(root, old, new):
+    path = root / PAYLOAD
+    text = path.read_text()
+    assert old in text, old
+    path.write_text(text.replace(old, new))
 
 
 def _find_step(job, needle):
@@ -70,36 +80,48 @@ def _on(wf):
 # mutations: each returns None and edits the tree in place                    #
 # --------------------------------------------------------------------------- #
 def m_delete_clippy_step(root):
-    wf = _load(root, RUNTIME_TESTS)
-    job = _test_job(wf)
-    i, _ = _find_step(job, "cargo clippy --locked")
-    del job["steps"][i]
-    _dump(root, RUNTIME_TESTS, wf)
+    path = root / PAYLOAD
+    path.write_text("\n".join(l for l in path.read_text().splitlines() if not l.startswith("cargo clippy")))
+
+
+def m_delete_workspace_test(root):
+    path = root / PAYLOAD
+    path.write_text("\n".join(l for l in path.read_text().splitlines()
+                              if not l.startswith("cargo test --locked --workspace")))
+
+
+def m_narrow_workspace_test(root):
+    _payload_replace(root, "cargo test --locked --workspace", "cargo test --locked -p pf-wire")
+
+
+def m_delete_workspace_clippy(root):
+    path = root / PAYLOAD
+    path.write_text("\n".join(l for l in path.read_text().splitlines()
+                              if not l.startswith("cargo clippy --locked --workspace")))
+
+
+def m_narrow_workspace_clippy(root):
+    _payload_replace(root, "cargo clippy --locked --workspace", "cargo clippy --locked -p pf-wire")
+
+
+def m_weaken_only_workspace_clippy(root):
+    _payload_replace(root, "cargo clippy --locked --workspace --offline --all-targets -- -D warnings",
+                     "cargo clippy --locked --workspace --offline --all-targets")
 
 
 def m_strip_locked_from_metadata(root):
-    wf = _load(root, RUNTIME_TESTS)
-    job = _test_job(wf)
-    i, step = _find_step(job, "cargo metadata")
-    step["run"] = step["run"].replace(" --locked", "")
-    job["steps"][i] = step
-    _dump(root, RUNTIME_TESTS, wf)
+    _payload_replace(root, "cargo metadata --offline --locked", "cargo metadata --offline")
 
 
 def m_continue_on_error_clippy(root):
     wf = _load(root, RUNTIME_TESTS)
     job = _test_job(wf)
-    i, step = _find_step(job, "cargo clippy --locked")
-    step["continue-on-error"] = True
+    job["continue-on-error"] = True
     _dump(root, RUNTIME_TESTS, wf)
 
 
 def m_or_true_clippy(root):
-    wf = _load(root, RUNTIME_TESTS)
-    job = _test_job(wf)
-    i, step = _find_step(job, "cargo clippy --locked")
-    step["run"] = step["run"].rstrip() + " || true\n"
-    _dump(root, RUNTIME_TESTS, wf)
+    _payload_replace(root, "-- -D warnings", "-- -D warnings || true")
 
 
 def m_path_exclude_crates(root):
@@ -110,11 +132,7 @@ def m_path_exclude_crates(root):
 
 
 def m_if_skip_clippy(root):
-    wf = _load(root, RUNTIME_TESTS)
-    job = _test_job(wf)
-    i, step = _find_step(job, "cargo clippy --locked")
-    step["if"] = "${{ false }}"
-    _dump(root, RUNTIME_TESTS, wf)
+    _payload_replace(root, "cargo clippy --locked", "if false; then cargo clippy --locked")
 
 
 def m_change_approved_job_if(root):
@@ -138,11 +156,7 @@ def m_reformat_approved_job_if(root):
 
 
 def m_weaken_clippy_flags(root):
-    wf = _load(root, RUNTIME_TESTS)
-    job = _test_job(wf)
-    i, step = _find_step(job, "cargo clippy --locked")
-    step["run"] = step["run"].replace(" -- -D warnings", "")
-    _dump(root, RUNTIME_TESTS, wf)
+    _payload_replace(root, " -- -D warnings", "")
 
 
 def m_drop_matrix_row(root):
@@ -152,25 +166,74 @@ def m_drop_matrix_row(root):
 
 
 def m_strip_platform_env(root):
-    wf = _load(root, RUNTIME_TESTS)
-    job = _test_job(wf)
-    i, step = _find_step(job, "cargo test --locked --workspace")
-    step.get("env", {}).pop("PF_PLATFORM_DIR", None)
-    if not step.get("env"):
-        step.pop("env", None)
-    _dump(root, RUNTIME_TESTS, wf)
+    _payload_replace(root, '${PF_PLATFORM_DIR:?', '${UNSET_PLATFORM_DIR:?')
 
 
 def m_remove_platform_checkout(root):
     wf = _load(root, RUNTIME_TESTS)
-    job = _test_job(wf)
-    job["steps"] = [
-        s for s in job["steps"]
-        if not (isinstance(s.get("uses"), str)
-                and s["uses"].startswith("actions/checkout")
-                and (s.get("with") or {}).get("repository") == "pocketforge-os/platform")
-    ]
+    # Checkout is owned by the immutable callee: changing it requires changing
+    # its pin, which must invalidate the approved fixture/environment contract.
+    _test_job(wf)["uses"] = _test_job(wf)["uses"].split("@")[0] + "@" + "0" * 40
     _dump(root, RUNTIME_TESTS, wf)
+
+
+def m_mismatch_helper(root):
+    wf = _load(root, RUNTIME_TESTS)
+    _test_job(wf)["with"]["workflow-sha"] = "0" * 40
+    _dump(root, RUNTIME_TESTS, wf)
+
+
+def m_unpinned_image(root):
+    wf = _load(root, RUNTIME_TESTS)
+    _test_job(wf)["with"]["image"] = "ci-rust:latest"
+    _dump(root, RUNTIME_TESTS, wf)
+
+
+def m_bypass_result(root):
+    wf = _load(root, RUNTIME_TESTS)
+    wf["jobs"]["test"]["steps"][0]["run"] = "true"
+    _dump(root, RUNTIME_TESTS, wf)
+
+
+def m_early_success(root):
+    _payload_replace(root, "set -euo pipefail", "set -euo pipefail\nexit 0")
+
+
+def m_compound_success(root):
+    group = "echo '::group::Lock and offline vendor gates (including negative control)'"
+    _payload_replace(root, group, group + "; exit 0")
+    # Execute the reviewer's evasion, not just a textual mutation. It exits zero
+    # after the banner, without reaching any actual Cargo/vendor workload.
+    platform = root / "platform"
+    for rel in ("core/caps.py", "devices/a133/capabilities.toml", "devices/a523/capabilities.toml"):
+        path = platform / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.touch()
+    (platform / "skins/a133").mkdir(parents=True)
+    result = subprocess.run(["bash", str(root / PAYLOAD)], cwd=root, capture_output=True,
+                            text=True, timeout=5, env={**os.environ,
+                                "PF_PLATFORM_DIR": str(platform), "PF_SOURCE_SHA": "a" * 40,
+                                "SOURCE_DATE_EPOCH": "1", "RUSTFLAGS": "",
+                                "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER": ""})
+    assert result.returncode == 0 and result.stdout.strip() == group[6:-1], result
+
+
+def m_compound_and_success(root):
+    _payload_replace(root, "echo '::endgroup::'", "echo '::endgroup::' && exit 0")
+
+
+def m_quoted_punctuation(root):
+    _payload_replace(root, "echo '::endgroup::'", "echo '::endgroup:: literal ; and && punctuation'")
+
+
+def m_script_redirect(root):
+    wf = _load(root, RUNTIME_TESTS)
+    _test_job(wf)["with"]["script"] = "scripts/empty.sh"
+    _dump(root, RUNTIME_TESTS, wf)
+
+
+def m_remove_format(root):
+    _payload_replace(root, "cargo fmt --all -- --check", "echo formatter removed")
 
 
 def m_delete_whole_workflow(root):
@@ -192,15 +255,31 @@ CASES = [
     (m_strip_platform_env,       "[workspace-tests]",             "PF_PLATFORM_DIR unset (VACUOUS skip)"),
     (m_remove_platform_checkout, "[workspace-tests]",             "platform checkout removed (VACUOUS skip)"),
     (m_delete_whole_workflow,    "does not exist",                "whole runtime-tests.yml deleted (EXCLUDED JOB)"),
+    (m_mismatch_helper,          "inputs differ",                  "helper pin differs from approved callee"),
+    (m_unpinned_image,           "inputs differ",                  "mutable image tag substituted"),
+    (m_bypass_result,            "result gate",                    "required-name result gate masks failure"),
+    (m_early_success,            "conditionally skippable",        "payload exits successfully before any tests"),
+    (m_script_redirect,          "inputs differ",                  "caller redirects execution to empty script"),
+    (m_remove_format,            "[format-workspace]",             "whole-workspace format check removed"),
+    (m_delete_workspace_test,    "[workspace-tests]",              "workspace test deleted, keyboard test remains"),
+    (m_narrow_workspace_test,    "[workspace-tests]",              "workspace test narrowed to pf-wire"),
+    (m_delete_workspace_clippy,  "[clippy-workspace]",             "workspace clippy deleted, keyboard clippy remains"),
+    (m_narrow_workspace_clippy,  "[clippy-workspace]",             "workspace clippy narrowed to pf-wire"),
+    (m_weaken_only_workspace_clippy, "[clippy-workspace]",         "workspace warnings flag cannot come from keyboard"),
+    (m_compound_success,         "compound shell",                 "executed echo; exit 0 bypass is rejected"),
+    (m_compound_and_success,     "compound shell",                 "echo && exit 0 bypass is rejected"),
 ]
 
 PASS_CASES = [
     (m_reformat_approved_job_if, "approved job `if:` whitespace/line-folding changed"),
+    (m_quoted_punctuation, "quoted banner punctuation stays literal"),
 ]
 
 
 def _copy_tree(src_root: Path, dst_root: Path):
     shutil.copytree(src_root / ".github", dst_root / ".github")
+    (dst_root / "scripts").mkdir()
+    shutil.copyfile(src_root / PAYLOAD, dst_root / PAYLOAD)
 
 
 def main(argv=None):

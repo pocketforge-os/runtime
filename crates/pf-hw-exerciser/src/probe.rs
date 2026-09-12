@@ -16,7 +16,9 @@ fn has_ff_rumble(fd: i32) -> bool {
 }
 
 fn read_str(path: &str) -> String {
-    std::fs::read_to_string(path).map(|s| s.trim().to_string()).unwrap_or_default()
+    std::fs::read_to_string(path)
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default()
 }
 
 pub fn run(_args: &[String]) -> i32 {
@@ -98,8 +100,10 @@ pub fn run(_args: &[String]) -> i32 {
     // --- /sys/class/leds ---
     println!("\n[/sys/class/leds]");
     if let Ok(rd) = std::fs::read_dir("/sys/class/leds") {
-        let mut names: Vec<String> =
-            rd.flatten().filter_map(|e| e.file_name().into_string().ok()).collect();
+        let mut names: Vec<String> = rd
+            .flatten()
+            .filter_map(|e| e.file_name().into_string().ok())
+            .collect();
         names.sort();
         println!("  count={}", names.len());
         for n in &names {

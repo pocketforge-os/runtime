@@ -14,7 +14,11 @@ pub const fn rgb(r: u8, g: u8, b: u8) -> Color {
 
 #[inline]
 pub fn channels(c: Color) -> (u8, u8, u8) {
-    (((c >> 16) & 0xff) as u8, ((c >> 8) & 0xff) as u8, (c & 0xff) as u8)
+    (
+        ((c >> 16) & 0xff) as u8,
+        ((c >> 8) & 0xff) as u8,
+        (c & 0xff) as u8,
+    )
 }
 
 /// An RGB software canvas.
@@ -26,7 +30,11 @@ pub struct Canvas {
 
 impl Canvas {
     pub fn new(w: usize, h: usize) -> Canvas {
-        Canvas { w, h, px: vec![0; w * h] }
+        Canvas {
+            w,
+            h,
+            px: vec![0; w * h],
+        }
     }
 
     /// Raw pixel access (row-major, `y * w + x`), for a framebuffer blit.
@@ -123,7 +131,15 @@ impl Canvas {
     /// Blit an [`crate::image::Rgb`] scaled (nearest-neighbor) into the dest rect. If `key` is set,
     /// source pixels within `tol` of the key color are skipped (transparent) — used to knock out the
     /// device render's solid background so the device floats on the dark UI.
-    pub fn blit_scaled_keyed(&mut self, img: &crate::image::Rgb, dx: i32, dy: i32, dw: i32, dh: i32, key: Option<(Color, u8)>) {
+    pub fn blit_scaled_keyed(
+        &mut self,
+        img: &crate::image::Rgb,
+        dx: i32,
+        dy: i32,
+        dw: i32,
+        dh: i32,
+        key: Option<(Color, u8)>,
+    ) {
         if img.w == 0 || img.h == 0 || dw <= 0 || dh <= 0 {
             return;
         }
@@ -176,7 +192,7 @@ mod tests {
         c.clear(rgb(0, 0, 0));
         c.put(1, 1, rgb(255, 128, 64));
         assert_eq!(c.pixels()[4 + 1], rgb(255, 128, 64)); // (x=1,y=1) in a width-4 canvas
-        // out-of-bounds put is a no-op, not a panic
+                                                          // out-of-bounds put is a no-op, not a panic
         c.put(-1, 0, rgb(1, 1, 1));
         c.put(4, 0, rgb(1, 1, 1));
     }

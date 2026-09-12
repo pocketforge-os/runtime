@@ -47,7 +47,12 @@ impl UseEntry {
             Some((c, m)) => (c.trim().to_ascii_lowercase(), Some(m.trim().to_string())),
             None => (t.trim().to_ascii_lowercase(), None),
         };
-        UseEntry { cap, modifier, optional, raw }
+        UseEntry {
+            cap,
+            modifier,
+            optional,
+            raw,
+        }
     }
 }
 
@@ -74,7 +79,10 @@ pub enum Violation {
     UnsupportedAbi { abi: String },
     /// The app pins an `[runtime] family` that is neither THIS Platform's canonical family id nor
     /// one of its accepted aliases — a build for a different SoC family (different kernel/GPU/SDL).
-    FamilyMismatch { app_family: String, platform_family: String },
+    FamilyMismatch {
+        app_family: String,
+        platform_family: String,
+    },
     /// [`AppManifest::check_runtime`] was asked to verify a launch that requires a Platform pin, but
     /// the `app.toml` carries no `[runtime]` table (parsing stays back-compatible; requiring the pin
     /// is the supervisor's launch-policy choice).
@@ -140,7 +148,12 @@ pub struct BlessedRegistration {
 impl BlessedRegistration {
     /// Does this registration enumerate `entry` (matching the full token or the bare capability)?
     pub fn covers(&self, entry: &UseEntry) -> bool {
-        let token = entry.raw.trim().trim_end_matches('?').trim().to_ascii_lowercase();
+        let token = entry
+            .raw
+            .trim()
+            .trim_end_matches('?')
+            .trim()
+            .to_ascii_lowercase();
         self.grants.iter().any(|g| {
             let g = g.trim().to_ascii_lowercase();
             g == token || g == entry.cap
@@ -172,13 +185,22 @@ pub struct LaunchTrust<'a> {
 
 impl LaunchTrust<'_> {
     /// The safe floor: no signing authority (used by the back-compat [`AppManifest::validate`]).
-    pub const UNTRUSTED: LaunchTrust<'static> = LaunchTrust { first_party: false, blessed: None };
+    pub const UNTRUSTED: LaunchTrust<'static> = LaunchTrust {
+        first_party: false,
+        blessed: None,
+    };
     /// A first-party-signed bundle (clears every signature-tier entry).
-    pub const FIRST_PARTY: LaunchTrust<'static> = LaunchTrust { first_party: true, blessed: None };
+    pub const FIRST_PARTY: LaunchTrust<'static> = LaunchTrust {
+        first_party: true,
+        blessed: None,
+    };
 
     /// A blessed-binary trust context over `reg` (not first-party, but exempt for what `reg` enumerates).
     pub fn blessed(reg: &BlessedRegistration) -> LaunchTrust<'_> {
-        LaunchTrust { first_party: false, blessed: Some(reg) }
+        LaunchTrust {
+            first_party: false,
+            blessed: Some(reg),
+        }
     }
 
     /// Does this trust context authorize declaring the signature-tier `entry` for `app_id`?
@@ -343,7 +365,8 @@ impl AppManifest {
     /// Load an `app.toml` from a path.
     pub fn load(path: impl AsRef<std::path::Path>) -> std::io::Result<AppManifest> {
         let text = std::fs::read_to_string(path)?;
-        AppManifest::from_toml(&text).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))
+        AppManifest::from_toml(&text)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))
     }
 
     /// Validate the `use = [...]` graph against the device descriptor (the CEILING check), treating
@@ -388,7 +411,10 @@ impl AppManifest {
             // Modifier rules.
             if let Some(m) = &e.modifier {
                 if !modifier_ok(&e.cap, m) {
-                    violations.push(Violation::BadModifier { cap: e.cap.clone(), modifier: m.clone() });
+                    violations.push(Violation::BadModifier {
+                        cap: e.cap.clone(),
+                        modifier: m.clone(),
+                    });
                     continue;
                 }
             }
@@ -399,7 +425,9 @@ impl AppManifest {
             if tier_of(&e.cap, e.modifier.as_deref()) == Tier::Signature
                 && !trust.authorizes_signature(&self.app.id, &e)
             {
-                violations.push(Violation::SignatureTierRequiresTrust { token: e.raw.clone() });
+                violations.push(Violation::SignatureTierRequiresTrust {
+                    token: e.raw.clone(),
+                });
                 continue;
             }
             if e.cap == EGRESS_CAP {
@@ -426,7 +454,12 @@ impl AppManifest {
         }
 
         if violations.is_empty() {
-            Ok(ValidatedManifest { app_id: self.app.id.clone(), entries, allowed, egress_hosts })
+            Ok(ValidatedManifest {
+                app_id: self.app.id.clone(),
+                entries,
+                allowed,
+                egress_hosts,
+            })
         } else {
             Err(violations)
         }
@@ -466,7 +499,9 @@ impl AppManifest {
             });
         }
         if !platform.offers_abi(&rt.abi) {
-            violations.push(Violation::UnsupportedAbi { abi: rt.abi.clone() });
+            violations.push(Violation::UnsupportedAbi {
+                abi: rt.abi.clone(),
+            });
         }
         if violations.is_empty() {
             Ok(rt)
@@ -492,20 +527,37 @@ mod tests {
 
     fn manifest(uses: &[&str]) -> AppManifest {
         AppManifest {
-            app: AppSection { id: "com.test.app".into(), uses: uses.iter().map(|s| s.to_string()).collect() },
+            app: AppSection {
+                id: "com.test.app".into(),
+                uses: uses.iter().map(|s| s.to_string()).collect(),
+            },
             runtime: None,
         }
     }
 
     #[test]
     fn parse_handles_modifier_and_optional() {
-        assert_eq!(UseEntry::parse("vibration"), UseEntry { cap: "vibration".into(), modifier: None, optional: false, raw: "vibration".into() });
+        assert_eq!(
+            UseEntry::parse("vibration"),
+            UseEntry {
+                cap: "vibration".into(),
+                modifier: None,
+                optional: false,
+                raw: "vibration".into()
+            }
+        );
         let e = UseEntry::parse("location:approximate");
-        assert_eq!((e.cap.as_str(), e.modifier.as_deref(), e.optional), ("location", Some("approximate"), false));
+        assert_eq!(
+            (e.cap.as_str(), e.modifier.as_deref(), e.optional),
+            ("location", Some("approximate"), false)
+        );
         let o = UseEntry::parse("imu?");
         assert_eq!((o.cap.as_str(), o.optional), ("imu", true));
         let eg = UseEntry::parse("egress:steampowered.com");
-        assert_eq!((eg.cap.as_str(), eg.modifier.as_deref()), ("egress", Some("steampowered.com")));
+        assert_eq!(
+            (eg.cap.as_str(), eg.modifier.as_deref()),
+            ("egress", Some("steampowered.com"))
+        );
     }
 
     #[test]
@@ -514,8 +566,17 @@ mod tests {
         // omits both rows (SPIKE-0, 2026-07-11) and a REQUIRED `imu` would be over-broad. The
         // list asked for a required `imu` until tsp-ozbp.16 and only validated against the stale
         // vendored copy; `imu?` is the honest declaration for hardware the device may not bind.
-        let m = manifest(&["input", "vibration", "imu?", "entropy", "location:approximate?", "egress:steampowered.com"]);
-        let v = m.validate(&desc("a523")).expect("a523 backs rumble; imu is optional");
+        let m = manifest(&[
+            "input",
+            "vibration",
+            "imu?",
+            "entropy",
+            "location:approximate?",
+            "egress:steampowered.com",
+        ]);
+        let v = m
+            .validate(&desc("a523"))
+            .expect("a523 backs rumble; imu is optional");
         assert!(v.allows("imu") && v.allows("vibration") && v.allows("egress"));
         assert_eq!(v.egress_hosts().collect::<Vec<_>>(), ["steampowered.com"]);
         // …and a REQUIRED imu on the a523 is now rejected exactly like it is on the a133.
@@ -529,23 +590,38 @@ mod tests {
     fn required_imu_on_a133_is_rejected_but_optional_is_allowed() {
         // a133 has no IMU. Required → reject (over-broad); optional → accept (graceful absence).
         let req = manifest(&["imu"]).validate(&desc("a133"));
-        assert_eq!(req.unwrap_err(), vec![Violation::UndescriptoredRequired("imu".into())]);
-        let opt = manifest(&["imu?"]).validate(&desc("a133")).expect("optional imu allowed");
-        assert!(opt.allows("imu"), "optional imu is in the ceiling (runtime returns HardwareAbsent)");
+        assert_eq!(
+            req.unwrap_err(),
+            vec![Violation::UndescriptoredRequired("imu".into())]
+        );
+        let opt = manifest(&["imu?"])
+            .validate(&desc("a133"))
+            .expect("optional imu allowed");
+        assert!(
+            opt.allows("imu"),
+            "optional imu is in the ceiling (runtime returns HardwareAbsent)"
+        );
     }
 
     #[test]
     fn unknown_dup_and_bad_modifier_are_each_rejected() {
-        let v = manifest(&["telepathy", "input", "input", "location:teleport"]).validate(&desc("a523")).unwrap_err();
+        let v = manifest(&["telepathy", "input", "input", "location:teleport"])
+            .validate(&desc("a523"))
+            .unwrap_err();
         assert!(v.contains(&Violation::UnknownCapability("telepathy".into())));
         assert!(v.contains(&Violation::DuplicateCapability("input".into())));
-        assert!(v.contains(&Violation::BadModifier { cap: "location".into(), modifier: "teleport".into() }));
+        assert!(v.contains(&Violation::BadModifier {
+            cap: "location".into(),
+            modifier: "teleport".into()
+        }));
     }
 
     #[test]
     fn platform_caps_need_no_descriptor_row() {
         // input/entropy/audio/settings are always backable, even required.
-        let v = manifest(&["input", "entropy", "audio", "settings"]).validate(&desc("a133")).expect("platform caps ok");
+        let v = manifest(&["input", "entropy", "audio", "settings"])
+            .validate(&desc("a133"))
+            .expect("platform caps ok");
         for c in ["input", "entropy", "audio", "settings"] {
             assert!(v.allows(c));
         }
@@ -593,7 +669,10 @@ mod tests {
         // An app.toml written before the pin existed carries no [runtime]: parse succeeds, runtime None.
         let m = AppManifest::from_toml("[app]\nid = \"com.legacy.app\"\nuse = [\"input\"]\n")
             .expect("legacy app.toml parses");
-        assert!(m.runtime.is_none(), "missing [runtime] stays None (back-compat)");
+        assert!(
+            m.runtime.is_none(),
+            "missing [runtime] stays None (back-compat)"
+        );
         // …but a launch that requires the pin gets MissingRuntime from check_runtime.
         assert_eq!(
             m.check_runtime(&a133_platform()).unwrap_err(),
@@ -604,7 +683,9 @@ mod tests {
     #[test]
     fn check_runtime_accepts_canonical_family_match() {
         let m = app_with_runtime("pocketforge/a133-powervr", "1");
-        let rt = m.check_runtime(&a133_platform()).expect("canonical family + offered abi accepted");
+        let rt = m
+            .check_runtime(&a133_platform())
+            .expect("canonical family + offered abi accepted");
         assert_eq!(rt.family, "pocketforge/a133-powervr");
     }
 
@@ -612,7 +693,8 @@ mod tests {
     fn check_runtime_accepts_alias_family_match() {
         // An app that pinned the E2 draft SoC-only id resolves against the Platform's accepted alias.
         let m = app_with_runtime("pocketforge/sun50i-a133", "1");
-        m.check_runtime(&a133_platform()).expect("alias family accepted");
+        m.check_runtime(&a133_platform())
+            .expect("alias family accepted");
     }
 
     #[test]
@@ -655,7 +737,10 @@ mod tests {
         // The family-advertisement source is device/platform config (parsed here), NOT Rust constants.
         let p = a133_platform();
         assert!(p.family_matches("pocketforge/a133-powervr"));
-        assert!(p.family_matches("pocketforge/sun50i-a133"), "alias resolves");
+        assert!(
+            p.family_matches("pocketforge/sun50i-a133"),
+            "alias resolves"
+        );
         assert!(!p.family_matches("pocketforge/a523-mali"));
         assert!(p.offers_abi("1"));
         assert!(!p.offers_abi("2"));
