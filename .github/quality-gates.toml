@@ -68,7 +68,7 @@ trigger_branch = "main"
 # script execution. The checker still inspects the real local payload commands.
 [[reusable]]
 workflow = ".github/workflows/runtime-tests.yml"
-uses = "pocketforge-os/shared-workflows/.github/workflows/rust-container.yml@8a6a6a87a7fb0a21363c4eae966759f941cee61c"
+uses = "pocketforge-os/shared-workflows/.github/workflows/rust-container.yml@74aec91c4a9236f1ddc29c34663b5d9ef18a690e"
 script = "scripts/ci-container.sh"
 image = "10.0.32.86:5555/pocketforge/ci-rust@sha256:801f15f7e8fd20b449e3b0d0a7a56d632e28dae825b251a19a30e6f8b32bd8e9"
 
