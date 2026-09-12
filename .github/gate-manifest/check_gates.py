@@ -37,6 +37,7 @@ import argparse
 import fnmatch
 import sys
 import re
+import shlex
 from pathlib import Path
 
 # Fail-closed on a missing dep: a meta-gate that cannot run is not a pass.
@@ -257,6 +258,43 @@ def _job_checks_out(job: dict, repo: str) -> bool:
     return False
 
 
+def _payload_command(line):
+    """Accept one simple shell command, never a prefix of compound shell code.
+
+    shlex preserves quoted banners as single words but separates unquoted shell
+    operators even without spaces. Expansion/substitution and compound/control
+    flow are deliberately not interpreted by this bounded meta-check.
+    """
+    if "$(" in line or "`" in line:
+        raise ValueError(f"unsupported compound shell substitution: {line!r}")
+    lexer = shlex.shlex(line, posix=True, punctuation_chars=";&|()<>")
+    lexer.whitespace_split = True
+    argv = list(lexer)
+    if argv[:2] == ["cargo", "metadata"] and argv[-2:] == [">", "/dev/null"]:
+        argv = argv[:-2]  # The one supported non-control-flow redirect.
+    if not argv or argv[0] not in {"set", ":", "test", "echo", "cargo", "bash", "sccache"}:
+        raise ValueError("payload is conditionally skippable or has unsupported control flow")
+    if any(word and all(c in ";&|()<>" for c in word) for word in argv):
+        raise ValueError(f"unsupported compound shell control flow: {line!r}")
+    if argv[0] == "set" and argv != ["set", "-euo", "pipefail"]:
+        raise ValueError("payload lost fail-closed shell mode")
+    if argv[0] == "bash" and (len(argv) != 2 or not re.fullmatch(r"scripts/[\w./-]+\.sh|ctest/[\w./-]+\.sh", argv[1])):
+        raise ValueError("unsupported compound shell script invocation")
+    return argv
+
+
+def _invocation_matches(line, required):
+    """Flags must belong to the named invocation, not another command or prose."""
+    argv = shlex.split(line, comments=True)
+    for token in required:
+        parts = shlex.split(token)
+        if parts[:1] == ["cargo"] and (argv[:len(parts)] != parts or "--help" in argv or "--version" in argv):
+            return False
+        if not any(argv[i:i + len(parts)] == parts for i in range(len(argv))):
+            return False
+    return True
+
+
 def _expand_reusable(job, wf, rel, root, contracts):
     """Model only the explicitly pinned, CI-verified public container contract.
 
@@ -290,17 +328,16 @@ def _expand_reusable(job, wf, rel, root, contracts):
     lines = _iter_lock_lines(payload)
     if "set -euo pipefail" not in lines:
         raise ValueError("payload lost fail-closed shell mode")
-    for line in lines:
-        if not line.startswith(("set -euo pipefail", ": ", "test ", "echo ", "cargo ", "bash ", "sccache ")):
-            raise ValueError("payload is conditionally skippable or has unsupported control flow")
-        if line.startswith("set ") and line != "set -euo pipefail":
-            raise ValueError("payload lost fail-closed shell mode")
+    parsed = [(line, _payload_command(line)) for line in lines]
     # The pinned callee supplies platform; the payload must demand it as well.
     env = {"PF_PLATFORM_DIR": "/work/platform"} if '${PF_PLATFORM_DIR:?' in payload else {}
-    commands = "\n".join(l for l in lines if l.startswith(("cargo ", "bash ", "sccache ")))
+    # One modeled step per actual invocation: never borrow --workspace or lint
+    # flags from the keyboard test, formatter, or another Cargo subcommand.
+    commands = [{"run": line, "env": env} for line, argv in parsed
+                if argv[0] in {"cargo", "bash", "sccache"}]
     return {**job, "steps": [
         {"uses": "actions/checkout", "with": {"repository": "pocketforge-os/platform"}},
-        {"run": commands, "env": env},
+        *commands,
     ]}
 
 
@@ -452,8 +489,7 @@ def evaluate(manifest_path: str, repo_root: str):
                 if not run_text:
                     continue
                 # strip shell-comment lines before matching (decorative-match guard)
-                body = "\n".join(_iter_lock_lines(run_text))
-                if all(t in body for t in tokens):
+                if any(_invocation_matches(line, tokens) for line in _iter_lock_lines(run_text)):
                     neutered, nreason = _step_neutered(job, step)
                     if neutered:
                         neuter_reasons.append(nreason)

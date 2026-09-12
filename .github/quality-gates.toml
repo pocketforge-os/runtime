@@ -68,7 +68,7 @@ trigger_branch = "main"
 # script execution. The checker still inspects the real local payload commands.
 [[reusable]]
 workflow = ".github/workflows/runtime-tests.yml"
-uses = "pocketforge-os/shared-workflows/.github/workflows/rust-container.yml@cdf8479049cfd868ae679d39628c93ff27834a4f"
+uses = "pocketforge-os/shared-workflows/.github/workflows/rust-container.yml@8a6a6a87a7fb0a21363c4eae966759f941cee61c"
 script = "scripts/ci-container.sh"
 image = "10.0.32.86:5555/pocketforge/ci-rust@sha256:801f15f7e8fd20b449e3b0d0a7a56d632e28dae825b251a19a30e6f8b32bd8e9"
 
@@ -115,6 +115,7 @@ workflow = ".github/workflows/runtime-tests.yml"
 job = "rust"
 allow_if = "github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository"
 required_tokens = ["scripts/check-vendor.sh", "scripts/test-check-vendor.sh"]
+tokens_in_separate_steps = true # Two distinct required invocations, not one Cargo gate.
 guards_paths = ["crates/**", "include/**", "Cargo.toml", "Cargo.lock", "vendor/**", "scripts/check-vendor.sh", "scripts/refresh-vendor.sh"]
 should_be_required_check = true
 origin = "tsp-h5ed.6"

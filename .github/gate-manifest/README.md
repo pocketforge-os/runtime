@@ -191,3 +191,11 @@ successful exit and a result gate that masks failures. Existing deleted/neutered
 clippy, unlocked metadata, path/fork/matrix and platform anti-vacuity mutations
 now target the real payload/caller surface. Shell parsing remains deliberately
 bounded to simple top-level commands; new control flow must be modelled explicitly.
+
+Each modeled payload step is one actual invocation. Cargo subcommand/flags must
+match that invocation's argv; workspace coverage cannot come from another test,
+formatter or clippy command. The vendor guard and its negative control are two
+explicitly required invocations. Quote-aware shell tokenization rejects compound
+operators/substitutions instead of accepting a safe-looking `echo` prefix. The
+selftest executes the `echo banner; exit 0` evasion and verifies that its zero
+exit without tests is rejected by the meta-gate.

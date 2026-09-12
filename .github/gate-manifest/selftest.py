@@ -25,6 +25,8 @@
 from __future__ import annotations
 
 import shutil
+import os
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -80,6 +82,31 @@ def _on(wf):
 def m_delete_clippy_step(root):
     path = root / PAYLOAD
     path.write_text("\n".join(l for l in path.read_text().splitlines() if not l.startswith("cargo clippy")))
+
+
+def m_delete_workspace_test(root):
+    path = root / PAYLOAD
+    path.write_text("\n".join(l for l in path.read_text().splitlines()
+                              if not l.startswith("cargo test --locked --workspace")))
+
+
+def m_narrow_workspace_test(root):
+    _payload_replace(root, "cargo test --locked --workspace", "cargo test --locked -p pf-wire")
+
+
+def m_delete_workspace_clippy(root):
+    path = root / PAYLOAD
+    path.write_text("\n".join(l for l in path.read_text().splitlines()
+                              if not l.startswith("cargo clippy --locked --workspace")))
+
+
+def m_narrow_workspace_clippy(root):
+    _payload_replace(root, "cargo clippy --locked --workspace", "cargo clippy --locked -p pf-wire")
+
+
+def m_weaken_only_workspace_clippy(root):
+    _payload_replace(root, "cargo clippy --locked --workspace --offline --all-targets -- -D warnings",
+                     "cargo clippy --locked --workspace --offline --all-targets")
 
 
 def m_strip_locked_from_metadata(root):
@@ -172,6 +199,33 @@ def m_early_success(root):
     _payload_replace(root, "set -euo pipefail", "set -euo pipefail\nexit 0")
 
 
+def m_compound_success(root):
+    group = "echo '::group::Lock and offline vendor gates (including negative control)'"
+    _payload_replace(root, group, group + "; exit 0")
+    # Execute the reviewer's evasion, not just a textual mutation. It exits zero
+    # after the banner, without reaching any actual Cargo/vendor workload.
+    platform = root / "platform"
+    for rel in ("core/caps.py", "devices/a133/capabilities.toml", "devices/a523/capabilities.toml"):
+        path = platform / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.touch()
+    (platform / "skins/a133").mkdir(parents=True)
+    result = subprocess.run(["bash", str(root / PAYLOAD)], cwd=root, capture_output=True,
+                            text=True, timeout=5, env={**os.environ,
+                                "PF_PLATFORM_DIR": str(platform), "PF_SOURCE_SHA": "a" * 40,
+                                "SOURCE_DATE_EPOCH": "1", "RUSTFLAGS": "",
+                                "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER": ""})
+    assert result.returncode == 0 and result.stdout.strip() == group[6:-1], result
+
+
+def m_compound_and_success(root):
+    _payload_replace(root, "echo '::endgroup::'", "echo '::endgroup::' && exit 0")
+
+
+def m_quoted_punctuation(root):
+    _payload_replace(root, "echo '::endgroup::'", "echo '::endgroup:: literal ; and && punctuation'")
+
+
 def m_script_redirect(root):
     wf = _load(root, RUNTIME_TESTS)
     _test_job(wf)["with"]["script"] = "scripts/empty.sh"
@@ -207,10 +261,18 @@ CASES = [
     (m_early_success,            "conditionally skippable",        "payload exits successfully before any tests"),
     (m_script_redirect,          "inputs differ",                  "caller redirects execution to empty script"),
     (m_remove_format,            "[format-workspace]",             "whole-workspace format check removed"),
+    (m_delete_workspace_test,    "[workspace-tests]",              "workspace test deleted, keyboard test remains"),
+    (m_narrow_workspace_test,    "[workspace-tests]",              "workspace test narrowed to pf-wire"),
+    (m_delete_workspace_clippy,  "[clippy-workspace]",             "workspace clippy deleted, keyboard clippy remains"),
+    (m_narrow_workspace_clippy,  "[clippy-workspace]",             "workspace clippy narrowed to pf-wire"),
+    (m_weaken_only_workspace_clippy, "[clippy-workspace]",         "workspace warnings flag cannot come from keyboard"),
+    (m_compound_success,         "compound shell",                 "executed echo; exit 0 bypass is rejected"),
+    (m_compound_and_success,     "compound shell",                 "echo && exit 0 bypass is rejected"),
 ]
 
 PASS_CASES = [
     (m_reformat_approved_job_if, "approved job `if:` whitespace/line-folding changed"),
+    (m_quoted_punctuation, "quoted banner punctuation stays literal"),
 ]
 
 
