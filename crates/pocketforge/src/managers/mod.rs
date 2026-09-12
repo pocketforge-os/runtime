@@ -111,9 +111,9 @@ impl HardwareProbe for LiveProbe {
         // No IIO root at all ⇒ we are off-hardware; stay inconclusive (trust the descriptor).
         let entries = std::fs::read_dir(&self.iio_root).ok()?;
         // Any `iio:deviceN` present ⇒ confirm; an existing-but-empty root ⇒ demote.
-        let any = entries.flatten().any(|e| {
-            e.file_name().to_string_lossy().starts_with("iio:device")
-        });
+        let any = entries
+            .flatten()
+            .any(|e| e.file_name().to_string_lossy().starts_with("iio:device"));
         Some(any)
     }
 }
@@ -215,7 +215,9 @@ pub struct SystemClock {
 impl SystemClock {
     /// A fresh clock rooted at the current instant.
     pub fn new() -> SystemClock {
-        SystemClock { start: Instant::now() }
+        SystemClock {
+            start: Instant::now(),
+        }
     }
 }
 
@@ -242,7 +244,9 @@ pub struct ManualClock {
 impl ManualClock {
     /// A fresh clock at t=0. Wrap in `Arc` to share between the ledger and the test driver.
     pub fn new() -> Arc<ManualClock> {
-        Arc::new(ManualClock { ns: AtomicU64::new(0) })
+        Arc::new(ManualClock {
+            ns: AtomicU64::new(0),
+        })
     }
 
     /// Advance the clock by `d`. Idempotent under time (never rewinds).
@@ -274,7 +278,11 @@ struct Bucket {
 
 impl Bucket {
     fn new(cfg: BucketConfig, now_ns: u64) -> Bucket {
-        Bucket { cfg, tokens: cfg.capacity, last_ns: now_ns }
+        Bucket {
+            cfg,
+            tokens: cfg.capacity,
+            last_ns: now_ns,
+        }
     }
 
     fn refill(&mut self, now_ns: u64) {
@@ -348,7 +356,10 @@ impl QuotaLedger {
     /// A fresh ledger over an explicit [`Clock`] — the STEP-3 harness passes a [`ManualClock`]
     /// so refill is a deterministic function of `advance()`, no sleeps.
     pub fn with_clock(clock: Arc<dyn Clock>) -> QuotaLedger {
-        QuotaLedger { clock, buckets: Mutex::new(HashMap::new()) }
+        QuotaLedger {
+            clock,
+            buckets: Mutex::new(HashMap::new()),
+        }
     }
 
     /// The tier-default bucket config for `name`. Coded here (rather than sourced from
@@ -381,7 +392,11 @@ impl QuotaLedger {
         let mut b = self.buckets.lock().unwrap();
         b.insert(
             name.to_string(),
-            Bucket { cfg, tokens: remaining as f64, last_ns: now },
+            Bucket {
+                cfg,
+                tokens: remaining as f64,
+                last_ns: now,
+            },
         );
     }
 
@@ -392,7 +407,11 @@ impl QuotaLedger {
         let mut b = self.buckets.lock().unwrap();
         b.insert(
             name.to_string(),
-            Bucket { cfg, tokens: tokens as f64, last_ns: now },
+            Bucket {
+                cfg,
+                tokens: tokens as f64,
+                last_ns: now,
+            },
         );
     }
 
@@ -446,7 +465,11 @@ mod tests {
         // Consuming egress must not touch the location bucket.
         assert!(q.try_consume("egress", 3));
         assert_eq!(q.remaining("egress"), EGRESS_QUOTA - 3);
-        assert_eq!(q.remaining("location"), loc0, "egress consumption leaked into location");
+        assert_eq!(
+            q.remaining("location"),
+            loc0,
+            "egress consumption leaked into location"
+        );
     }
 
     #[test]
@@ -454,7 +477,10 @@ mod tests {
         let q = QuotaLedger::new();
         q.set_remaining("egress", 2);
         assert!(q.try_consume("egress", 2));
-        assert!(!q.try_consume("egress", 1), "exhausted bucket refuses, does not underflow");
+        assert!(
+            !q.try_consume("egress", 1),
+            "exhausted bucket refuses, does not underflow"
+        );
         assert_eq!(q.remaining("egress"), 0);
     }
 
@@ -484,7 +510,10 @@ mod tests {
         clock.advance_secs(5);
         assert_eq!(q.remaining("location"), 5, "refill = elapsed × rate");
         assert!(q.try_consume("location", 5));
-        assert!(!q.try_consume("location", 1), "drained again after refill-consume");
+        assert!(
+            !q.try_consume("location", 1),
+            "drained again after refill-consume"
+        );
     }
 
     #[test]
@@ -494,7 +523,11 @@ mod tests {
         q.set_remaining("egress", 0);
         // Wait ridiculously long: refill saturates at the 16-op burst.
         clock.advance_secs(10_000);
-        assert_eq!(q.remaining("egress"), EGRESS_QUOTA, "refill saturates at capacity");
+        assert_eq!(
+            q.remaining("egress"),
+            EGRESS_QUOTA,
+            "refill saturates at capacity"
+        );
     }
 
     #[test]
@@ -521,9 +554,23 @@ mod tests {
         assert!(!QuotaLedger::default_config_for("gnss").is_ungated());
         assert!(!QuotaLedger::default_config_for("egress").is_ungated());
         // Every Normal-tier known cap is ungated.
-        for c in ["input", "vibration", "rumble", "leds", "audio", "settings", "entropy",
-                  "imu", "accelerometer", "gyroscope", "magnetometer"] {
-            assert!(QuotaLedger::default_config_for(c).is_ungated(), "{c} should be ungated");
+        for c in [
+            "input",
+            "vibration",
+            "rumble",
+            "leds",
+            "audio",
+            "settings",
+            "entropy",
+            "imu",
+            "accelerometer",
+            "gyroscope",
+            "magnetometer",
+        ] {
+            assert!(
+                QuotaLedger::default_config_for(c).is_ungated(),
+                "{c} should be ungated"
+            );
         }
     }
 
@@ -549,8 +596,14 @@ mod tests {
         }
         // Descriptor says present:
         assert!(reconcile_presence(true, &Yes, "imu"));
-        assert!(reconcile_presence(true, &Dunno, "imu"), "inconclusive ⇒ trust descriptor");
-        assert!(!reconcile_presence(true, &No, "imu"), "probe demotes DT-but-unbound");
+        assert!(
+            reconcile_presence(true, &Dunno, "imu"),
+            "inconclusive ⇒ trust descriptor"
+        );
+        assert!(
+            !reconcile_presence(true, &No, "imu"),
+            "probe demotes DT-but-unbound"
+        );
         // Descriptor says absent ⇒ never fabricated, whatever the probe claims:
         assert!(!reconcile_presence(false, &Yes, "imu"));
     }

@@ -99,7 +99,10 @@ pub fn sdl_guid(bus: u16, vid: u16, pid: u16, version: u16) -> String {
 }
 
 fn axis_inline(a: &Axis) -> String {
-    let mut s = format!("{{ min = {}, max = {}, fuzz = {}, flat = {}", a.min, a.max, a.fuzz, a.flat);
+    let mut s = format!(
+        "{{ min = {}, max = {}, fuzz = {}, flat = {}",
+        a.min, a.max, a.fuzz, a.flat
+    );
     if a.resolution != 0 {
         s.push_str(&format!(", resolution = {}", a.resolution));
     }
@@ -128,7 +131,10 @@ impl Capabilities {
         // [identity]
         out.push_str("[identity]\n");
         out.push_str(&format!("id           = \"{}\"\n", self.identity.id));
-        out.push_str(&format!("manufacturer = \"{}\"\n", self.identity.manufacturer));
+        out.push_str(&format!(
+            "manufacturer = \"{}\"\n",
+            self.identity.manufacturer
+        ));
         out.push_str(&format!("model        = \"{}\"\n", self.identity.model));
         out.push_str(&format!("sdl_guid     = \"{}\"\n", self.identity.sdl_guid));
         let mut m = format!("evdev_name = \"{}\"", self.identity.evdev_name);
@@ -184,20 +190,50 @@ mod tests {
     #[test]
     fn sdl_guid_matches_the_shipped_a133_value() {
         // bus=USB(3), vid=045e (MS), pid=028e (X360), version=0110.
-        assert_eq!(sdl_guid(3, 0x045e, 0x028e, 0x0110), "030000005e0400008e02000010010000");
+        assert_eq!(
+            sdl_guid(3, 0x045e, 0x028e, 0x0110),
+            "030000005e0400008e02000010010000"
+        );
     }
 
     #[test]
     fn axis_inline_omits_zero_resolution() {
-        let a = Axis { min: 0, max: 255, fuzz: 0, flat: 0, resolution: 0, value: None };
-        assert_eq!(axis_inline(&a), "{ min = 0, max = 255, fuzz = 0, flat = 0 }");
-        let b = Axis { min: -32768, max: 32767, fuzz: 16, flat: 128, resolution: 5, value: None };
+        let a = Axis {
+            min: 0,
+            max: 255,
+            fuzz: 0,
+            flat: 0,
+            resolution: 0,
+            value: None,
+        };
+        assert_eq!(
+            axis_inline(&a),
+            "{ min = 0, max = 255, fuzz = 0, flat = 0 }"
+        );
+        let b = Axis {
+            min: -32768,
+            max: 32767,
+            fuzz: 16,
+            flat: 128,
+            resolution: 5,
+            value: None,
+        };
         assert_eq!(
             axis_inline(&b),
             "{ min = -32768, max = 32767, fuzz = 16, flat = 128, resolution = 5 }"
         );
         // A measured axis carries its observed rest/centre as `value`.
-        let c = Axis { min: 12, max: 4083, fuzz: 0, flat: 0, resolution: 0, value: Some(2097) };
-        assert_eq!(axis_inline(&c), "{ min = 12, max = 4083, fuzz = 0, flat = 0, value = 2097 }");
+        let c = Axis {
+            min: 12,
+            max: 4083,
+            fuzz: 0,
+            flat: 0,
+            resolution: 0,
+            value: Some(2097),
+        };
+        assert_eq!(
+            axis_inline(&c),
+            "{ min = 12, max = 4083, fuzz = 0, flat = 0, value = 2097 }"
+        );
     }
 }

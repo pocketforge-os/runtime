@@ -44,7 +44,10 @@ impl Uinput {
         let path = std::ffi::CString::new("/dev/uinput").unwrap();
         // SAFETY: valid C string; standard uinput open.
         let raw = unsafe {
-            libc::open(path.as_ptr(), libc::O_RDWR | libc::O_NONBLOCK | libc::O_CLOEXEC)
+            libc::open(
+                path.as_ptr(),
+                libc::O_RDWR | libc::O_NONBLOCK | libc::O_CLOEXEC,
+            )
         };
         if raw < 0 {
             return Err(io::Error::last_os_error());
@@ -118,7 +121,11 @@ impl Uinput {
         let mut buf = [0u8; 64];
         // SAFETY: buf is a valid writable buffer of the length passed in the ioctl.
         let n = unsafe {
-            libc::ioctl(self.fd.as_raw_fd(), ioc::ui_get_sysname(buf.len()), buf.as_mut_ptr())
+            libc::ioctl(
+                self.fd.as_raw_fd(),
+                ioc::ui_get_sysname(buf.len()),
+                buf.as_mut_ptr(),
+            )
         };
         let sysname = if n >= 0 {
             let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
@@ -140,7 +147,10 @@ impl Uinput {
                     }
                     let devlink = ent.path().join("device");
                     if let Ok(target) = std::fs::read_link(&devlink) {
-                        if target.file_name().map(|f| f.to_string_lossy() == sysname).unwrap_or(false)
+                        if target
+                            .file_name()
+                            .map(|f| f.to_string_lossy() == sysname)
+                            .unwrap_or(false)
                         {
                             return Some(format!("/dev/input/{name}"));
                         }
@@ -165,8 +175,13 @@ impl Uinput {
         ie.value = value;
         let bytes = std::mem::size_of::<libc::input_event>();
         // SAFETY: writing exactly sizeof(input_event) from a valid struct to the uinput fd.
-        let w =
-            unsafe { libc::write(self.fd.as_raw_fd(), &ie as *const _ as *const libc::c_void, bytes) };
+        let w = unsafe {
+            libc::write(
+                self.fd.as_raw_fd(),
+                &ie as *const _ as *const libc::c_void,
+                bytes,
+            )
+        };
         if w != bytes as isize {
             return Err(io::Error::last_os_error());
         }

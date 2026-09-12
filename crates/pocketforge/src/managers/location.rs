@@ -42,12 +42,20 @@ impl LocationManager {
         probe: Arc<dyn HardwareProbe>,
         quotas: Arc<QuotaLedger>,
     ) -> LocationManager {
-        LocationManager { backend, probe, quotas }
+        LocationManager {
+            backend,
+            probe,
+            quotas,
+        }
     }
 
     /// Is GNSS present (descriptor ∧ ¬probe-demoted)?
     pub fn present(&self) -> bool {
-        reconcile_presence(self.backend.is_present("location"), &*self.probe, "location")
+        reconcile_presence(
+            self.backend.is_present("location"),
+            &*self.probe,
+            "location",
+        )
     }
 
     /// The side-effect-free permission state (`Granted` / `Denied` / `Prompt`). Default-deny ⇒
@@ -72,6 +80,9 @@ impl LocationManager {
             return Err(CapError::PolicyBlocked); // cooperative rate cap exhausted
         }
         // Honesty: no real GNSS — return a typed, accuracy-unknown placeholder.
-        Ok(Fix { accuracy_m: f64::INFINITY, ..Fix::default() })
+        Ok(Fix {
+            accuracy_m: f64::INFINITY,
+            ..Fix::default()
+        })
     }
 }

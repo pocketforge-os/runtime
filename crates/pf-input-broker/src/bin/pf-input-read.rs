@@ -17,17 +17,24 @@ use std::time::{Duration, Instant};
 use pf_input_broker::{acquire_input_fd, broker::open_read_fd, read_events_raw};
 
 fn arg(args: &[String], flag: &str) -> Option<String> {
-    args.iter().position(|a| a == flag).and_then(|i| args.get(i + 1)).cloned()
+    args.iter()
+        .position(|a| a == flag)
+        .and_then(|i| args.get(i + 1))
+        .cloned()
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let ms: u64 = arg(&args, "--ms").and_then(|s| s.parse().ok()).unwrap_or(1500);
+    let ms: u64 = arg(&args, "--ms")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1500);
 
     // Acquire the read fd either via the broker (SCM_RIGHTS) or by opening the node directly.
     let read_fd = if let Some(sock) = arg(&args, "--from-broker") {
         let (_resp, fd) = acquire_input_fd(&sock)?;
-        eprintln!("pf-input-read: acquired input fd via Acquire(\"input\") + SCM_RIGHTS from {sock}");
+        eprintln!(
+            "pf-input-read: acquired input fd via Acquire(\"input\") + SCM_RIGHTS from {sock}"
+        );
         fd
     } else if let Some(node) = arg(&args, "--node") {
         eprintln!("pf-input-read: reading re-emit node {node} directly");
@@ -62,7 +69,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let until = Instant::now() + Duration::from_millis(300);
         while Instant::now() < until {
             let n = read_events_raw(src_fd.as_raw_fd(), &mut buf)?;
-            src_seen += buf[..n].iter().filter(|e| e.type_ != pf_input_broker::ioc::EV_SYN).count();
+            src_seen += buf[..n]
+                .iter()
+                .filter(|e| e.type_ != pf_input_broker::ioc::EV_SYN)
+                .count();
             std::thread::sleep(Duration::from_millis(10));
         }
         println!("SOURCE_EVENTS {src_seen}");

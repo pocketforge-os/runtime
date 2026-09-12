@@ -42,7 +42,11 @@ fn wrap(s: &str, max_px: i32, scale: usize) -> Vec<String> {
     let mut lines = Vec::new();
     let mut cur = String::new();
     for word in s.split_whitespace() {
-        let trial = if cur.is_empty() { word.to_string() } else { format!("{cur} {word}") };
+        let trial = if cur.is_empty() {
+            word.to_string()
+        } else {
+            format!("{cur} {word}")
+        };
         if font::text_width(&trial, scale) as i32 <= max_px {
             cur = trial;
         } else {
@@ -78,12 +82,27 @@ pub fn render_frame(c: &mut Canvas, skin: &SkinSet, st: &FrameState) {
 
     // Title + progress.
     c.text_centered(CANVAS_W / 2, 22, st.title, 3, TITLE_C);
-    let progress = if st.done { "DONE".to_string() } else { format!("{} / {}", st.index, st.total) };
-    c.text(CANVAS_W - font::text_width(&progress, 3) as i32 - 22, 22, &progress, 3, TEXT);
+    let progress = if st.done {
+        "DONE".to_string()
+    } else {
+        format!("{} / {}", st.index, st.total)
+    };
+    c.text(
+        CANVAS_W - font::text_width(&progress, 3) as i32 - 22,
+        22,
+        &progress,
+        3,
+        TEXT,
+    );
 
     // The real device, with the prompted control highlighted (neutral when done).
     let img = skin.compose(if st.done { None } else { st.active_id });
-    let (dw, dh) = fit(img.w as i32, img.h as i32, CANVAS_W - 2 * DEVICE_MARGIN_X, DEVICE_H);
+    let (dw, dh) = fit(
+        img.w as i32,
+        img.h as i32,
+        CANVAS_W - 2 * DEVICE_MARGIN_X,
+        DEVICE_H,
+    );
     let dx = (CANVAS_W - dw) / 2;
     let dy = DEVICE_Y + (DEVICE_H - dh) / 2;
     c.blit_scaled_keyed(&img, dx, dy, dw, dh, Some((skin.bg, 12)));
@@ -117,7 +136,15 @@ mod tests {
             }
         }
         let mut parts = HashMap::new();
-        parts.insert("btn_south".to_string(), Rect { x: 18, y: 8, w: 6, h: 4 });
+        parts.insert(
+            "btn_south".to_string(),
+            Rect {
+                x: 18,
+                y: 8,
+                w: 6,
+                h: 4,
+            },
+        );
         let mut map = HashMap::new();
         map.insert("south".to_string(), "btn_south".to_string());
         SkinSet::from_parts(map, View { body, lit, parts }, None, rgb(248, 248, 248))
@@ -149,7 +176,10 @@ mod tests {
                 }
             }
         }
-        assert!(saw_red, "the highlighted control's red should be visible on the device");
+        assert!(
+            saw_red,
+            "the highlighted control's red should be visible on the device"
+        );
     }
 
     #[test]

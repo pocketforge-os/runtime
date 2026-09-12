@@ -11,7 +11,16 @@ const CENTER: u16 = 2048;
 
 /// Build one 8-byte wire frame.
 fn wire(buttons: u8, x: u16, y: u16) -> [u8; 8] {
-    [0xFF, 0x01, buttons, (x >> 8) as u8, x as u8, (y >> 8) as u8, y as u8, 0xFE]
+    [
+        0xFF,
+        0x01,
+        buttons,
+        (x >> 8) as u8,
+        x as u8,
+        (y >> 8) as u8,
+        y as u8,
+        0xFE,
+    ]
 }
 
 /// Drive a side end-to-end through the real byte-stream scanner + decoder, returning the events
@@ -30,10 +39,16 @@ fn run(side: Side, sequence: &[[u8; 8]]) -> Vec<Ev> {
 }
 
 fn keys(evs: &[Ev]) -> Vec<(u16, i32)> {
-    evs.iter().filter(|e| e.ev_type == codes::EV_KEY).map(|e| (e.code, e.value)).collect()
+    evs.iter()
+        .filter(|e| e.ev_type == codes::EV_KEY)
+        .map(|e| (e.code, e.value))
+        .collect()
 }
 fn abses(evs: &[Ev]) -> Vec<(u16, i32)> {
-    evs.iter().filter(|e| e.ev_type == codes::EV_ABS).map(|e| (e.code, e.value)).collect()
+    evs.iter()
+        .filter(|e| e.ev_type == codes::EV_ABS)
+        .map(|e| (e.code, e.value))
+        .collect()
 }
 
 /// EVERY right-cluster button (ttyS3), press then release, through the real scanner + decoder.
@@ -59,11 +74,18 @@ fn right_cluster_every_button() {
     ];
     for (mask, code, label) in table {
         // baseline (no buttons) → press → release.
-        let press = run(Side::Right, &[wire(0x00, CENTER, CENTER), wire(mask, CENTER, CENTER)]);
+        let press = run(
+            Side::Right,
+            &[wire(0x00, CENTER, CENTER), wire(mask, CENTER, CENTER)],
+        );
         assert_eq!(keys(&press), vec![(code, 1)], "{label} press → {code:#05x}");
         let release = run(
             Side::Right,
-            &[wire(0x00, CENTER, CENTER), wire(mask, CENTER, CENTER), wire(0x00, CENTER, CENTER)],
+            &[
+                wire(0x00, CENTER, CENTER),
+                wire(mask, CENTER, CENTER),
+                wire(0x00, CENTER, CENTER),
+            ],
         );
         assert_eq!(keys(&release), vec![(code, 0)], "{label} release");
     }
@@ -78,7 +100,10 @@ fn left_cluster_every_button() {
         (0x80, codes::BTN_MODE, "Menu"),
     ];
     for (mask, code, label) in table {
-        let press = run(Side::Left, &[wire(0x00, CENTER, CENTER), wire(mask, CENTER, CENTER)]);
+        let press = run(
+            Side::Left,
+            &[wire(0x00, CENTER, CENTER), wire(mask, CENTER, CENTER)],
+        );
         assert_eq!(keys(&press), vec![(code, 1)], "{label} press → {code:#05x}");
     }
 }
@@ -88,16 +113,31 @@ fn left_cluster_every_button() {
 fn dpad_hat_all_directions() {
     let base = wire(0x00, CENTER, CENTER);
     // Up.
-    assert_eq!(abses(&run(Side::Left, &[base, wire(0x04, CENTER, CENTER)])), vec![(codes::ABS_HAT0Y, -1)]);
+    assert_eq!(
+        abses(&run(Side::Left, &[base, wire(0x04, CENTER, CENTER)])),
+        vec![(codes::ABS_HAT0Y, -1)]
+    );
     // Down.
-    assert_eq!(abses(&run(Side::Left, &[base, wire(0x20, CENTER, CENTER)])), vec![(codes::ABS_HAT0Y, 1)]);
+    assert_eq!(
+        abses(&run(Side::Left, &[base, wire(0x20, CENTER, CENTER)])),
+        vec![(codes::ABS_HAT0Y, 1)]
+    );
     // Left.
-    assert_eq!(abses(&run(Side::Left, &[base, wire(0x08, CENTER, CENTER)])), vec![(codes::ABS_HAT0X, -1)]);
+    assert_eq!(
+        abses(&run(Side::Left, &[base, wire(0x08, CENTER, CENTER)])),
+        vec![(codes::ABS_HAT0X, -1)]
+    );
     // Right.
-    assert_eq!(abses(&run(Side::Left, &[base, wire(0x10, CENTER, CENTER)])), vec![(codes::ABS_HAT0X, 1)]);
+    assert_eq!(
+        abses(&run(Side::Left, &[base, wire(0x10, CENTER, CENTER)])),
+        vec![(codes::ABS_HAT0X, 1)]
+    );
     // Diagonal up-right → both axes.
     let ur = abses(&run(Side::Left, &[base, wire(0x04 | 0x10, CENTER, CENTER)]));
-    assert!(ur.contains(&(codes::ABS_HAT0Y, -1)) && ur.contains(&(codes::ABS_HAT0X, 1)), "up-right diagonal");
+    assert!(
+        ur.contains(&(codes::ABS_HAT0Y, -1)) && ur.contains(&(codes::ABS_HAT0X, 1)),
+        "up-right diagonal"
+    );
     // Release from up → HAT0Y back to 0.
     let rel = abses(&run(Side::Left, &[base, wire(0x04, CENTER, CENTER), base]));
     assert_eq!(rel, vec![(codes::ABS_HAT0Y, 0)]);
@@ -108,10 +148,16 @@ fn dpad_hat_all_directions() {
 #[test]
 fn both_sticks_full_scale() {
     // Left stick to (min, max).
-    let l = abses(&run(Side::Left, &[wire(0x00, CENTER, CENTER), wire(0x00, 0, 4095)]));
+    let l = abses(&run(
+        Side::Left,
+        &[wire(0x00, CENTER, CENTER), wire(0x00, 0, 4095)],
+    ));
     assert_eq!(l, vec![(codes::ABS_X, 0), (codes::ABS_Y, 4095)]);
     // Right stick to (max, min).
-    let r = abses(&run(Side::Right, &[wire(0x00, CENTER, CENTER), wire(0x00, 4095, 0)]));
+    let r = abses(&run(
+        Side::Right,
+        &[wire(0x00, CENTER, CENTER), wire(0x00, 4095, 0)],
+    ));
     assert_eq!(r, vec![(codes::ABS_RX, 4095), (codes::ABS_RY, 0)]);
 }
 
@@ -120,13 +166,19 @@ fn both_sticks_full_scale() {
 #[test]
 fn combined_press_and_move_in_one_frame() {
     // Right side: east/right face button (0x10) + R1 (0x01) held, right stick pushed.
-    let evs = run(Side::Right, &[wire(0x00, CENTER, CENTER), wire(0x11, 3000, 1000)]);
+    let evs = run(
+        Side::Right,
+        &[wire(0x00, CENTER, CENTER), wire(0x11, 3000, 1000)],
+    );
     let mut k = keys(&evs);
     k.sort();
     let mut want = vec![(codes::BTN_TR, 1), (codes::BTN_EAST, 1)];
     want.sort();
     assert_eq!(k, want, "east + R1 both press in one report");
-    assert_eq!(abses(&evs), vec![(codes::ABS_RX, 3000), (codes::ABS_RY, 1000)]);
+    assert_eq!(
+        abses(&evs),
+        vec![(codes::ABS_RX, 3000), (codes::ABS_RY, 1000)]
+    );
 }
 
 /// The scanner survives real-world stream noise (a garbage prefix + a torn frame) and still
@@ -146,5 +198,9 @@ fn decodes_through_stream_noise() {
     for f in scanner.push(&clean[4..]) {
         evs = decoder.apply(f);
     }
-    assert_eq!(keys(&evs), vec![(codes::BTN_SOUTH, 1)], "south decoded through noise + a torn frame");
+    assert_eq!(
+        keys(&evs),
+        vec![(codes::BTN_SOUTH, 1)],
+        "south decoded through noise + a torn frame"
+    );
 }

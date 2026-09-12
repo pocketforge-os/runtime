@@ -28,7 +28,11 @@ impl InputManager {
         probe: Arc<dyn HardwareProbe>,
     ) -> InputManager {
         let map = InputMap::from_descriptor(descriptor);
-        InputManager { backend, probe, map }
+        InputManager {
+            backend,
+            probe,
+            map,
+        }
     }
 
     /// Is input present? (Every device has controls, but the probe seam is honored for symmetry.)

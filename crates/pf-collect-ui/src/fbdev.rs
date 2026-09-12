@@ -162,7 +162,8 @@ pub struct FbDev {
 
 impl FbDev {
     pub fn open(path: &str) -> io::Result<FbDev> {
-        let cpath = std::ffi::CString::new(path).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+        let cpath = std::ffi::CString::new(path)
+            .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
         let fd = unsafe { libc::open(cpath.as_ptr(), libc::O_RDWR) };
         if fd < 0 {
             return Err(io::Error::last_os_error());
@@ -198,21 +199,45 @@ impl FbDev {
         // page 0/1 each present, forcing the offset to change every frame. (Page 1 DOES display — the
         // menu uses it; the earlier "page 1 is black" note was undrawn / pre-alpha-fix content.)
         let page_bytes = fix.line_length as usize * var.yres as usize;
-        let n_pages: u32 = if var.yres_virtual >= 2 * var.yres { 2 } else { 1 };
+        let n_pages: u32 = if var.yres_virtual >= 2 * var.yres {
+            2
+        } else {
+            1
+        };
         let map_len = page_bytes * n_pages as usize;
         // Start `page` at whatever the panel is CURRENTLY showing, so the first present's toggle moves
         // to the OTHER page — guaranteeing even a single present (a long parked timeout) changes the
         // offset and refreshes rather than no-op'ing onto a stale frame.
-        let cur_page = if n_pages > 1 { (var.yoffset / var.yres.max(1)).min(1) } else { 0 };
+        let cur_page = if n_pages > 1 {
+            (var.yoffset / var.yres.max(1)).min(1)
+        } else {
+            0
+        };
         let map = unsafe {
-            libc::mmap(std::ptr::null_mut(), map_len, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_SHARED, fd, 0)
+            libc::mmap(
+                std::ptr::null_mut(),
+                map_len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                fd,
+                0,
+            )
         };
         if map == libc::MAP_FAILED {
             let e = io::Error::last_os_error();
             unsafe { libc::close(fd) };
             return Err(e);
         }
-        Ok(FbDev { fd, map: map as *mut u8, map_len, fmt, var, page_bytes, n_pages, page: cur_page })
+        Ok(FbDev {
+            fd,
+            map: map as *mut u8,
+            map_len,
+            fmt,
+            var,
+            page_bytes,
+            n_pages,
+            page: cur_page,
+        })
     }
 
     pub fn format(&self) -> FbFormat {
@@ -226,22 +251,24 @@ impl FbDev {
         // panning to the same offset is a no-op that leaves a stale frame on this g2d-rotated panel.
         self.page = if self.n_pages > 1 { self.page ^ 1 } else { 0 };
         let page_off = self.page as usize * self.page_bytes;
-        let (draw_w, draw_h, off_x, off_y) = letterbox(canvas.w as u32, canvas.h as u32, self.fmt.w, self.fmt.h);
+        let (draw_w, draw_h, off_x, off_y) =
+            letterbox(canvas.w as u32, canvas.h as u32, self.fmt.w, self.fmt.h);
         let bpp = self.fmt.bytes_per_pixel();
         let ll = self.fmt.line_length as usize;
         let src = canvas.pixels();
         for dy in 0..self.fmt.h {
             let row = unsafe { self.map.add(page_off + dy as usize * ll) };
             for dx in 0..self.fmt.w {
-                let word = if dx >= off_x && dx < off_x + draw_w && dy >= off_y && dy < off_y + draw_h {
-                    let sx = ((dx - off_x) as u64 * canvas.w as u64 / draw_w as u64) as usize;
-                    let sy = ((dy - off_y) as u64 * canvas.h as u64 / draw_h as u64) as usize;
-                    let sx = sx.min(canvas.w - 1);
-                    let sy = sy.min(canvas.h - 1);
-                    self.fmt.pack(src[sy * canvas.w + sx])
-                } else {
-                    0 // black border
-                };
+                let word =
+                    if dx >= off_x && dx < off_x + draw_w && dy >= off_y && dy < off_y + draw_h {
+                        let sx = ((dx - off_x) as u64 * canvas.w as u64 / draw_w as u64) as usize;
+                        let sy = ((dy - off_y) as u64 * canvas.h as u64 / draw_h as u64) as usize;
+                        let sx = sx.min(canvas.w - 1);
+                        let sy = sy.min(canvas.h - 1);
+                        self.fmt.pack(src[sy * canvas.w + sx])
+                    } else {
+                        0 // black border
+                    };
                 unsafe {
                     let p = row.add(dx as usize * bpp);
                     for b in 0..bpp {
@@ -284,7 +311,18 @@ mod tests {
     fn pack_xrgb8888() {
         // 32bpp XRGB: R@16 G@8 B@0, each 8 bits. The X (high) byte is forced to 0xFF (opaque) — the
         // sunxi DE2.0 scan-out treats it as alpha and shows X=0 as transparent/black (tsp-bwrg.6).
-        let f = FbFormat { w: 1, h: 1, bpp: 32, line_length: 4, r_off: 16, r_len: 8, g_off: 8, g_len: 8, b_off: 0, b_len: 8 };
+        let f = FbFormat {
+            w: 1,
+            h: 1,
+            bpp: 32,
+            line_length: 4,
+            r_off: 16,
+            r_len: 8,
+            g_off: 8,
+            g_len: 8,
+            b_off: 0,
+            b_len: 8,
+        };
         assert_eq!(f.pack(rgb(0xAB, 0xCD, 0xEF)), 0xFFAB_CDEF);
         assert_eq!(f.bytes_per_pixel(), 4);
     }
@@ -292,7 +330,18 @@ mod tests {
     #[test]
     fn pack_rgb565() {
         // 16bpp RGB565: R@11 len5, G@5 len6, B@0 len5.
-        let f = FbFormat { w: 1, h: 1, bpp: 16, line_length: 2, r_off: 11, r_len: 5, g_off: 5, g_len: 6, b_off: 0, b_len: 5 };
+        let f = FbFormat {
+            w: 1,
+            h: 1,
+            bpp: 16,
+            line_length: 2,
+            r_off: 11,
+            r_len: 5,
+            g_off: 5,
+            g_len: 6,
+            b_off: 0,
+            b_len: 5,
+        };
         // white -> all bits set
         assert_eq!(f.pack(rgb(255, 255, 255)), 0xFFFF);
         // pure red -> top 5 bits

@@ -87,7 +87,17 @@ pub fn a133_spec() -> UinputSpec {
     let keys = decode::all_button_codes();
     let abs = decode::all_axes()
         .into_iter()
-        .map(|(code, min, max)| (code, AbsInfo { min, max, fuzz: 0, flat: 0 }))
+        .map(|(code, min, max)| {
+            (
+                code,
+                AbsInfo {
+                    min,
+                    max,
+                    fuzz: 0,
+                    flat: 0,
+                },
+            )
+        })
         .collect();
     UinputSpec {
         name: identity::NAME.to_string(),
@@ -124,7 +134,11 @@ mod tests {
             codes::BTN_MODE,
         ];
         for k in expect_keys {
-            assert_eq!(s.keys.iter().filter(|&&c| c == k).count(), 1, "key {k:#05x} advertised once");
+            assert_eq!(
+                s.keys.iter().filter(|&&c| c == k).count(),
+                1,
+                "key {k:#05x} advertised once"
+            );
         }
         assert_eq!(s.keys.len(), expect_keys.len(), "no extra/missing buttons");
         // Axes: both sticks (raw 12-bit) + the hat.

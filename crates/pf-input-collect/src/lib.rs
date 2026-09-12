@@ -35,7 +35,11 @@ pub mod emit;
 pub mod plan;
 pub mod source;
 
-pub use collect::{Collector, CollectError, CommitOutcome, DeviceMeta, Recorded, RunConfig, Semantics};
+pub use collect::{
+    CollectError, Collector, CommitOutcome, DeviceMeta, Recorded, RunConfig, Semantics,
+};
 pub use emit::Capabilities;
 pub use plan::{default_gamepad_plan, ControlSpec, Kind};
-pub use source::{AbsInfo, EventSource, EvdevSource, Identity, MultiSource, RawEvent, ScriptedSource};
+pub use source::{
+    AbsInfo, EvdevSource, EventSource, Identity, MultiSource, RawEvent, ScriptedSource,
+};

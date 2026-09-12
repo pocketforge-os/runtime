@@ -30,22 +30,50 @@ const ABS_RX: u16 = 0x03;
 const ABS_RY: u16 = 0x04;
 const ABS_HAT0X: u16 = 0x10;
 const ABS_HAT0Y: u16 = 0x11;
-const STICK: AbsInfo = AbsInfo { min: 0, max: 4095, fuzz: 0, flat: 0, resolution: 0 };
-const HAT: AbsInfo = AbsInfo { min: -1, max: 1, fuzz: 0, flat: 0, resolution: 0 };
+const STICK: AbsInfo = AbsInfo {
+    min: 0,
+    max: 4095,
+    fuzz: 0,
+    flat: 0,
+    resolution: 0,
+};
+const HAT: AbsInfo = AbsInfo {
+    min: -1,
+    max: 1,
+    fuzz: 0,
+    flat: 0,
+    resolution: 0,
+};
 
-fn abs(code: u16, val: i32) -> RawEvent { RawEvent::new(EV_ABS, code, val) }
+fn abs(code: u16, val: i32) -> RawEvent {
+    RawEvent::new(EV_ABS, code, val)
+}
 
 /// One "frame" of the a133's continuous rest stream: all four stick axes at their (non-zero) rest.
 fn rest_frame() -> Vec<RawEvent> {
-    vec![abs(ABS_X, 2098), abs(ABS_Y, 2107), abs(ABS_RX, 2013), abs(ABS_RY, 2129)]
+    vec![
+        abs(ABS_X, 2098),
+        abs(ABS_Y, 2107),
+        abs(ABS_RX, 2013),
+        abs(ABS_RY, 2129),
+    ]
 }
 
 fn dut() -> ScriptedSource {
-    let ident = Identity { name: "TRIMUI Player1".into(), bus: 3, vid: 0x045e, pid: 0x028e, version: 0x0110 };
+    let ident = Identity {
+        name: "TRIMUI Player1".into(),
+        bus: 3,
+        vid: 0x045e,
+        pid: 0x028e,
+        version: 0x0110,
+    };
     ScriptedSource::new(ident)
-        .with_abs(ABS_X, STICK).with_abs(ABS_Y, STICK)
-        .with_abs(ABS_RX, STICK).with_abs(ABS_RY, STICK)
-        .with_abs(ABS_HAT0X, HAT).with_abs(ABS_HAT0Y, HAT)
+        .with_abs(ABS_X, STICK)
+        .with_abs(ABS_Y, STICK)
+        .with_abs(ABS_RX, STICK)
+        .with_abs(ABS_RY, STICK)
+        .with_abs(ABS_HAT0X, HAT)
+        .with_abs(ABS_HAT0Y, HAT)
 }
 
 /// The dpad prompt: continuous rest-stick stream with a real HAT actuation mixed in — exactly what
@@ -54,13 +82,30 @@ fn dut() -> ScriptedSource {
 fn dpad_capture_under_continuous_stick_stream() {
     let mut src = dut();
     // Several rest frames, then the dpad press (HAT deflect+return) still amid rest-stick frames.
-    for _ in 0..3 { src.push_batch(rest_frame()); }
-    let mut press = rest_frame(); press.extend([abs(ABS_HAT0X, -1), abs(ABS_HAT0X, 0), abs(ABS_HAT0Y, 1), abs(ABS_HAT0Y, 0)]);
+    for _ in 0..3 {
+        src.push_batch(rest_frame());
+    }
+    let mut press = rest_frame();
+    press.extend([
+        abs(ABS_HAT0X, -1),
+        abs(ABS_HAT0X, 0),
+        abs(ABS_HAT0Y, 1),
+        abs(ABS_HAT0Y, 0),
+    ]);
     src.push_batch(press);
-    for _ in 0..3 { src.push_batch(rest_frame()); }
-    src.push_batch(vec![]); src.push_batch(vec![]);
+    for _ in 0..3 {
+        src.push_batch(rest_frame());
+    }
+    src.push_batch(vec![]);
+    src.push_batch(vec![]);
 
-    let spec = ControlSpec { id: "dpad".into(), kind: Kind::Hat, prompt: "dpad".into(), optional: false, source: None };
+    let spec = ControlSpec {
+        id: "dpad".into(),
+        kind: Kind::Hat,
+        prompt: "dpad".into(),
+        optional: false,
+        source: None,
+    };
     let mut c = Collector::new(vec![spec]);
     let cfg = RunConfig {
         quiet_polls: 2,
@@ -73,8 +118,15 @@ fn dpad_capture_under_continuous_stick_stream() {
     let caps = collect::run(&mut c, &mut src, &meta(), &cfg, &mut log);
     match caps {
         Ok(cap) => {
-            let dpad = cap.inputs.iter().find(|i| i.id == "dpad").expect("dpad row");
-            println!("dpad collected as: ev_type={} code={}", dpad.ev_type, dpad.code);
+            let dpad = cap
+                .inputs
+                .iter()
+                .find(|i| i.id == "dpad")
+                .expect("dpad row");
+            println!(
+                "dpad collected as: ev_type={} code={}",
+                dpad.ev_type, dpad.code
+            );
             // THE ASSERTION THE FIX MUST SATISFY: the dpad must be the HAT axes, not the sticks.
             assert_eq!(dpad.code, "ABS_HAT0X,ABS_HAT0Y",
                 "dpad mis-attributed to {} — the resting sticks (~2098, value!=0) were counted as active",
@@ -101,10 +153,19 @@ fn dpad_capture_under_continuous_stick_stream() {
 fn required_control_is_not_fabricated_from_the_ambient_rest_stream() {
     let mut src = dut();
     // A long continuous at-rest stream, then quiet — the owner NEVER actuated the stick.
-    for _ in 0..500 { src.push_batch(rest_frame()); }
-    src.push_batch(vec![]); src.push_batch(vec![]);
+    for _ in 0..500 {
+        src.push_batch(rest_frame());
+    }
+    src.push_batch(vec![]);
+    src.push_batch(vec![]);
 
-    let spec = ControlSpec { id: "lstick".into(), kind: Kind::Stick, prompt: "lstick".into(), optional: false, source: None };
+    let spec = ControlSpec {
+        id: "lstick".into(),
+        kind: Kind::Stick,
+        prompt: "lstick".into(),
+        optional: false,
+        source: None,
+    };
     let mut c = Collector::new(vec![spec]);
     let cfg = RunConfig {
         quiet_polls: 2,
@@ -118,9 +179,14 @@ fn required_control_is_not_fabricated_from_the_ambient_rest_stream() {
         Err(collect::CollectError::NoActivity { id }) => assert_eq!(id, "lstick"),
         Ok(cap) => panic!(
             "FABRICATED a control from the ambient rest stream (the race bug): {:?}",
-            cap.inputs.iter().map(|i| (i.id.clone(), i.code.clone())).collect::<Vec<_>>()
+            cap.inputs
+                .iter()
+                .map(|i| (i.id.clone(), i.code.clone()))
+                .collect::<Vec<_>>()
         ),
-        Err(e) => panic!("unexpected error (expected NoActivity for an untouched required control): {e}"),
+        Err(e) => {
+            panic!("unexpected error (expected NoActivity for an untouched required control): {e}")
+        }
     }
 }
 
@@ -135,18 +201,37 @@ fn required_control_is_not_fabricated_from_the_ambient_rest_stream() {
 #[test]
 fn full_both_axis_stick_sweep_captures_on_unsigned_range_without_panicking() {
     let mut src = dut();
-    for _ in 0..3 { src.push_batch(rest_frame()); }
+    for _ in 0..3 {
+        src.push_batch(rest_frame());
+    }
     // A circular sweep: both ABS_X and ABS_Y travel edge-to-edge across the full 0..4095 range
     // (the extremes a real "roll it all the way around" produces), still amid the rest stream.
-    for &(x, y) in &[(4095, 2048), (2048, 4095), (0, 2048), (2048, 0), (4095, 4095), (0, 0), (2048, 2048)] {
+    for &(x, y) in &[
+        (4095, 2048),
+        (2048, 4095),
+        (0, 2048),
+        (2048, 0),
+        (4095, 4095),
+        (0, 0),
+        (2048, 2048),
+    ] {
         let mut f = rest_frame();
         f.extend([abs(ABS_X, x), abs(ABS_Y, y)]);
         src.push_batch(f);
     }
-    for _ in 0..3 { src.push_batch(rest_frame()); }
-    src.push_batch(vec![]); src.push_batch(vec![]);
+    for _ in 0..3 {
+        src.push_batch(rest_frame());
+    }
+    src.push_batch(vec![]);
+    src.push_batch(vec![]);
 
-    let spec = ControlSpec { id: "lstick".into(), kind: Kind::Stick, prompt: "lstick".into(), optional: false, source: None };
+    let spec = ControlSpec {
+        id: "lstick".into(),
+        kind: Kind::Stick,
+        prompt: "lstick".into(),
+        optional: false,
+        source: None,
+    };
     let mut c = Collector::new(vec![spec]);
     let cfg = RunConfig {
         quiet_polls: 2,
@@ -158,8 +243,16 @@ fn full_both_axis_stick_sweep_captures_on_unsigned_range_without_panicking() {
     let mut log = Vec::new();
     match collect::run(&mut c, &mut src, &meta(), &cfg, &mut log) {
         Ok(cap) => {
-            let ls = cap.inputs.iter().find(|i| i.id == "lstick").expect("lstick row");
-            assert_eq!(ls.code, "ABS_X,ABS_Y", "a full both-axis sweep must record both stick axes, got {}", ls.code);
+            let ls = cap
+                .inputs
+                .iter()
+                .find(|i| i.id == "lstick")
+                .expect("lstick row");
+            assert_eq!(
+                ls.code, "ABS_X,ABS_Y",
+                "a full both-axis sweep must record both stick axes, got {}",
+                ls.code
+            );
         }
         Err(e) => panic!("a full both-axis stick sweep must capture cleanly, not error: {e}"),
     }
@@ -174,29 +267,73 @@ fn full_both_axis_stick_sweep_captures_on_unsigned_range_without_panicking() {
 #[test]
 fn stick_completes_on_sequential_two_axis_motion() {
     let mut src = dut();
-    let lx = |x: i32| vec![abs(ABS_X, x), abs(ABS_Y, 2107), abs(ABS_RX, 2013), abs(ABS_RY, 2129)];
-    let ly = |y: i32| vec![abs(ABS_X, 2098), abs(ABS_Y, y), abs(ABS_RX, 2013), abs(ABS_RY, 2129)];
+    let lx = |x: i32| {
+        vec![
+            abs(ABS_X, x),
+            abs(ABS_Y, 2107),
+            abs(ABS_RX, 2013),
+            abs(ABS_RY, 2129),
+        ]
+    };
+    let ly = |y: i32| {
+        vec![
+            abs(ABS_X, 2098),
+            abs(ABS_Y, y),
+            abs(ABS_RX, 2013),
+            abs(ABS_RY, 2129),
+        ]
+    };
     // sweep ABS_X only, return to rest
-    src.push_batch(lx(4095)); src.push_batch(lx(0)); src.push_batch(lx(2098));
+    src.push_batch(lx(4095));
+    src.push_batch(lx(0));
+    src.push_batch(lx(2098));
     // a real mid-roll PAUSE (closes a one-axis window under the old logic)
-    for _ in 0..3 { src.push_batch(rest_frame()); }
+    for _ in 0..3 {
+        src.push_batch(rest_frame());
+    }
     // then sweep ABS_Y only
-    src.push_batch(ly(4095)); src.push_batch(ly(0)); src.push_batch(ly(2107));
-    for _ in 0..3 { src.push_batch(rest_frame()); }
-    src.push_batch(vec![]); src.push_batch(vec![]);
+    src.push_batch(ly(4095));
+    src.push_batch(ly(0));
+    src.push_batch(ly(2107));
+    for _ in 0..3 {
+        src.push_batch(rest_frame());
+    }
+    src.push_batch(vec![]);
+    src.push_batch(vec![]);
 
-    let spec = ControlSpec { id: "lstick".into(), kind: Kind::Stick, prompt: "lstick".into(), optional: false, source: None };
+    let spec = ControlSpec {
+        id: "lstick".into(),
+        kind: Kind::Stick,
+        prompt: "lstick".into(),
+        optional: false,
+        source: None,
+    };
     let mut c = Collector::new(vec![spec]);
-    let cfg = RunConfig { quiet_polls: 2, idle_skip_polls: 40, max_polls: 600, control_timeout: std::time::Duration::from_secs(5), ..RunConfig::default() };
+    let cfg = RunConfig {
+        quiet_polls: 2,
+        idle_skip_polls: 40,
+        max_polls: 600,
+        control_timeout: std::time::Duration::from_secs(5),
+        ..RunConfig::default()
+    };
     let mut log = Vec::new();
     match collect::run(&mut c, &mut src, &meta(), &cfg, &mut log) {
         Ok(cap) => {
-            let ls = cap.inputs.iter().find(|i| i.id == "lstick").expect("lstick row");
-            assert_eq!(ls.code, "ABS_X,ABS_Y",
-                "a sequential two-axis stick motion must record BOTH axes, got {}", ls.code);
+            let ls = cap
+                .inputs
+                .iter()
+                .find(|i| i.id == "lstick")
+                .expect("lstick row");
+            assert_eq!(
+                ls.code, "ABS_X,ABS_Y",
+                "a sequential two-axis stick motion must record BOTH axes, got {}",
+                ls.code
+            );
         }
-        Err(e) => panic!("stick must COMPLETE on a sequential two-axis motion, not abort \
-            (this IS the owner's lstick abort): {e}"),
+        Err(e) => panic!(
+            "stick must COMPLETE on a sequential two-axis motion, not abort \
+            (this IS the owner's lstick abort): {e}"
+        ),
     }
 }
 
@@ -208,29 +345,85 @@ fn stick_completes_on_sequential_two_axis_motion() {
 #[test]
 fn stick_records_observed_calibration_envelope() {
     let mut src = dut();
-    let lx = |x: i32| vec![abs(ABS_X, x), abs(ABS_Y, 2107), abs(ABS_RX, 2013), abs(ABS_RY, 2129)];
-    let ly = |y: i32| vec![abs(ABS_X, 2097), abs(ABS_Y, y), abs(ABS_RX, 2013), abs(ABS_RY, 2129)];
-    for _ in 0..6 { src.push_batch(rest_frame()); }
-    src.push_batch(lx(12)); src.push_batch(lx(4083));    // X sweep to observed extremes
-    for _ in 0..6 { src.push_batch(rest_frame()); }
-    src.push_batch(ly(9)); src.push_batch(ly(4090));      // Y sweep to observed extremes
-    for _ in 0..6 { src.push_batch(rest_frame()); }
-    src.push_batch(vec![]); src.push_batch(vec![]);
+    let lx = |x: i32| {
+        vec![
+            abs(ABS_X, x),
+            abs(ABS_Y, 2107),
+            abs(ABS_RX, 2013),
+            abs(ABS_RY, 2129),
+        ]
+    };
+    let ly = |y: i32| {
+        vec![
+            abs(ABS_X, 2097),
+            abs(ABS_Y, y),
+            abs(ABS_RX, 2013),
+            abs(ABS_RY, 2129),
+        ]
+    };
+    for _ in 0..6 {
+        src.push_batch(rest_frame());
+    }
+    src.push_batch(lx(12));
+    src.push_batch(lx(4083)); // X sweep to observed extremes
+    for _ in 0..6 {
+        src.push_batch(rest_frame());
+    }
+    src.push_batch(ly(9));
+    src.push_batch(ly(4090)); // Y sweep to observed extremes
+    for _ in 0..6 {
+        src.push_batch(rest_frame());
+    }
+    src.push_batch(vec![]);
+    src.push_batch(vec![]);
 
-    let spec = ControlSpec { id: "lstick".into(), kind: Kind::Stick, prompt: "lstick".into(), optional: false, source: None };
+    let spec = ControlSpec {
+        id: "lstick".into(),
+        kind: Kind::Stick,
+        prompt: "lstick".into(),
+        optional: false,
+        source: None,
+    };
     let mut c = Collector::new(vec![spec]);
-    let cfg = RunConfig { quiet_polls: 2, idle_skip_polls: 40, max_polls: 600, control_timeout: std::time::Duration::from_secs(5), ..RunConfig::default() };
+    let cfg = RunConfig {
+        quiet_polls: 2,
+        idle_skip_polls: 40,
+        max_polls: 600,
+        control_timeout: std::time::Duration::from_secs(5),
+        ..RunConfig::default()
+    };
     let mut log = Vec::new();
-    let cap = collect::run(&mut c, &mut src, &meta(), &cfg, &mut log).expect("lstick must complete");
-    let ls = cap.inputs.iter().find(|i| i.id == "lstick").expect("lstick row");
+    let cap =
+        collect::run(&mut c, &mut src, &meta(), &cfg, &mut log).expect("lstick must complete");
+    let ls = cap
+        .inputs
+        .iter()
+        .find(|i| i.id == "lstick")
+        .expect("lstick row");
     let x = ls.x.expect("lstick x axis");
     let y = ls.y.expect("lstick y axis");
     // Observed TRAVEL, not the declared 0..4095 full-scale.
-    assert_eq!((x.min, x.max), (12, 4083), "x records OBSERVED travel, not declared range");
-    assert_eq!((y.min, y.max), (9, 4090), "y records OBSERVED travel, not declared range");
+    assert_eq!(
+        (x.min, x.max),
+        (12, 4083),
+        "x records OBSERVED travel, not declared range"
+    );
+    assert_eq!(
+        (y.min, y.max),
+        (9, 4090),
+        "y records OBSERVED travel, not declared range"
+    );
     // Rest/centre recorded and corroborating tsp-ozbp.9's rest values.
-    assert!((x.value.expect("x centre recorded") - 2098).abs() <= 3, "x centre ~ rest, got {:?}", x.value);
-    assert!((y.value.expect("y centre recorded") - 2107).abs() <= 3, "y centre ~ rest, got {:?}", y.value);
+    assert!(
+        (x.value.expect("x centre recorded") - 2098).abs() <= 3,
+        "x centre ~ rest, got {:?}",
+        x.value
+    );
+    assert!(
+        (y.value.expect("y centre recorded") - 2107).abs() <= 3,
+        "y centre ~ rest, got {:?}",
+        y.value
+    );
 }
 
 /// tsp-bwrg.6 OWNER PASS #5: the stick advanced after ~0.25s (both axes merely TOUCHED) on a brief
@@ -241,28 +434,76 @@ fn stick_records_observed_calibration_envelope() {
 #[test]
 fn stick_full_roll_survives_a_mid_roll_pause_and_records_the_whole_envelope() {
     let mut src = dut();
-    let lx = |x: i32| vec![abs(ABS_X, x), abs(ABS_Y, 2107), abs(ABS_RX, 2013), abs(ABS_RY, 2129)];
-    let ly = |y: i32| vec![abs(ABS_X, 2097), abs(ABS_Y, y), abs(ABS_RX, 2013), abs(ABS_RY, 2129)];
+    let lx = |x: i32| {
+        vec![
+            abs(ABS_X, x),
+            abs(ABS_Y, 2107),
+            abs(ABS_RX, 2013),
+            abs(ABS_RY, 2129),
+        ]
+    };
+    let ly = |y: i32| {
+        vec![
+            abs(ABS_X, 2097),
+            abs(ABS_Y, y),
+            abs(ABS_RX, 2013),
+            abs(ABS_RY, 2129),
+        ]
+    };
     // First corner: X then Y to MAX (both axes seen active) ...
-    src.push_batch(lx(4095)); src.push_batch(ly(4095));
+    src.push_batch(lx(4095));
+    src.push_batch(ly(4095));
     // ... then a real mid-roll PAUSE at rest (would complete under the old "both axes seen" gate) ...
-    for _ in 0..4 { src.push_batch(rest_frame()); }
+    for _ in 0..4 {
+        src.push_batch(rest_frame());
+    }
     // ... then the REST of the roll: both axes to MIN, then settle at rest.
-    src.push_batch(lx(0)); src.push_batch(ly(0));
-    for _ in 0..4 { src.push_batch(rest_frame()); }
-    src.push_batch(vec![]); src.push_batch(vec![]);
+    src.push_batch(lx(0));
+    src.push_batch(ly(0));
+    for _ in 0..4 {
+        src.push_batch(rest_frame());
+    }
+    src.push_batch(vec![]);
+    src.push_batch(vec![]);
 
-    let spec = ControlSpec { id: "lstick".into(), kind: Kind::Stick, prompt: "lstick".into(), optional: false, source: None };
+    let spec = ControlSpec {
+        id: "lstick".into(),
+        kind: Kind::Stick,
+        prompt: "lstick".into(),
+        optional: false,
+        source: None,
+    };
     let mut c = Collector::new(vec![spec]);
-    let cfg = RunConfig { quiet_polls: 2, idle_skip_polls: 40, max_polls: 600, control_timeout: std::time::Duration::from_secs(5), ..RunConfig::default() };
+    let cfg = RunConfig {
+        quiet_polls: 2,
+        idle_skip_polls: 40,
+        max_polls: 600,
+        control_timeout: std::time::Duration::from_secs(5),
+        ..RunConfig::default()
+    };
     let mut log = Vec::new();
-    let cap = collect::run(&mut c, &mut src, &meta(), &cfg, &mut log).expect("lstick completes after the full roll");
-    let ls = cap.inputs.iter().find(|i| i.id == "lstick").expect("lstick row");
+    let cap = collect::run(&mut c, &mut src, &meta(), &cfg, &mut log)
+        .expect("lstick completes after the full roll");
+    let ls = cap
+        .inputs
+        .iter()
+        .find(|i| i.id == "lstick")
+        .expect("lstick row");
     let x = ls.x.expect("x axis");
     let y = ls.y.expect("y axis");
     // The WHOLE envelope was captured — the mid-roll pause did NOT truncate the roll at the corner.
-    assert!(x.min <= 100 && x.max >= 3995, "x must span the full roll (mid-roll pause must not truncate), got {}..{}", x.min, x.max);
-    assert!(y.min <= 100 && y.max >= 3995, "y must span the full roll, got {}..{}", y.min, y.max);
+    assert!(
+        x.min <= 100 && x.max >= 3995,
+        "x must span the full roll (mid-roll pause must not truncate), got {}..{}",
+        x.min,
+        x.max
+    );
+    assert!(
+        y.min <= 100 && y.max >= 3995,
+        "y must span the full roll, got {}..{}",
+        y.min,
+        y.max
+    );
 }
 
 /// tsp-bwrg.6 OWNER PASS #5, the CASCADE half: the stick completed early and the REST of the roll
@@ -273,36 +514,109 @@ fn stick_full_roll_survives_a_mid_roll_pause_and_records_the_whole_envelope() {
 #[test]
 fn a_long_stick_roll_does_not_bleed_into_the_next_control() {
     let mut src = dut();
-    let lx = |x: i32| vec![abs(ABS_X, x), abs(ABS_Y, 2107), abs(ABS_RX, 2013), abs(ABS_RY, 2129)];
-    let ly = |y: i32| vec![abs(ABS_X, 2097), abs(ABS_Y, y), abs(ABS_RX, 2013), abs(ABS_RY, 2129)];
-    let rx = |x: i32| vec![abs(ABS_X, 2098), abs(ABS_Y, 2107), abs(ABS_RX, x), abs(ABS_RY, 2129)];
-    let ry = |y: i32| vec![abs(ABS_X, 2098), abs(ABS_Y, 2107), abs(ABS_RX, 2013), abs(ABS_RY, y)];
+    let lx = |x: i32| {
+        vec![
+            abs(ABS_X, x),
+            abs(ABS_Y, 2107),
+            abs(ABS_RX, 2013),
+            abs(ABS_RY, 2129),
+        ]
+    };
+    let ly = |y: i32| {
+        vec![
+            abs(ABS_X, 2097),
+            abs(ABS_Y, y),
+            abs(ABS_RX, 2013),
+            abs(ABS_RY, 2129),
+        ]
+    };
+    let rx = |x: i32| {
+        vec![
+            abs(ABS_X, 2098),
+            abs(ABS_Y, 2107),
+            abs(ABS_RX, x),
+            abs(ABS_RY, 2129),
+        ]
+    };
+    let ry = |y: i32| {
+        vec![
+            abs(ABS_X, 2098),
+            abs(ABS_Y, 2107),
+            abs(ABS_RX, 2013),
+            abs(ABS_RY, y),
+        ]
+    };
     // lstick: one corner, a mid-roll PAUSE (the old early-complete point), then finish to the
     // opposite extremes, then MORE roll (the "excess" that used to bleed) — all before any settle.
-    src.push_batch(lx(4095)); src.push_batch(ly(4095));
-    for _ in 0..3 { src.push_batch(rest_frame()); }
-    src.push_batch(lx(0)); src.push_batch(ly(0));
-    src.push_batch(lx(4095)); src.push_batch(ly(0)); src.push_batch(lx(0)); src.push_batch(ly(4095));
+    src.push_batch(lx(4095));
+    src.push_batch(ly(4095));
+    for _ in 0..3 {
+        src.push_batch(rest_frame());
+    }
+    src.push_batch(lx(0));
+    src.push_batch(ly(0));
+    src.push_batch(lx(4095));
+    src.push_batch(ly(0));
+    src.push_batch(lx(0));
+    src.push_batch(ly(4095));
     // A real human INTER-CONTROL gap (the owner lets go, reads the next prompt, reaches over). It
     // must outlast BOTH the settle that closes lstick's window AND the inter-control drain that
     // follows it (tsp-bwrg.12) — a 3-frame gap was a machine-timed fixture, not a human one.
-    for _ in 0..12 { src.push_batch(rest_frame()); }
+    for _ in 0..12 {
+        src.push_batch(rest_frame());
+    }
     // rstick: its OWN roll on RX/RY.
-    src.push_batch(rx(4095)); src.push_batch(rx(0)); src.push_batch(ry(4095)); src.push_batch(ry(0));
-    for _ in 0..3 { src.push_batch(rest_frame()); }
-    src.push_batch(vec![]); src.push_batch(vec![]);
+    src.push_batch(rx(4095));
+    src.push_batch(rx(0));
+    src.push_batch(ry(4095));
+    src.push_batch(ry(0));
+    for _ in 0..3 {
+        src.push_batch(rest_frame());
+    }
+    src.push_batch(vec![]);
+    src.push_batch(vec![]);
 
     let plan = vec![
-        ControlSpec { id: "lstick".into(), kind: Kind::Stick, prompt: "lstick".into(), optional: false, source: None },
-        ControlSpec { id: "rstick".into(), kind: Kind::Stick, prompt: "rstick".into(), optional: false, source: None },
+        ControlSpec {
+            id: "lstick".into(),
+            kind: Kind::Stick,
+            prompt: "lstick".into(),
+            optional: false,
+            source: None,
+        },
+        ControlSpec {
+            id: "rstick".into(),
+            kind: Kind::Stick,
+            prompt: "rstick".into(),
+            optional: false,
+            source: None,
+        },
     ];
     let mut c = Collector::new(plan);
-    let cfg = RunConfig { quiet_polls: 2, idle_skip_polls: 40, max_polls: 2000, control_timeout: std::time::Duration::from_secs(5), ..RunConfig::default() };
+    let cfg = RunConfig {
+        quiet_polls: 2,
+        idle_skip_polls: 40,
+        max_polls: 2000,
+        control_timeout: std::time::Duration::from_secs(5),
+        ..RunConfig::default()
+    };
     let mut log = Vec::new();
-    let cap = collect::run(&mut c, &mut src, &meta(), &cfg, &mut log).expect("both sticks complete");
-    let ls = cap.inputs.iter().find(|i| i.id == "lstick").expect("lstick row");
-    let rs = cap.inputs.iter().find(|i| i.id == "rstick").expect("rstick row");
-    assert_eq!(ls.code, "ABS_X,ABS_Y", "lstick must own the left-stick axes");
+    let cap =
+        collect::run(&mut c, &mut src, &meta(), &cfg, &mut log).expect("both sticks complete");
+    let ls = cap
+        .inputs
+        .iter()
+        .find(|i| i.id == "lstick")
+        .expect("lstick row");
+    let rs = cap
+        .inputs
+        .iter()
+        .find(|i| i.id == "rstick")
+        .expect("rstick row");
+    assert_eq!(
+        ls.code, "ABS_X,ABS_Y",
+        "lstick must own the left-stick axes"
+    );
     assert_eq!(rs.code, "ABS_RX,ABS_RY",
         "rstick must capture ITS OWN axes — the lstick roll must not bleed in and falsely satisfy it");
 }
@@ -314,28 +628,79 @@ fn a_long_stick_roll_does_not_bleed_into_the_next_control() {
 #[test]
 fn four_dpad_direction_steps_merge_to_one_hat_row() {
     let mut src = dut();
-    let dir = |code: u16, v: i32| { let mut f = rest_frame(); f.extend([abs(code, v), abs(code, 0)]); f };
+    let dir = |code: u16, v: i32| {
+        let mut f = rest_frame();
+        f.extend([abs(code, v), abs(code, 0)]);
+        f
+    };
     // Human INTER-CONTROL gaps: long enough to outlast the settle AND the inter-control drain
     // (tsp-bwrg.12). A 2-frame gap models a machine, not a person moving between directions.
-    src.push_batch(dir(ABS_HAT0Y, -1)); for _ in 0..12 { src.push_batch(rest_frame()); } // up
-    src.push_batch(dir(ABS_HAT0Y, 1));  for _ in 0..12 { src.push_batch(rest_frame()); } // down
-    src.push_batch(dir(ABS_HAT0X, -1)); for _ in 0..12 { src.push_batch(rest_frame()); } // left
-    src.push_batch(dir(ABS_HAT0X, 1));  for _ in 0..12 { src.push_batch(rest_frame()); } // right
-    src.push_batch(vec![]); src.push_batch(vec![]);
+    src.push_batch(dir(ABS_HAT0Y, -1));
+    for _ in 0..12 {
+        src.push_batch(rest_frame());
+    } // up
+    src.push_batch(dir(ABS_HAT0Y, 1));
+    for _ in 0..12 {
+        src.push_batch(rest_frame());
+    } // down
+    src.push_batch(dir(ABS_HAT0X, -1));
+    for _ in 0..12 {
+        src.push_batch(rest_frame());
+    } // left
+    src.push_batch(dir(ABS_HAT0X, 1));
+    for _ in 0..12 {
+        src.push_batch(rest_frame());
+    } // right
+    src.push_batch(vec![]);
+    src.push_batch(vec![]);
 
     let plan = vec![
-        ControlSpec { id: "dpad_up".into(), kind: Kind::HatDir, prompt: "up".into(), optional: false, source: None },
-        ControlSpec { id: "dpad_down".into(), kind: Kind::HatDir, prompt: "down".into(), optional: false, source: None },
-        ControlSpec { id: "dpad_left".into(), kind: Kind::HatDir, prompt: "left".into(), optional: false, source: None },
-        ControlSpec { id: "dpad_right".into(), kind: Kind::HatDir, prompt: "right".into(), optional: false, source: None },
+        ControlSpec {
+            id: "dpad_up".into(),
+            kind: Kind::HatDir,
+            prompt: "up".into(),
+            optional: false,
+            source: None,
+        },
+        ControlSpec {
+            id: "dpad_down".into(),
+            kind: Kind::HatDir,
+            prompt: "down".into(),
+            optional: false,
+            source: None,
+        },
+        ControlSpec {
+            id: "dpad_left".into(),
+            kind: Kind::HatDir,
+            prompt: "left".into(),
+            optional: false,
+            source: None,
+        },
+        ControlSpec {
+            id: "dpad_right".into(),
+            kind: Kind::HatDir,
+            prompt: "right".into(),
+            optional: false,
+            source: None,
+        },
     ];
     let mut c = Collector::new(plan);
-    let cfg = RunConfig { quiet_polls: 2, idle_skip_polls: 40, max_polls: 600, control_timeout: std::time::Duration::from_secs(5), ..RunConfig::default() };
+    let cfg = RunConfig {
+        quiet_polls: 2,
+        idle_skip_polls: 40,
+        max_polls: 600,
+        control_timeout: std::time::Duration::from_secs(5),
+        ..RunConfig::default()
+    };
     let mut log = Vec::new();
     match collect::run(&mut c, &mut src, &meta(), &cfg, &mut log) {
         Ok(cap) => {
             let ids: Vec<&str> = cap.inputs.iter().map(|i| i.id.as_str()).collect();
-            assert_eq!(ids, vec!["dpad"], "the four dpad steps must merge to exactly ONE dpad row, got {ids:?}");
+            assert_eq!(
+                ids,
+                vec!["dpad"],
+                "the four dpad steps must merge to exactly ONE dpad row, got {ids:?}"
+            );
             assert_eq!(cap.inputs[0].code, "ABS_HAT0X,ABS_HAT0Y");
         }
         Err(e) => panic!("four dpad direction steps must each complete + merge, not error: {e}"),
@@ -360,12 +725,51 @@ fn full_17_prompt_plan_walks_to_completion() {
     use pf_input_decode::codes::{
         BTN_MODE, BTN_NORTH, BTN_SELECT, BTN_START, BTN_TL, BTN_TL2, BTN_TR, BTN_TR2, BTN_WEST,
     };
-    let key = |code: u16| { let mut f = rest_frame(); f.extend([RawEvent::new(EV_KEY, code, 1), RawEvent::new(EV_KEY, code, 0)]); f };
-    let dir = |code: u16, v: i32| { let mut f = rest_frame(); f.extend([abs(code, v), abs(code, 0)]); f };
-    let lx = |x: i32| vec![abs(ABS_X, x), abs(ABS_Y, 2107), abs(ABS_RX, 2013), abs(ABS_RY, 2129)];
-    let ly = |y: i32| vec![abs(ABS_X, 2098), abs(ABS_Y, y), abs(ABS_RX, 2013), abs(ABS_RY, 2129)];
-    let rx = |x: i32| vec![abs(ABS_X, 2098), abs(ABS_Y, 2107), abs(ABS_RX, x), abs(ABS_RY, 2129)];
-    let ry = |y: i32| vec![abs(ABS_X, 2098), abs(ABS_Y, 2107), abs(ABS_RX, 2013), abs(ABS_RY, y)];
+    let key = |code: u16| {
+        let mut f = rest_frame();
+        f.extend([
+            RawEvent::new(EV_KEY, code, 1),
+            RawEvent::new(EV_KEY, code, 0),
+        ]);
+        f
+    };
+    let dir = |code: u16, v: i32| {
+        let mut f = rest_frame();
+        f.extend([abs(code, v), abs(code, 0)]);
+        f
+    };
+    let lx = |x: i32| {
+        vec![
+            abs(ABS_X, x),
+            abs(ABS_Y, 2107),
+            abs(ABS_RX, 2013),
+            abs(ABS_RY, 2129),
+        ]
+    };
+    let ly = |y: i32| {
+        vec![
+            abs(ABS_X, 2098),
+            abs(ABS_Y, y),
+            abs(ABS_RX, 2013),
+            abs(ABS_RY, 2129),
+        ]
+    };
+    let rx = |x: i32| {
+        vec![
+            abs(ABS_X, 2098),
+            abs(ABS_Y, 2107),
+            abs(ABS_RX, x),
+            abs(ABS_RY, 2129),
+        ]
+    };
+    let ry = |y: i32| {
+        vec![
+            abs(ABS_X, 2098),
+            abs(ABS_Y, 2107),
+            abs(ABS_RX, 2013),
+            abs(ABS_RY, y),
+        ]
+    };
     // The 9 button prompts IN PLAN ORDER, each paired with the code that PHYSICAL POSITION emits —
     // taken from `pf_input_decode::codes` (Frame C, positional), never a letter. The prior fixture
     // spelled these as `(a, b, x, y, …)` and, reading the letters positionally, fed 0x133 to the
@@ -387,39 +791,77 @@ fn full_17_prompt_plan_walks_to_completion() {
     // A human INTER-CONTROL gap. It must outlast BOTH the settle that closes a control's window AND
     // the inter-control drain that follows it (tsp-bwrg.12). The old 2-3 frame gaps were
     // MACHINE-timed — the exact fixture profile that kept this suite green while the bugs shipped.
-    let gap = |src: &mut ScriptedSource, n: usize| { for _ in 0..n { src.push_batch(rest_frame()); } };
+    let gap = |src: &mut ScriptedSource, n: usize| {
+        for _ in 0..n {
+            src.push_batch(rest_frame());
+        }
+    };
     const HUMAN_GAP: usize = 12;
     let mut src = dut();
-    for (_, code) in buttons { src.push_batch(key(code)); gap(&mut src, HUMAN_GAP); }
+    for (_, code) in buttons {
+        src.push_batch(key(code));
+        gap(&mut src, HUMAN_GAP);
+    }
     // 4 dpad directions — each an ATOMIC single-axis press, each followed by a gap (up,down,left,right)
-    for (code, v) in [(ABS_HAT0Y, -1), (ABS_HAT0Y, 1), (ABS_HAT0X, -1), (ABS_HAT0X, 1)] {
-        src.push_batch(dir(code, v)); gap(&mut src, HUMAN_GAP);
+    for (code, v) in [
+        (ABS_HAT0Y, -1),
+        (ABS_HAT0Y, 1),
+        (ABS_HAT0X, -1),
+        (ABS_HAT0X, 1),
+    ] {
+        src.push_batch(dir(code, v));
+        gap(&mut src, HUMAN_GAP);
     }
     // lstick — SEQUENTIAL X then a real mid-roll PAUSE then Y (the 2-axis case the fix protects)
-    src.push_batch(lx(4095)); src.push_batch(lx(0)); gap(&mut src, HUMAN_GAP);
-    src.push_batch(ly(4095)); src.push_batch(ly(0)); gap(&mut src, HUMAN_GAP);
+    src.push_batch(lx(4095));
+    src.push_batch(lx(0));
+    gap(&mut src, HUMAN_GAP);
+    src.push_batch(ly(4095));
+    src.push_batch(ly(0));
+    gap(&mut src, HUMAN_GAP);
     // rstick — SEQUENTIAL RX then gap then RY
-    src.push_batch(rx(4095)); src.push_batch(rx(0)); gap(&mut src, HUMAN_GAP);
-    src.push_batch(ry(4095)); src.push_batch(ry(0)); gap(&mut src, HUMAN_GAP);
+    src.push_batch(rx(4095));
+    src.push_batch(rx(0));
+    gap(&mut src, HUMAN_GAP);
+    src.push_batch(ry(4095));
+    src.push_batch(ry(0));
+    gap(&mut src, HUMAN_GAP);
     // ltrig, rtrig — binary buttons (BTN_TL2 / BTN_TR2)
-    src.push_batch(key(BTN_TL2)); gap(&mut src, HUMAN_GAP);
-    src.push_batch(key(BTN_TR2)); gap(&mut src, HUMAN_GAP);
-    src.push_batch(vec![]); src.push_batch(vec![]);
+    src.push_batch(key(BTN_TL2));
+    gap(&mut src, HUMAN_GAP);
+    src.push_batch(key(BTN_TR2));
+    gap(&mut src, HUMAN_GAP);
+    src.push_batch(vec![]);
+    src.push_batch(vec![]);
 
     let mut c = Collector::new(a133_gamepad_plan());
-    let cfg = RunConfig { quiet_polls: 2, idle_skip_polls: 40, max_polls: 10000, control_timeout: std::time::Duration::from_secs(5), ..RunConfig::default() };
+    let cfg = RunConfig {
+        quiet_polls: 2,
+        idle_skip_polls: 40,
+        max_polls: 10000,
+        control_timeout: std::time::Duration::from_secs(5),
+        ..RunConfig::default()
+    };
     let mut log = Vec::new();
     match collect::run(&mut c, &mut src, &meta(), &cfg, &mut log) {
         Ok(cap) => {
             let ids: Vec<&str> = cap.inputs.iter().map(|i| i.id.as_str()).collect();
             // Collected MAP = 14 controls (the four dpad PROMPTS merge to ONE dpad hat CONTROL).
-            for want in ["south", "east", "west", "north", "select", "start", "guide", "l1", "r1",
-                "dpad", "lstick", "rstick", "ltrig", "rtrig"]
-            {
-                assert!(ids.contains(&want), "control {want} missing — the walk did not advance through it: {ids:?}");
+            for want in [
+                "south", "east", "west", "north", "select", "start", "guide", "l1", "r1", "dpad",
+                "lstick", "rstick", "ltrig", "rtrig",
+            ] {
+                assert!(
+                    ids.contains(&want),
+                    "control {want} missing — the walk did not advance through it: {ids:?}"
+                );
             }
             // Splitting a PROMPT must NEVER split a CONTROL: exactly one dpad row, both hat axes.
-            assert_eq!(ids.iter().filter(|&&i| i == "dpad").count(), 1, "dpad must merge to ONE row: {ids:?}");
+            assert_eq!(
+                ids.iter().filter(|&&i| i == "dpad").count(),
+                1,
+                "dpad must merge to ONE row: {ids:?}"
+            );
             let dpad = cap.inputs.iter().find(|i| i.id == "dpad").unwrap();
             assert_eq!(dpad.code, "ABS_HAT0X,ABS_HAT0Y");
             // Each button control recorded ITS OWN code — a walk that merely reaches the end proves
@@ -438,7 +880,13 @@ fn full_17_prompt_plan_walks_to_completion() {
     }
 }
 
-fn meta() -> DeviceMeta { DeviceMeta { id: "a133".into(), manufacturer: "TrimUI".into(), model: "Smart Pro".into() } }
+fn meta() -> DeviceMeta {
+    DeviceMeta {
+        id: "a133".into(),
+        manufacturer: "TrimUI".into(),
+        model: "Smart Pro".into(),
+    }
+}
 
 // =============================================================================================
 // tsp-bwrg.12 — ADVERSARIAL HUMAN-TIMED TESTS for the BUTTON and DPAD classes.
@@ -475,7 +923,9 @@ fn meta() -> DeviceMeta { DeviceMeta { id: "a133".into(), manufacturer: "TrimUI"
 // The per-test pre-change failure is recorded in the PR's test plan.
 // =============================================================================================
 
-fn key(code: u16, val: i32) -> RawEvent { RawEvent::new(EV_KEY, code, val) }
+fn key(code: u16, val: i32) -> RawEvent {
+    RawEvent::new(EV_KEY, code, val)
+}
 
 /// A press of `code` riding the continuous at-rest stick stream (down + up in one poll, which is
 /// what a ~48fps decoder emits for a normal human tap).
@@ -540,8 +990,20 @@ fn button_prompt_rejects_the_previous_controls_key_tail() {
     src.push_batch(vec![]);
 
     let plan = vec![
-        ControlSpec { id: "south".into(), kind: Kind::Button, prompt: "south".into(), optional: false, source: None },
-        ControlSpec { id: "east".into(), kind: Kind::Button, prompt: "east".into(), optional: false, source: None },
+        ControlSpec {
+            id: "south".into(),
+            kind: Kind::Button,
+            prompt: "south".into(),
+            optional: false,
+            source: None,
+        },
+        ControlSpec {
+            id: "east".into(),
+            kind: Kind::Button,
+            prompt: "east".into(),
+            optional: false,
+            source: None,
+        },
     ];
     let mut c = Collector::new(plan);
     let mut log = Vec::new();
@@ -582,8 +1044,20 @@ fn button_prompt_rejects_a_multi_poll_overshoot_from_the_previous_control() {
     src.push_batch(vec![]);
 
     let plan = vec![
-        ControlSpec { id: "south".into(), kind: Kind::Button, prompt: "south".into(), optional: false, source: None },
-        ControlSpec { id: "east".into(), kind: Kind::Button, prompt: "east".into(), optional: false, source: None },
+        ControlSpec {
+            id: "south".into(),
+            kind: Kind::Button,
+            prompt: "south".into(),
+            optional: false,
+            source: None,
+        },
+        ControlSpec {
+            id: "east".into(),
+            kind: Kind::Button,
+            prompt: "east".into(),
+            optional: false,
+            source: None,
+        },
     ];
     let mut c = Collector::new(plan);
     let mut log = Vec::new();
@@ -627,7 +1101,13 @@ fn dpad_prompt_rejects_the_previous_directions_overshoot() {
 
     let plan = ["dpad_up", "dpad_down", "dpad_left", "dpad_right"]
         .into_iter()
-        .map(|id| ControlSpec { id: id.into(), kind: Kind::HatDir, prompt: id.into(), optional: false, source: None })
+        .map(|id| ControlSpec {
+            id: id.into(),
+            kind: Kind::HatDir,
+            prompt: id.into(),
+            optional: false,
+            source: None,
+        })
         .collect();
     let mut c = Collector::new(plan);
     let mut log = Vec::new();
@@ -685,7 +1165,13 @@ fn dpad_prompt_survives_a_mid_actuation_pause_with_stick_crosstalk() {
 
     let plan = ["dpad_up", "dpad_left"]
         .into_iter()
-        .map(|id| ControlSpec { id: id.into(), kind: Kind::HatDir, prompt: id.into(), optional: false, source: None })
+        .map(|id| ControlSpec {
+            id: id.into(),
+            kind: Kind::HatDir,
+            prompt: id.into(),
+            optional: false,
+            source: None,
+        })
         .collect();
     let mut c = Collector::new(plan);
     let mut log = Vec::new();
@@ -703,7 +1189,11 @@ fn dpad_prompt_survives_a_mid_actuation_pause_with_stick_crosstalk() {
         "the LEFT prompt must record the horizontal hat axis"
     );
     let cap = run.expect("both directions must capture and merge into one hat row");
-    let dpad = cap.inputs.iter().find(|i| i.id == "dpad").expect("merged dpad row");
+    let dpad = cap
+        .inputs
+        .iter()
+        .find(|i| i.id == "dpad")
+        .expect("merged dpad row");
     assert_eq!(
         dpad.code, "ABS_HAT0X,ABS_HAT0Y",
         "the merged D-PAD row must be the two HAT axes, not a stick axis"
@@ -723,11 +1213,28 @@ fn dpad_prompt_survives_a_mid_actuation_pause_with_stick_crosstalk() {
 #[test]
 fn analog_trigger_survives_a_mid_squeeze_pause() {
     const ABS_Z: u16 = 0x02;
-    const TRIG: AbsInfo = AbsInfo { min: 0, max: 255, fuzz: 0, flat: 0, resolution: 0 };
-    let ident = Identity { name: "Generic Pad".into(), bus: 3, vid: 0x1234, pid: 0x5678, version: 1 };
+    const TRIG: AbsInfo = AbsInfo {
+        min: 0,
+        max: 255,
+        fuzz: 0,
+        flat: 0,
+        resolution: 0,
+    };
+    let ident = Identity {
+        name: "Generic Pad".into(),
+        bus: 3,
+        vid: 0x1234,
+        pid: 0x5678,
+        version: 1,
+    };
     let mut src = ScriptedSource::new(ident).with_abs(ABS_Z, TRIG);
     // Squeeze most of the way — past the activity threshold, short of a full press ...
-    src.push_batch([0, 40, 90, 140, 200].iter().map(|&v| abs(ABS_Z, v)).collect());
+    src.push_batch(
+        [0, 40, 90, 140, 200]
+            .iter()
+            .map(|&v| abs(ABS_Z, v))
+            .collect(),
+    );
     for _ in 0..5 {
         src.push_batch(vec![]); // ... then PAUSE mid-squeeze ...
     }
@@ -735,12 +1242,23 @@ fn analog_trigger_survives_a_mid_squeeze_pause() {
     src.push_batch(vec![]);
     src.push_batch(vec![]);
 
-    let plan = vec![ControlSpec { id: "ltrig".into(), kind: Kind::Trigger, prompt: "ltrig".into(), optional: false, source: None }];
+    let plan = vec![ControlSpec {
+        id: "ltrig".into(),
+        kind: Kind::Trigger,
+        prompt: "ltrig".into(),
+        optional: false,
+        source: None,
+    }];
     let mut c = Collector::new(plan);
     let mut log = Vec::new();
-    let cap = collect::run(&mut c, &mut src, &meta(), &human_cfg(), &mut log)
-        .expect("a mid-squeeze PAUSE must not complete the trigger at partial travel and abort the run");
-    let t = cap.inputs.iter().find(|i| i.id == "ltrig").expect("ltrig row");
+    let cap = collect::run(&mut c, &mut src, &meta(), &human_cfg(), &mut log).expect(
+        "a mid-squeeze PAUSE must not complete the trigger at partial travel and abort the run",
+    );
+    let t = cap
+        .inputs
+        .iter()
+        .find(|i| i.id == "ltrig")
+        .expect("ltrig row");
     assert_eq!(t.code, "ABS_Z");
     assert_eq!(
         t.semantics.as_deref(),
@@ -781,7 +1299,13 @@ fn foreign_actuation_never_completes_a_control() {
     ] {
         let mut src = dut();
         stick_sweep(&mut src);
-        let plan = vec![ControlSpec { id: id.into(), kind, prompt: id.into(), optional: false, source: None }];
+        let plan = vec![ControlSpec {
+            id: id.into(),
+            kind,
+            prompt: id.into(),
+            optional: false,
+            source: None,
+        }];
         let mut c = Collector::new(plan);
         let mut log = Vec::new();
         let got = collect::run(&mut c, &mut src, &meta(), &human_cfg(), &mut log);
@@ -799,8 +1323,13 @@ fn foreign_actuation_never_completes_a_control() {
             Err(collect::CollectError::NoActivity { id: got_id }) => assert_eq!(got_id, id),
             other => panic!(
                 "{id} ({kind:?}) must report NoActivity when only foreign input was seen; got {:?}",
-                other.map(|c| c.inputs.iter().map(|i| (i.id.clone(), i.code.clone())).collect::<Vec<_>>())
-                     .map_err(|e| e.to_string())
+                other
+                    .map(|c| c
+                        .inputs
+                        .iter()
+                        .map(|i| (i.id.clone(), i.code.clone()))
+                        .collect::<Vec<_>>())
+                    .map_err(|e| e.to_string())
             ),
         }
     }

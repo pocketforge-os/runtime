@@ -83,25 +83,64 @@ fn main() -> ExitCode {
     let _argv0 = args.next();
     while let Some(a) = args.next() {
         match a.as_str() {
-            "--dump-dir" => match next(&mut args, "--dump-dir") { Some(v) => dump_dir = Some(v), None => return ExitCode::from(2) },
-            "--mode" => match next(&mut args, "--mode") { Some(v) => mode = v, None => return ExitCode::from(2) },
-            "--source" => match next(&mut args, "--source") { Some(v) => source = Some(v), None => return ExitCode::from(2) },
-            "--fb" => match next(&mut args, "--fb") { Some(v) => fb = v, None => return ExitCode::from(2) },
-            "--descriptor" => match next(&mut args, "--descriptor") { Some(v) => descriptor = Some(v), None => return ExitCode::from(2) },
-            "--skin-root" => match next(&mut args, "--skin-root") { Some(v) => skin_root = Some(v), None => return ExitCode::from(2) },
-            "--id" => match next(&mut args, "--id") { Some(v) => id = Some(v), None => return ExitCode::from(2) },
-            "--manufacturer" => match next(&mut args, "--manufacturer") { Some(v) => manufacturer = Some(v), None => return ExitCode::from(2) },
-            "--model" => match next(&mut args, "--model") { Some(v) => model = Some(v), None => return ExitCode::from(2) },
-            "--out" => match next(&mut args, "--out") { Some(v) => out = Some(v), None => return ExitCode::from(2) },
-            "-h" | "--help" => { print!("{USAGE}"); return ExitCode::SUCCESS; }
-            other => { eprintln!("error: unknown argument '{other}'\n\n{USAGE}"); return ExitCode::from(2); }
+            "--dump-dir" => match next(&mut args, "--dump-dir") {
+                Some(v) => dump_dir = Some(v),
+                None => return ExitCode::from(2),
+            },
+            "--mode" => match next(&mut args, "--mode") {
+                Some(v) => mode = v,
+                None => return ExitCode::from(2),
+            },
+            "--source" => match next(&mut args, "--source") {
+                Some(v) => source = Some(v),
+                None => return ExitCode::from(2),
+            },
+            "--fb" => match next(&mut args, "--fb") {
+                Some(v) => fb = v,
+                None => return ExitCode::from(2),
+            },
+            "--descriptor" => match next(&mut args, "--descriptor") {
+                Some(v) => descriptor = Some(v),
+                None => return ExitCode::from(2),
+            },
+            "--skin-root" => match next(&mut args, "--skin-root") {
+                Some(v) => skin_root = Some(v),
+                None => return ExitCode::from(2),
+            },
+            "--id" => match next(&mut args, "--id") {
+                Some(v) => id = Some(v),
+                None => return ExitCode::from(2),
+            },
+            "--manufacturer" => match next(&mut args, "--manufacturer") {
+                Some(v) => manufacturer = Some(v),
+                None => return ExitCode::from(2),
+            },
+            "--model" => match next(&mut args, "--model") {
+                Some(v) => model = Some(v),
+                None => return ExitCode::from(2),
+            },
+            "--out" => match next(&mut args, "--out") {
+                Some(v) => out = Some(v),
+                None => return ExitCode::from(2),
+            },
+            "-h" | "--help" => {
+                print!("{USAGE}");
+                return ExitCode::SUCCESS;
+            }
+            other => {
+                eprintln!("error: unknown argument '{other}'\n\n{USAGE}");
+                return ExitCode::from(2);
+            }
         }
     }
 
     // The device skin is required for every mode — the face IS the consumed device render.
     let descriptor = match descriptor {
         Some(d) => d,
-        None => { eprintln!("error: --descriptor <caps.toml> is required (the device skin is consumed from it)\n\n{USAGE}"); return ExitCode::from(2); }
+        None => {
+            eprintln!("error: --descriptor <caps.toml> is required (the device skin is consumed from it)\n\n{USAGE}");
+            return ExitCode::from(2);
+        }
     };
     let descriptor_path = PathBuf::from(&descriptor);
     let skin_root = match skin_root {
@@ -118,7 +157,10 @@ fn main() -> ExitCode {
     let skin = match SkinSet::load(&descriptor_path, &skin_root) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("error: loading device skin from {descriptor} (skin-root {}): {e}", skin_root.display());
+            eprintln!(
+                "error: loading device skin from {descriptor} (skin-root {}): {e}",
+                skin_root.display()
+            );
             eprintln!("hint: --descriptor must point at the device capabilities.toml and --skin-root at the dir its skins/<dev>/*.png resolve against");
             return ExitCode::FAILURE;
         }
@@ -134,7 +176,10 @@ fn main() -> ExitCode {
                 eprintln!("pf-collect-ui: wrote {} frames to {dir}", paths.len());
                 return ExitCode::SUCCESS;
             }
-            Err(e) => { eprintln!("error: dump failed: {e}"); return ExitCode::FAILURE; }
+            Err(e) => {
+                eprintln!("error: dump failed: {e}");
+                return ExitCode::FAILURE;
+            }
         }
     }
 
@@ -166,15 +211,24 @@ fn main() -> ExitCode {
         "live" => {
             let node = match source {
                 Some(s) => s,
-                None => { eprintln!("error: --mode live requires --source <node>\n\n{USAGE}"); return ExitCode::from(2); }
+                None => {
+                    eprintln!("error: --mode live requires --source <node>\n\n{USAGE}");
+                    return ExitCode::from(2);
+                }
             };
             let mut src = match EvdevSource::open(&node) {
                 Ok(s) => s,
-                Err(e) => { eprintln!("error: cannot open evdev source '{node}': {e}"); return ExitCode::FAILURE; }
+                Err(e) => {
+                    eprintln!("error: cannot open evdev source '{node}': {e}");
+                    return ExitCode::FAILURE;
+                }
             };
             wizard::drive_live(&mut src, &mut sink, &skin, &meta, &Timing::live())
         }
-        other => { eprintln!("error: unknown --mode '{other}' (want demo|live)\n\n{USAGE}"); return ExitCode::from(2); }
+        other => {
+            eprintln!("error: unknown --mode '{other}' (want demo|live)\n\n{USAGE}");
+            return ExitCode::from(2);
+        }
     };
 
     match caps {
@@ -192,6 +246,9 @@ fn main() -> ExitCode {
             }
             ExitCode::SUCCESS
         }
-        Err(e) => { eprintln!("error: collection failed: {e}"); ExitCode::FAILURE }
+        Err(e) => {
+            eprintln!("error: collection failed: {e}");
+            ExitCode::FAILURE
+        }
     }
 }

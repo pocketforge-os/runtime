@@ -7,7 +7,9 @@ use std::io::Write;
 const LED_ROOT: &str = "/sys/class/leds";
 
 fn read_u64(path: &str) -> Option<u64> {
-    std::fs::read_to_string(path).ok().and_then(|s| s.trim().parse().ok())
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
 }
 
 fn write_val(dir: &str, attr: &str, val: u64) -> std::io::Result<()> {
@@ -52,9 +54,15 @@ fn natural(s: &str) -> Vec<(String, u64)> {
 
 pub fn run(args: &[String]) -> i32 {
     let only = opt(args, "--only");
-    let on_ms: u64 = opt(args, "--on-ms").and_then(|s| s.parse().ok()).unwrap_or(900);
-    let gap_ms: u64 = opt(args, "--gap-ms").and_then(|s| s.parse().ok()).unwrap_or(400);
-    let repeat: u32 = opt(args, "--repeat").and_then(|s| s.parse().ok()).unwrap_or(1);
+    let on_ms: u64 = opt(args, "--on-ms")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(900);
+    let gap_ms: u64 = opt(args, "--gap-ms")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(400);
+    let repeat: u32 = opt(args, "--repeat")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1);
     let list_only = has_flag(args, "--list");
 
     println!("== led exerciser (/sys/class/leds) ==");
@@ -78,13 +86,18 @@ pub fn run(args: &[String]) -> i32 {
     if list_only {
         return 0;
     }
-    println!("blinking {} node(s), on={on_ms}ms gap={gap_ms}ms repeat={repeat}", selected.len());
+    println!(
+        "blinking {} node(s), on={on_ms}ms gap={gap_ms}ms repeat={repeat}",
+        selected.len()
+    );
     println!();
 
     for r in 1..=repeat {
         for (i, name) in selected.iter().enumerate() {
             let dir = format!("{LED_ROOT}/{name}");
-            let maxb = read_u64(&format!("{dir}/max_brightness")).unwrap_or(1).max(1);
+            let maxb = read_u64(&format!("{dir}/max_brightness"))
+                .unwrap_or(1)
+                .max(1);
             let saved = read_u64(&format!("{dir}/brightness")).unwrap_or(0);
             print!("LED[{i}] round {r}/{repeat}  {name}  -> ON (brightness={maxb}) ... ");
             std::io::stdout().flush().ok();
@@ -99,6 +112,9 @@ pub fn run(args: &[String]) -> i32 {
         }
     }
     println!();
-    println!("PASS: blinked {} LED node(s) — OWNER maps each node index to a physical LED", selected.len());
+    println!(
+        "PASS: blinked {} LED node(s) — OWNER maps each node index to a physical LED",
+        selected.len()
+    );
     0
 }

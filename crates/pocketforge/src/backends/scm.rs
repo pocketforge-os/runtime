@@ -22,7 +22,12 @@ pub fn open_read_fd(path: impl AsRef<Path>) -> io::Result<OwnedFd> {
     let c = std::ffi::CString::new(path.as_ref().as_os_str().as_encoded_bytes())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path has NUL"))?;
     // SAFETY: valid C string; O_CLOEXEC so the fd never leaks across an exec.
-    let raw = unsafe { libc::open(c.as_ptr(), libc::O_RDONLY | libc::O_NONBLOCK | libc::O_CLOEXEC) };
+    let raw = unsafe {
+        libc::open(
+            c.as_ptr(),
+            libc::O_RDONLY | libc::O_NONBLOCK | libc::O_CLOEXEC,
+        )
+    };
     if raw < 0 {
         return Err(io::Error::last_os_error());
     }

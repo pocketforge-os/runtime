@@ -74,7 +74,13 @@ pub struct ControlSpec {
 
 impl ControlSpec {
     pub fn new(id: &str, kind: Kind, prompt: &str, optional: bool) -> ControlSpec {
-        ControlSpec { id: id.to_string(), kind, prompt: prompt.to_string(), optional, source: None }
+        ControlSpec {
+            id: id.to_string(),
+            kind,
+            prompt: prompt.to_string(),
+            optional,
+            source: None,
+        }
     }
 
     /// Builder: pin this control to a NON-primary evdev node (its descriptor `source`).
@@ -91,13 +97,38 @@ impl ControlSpec {
 /// than failing. Order is press-friendly: faces, system, shoulders, dpad, sticks, triggers.
 pub fn default_gamepad_plan() -> Vec<ControlSpec> {
     vec![
-        ControlSpec::new("south", Kind::Button, "Press the BOTTOM face button (south)", false),
-        ControlSpec::new("east", Kind::Button, "Press the RIGHT face button (east)", false),
-        ControlSpec::new("west", Kind::Button, "Press the LEFT face button (west)", false),
-        ControlSpec::new("north", Kind::Button, "Press the TOP face button (north)", false),
+        ControlSpec::new(
+            "south",
+            Kind::Button,
+            "Press the BOTTOM face button (south)",
+            false,
+        ),
+        ControlSpec::new(
+            "east",
+            Kind::Button,
+            "Press the RIGHT face button (east)",
+            false,
+        ),
+        ControlSpec::new(
+            "west",
+            Kind::Button,
+            "Press the LEFT face button (west)",
+            false,
+        ),
+        ControlSpec::new(
+            "north",
+            Kind::Button,
+            "Press the TOP face button (north)",
+            false,
+        ),
         ControlSpec::new("select", Kind::Button, "Press SELECT", false),
         ControlSpec::new("start", Kind::Button, "Press START", false),
-        ControlSpec::new("guide", Kind::Button, "Press GUIDE / MENU (skip if none)", true),
+        ControlSpec::new(
+            "guide",
+            Kind::Button,
+            "Press GUIDE / MENU (skip if none)",
+            true,
+        ),
         ControlSpec::new("l1", Kind::Button, "Press the LEFT shoulder (L1)", false),
         ControlSpec::new("r1", Kind::Button, "Press the RIGHT shoulder (R1)", false),
         ControlSpec::new(
@@ -118,8 +149,18 @@ pub fn default_gamepad_plan() -> Vec<ControlSpec> {
             "Sweep the RIGHT STICK fully in a circle (all the way in every direction)",
             false,
         ),
-        ControlSpec::new("l3", Kind::StickClick, "Click the LEFT STICK (L3) (skip if none)", true),
-        ControlSpec::new("r3", Kind::StickClick, "Click the RIGHT STICK (R3) (skip if none)", true),
+        ControlSpec::new(
+            "l3",
+            Kind::StickClick,
+            "Click the LEFT STICK (L3) (skip if none)",
+            true,
+        ),
+        ControlSpec::new(
+            "r3",
+            Kind::StickClick,
+            "Click the RIGHT STICK (R3) (skip if none)",
+            true,
+        ),
         ControlSpec::new(
             "ltrig",
             Kind::Trigger,
@@ -192,7 +233,12 @@ pub fn a133_gamepad_plan() -> Vec<ControlSpec> {
         ControlSpec::new("dpad_up", Kind::HatDir, "Press UP on the D-PAD", false),
         ControlSpec::new("dpad_down", Kind::HatDir, "Press DOWN on the D-PAD", false),
         ControlSpec::new("dpad_left", Kind::HatDir, "Press LEFT on the D-PAD", false),
-        ControlSpec::new("dpad_right", Kind::HatDir, "Press RIGHT on the D-PAD", false),
+        ControlSpec::new(
+            "dpad_right",
+            Kind::HatDir,
+            "Press RIGHT on the D-PAD",
+            false,
+        ),
         // A stick completes on ONE full circle that touches all four edges (both axes reach both
         // extremes). Prompt for exactly that ONE sweep — never "both directions"/back-and-forth,
         // which reads as a second roll and confused the owner when the step advanced after one
@@ -211,8 +257,18 @@ pub fn a133_gamepad_plan() -> Vec<ControlSpec> {
         ),
         // L2/R2 are BINARY on the a133 — endpoint-only ABS_Z/ABS_RZ (semantics="binary" in the
         // descriptor), a press with no proportional travel, not an analog squeeze. Prompt as a press.
-        ControlSpec::new("ltrig", Kind::Trigger, "Press the LEFT TRIGGER (L2) fully", false),
-        ControlSpec::new("rtrig", Kind::Trigger, "Press the RIGHT TRIGGER (R2) fully", false),
+        ControlSpec::new(
+            "ltrig",
+            Kind::Trigger,
+            "Press the LEFT TRIGGER (L2) fully",
+            false,
+        ),
+        ControlSpec::new(
+            "rtrig",
+            Kind::Trigger,
+            "Press the RIGHT TRIGGER (R2) fully",
+            false,
+        ),
     ]
 }
 
@@ -236,9 +292,10 @@ mod tests {
     #[test]
     fn default_plan_covers_the_a133_base_controls() {
         let ids: Vec<_> = default_gamepad_plan().into_iter().map(|c| c.id).collect();
-        for want in ["south", "east", "west", "north", "select", "start", "l1", "r1", "dpad",
-            "lstick", "rstick", "ltrig", "rtrig"]
-        {
+        for want in [
+            "south", "east", "west", "north", "select", "start", "l1", "r1", "dpad", "lstick",
+            "rstick", "ltrig", "rtrig",
+        ] {
             assert!(ids.contains(&want.to_string()), "plan missing {want}");
         }
     }
@@ -254,20 +311,41 @@ mod tests {
         assert_eq!(
             ids,
             [
-                "south", "east", "west", "north", "select", "start", "guide", "l1", "r1",
-                "dpad_up", "dpad_down", "dpad_left", "dpad_right",
-                "lstick", "rstick", "ltrig", "rtrig",
+                "south",
+                "east",
+                "west",
+                "north",
+                "select",
+                "start",
+                "guide",
+                "l1",
+                "r1",
+                "dpad_up",
+                "dpad_down",
+                "dpad_left",
+                "dpad_right",
+                "lstick",
+                "rstick",
+                "ltrig",
+                "rtrig",
             ],
             "a133 plan must be exactly the 17-prompt frozen baseline"
         );
         assert_eq!(plan.len(), 17, "the a133 plan is 17 prompts (baseline 1:1)");
         // No phantom, and NO lumped single "dpad" entry.
         for phantom in ["l3", "r3", "home", "capture", "misc", "dpad"] {
-            assert!(!ids.contains(&phantom), "a133 plan must not prompt {phantom}");
+            assert!(
+                !ids.contains(&phantom),
+                "a133 plan must not prompt {phantom}"
+            );
         }
         // EVERY prompt is required (no flash-then-skip); each dpad direction is an atomic HatDir.
         for c in &plan {
-            assert!(!c.optional, "a133 control {} must be required (no flash-then-skip)", c.id);
+            assert!(
+                !c.optional,
+                "a133 control {} must be required (no flash-then-skip)",
+                c.id
+            );
         }
         for d in ["dpad_up", "dpad_down", "dpad_left", "dpad_right"] {
             let c = plan.iter().find(|c| c.id == d).unwrap();
@@ -294,7 +372,15 @@ mod tests {
                 c.id
             );
         }
-        for sys in ["vol_up", "vol_down", "volumeup", "volumedown", "home", "power", "mute"] {
+        for sys in [
+            "vol_up",
+            "vol_down",
+            "volumeup",
+            "volumedown",
+            "home",
+            "power",
+            "mute",
+        ] {
             assert!(
                 !plan.iter().any(|c| c.id == sys),
                 "system control '{sys}' must NOT appear in the a133 gamepad-node plan — it lives on \

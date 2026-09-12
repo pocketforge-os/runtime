@@ -61,10 +61,18 @@ pub struct Ev {
 
 impl Ev {
     fn key(code: u16, pressed: bool) -> Ev {
-        Ev { ev_type: codes::EV_KEY, code, value: pressed as i32 }
+        Ev {
+            ev_type: codes::EV_KEY,
+            code,
+            value: pressed as i32,
+        }
     }
     fn abs(code: u16, value: i32) -> Ev {
-        Ev { ev_type: codes::EV_ABS, code, value }
+        Ev {
+            ev_type: codes::EV_ABS,
+            code,
+            value,
+        }
     }
 }
 
@@ -103,7 +111,11 @@ const D_DOWN: u8 = 0x20;
 
 /// The full set of button codes this device advertises (both sides), in a stable order.
 pub fn all_button_codes() -> Vec<u16> {
-    RIGHT_BTN.iter().chain(LEFT_BTN.iter()).map(|&(_, c)| c).collect()
+    RIGHT_BTN
+        .iter()
+        .chain(LEFT_BTN.iter())
+        .map(|&(_, c)| c)
+        .collect()
 }
 
 /// The full set of `(abs_code, min, max)` this device advertises. Sticks are the honest raw
@@ -236,10 +248,16 @@ mod tests {
 
     /// Filter to just the button (EV_KEY) events, for readable assertions.
     fn keys(evs: &[Ev]) -> Vec<(u16, i32)> {
-        evs.iter().filter(|e| e.ev_type == codes::EV_KEY).map(|e| (e.code, e.value)).collect()
+        evs.iter()
+            .filter(|e| e.ev_type == codes::EV_KEY)
+            .map(|e| (e.code, e.value))
+            .collect()
     }
     fn abses(evs: &[Ev]) -> Vec<(u16, i32)> {
-        evs.iter().filter(|e| e.ev_type == codes::EV_ABS).map(|e| (e.code, e.value)).collect()
+        evs.iter()
+            .filter(|e| e.ev_type == codes::EV_ABS)
+            .map(|e| (e.code, e.value))
+            .collect()
     }
 
     #[test]
@@ -247,8 +265,15 @@ mod tests {
         let mut d = SideDecoder::new(Side::Right);
         // The RIGHT/east face button held (bit 0x10) + centre-ish sticks.
         let evs = d.apply(f(0x10, 2048, 2050));
-        assert_eq!(keys(&evs), vec![(codes::BTN_EAST, 1)], "east pressed at startup");
-        assert_eq!(abses(&evs), vec![(codes::ABS_RX, 2048), (codes::ABS_RY, 2050)]);
+        assert_eq!(
+            keys(&evs),
+            vec![(codes::BTN_EAST, 1)],
+            "east pressed at startup"
+        );
+        assert_eq!(
+            abses(&evs),
+            vec![(codes::ABS_RX, 2048), (codes::ABS_RY, 2050)]
+        );
     }
 
     /// ⚠ A MIRROR of [`RIGHT_BTN`], not an independent check of it: the cases below are the same
@@ -272,21 +297,36 @@ mod tests {
             let mut d = SideDecoder::new(Side::Right);
             d.apply(f(0x00, 2048, 2048)); // establish baseline (no buttons)
             let evs = d.apply(f(mask, 2048, 2048));
-            assert_eq!(keys(&evs), vec![(code, 1)], "bit {mask:#04x} → {code:#05x} press");
+            assert_eq!(
+                keys(&evs),
+                vec![(code, 1)],
+                "bit {mask:#04x} → {code:#05x} press"
+            );
             let evs = d.apply(f(0x00, 2048, 2048));
-            assert_eq!(keys(&evs), vec![(code, 0)], "bit {mask:#04x} → {code:#05x} release");
+            assert_eq!(
+                keys(&evs),
+                vec![(code, 0)],
+                "bit {mask:#04x} → {code:#05x} release"
+            );
         }
     }
 
     #[test]
     fn every_left_button_maps_to_its_ground_truth_code() {
-        let cases =
-            [(0x01u8, codes::BTN_TL), (0x02, codes::BTN_TL2), (0x80, codes::BTN_MODE)];
+        let cases = [
+            (0x01u8, codes::BTN_TL),
+            (0x02, codes::BTN_TL2),
+            (0x80, codes::BTN_MODE),
+        ];
         for (mask, code) in cases {
             let mut d = SideDecoder::new(Side::Left);
             d.apply(f(0x00, 2048, 2048));
             let evs = d.apply(f(mask, 2048, 2048));
-            assert_eq!(keys(&evs), vec![(code, 1)], "left bit {mask:#04x} → {code:#05x}");
+            assert_eq!(
+                keys(&evs),
+                vec![(code, 1)],
+                "left bit {mask:#04x} → {code:#05x}"
+            );
         }
     }
 
@@ -294,7 +334,7 @@ mod tests {
     fn left_dpad_bits_produce_a_hat_not_buttons() {
         let mut d = SideDecoder::new(Side::Left);
         d.apply(f(0x00, 2048, 2048)); // baseline centred
-        // Up.
+                                      // Up.
         let evs = d.apply(f(D_UP, 2048, 2048));
         assert_eq!(keys(&evs), vec![], "d-pad never emits a button");
         assert_eq!(abses(&evs), vec![(codes::ABS_HAT0Y, -1)], "Dup → HAT0Y=-1");
@@ -303,10 +343,17 @@ mod tests {
         assert_eq!(abses(&evs), vec![(codes::ABS_HAT0Y, 1)], "Ddown → HAT0Y=+1");
         // Left — HAT0X goes to -1 and the prior HAT0Y returns to centre (X emitted before Y).
         let evs = d.apply(f(D_LEFT, 2048, 2048));
-        assert_eq!(abses(&evs), vec![(codes::ABS_HAT0X, -1), (codes::ABS_HAT0Y, 0)]);
+        assert_eq!(
+            abses(&evs),
+            vec![(codes::ABS_HAT0X, -1), (codes::ABS_HAT0Y, 0)]
+        );
         // Right.
         let evs = d.apply(f(D_RIGHT, 2048, 2048));
-        assert_eq!(abses(&evs), vec![(codes::ABS_HAT0X, 1)], "Dright → HAT0X=+1");
+        assert_eq!(
+            abses(&evs),
+            vec![(codes::ABS_HAT0X, 1)],
+            "Dright → HAT0X=+1"
+        );
         // Release to centre.
         let evs = d.apply(f(0x00, 2048, 2048));
         assert_eq!(abses(&evs), vec![(codes::ABS_HAT0X, 0)]);
@@ -317,7 +364,11 @@ mod tests {
         let mut d = SideDecoder::new(Side::Left);
         d.apply(f(0x00, 2048, 2048));
         let evs = d.apply(f(D_LEFT | D_RIGHT, 2048, 2048));
-        assert_eq!(abses(&evs), vec![], "left+right → centre, no motion from rest");
+        assert_eq!(
+            abses(&evs),
+            vec![],
+            "left+right → centre, no motion from rest"
+        );
     }
 
     #[test]
@@ -335,14 +386,24 @@ mod tests {
         let evs = d.apply(f(0x00, 1000, 2000));
         assert_eq!(evs, vec![], "unchanged frame → no events");
         let evs = d.apply(f(0x00, 1234, 2000));
-        assert_eq!(abses(&evs), vec![(codes::ABS_X, 1234)], "only the moved axis re-emits");
+        assert_eq!(
+            abses(&evs),
+            vec![(codes::ABS_X, 1234)],
+            "only the moved axis re-emits"
+        );
     }
 
     #[test]
     fn left_and_right_sticks_use_different_axis_codes() {
         let mut l = SideDecoder::new(Side::Left);
         let mut r = SideDecoder::new(Side::Right);
-        assert_eq!(abses(&l.apply(f(0, 10, 20))), vec![(codes::ABS_X, 10), (codes::ABS_Y, 20)]);
-        assert_eq!(abses(&r.apply(f(0, 30, 40))), vec![(codes::ABS_RX, 30), (codes::ABS_RY, 40)]);
+        assert_eq!(
+            abses(&l.apply(f(0, 10, 20))),
+            vec![(codes::ABS_X, 10), (codes::ABS_Y, 20)]
+        );
+        assert_eq!(
+            abses(&r.apply(f(0, 30, 40))),
+            vec![(codes::ABS_RX, 30), (codes::ABS_RY, 40)]
+        );
     }
 }

@@ -33,10 +33,20 @@ fn eviocgname(len: usize) -> Ioctl {
     ioc(IOC_READ, EV, 0x06, len as c_ulong)
 }
 fn eviocgid() -> Ioctl {
-    ioc(IOC_READ, EV, 0x02, std::mem::size_of::<libc::input_id>() as c_ulong)
+    ioc(
+        IOC_READ,
+        EV,
+        0x02,
+        std::mem::size_of::<libc::input_id>() as c_ulong,
+    )
 }
 fn eviocgabs(abs: u16) -> Ioctl {
-    ioc(IOC_READ, EV, 0x40 + abs as c_ulong, std::mem::size_of::<libc::input_absinfo>() as c_ulong)
+    ioc(
+        IOC_READ,
+        EV,
+        0x40 + abs as c_ulong,
+        std::mem::size_of::<libc::input_absinfo>() as c_ulong,
+    )
 }
 
 /// One decoded evdev event: the `(ev_type, code, value)` triple the engine records per prompt.
@@ -49,7 +59,11 @@ pub struct RawEvent {
 
 impl RawEvent {
     pub fn new(ev_type: u16, code: u16, value: i32) -> RawEvent {
-        RawEvent { ev_type, code, value }
+        RawEvent {
+            ev_type,
+            code,
+            value,
+        }
     }
 }
 
@@ -128,7 +142,10 @@ impl EvdevSource {
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path has NUL"))?;
         // SAFETY: cpath is a valid NUL-terminated C string for the duration of the call.
         let raw = unsafe {
-            libc::open(cpath.as_ptr(), libc::O_RDONLY | libc::O_NONBLOCK | libc::O_CLOEXEC)
+            libc::open(
+                cpath.as_ptr(),
+                libc::O_RDONLY | libc::O_NONBLOCK | libc::O_CLOEXEC,
+            )
         };
         if raw < 0 {
             return Err(io::Error::last_os_error());
@@ -179,7 +196,11 @@ impl EventSource for EvdevSource {
         let mut ai: libc::input_absinfo = unsafe { std::mem::zeroed() };
         // SAFETY: &mut ai is a valid input_absinfo-sized buffer matching the ioctl's size field.
         let rc = unsafe {
-            libc::ioctl(self.raw_fd(), eviocgabs(abs_code), &mut ai as *mut libc::input_absinfo)
+            libc::ioctl(
+                self.raw_fd(),
+                eviocgabs(abs_code),
+                &mut ai as *mut libc::input_absinfo,
+            )
         };
         if rc < 0 {
             return Err(io::Error::last_os_error());
@@ -194,7 +215,11 @@ impl EventSource for EvdevSource {
     }
 
     fn poll(&mut self, timeout: Duration) -> io::Result<Vec<RawEvent>> {
-        let mut pfd = libc::pollfd { fd: self.raw_fd(), events: libc::POLLIN, revents: 0 };
+        let mut pfd = libc::pollfd {
+            fd: self.raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
         let ms: i32 = timeout.as_millis().min(i32::MAX as u128) as i32;
         // SAFETY: pfd points to one valid pollfd; count = 1.
         let rc = unsafe { libc::poll(&mut pfd as *mut libc::pollfd, 1, ms) };
@@ -210,8 +235,13 @@ impl EventSource for EvdevSource {
         }
         let cap = std::mem::size_of_val(&self.buf[..]);
         // SAFETY: buf is a valid writable buffer of `cap` bytes; read writes at most `cap`.
-        let n =
-            unsafe { libc::read(self.raw_fd(), self.buf.as_mut_ptr() as *mut libc::c_void, cap) };
+        let n = unsafe {
+            libc::read(
+                self.raw_fd(),
+                self.buf.as_mut_ptr() as *mut libc::c_void,
+                cap,
+            )
+        };
         if n < 0 {
             let e = io::Error::last_os_error();
             if e.raw_os_error() == Some(libc::EAGAIN) {
@@ -249,7 +279,10 @@ pub struct ScriptedSource {
 
 impl ScriptedSource {
     pub fn new(ident: Identity) -> ScriptedSource {
-        ScriptedSource { ident, ..Default::default() }
+        ScriptedSource {
+            ident,
+            ..Default::default()
+        }
     }
 
     /// Register the declared range for an absolute axis (what `EVIOCGABS(code)` returns).
@@ -337,14 +370,19 @@ impl MultiSource {
     fn active_mut(&mut self) -> &mut Box<dyn EventSource> {
         // `active` is only ever set to a registered key (set_active_source falls back to primary),
         // and primary is inserted at construction — so this key is always present.
-        self.sources.get_mut(&self.active).expect("active source is always a registered node")
+        self.sources
+            .get_mut(&self.active)
+            .expect("active source is always a registered node")
     }
 }
 
 impl EventSource for MultiSource {
     fn identity(&mut self) -> io::Result<Identity> {
         let p = self.primary.clone();
-        self.sources.get_mut(&p).expect("primary source is registered at construction").identity()
+        self.sources
+            .get_mut(&p)
+            .expect("primary source is registered at construction")
+            .identity()
     }
 
     fn absinfo(&mut self, abs_code: u16) -> io::Result<AbsInfo> {

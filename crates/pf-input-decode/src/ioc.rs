@@ -44,10 +44,22 @@ mod tests {
     #[test]
     fn fixed_codes_match_canonical_linux_values() {
         assert_eq!(UI_DEV_CREATE as u32, 0x5501, "UI_DEV_CREATE = _IO('U', 1)");
-        assert_eq!(UI_DEV_DESTROY as u32, 0x5502, "UI_DEV_DESTROY = _IO('U', 2)");
-        assert_eq!(UI_SET_EVBIT as u32, 0x40045564, "UI_SET_EVBIT = _IOW('U', 100, int)");
-        assert_eq!(UI_SET_KEYBIT as u32, 0x40045565, "UI_SET_KEYBIT = _IOW('U', 101, int)");
-        assert_eq!(UI_SET_ABSBIT as u32, 0x40045567, "UI_SET_ABSBIT = _IOW('U', 103, int)");
+        assert_eq!(
+            UI_DEV_DESTROY as u32, 0x5502,
+            "UI_DEV_DESTROY = _IO('U', 2)"
+        );
+        assert_eq!(
+            UI_SET_EVBIT as u32, 0x40045564,
+            "UI_SET_EVBIT = _IOW('U', 100, int)"
+        );
+        assert_eq!(
+            UI_SET_KEYBIT as u32, 0x40045565,
+            "UI_SET_KEYBIT = _IOW('U', 101, int)"
+        );
+        assert_eq!(
+            UI_SET_ABSBIT as u32, 0x40045567,
+            "UI_SET_ABSBIT = _IOW('U', 103, int)"
+        );
     }
 
     #[test]

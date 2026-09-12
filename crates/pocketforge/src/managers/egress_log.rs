@@ -127,7 +127,10 @@ impl EgressLog {
     pub fn open(dir: impl AsRef<Path>) -> Result<EgressLog, EgressLogError> {
         let dir = dir.as_ref().to_path_buf();
         std::fs::create_dir_all(&dir)?;
-        Ok(EgressLog { dir, write_guard: Mutex::new(()) })
+        Ok(EgressLog {
+            dir,
+            write_guard: Mutex::new(()),
+        })
     }
 
     /// Open the log at the platform-default state root.
@@ -212,7 +215,9 @@ impl EgressLog {
 
     fn append(&self, event: &EgressEvent) -> Result<(), EgressLogError> {
         let _lock = self.write_guard.lock().unwrap();
-        let path = self.dir.join(format!("{}.log", sanitize_app_id(&event.app_id)));
+        let path = self
+            .dir
+            .join(format!("{}.log", sanitize_app_id(&event.app_id)));
         let mut f = OpenOptions::new().create(true).append(true).open(&path)?;
         let line = encode(event);
         f.write_all(line.as_bytes())?;
@@ -247,7 +252,13 @@ fn now_ms() -> u64 {
 
 fn sanitize_app_id(id: &str) -> String {
     id.chars()
-        .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect()
 }
 
@@ -373,7 +384,10 @@ pub fn total_bytes_per_host(events: &[EgressEvent]) -> HashMap<String, u64> {
 /// `pf-permissions egress --refusals`.
 pub fn refusals_per_host(events: &[EgressEvent]) -> HashMap<String, u64> {
     let mut out: HashMap<String, u64> = HashMap::new();
-    for e in events.iter().filter(|e| e.event == EgressEventKind::Refused) {
+    for e in events
+        .iter()
+        .filter(|e| e.event == EgressEventKind::Refused)
+    {
         *out.entry(e.host.clone()).or_default() += 1;
     }
     out
@@ -398,7 +412,8 @@ mod tests {
     fn send_and_refused_round_trip_through_the_log() {
         let dir = tmp_dir("round");
         let log = EgressLog::open(&dir).unwrap();
-        log.record_send("com.test.round", "tile.example", 1500, 15).unwrap();
+        log.record_send("com.test.round", "tile.example", 1500, 15)
+            .unwrap();
         log.record_refused(
             "com.test.round",
             "evil.example",
@@ -412,7 +427,10 @@ mod tests {
         assert_eq!(events[0].host, "tile.example");
         assert_eq!(events[0].bytes, 1500);
         assert_eq!(events[1].event, EgressEventKind::Refused);
-        assert_eq!(events[1].reason.as_deref(), Some("host evil.example not declared"));
+        assert_eq!(
+            events[1].reason.as_deref(),
+            Some("host evil.example not declared")
+        );
     }
 
     #[test]
@@ -422,8 +440,10 @@ mod tests {
         log.record_send("com.test.roll", "a.host", 100, 15).unwrap();
         log.record_send("com.test.roll", "a.host", 200, 14).unwrap();
         log.record_send("com.test.roll", "b.host", 50, 13).unwrap();
-        log.record_refused("com.test.roll", "z.host", "undeclared", 13).unwrap();
-        log.record_refused("com.test.roll", "z.host", "undeclared", 13).unwrap();
+        log.record_refused("com.test.roll", "z.host", "undeclared", 13)
+            .unwrap();
+        log.record_refused("com.test.roll", "z.host", "undeclared", 13)
+            .unwrap();
         let all = log.snapshot_for("com.test.roll").unwrap();
         let totals = total_bytes_per_host(&all);
         assert_eq!(totals.get("a.host"), Some(&300));
@@ -446,7 +466,10 @@ mod tests {
         .unwrap();
         let events = log.snapshot_for("com.test.escape").unwrap();
         assert_eq!(events[0].host, "a\thost");
-        assert_eq!(events[0].reason.as_deref(), Some("reason with \\ and \t and \n"));
+        assert_eq!(
+            events[0].reason.as_deref(),
+            Some("reason with \\ and \t and \n")
+        );
     }
 
     #[test]

@@ -66,12 +66,18 @@ fn a523_control_plane_flip_fires_observer_and_suppresses_pulse() {
     // Next pulse: the primitive reads the flipped preference, silently no-ops, NOT `Fired`. The
     // *diagnostic* layer honestly reports `NoopSuppressed` (the a523 half of the unification).
     let after = app.pulse();
-    assert_ne!(after, RumbleStatus::Fired, "primitive must not fire under suppression");
+    assert_ne!(
+        after,
+        RumbleStatus::Fired,
+        "primitive must not fire under suppression"
+    );
     assert_eq!(after, RumbleStatus::NoopSuppressed);
 
     // Flip back → observer fires again, primitive fires again.
     pf.settings().set_bool("hapticsEnabled", true);
-    let evt = app.observed(OBSERVER_WAIT).expect("re-enable event delivered");
+    let evt = app
+        .observed(OBSERVER_WAIT)
+        .expect("re-enable event delivered");
     assert_eq!(evt, PrefValue::Bool(true));
     assert_eq!(app.pulse(), RumbleStatus::Fired);
 
@@ -105,7 +111,10 @@ fn a523_external_cli_flip_fires_observer_via_reload_and_suppresses_pulse() {
         String::from_utf8_lossy(&out.stderr),
     );
     // The disk-level write happened (the CLI walks parse → apply → persist).
-    assert!(!store.load().unwrap().haptics_enabled(), "disk value must have flipped");
+    assert!(
+        !store.load().unwrap().haptics_enabled(),
+        "disk value must have flipped"
+    );
 
     // Until the running app reloads, its in-process cache is unchanged → no spurious event; and
     // the primitive still fires (the v0 store is not shared memory).
@@ -114,12 +123,18 @@ fn a523_external_cli_flip_fires_observer_via_reload_and_suppresses_pulse() {
         Err(RecvTimeoutError::Timeout),
         "no PrefsDidChange must fire before the host reloads (v0 semantics)",
     );
-    assert_eq!(app.pulse(), RumbleStatus::Fired, "pre-reload primitive still sees the cache");
+    assert_eq!(
+        app.pulse(),
+        RumbleStatus::Fired,
+        "pre-reload primitive still sees the cache"
+    );
 
     // The host learns of the change → reload fires the observer AND updates the in-memory cache
     // that the primitive reads. The RIDER leg proved end-to-end across a real process boundary.
     backend.reload_prefs();
-    let evt = app.observed(OBSERVER_WAIT).expect("reload delivers PrefsDidChange");
+    let evt = app
+        .observed(OBSERVER_WAIT)
+        .expect("reload delivers PrefsDidChange");
     assert_eq!(evt, PrefValue::Bool(false));
     let after = app.pulse();
     assert_ne!(after, RumbleStatus::Fired);
@@ -148,7 +163,9 @@ fn a133_control_plane_flip_fires_observer_and_pulse_is_noop_absent_throughout() 
     // The observer still fires — the preference is user-mutable state, hardware-presence is a
     // separate axis. This is what makes a shared payload-app snippet legal on both descriptors.
     pf.settings().set_bool("hapticsEnabled", false);
-    let evt = app.observed(OBSERVER_WAIT).expect("PrefsDidChange delivered");
+    let evt = app
+        .observed(OBSERVER_WAIT)
+        .expect("PrefsDidChange delivered");
     assert_eq!(evt, PrefValue::Bool(false));
 
     // The primitive: SAME app-visible semantic (silent no-op, not Fired). Diagnostic still Absent.
@@ -181,7 +198,9 @@ fn a133_external_cli_flip_fires_observer_via_reload_and_pulse_is_noop_absent_thr
     );
 
     backend.reload_prefs();
-    let evt = app.observed(OBSERVER_WAIT).expect("reload delivers PrefsDidChange");
+    let evt = app
+        .observed(OBSERVER_WAIT)
+        .expect("reload delivers PrefsDidChange");
     assert_eq!(evt, PrefValue::Bool(false));
     let after = app.pulse();
     assert_ne!(after, RumbleStatus::Fired);
@@ -216,17 +235,26 @@ fn run_unified_scenario(descriptor_id: &str, expected_off_diagnostic: RumbleStat
 
     // Same call, either descriptor: the observer fires — the running app reacts live regardless of
     // whether the hardware would have actuated.
-    let evt = app.observed(OBSERVER_WAIT).expect("PrefsDidChange under identical call code");
+    let evt = app
+        .observed(OBSERVER_WAIT)
+        .expect("PrefsDidChange under identical call code");
     assert_eq!(evt, PrefValue::Bool(false));
 
     // Same call, either descriptor: the primitive is a silent no-op (NEVER `Fired`, NEVER an error
     // the app must handle) — the app-visible semantic collapse the epic promises.
     let after = app.pulse();
-    assert_ne!(after, RumbleStatus::Fired, "app-visible semantic must be silent no-op");
+    assert_ne!(
+        after,
+        RumbleStatus::Fired,
+        "app-visible semantic must be silent no-op"
+    );
 
     // The DIAGNOSTIC layer (frozen discriminants, deliberate honesty) still distinguishes WHY,
     // for surfaces like pf-hwprobe — WITHOUT forking the app-visible behavior above.
-    assert_eq!(after, expected_off_diagnostic, "honest diagnostic per descriptor row");
+    assert_eq!(
+        after, expected_off_diagnostic,
+        "honest diagnostic per descriptor row"
+    );
 
     common::cleanup(&prefs_dir);
 }
@@ -255,8 +283,7 @@ fn unified_zero_code_diff_a523_suppressed() {
 fn mono_audio_flip_via_external_cli_flips_routing_layer() {
     let prefs_dir = scratch_prefs_dir("mono-cli");
     let store = Arc::new(PrefsStore::at(&prefs_dir));
-    let backend =
-        InProcessBackend::shared_with_store(Arc::new(common::descriptor("a523")), store);
+    let backend = InProcessBackend::shared_with_store(Arc::new(common::descriptor("a523")), store);
     let pf = Pf::over_in_process(backend.clone());
     let app = PayloadApp::start(&pf, "monoAudio").expect("observer available");
 
@@ -266,7 +293,9 @@ fn mono_audio_flip_via_external_cli_flips_routing_layer() {
     assert!(out.status.success());
 
     backend.reload_prefs();
-    let evt = app.observed(OBSERVER_WAIT).expect("monoAudio observed via reload");
+    let evt = app
+        .observed(OBSERVER_WAIT)
+        .expect("monoAudio observed via reload");
     assert_eq!(evt, PrefValue::Bool(true));
     // The routing-layer semantic honored (docs/PREFERENCES.md §4: sim-visible; real DSP is post-v0).
     assert_eq!(pf.audio().output_mix(), OutputMix::Mono);
@@ -278,8 +307,7 @@ fn mono_audio_flip_via_external_cli_flips_routing_layer() {
 fn reduce_motion_flip_via_control_plane_fires_observer_and_read_flips() {
     let prefs_dir = scratch_prefs_dir("reducemotion-ctrl");
     let store = Arc::new(PrefsStore::at(&prefs_dir));
-    let backend =
-        InProcessBackend::shared_with_store(Arc::new(common::descriptor("a523")), store);
+    let backend = InProcessBackend::shared_with_store(Arc::new(common::descriptor("a523")), store);
     let pf = Pf::over_in_process(backend.clone());
     let app = PayloadApp::start(&pf, "reduceMotion").expect("observer available");
 
@@ -302,8 +330,7 @@ fn brightness_is_contract_only_readable_and_observable_via_external_cli() {
     // fires; a hardware-apply assertion would be a scope violation.
     let prefs_dir = scratch_prefs_dir("brightness-cli");
     let store = Arc::new(PrefsStore::at(&prefs_dir));
-    let backend =
-        InProcessBackend::shared_with_store(Arc::new(common::descriptor("a523")), store);
+    let backend = InProcessBackend::shared_with_store(Arc::new(common::descriptor("a523")), store);
     let pf = Pf::over_in_process(backend.clone());
     let app = PayloadApp::start(&pf, "brightness").expect("observer available");
 
@@ -313,7 +340,9 @@ fn brightness_is_contract_only_readable_and_observable_via_external_cli() {
     assert!(out.status.success());
 
     backend.reload_prefs();
-    let evt = app.observed(OBSERVER_WAIT).expect("brightness observed via reload");
+    let evt = app
+        .observed(OBSERVER_WAIT)
+        .expect("brightness observed via reload");
     assert_eq!(evt, PrefValue::Scalar(40));
     assert_eq!(pf.settings().brightness(), 40);
 

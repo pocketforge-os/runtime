@@ -2,7 +2,7 @@
 //! physically confirms the motor fires (relayed via the coordinator).
 
 use crate::evdev;
-use crate::{opt, has_flag};
+use crate::{has_flag, opt};
 use libc::{c_void, ff_effect, input_event};
 use std::os::unix::io::AsRawFd;
 
@@ -35,7 +35,10 @@ fn upload(fd: i32, strong: u16, weak: u16, ms: u16) -> Result<i16, String> {
     eff.u[0] = (strong as u64) | ((weak as u64) << 16);
     let r = unsafe { libc::ioctl(fd, evdev::eviocsff(), &mut eff as *mut ff_effect) };
     if r < 0 {
-        return Err(format!("EVIOCSFF failed: {}", std::io::Error::last_os_error()));
+        return Err(format!(
+            "EVIOCSFF failed: {}",
+            std::io::Error::last_os_error()
+        ));
     }
     Ok(eff.id)
 }
@@ -47,10 +50,17 @@ fn set_play(fd: i32, id: i16, on: bool) -> Result<(), String> {
     ev.code = id as u16;
     ev.value = if on { 1 } else { 0 };
     let n = unsafe {
-        libc::write(fd, &ev as *const input_event as *const c_void, std::mem::size_of::<input_event>())
+        libc::write(
+            fd,
+            &ev as *const input_event as *const c_void,
+            std::mem::size_of::<input_event>(),
+        )
     };
     if n < 0 {
-        return Err(format!("play write failed: {}", std::io::Error::last_os_error()));
+        return Err(format!(
+            "play write failed: {}",
+            std::io::Error::last_os_error()
+        ));
     }
     Ok(())
 }
@@ -76,7 +86,11 @@ fn scan() -> Vec<(String, String, bool)> {
     entries.sort_by_key(|n| n[5..].parse::<u32>().unwrap_or(u32::MAX));
     for name in entries {
         let path = format!("/dev/input/{name}");
-        let f = match std::fs::OpenOptions::new().read(true).write(true).open(&path) {
+        let f = match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+        {
             Ok(f) => f,
             Err(_) => {
                 // fall back to read-only just to read the name for the inventory
@@ -99,11 +113,21 @@ fn scan() -> Vec<(String, String, bool)> {
 }
 
 pub fn run(args: &[String]) -> i32 {
-    let strong: u16 = opt(args, "--strong").and_then(|s| s.parse().ok()).unwrap_or(0xFFFF);
-    let weak: u16 = opt(args, "--weak").and_then(|s| s.parse().ok()).unwrap_or(0xFFFF);
-    let ms: u16 = opt(args, "--ms").and_then(|s| s.parse().ok()).unwrap_or(500);
-    let count: u32 = opt(args, "--count").and_then(|s| s.parse().ok()).unwrap_or(3);
-    let gap_ms: u64 = opt(args, "--gap").and_then(|s| s.parse().ok()).unwrap_or(700);
+    let strong: u16 = opt(args, "--strong")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0xFFFF);
+    let weak: u16 = opt(args, "--weak")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0xFFFF);
+    let ms: u16 = opt(args, "--ms")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(500);
+    let count: u32 = opt(args, "--count")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(3);
+    let gap_ms: u64 = opt(args, "--gap")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(700);
     let list = has_flag(args, "--list");
 
     println!("== rumble exerciser (FF_RUMBLE) ==");
@@ -128,7 +152,11 @@ pub fn run(args: &[String]) -> i32 {
     };
     println!("chosen_node={chosen}");
 
-    let f = match std::fs::OpenOptions::new().read(true).write(true).open(&chosen) {
+    let f = match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&chosen)
+    {
         Ok(f) => f,
         Err(e) => {
             eprintln!("FAIL: open {chosen} rw: {e} (need root)");

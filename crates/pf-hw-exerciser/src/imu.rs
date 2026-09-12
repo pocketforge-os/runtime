@@ -15,7 +15,9 @@ use pocketforge::physical_model::{self, Mat3, IDENTITY_MOUNT};
 const IIO_ROOT: &str = "/sys/bus/iio/devices";
 
 fn read_str(path: &str) -> Option<String> {
-    std::fs::read_to_string(path).ok().map(|s| s.trim().to_string())
+    std::fs::read_to_string(path)
+        .ok()
+        .map(|s| s.trim().to_string())
 }
 
 fn read_f64(path: &str) -> Option<f64> {
@@ -24,9 +26,9 @@ fn read_f64(path: &str) -> Option<f64> {
 
 /// An IIO channel group (accel or gyro) resolved to concrete sysfs paths + scale/offset.
 struct Chan {
-    dev: String,      // iio:deviceN dir
-    prefix: String,   // "in_accel" | "in_anglvel"
-    scale: [f64; 3],  // per-axis scale (shared scale broadcast to all 3)
+    dev: String,     // iio:deviceN dir
+    prefix: String,  // "in_accel" | "in_anglvel"
+    scale: [f64; 3], // per-axis scale (shared scale broadcast to all 3)
     offset: [f64; 3],
 }
 
@@ -105,8 +107,12 @@ fn parse_mount(s: &str) -> Option<Mat3> {
 }
 
 pub fn run(args: &[String]) -> i32 {
-    let secs: f64 = opt(args, "--secs").and_then(|s| s.parse().ok()).unwrap_or(4.0);
-    let hz: f64 = opt(args, "--hz").and_then(|s| s.parse().ok()).unwrap_or(50.0);
+    let secs: f64 = opt(args, "--secs")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(4.0);
+    let hz: f64 = opt(args, "--hz")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(50.0);
     let mount: Mat3 = match opt(args, "--mount") {
         Some(s) => match parse_mount(s) {
             Some(m) => m,
@@ -121,7 +127,9 @@ pub fn run(args: &[String]) -> i32 {
     println!("== imu exerciser (IIO accel+gyro) ==");
     let devs = iio_devices();
     if devs.is_empty() {
-        println!("IIO_BIND: NONE — {IIO_ROOT} is EMPTY. qmi8658/mmc5603 did NOT bind as IIO on stock.");
+        println!(
+            "IIO_BIND: NONE — {IIO_ROOT} is EMPTY. qmi8658/mmc5603 did NOT bind as IIO on stock."
+        );
         println!("(This is the SPIKE-0 sensor-bind finding: DT-present but driver-unbound.)");
         return 4;
     }
@@ -139,16 +147,24 @@ pub fn run(args: &[String]) -> i32 {
 
     // Resolve accel + gyro channel groups (may live on the same iio device — qmi8658 does both).
     let accel = devs.iter().find_map(|(d, _)| Chan::resolve(d, "in_accel"));
-    let gyro = devs.iter().find_map(|(d, _)| Chan::resolve(d, "in_anglvel"));
+    let gyro = devs
+        .iter()
+        .find_map(|(d, _)| Chan::resolve(d, "in_anglvel"));
     if accel.is_none() && gyro.is_none() {
         eprintln!("FAIL: no in_accel_*_raw or in_anglvel_*_raw channels on any IIO device");
         return 4;
     }
     if let Some(a) = &accel {
-        println!("accel: {}/{}_*  scale={:?} offset={:?}", a.dev, a.prefix, a.scale, a.offset);
+        println!(
+            "accel: {}/{}_*  scale={:?} offset={:?}",
+            a.dev, a.prefix, a.scale, a.offset
+        );
     }
     if let Some(g) = &gyro {
-        println!("gyro:  {}/{}_*  scale={:?} offset={:?}", g.dev, g.prefix, g.scale, g.offset);
+        println!(
+            "gyro:  {}/{}_*  scale={:?} offset={:?}",
+            g.dev, g.prefix, g.scale, g.offset
+        );
     }
     println!("mount_matrix (chip->device, M·chip) = {mount:?}");
     println!();
@@ -172,21 +188,35 @@ pub fn run(args: &[String]) -> i32 {
                     acc_sum[i] += dev[i];
                 }
                 acc_n += 1;
-                println!(" accel | {:>26} | {:>26} | {:>26}", fmt(&raw), fmt(&chip), fmt(&dev));
+                println!(
+                    " accel | {:>26} | {:>26} | {:>26}",
+                    fmt(&raw),
+                    fmt(&chip),
+                    fmt(&dev)
+                );
             }
         }
         if let Some(g) = &gyro {
             if let Some(raw) = g.raw() {
                 let chip = g.si(&raw);
                 let dev = physical_model::apply_mount(&mount, &chip);
-                println!("  gyro | {:>26} | {:>26} | {:>26}", fmt(&raw), fmt(&chip), fmt(&dev));
+                println!(
+                    "  gyro | {:>26} | {:>26} | {:>26}",
+                    fmt(&raw),
+                    fmt(&chip),
+                    fmt(&dev)
+                );
             }
         }
         std::thread::sleep(period);
     }
 
     if acc_n > 0 {
-        let mean = [acc_sum[0] / acc_n as f64, acc_sum[1] / acc_n as f64, acc_sum[2] / acc_n as f64];
+        let mean = [
+            acc_sum[0] / acc_n as f64,
+            acc_sum[1] / acc_n as f64,
+            acc_sum[2] / acc_n as f64,
+        ];
         let (axis, val) = mean
             .iter()
             .enumerate()

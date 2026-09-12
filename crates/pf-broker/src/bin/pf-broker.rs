@@ -26,7 +26,10 @@ extern "C" fn on_signal(_sig: c_int) {
 }
 
 fn arg(args: &[String], flag: &str) -> Option<String> {
-    args.iter().position(|a| a == flag).and_then(|i| args.get(i + 1)).cloned()
+    args.iter()
+        .position(|a| a == flag)
+        .and_then(|i| args.get(i + 1))
+        .cloned()
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -45,7 +48,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let validated = match manifest.validate(&descriptor) {
         Ok(v) => v,
         Err(violations) => {
-            eprintln!("pf-broker: REFUSING to launch '{}' — app.toml violates the authority graph:", manifest.app.id);
+            eprintln!(
+                "pf-broker: REFUSING to launch '{}' — app.toml violates the authority graph:",
+                manifest.app.id
+            );
             for v in &violations {
                 eprintln!("  - {v}");
             }

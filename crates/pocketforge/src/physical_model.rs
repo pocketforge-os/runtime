@@ -117,13 +117,19 @@ mod tests {
     #[test]
     fn pitch_ninety_puts_gravity_on_y() {
         // Tilt the top fully away: gravity reaction rotates onto +Y.
-        close(&accel_device(0.0, std::f64::consts::FRAC_PI_2), &[0.0, G, 0.0]);
+        close(
+            &accel_device(0.0, std::f64::consts::FRAC_PI_2),
+            &[0.0, G, 0.0],
+        );
     }
 
     #[test]
     fn roll_ninety_puts_gravity_on_minus_x() {
         // Tilt fully right: gravity reaction rotates onto -X.
-        close(&accel_device(std::f64::consts::FRAC_PI_2, 0.0), &[-G, 0.0, 0.0]);
+        close(
+            &accel_device(std::f64::consts::FRAC_PI_2, 0.0),
+            &[-G, 0.0, 0.0],
+        );
     }
 
     #[test]
@@ -151,8 +157,14 @@ mod tests {
     #[test]
     fn drag_maps_to_pitch_and_roll_degrees() {
         assert_eq!(pose_from_drag(0.0, 0.0), (0.0, 0.0));
-        assert_eq!(pose_from_drag(1.0, 1.0), (TILT_BUBBLE_MAX_DEG, TILT_BUBBLE_MAX_DEG));
+        assert_eq!(
+            pose_from_drag(1.0, 1.0),
+            (TILT_BUBBLE_MAX_DEG, TILT_BUBBLE_MAX_DEG)
+        );
         // Clamped beyond full deflection.
-        assert_eq!(pose_from_drag(2.0, -2.0), (-TILT_BUBBLE_MAX_DEG, TILT_BUBBLE_MAX_DEG));
+        assert_eq!(
+            pose_from_drag(2.0, -2.0),
+            (-TILT_BUBBLE_MAX_DEG, TILT_BUBBLE_MAX_DEG)
+        );
     }
 }

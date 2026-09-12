@@ -41,13 +41,17 @@ fn control_plane_write_fires_observer_and_honors_at_the_primitive() {
     // Control-plane write (the sim's injection-as-API surface) → observer fires AND the primitive
     // flips to the SUPPRESSED no-op, via the same path as an absent motor.
     backend.set_preference_bool("hapticsEnabled", false);
-    let evt = rx.recv_timeout(Duration::from_secs(1)).expect("PrefsDidChange delivered");
+    let evt = rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("PrefsDidChange delivered");
     assert_eq!(evt, PrefValue::Bool(false));
     assert_eq!(pf.vibration().pulse(40), RumbleStatus::NoopSuppressed);
 
     // Flip back → another event, primitive fires again.
     backend.set_preference_bool("hapticsEnabled", true);
-    let evt = rx.recv_timeout(Duration::from_secs(1)).expect("re-enable event delivered");
+    let evt = rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("re-enable event delivered");
     assert_eq!(evt, PrefValue::Bool(true));
     assert_eq!(pf.vibration().pulse(40), RumbleStatus::Fired);
 }
@@ -58,7 +62,8 @@ fn control_plane_write_persists_to_the_store() {
     // a fresh backend over the same store reads the flipped value at init.
     let dir = scratch("persist");
     let store = Arc::new(PrefsStore::at(&dir));
-    let backend = InProcessBackend::shared_with_store(Arc::new(common::descriptor("a523")), store.clone());
+    let backend =
+        InProcessBackend::shared_with_store(Arc::new(common::descriptor("a523")), store.clone());
     backend.set_preference_bool("hapticsEnabled", false);
 
     // Same value on disk, read by an independent handle (what `pf-settings get` sees).
@@ -77,7 +82,8 @@ fn external_cli_write_becomes_observable_via_reload() {
     // fires when the host calls `reload_prefs()` (the v0 supervisor-file-watch stand-in).
     let dir = scratch("reload");
     let store = Arc::new(PrefsStore::at(&dir));
-    let backend = InProcessBackend::shared_with_store(Arc::new(common::descriptor("a523")), store.clone());
+    let backend =
+        InProcessBackend::shared_with_store(Arc::new(common::descriptor("a523")), store.clone());
     let pf = Pf::over_in_process(backend.clone());
 
     let rx = backend.subscribe_preference("hapticsEnabled");
@@ -86,14 +92,21 @@ fn external_cli_write_becomes_observable_via_reload() {
     // Out-of-band write through the SAME seam the CLI uses (a separate `PrefsStore` handle stands
     // in for the separate CLI process pointing at the same $PF_PREFS_DIR).
     let cli_view = PrefsStore::at(&dir);
-    cli_view.apply("hapticsEnabled", PrefValue::Bool(false)).unwrap();
+    cli_view
+        .apply("hapticsEnabled", PrefValue::Bool(false))
+        .unwrap();
 
     // Until the host reloads, the in-process cache is unchanged → no spurious event yet.
-    assert_eq!(rx.recv_timeout(Duration::from_millis(100)), Err(RecvTimeoutError::Timeout));
+    assert_eq!(
+        rx.recv_timeout(Duration::from_millis(100)),
+        Err(RecvTimeoutError::Timeout)
+    );
 
     // Host learns of the change and reloads → observer fires AND the primitive honors it.
     backend.reload_prefs();
-    let evt = rx.recv_timeout(Duration::from_secs(1)).expect("reload fires PrefsDidChange");
+    let evt = rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("reload fires PrefsDidChange");
     assert_eq!(evt, PrefValue::Bool(false));
     assert_eq!(pf.vibration().pulse(40), RumbleStatus::NoopSuppressed);
 }
@@ -106,7 +119,10 @@ fn reload_without_a_change_fires_no_event() {
     let rx = backend.subscribe_preference("hapticsEnabled");
     // Nothing on disk changed → reload is a no-op, no spurious event.
     backend.reload_prefs();
-    assert_eq!(rx.recv_timeout(Duration::from_millis(100)), Err(RecvTimeoutError::Timeout));
+    assert_eq!(
+        rx.recv_timeout(Duration::from_millis(100)),
+        Err(RecvTimeoutError::Timeout)
+    );
 }
 
 #[test]
@@ -121,7 +137,9 @@ fn brightness_is_contract_only_readable_and_observable() {
     assert_eq!(pf.settings().brightness(), 100); // schema default
     let rx = backend.subscribe_preference("brightness");
     backend.set_preference("brightness", PrefValue::Scalar(40));
-    let evt = rx.recv_timeout(Duration::from_secs(1)).expect("brightness change observed");
+    let evt = rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("brightness change observed");
     assert_eq!(evt, PrefValue::Scalar(40));
     assert_eq!(pf.settings().brightness(), 40);
 }
@@ -139,7 +157,10 @@ fn mono_audio_is_honored_on_the_routing_layer() {
     assert_eq!(pf.audio().output_mix(), OutputMix::Stereo);
     let rx = backend.subscribe_preference("monoAudio");
     backend.set_preference_bool("monoAudio", true);
-    assert_eq!(rx.recv_timeout(Duration::from_secs(1)).unwrap(), PrefValue::Bool(true));
+    assert_eq!(
+        rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+        PrefValue::Bool(true)
+    );
     assert_eq!(pf.audio().output_mix(), OutputMix::Mono);
 }
 
@@ -155,7 +176,10 @@ fn reduce_motion_is_a_readable_observable_flag_with_no_v0_machinery() {
     assert!(!pf.settings().reduce_motion());
     let rx = backend.subscribe_preference("reduceMotion");
     backend.set_preference_bool("reduceMotion", true);
-    assert_eq!(rx.recv_timeout(Duration::from_secs(1)).unwrap(), PrefValue::Bool(true));
+    assert_eq!(
+        rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+        PrefValue::Bool(true)
+    );
     assert!(pf.settings().reduce_motion());
 }
 
@@ -186,8 +210,14 @@ fn suppression_and_absence_are_one_silent_no_op_under_identical_code() {
 
     // App-visible SEMANTIC is identical: both are a silent no-op (neither `Fired`), so an app that
     // just calls `pulse()` behaves identically on both — no special-casing, no error to handle.
-    assert!(matches!(r_suppressed, RumbleStatus::NoopSuppressed | RumbleStatus::NoopAbsent));
-    assert!(matches!(r_absent, RumbleStatus::NoopSuppressed | RumbleStatus::NoopAbsent));
+    assert!(matches!(
+        r_suppressed,
+        RumbleStatus::NoopSuppressed | RumbleStatus::NoopAbsent
+    ));
+    assert!(matches!(
+        r_absent,
+        RumbleStatus::NoopSuppressed | RumbleStatus::NoopAbsent
+    ));
     assert_ne!(r_suppressed, RumbleStatus::Fired);
     assert_ne!(r_absent, RumbleStatus::Fired);
 
@@ -206,6 +236,9 @@ fn store_less_backend_keeps_in_memory_prefs_and_observer() {
     let rx = backend.subscribe_preference("hapticsEnabled");
     assert_eq!(pf.vibration().pulse(40), RumbleStatus::Fired);
     backend.set_preference_bool("hapticsEnabled", false);
-    assert_eq!(rx.recv_timeout(Duration::from_secs(1)).unwrap(), PrefValue::Bool(false));
+    assert_eq!(
+        rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+        PrefValue::Bool(false)
+    );
     assert_eq!(pf.vibration().pulse(40), RumbleStatus::NoopSuppressed);
 }

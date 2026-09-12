@@ -100,7 +100,11 @@ pub struct GrantKey {
 
 impl GrantKey {
     /// Build a key with normalized (lowercase) cap + modifier — the ceiling check keys off this.
-    pub fn new(app_id: impl Into<String>, cap: impl AsRef<str>, modifier: Option<&str>) -> GrantKey {
+    pub fn new(
+        app_id: impl Into<String>,
+        cap: impl AsRef<str>,
+        modifier: Option<&str>,
+    ) -> GrantKey {
         GrantKey {
             app_id: app_id.into(),
             cap: cap.as_ref().to_ascii_lowercase(),
@@ -143,7 +147,10 @@ impl std::fmt::Display for LedgerError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             LedgerError::OutsideCeiling { app_id, cap } => {
-                write!(f, "grant refused: '{cap}' is outside app '{app_id}' manifest ceiling")
+                write!(
+                    f,
+                    "grant refused: '{cap}' is outside app '{app_id}' manifest ceiling"
+                )
             }
             LedgerError::Malformed { line_no, reason } => {
                 write!(f, "ledger line {line_no}: malformed ({reason})")
@@ -345,7 +352,10 @@ impl AppOpsLedger {
             once_used: false,
             supervisor_note,
         };
-        self.state.lock().unwrap().insert(key, LiveState::Granted(entry.clone()));
+        self.state
+            .lock()
+            .unwrap()
+            .insert(key, LiveState::Granted(entry.clone()));
         Ok(entry)
     }
 
@@ -374,7 +384,10 @@ impl AppOpsLedger {
         };
         self.append(&rec)?;
         entry.once_used = true;
-        self.state.lock().unwrap().insert(key.clone(), LiveState::Granted(entry));
+        self.state
+            .lock()
+            .unwrap()
+            .insert(key.clone(), LiveState::Granted(entry));
         Ok(())
     }
 
@@ -449,7 +462,10 @@ impl AppOpsLedger {
     /// re-Prompt. **This method is a `.5`-flow helper: it is NOT called automatically on ledger
     /// open (that would be surprising for a pure ledger); the re-permission review path drives
     /// it.** Returns the list of revoked keys.
-    pub fn revoke_orphans(&self, manifest: &ValidatedManifest) -> Result<Vec<GrantKey>, LedgerError> {
+    pub fn revoke_orphans(
+        &self,
+        manifest: &ValidatedManifest,
+    ) -> Result<Vec<GrantKey>, LedgerError> {
         let orphaned = self.orphaned_grants(manifest);
         let mut revoked = Vec::with_capacity(orphaned.len());
         for g in orphaned {
@@ -460,7 +476,9 @@ impl AppOpsLedger {
     }
 
     fn append(&self, rec: &Record) -> Result<(), LedgerError> {
-        let path = self.dir.join(format!("{}.log", sanitize_app_id(&rec.key.app_id)));
+        let path = self
+            .dir
+            .join(format!("{}.log", sanitize_app_id(&rec.key.app_id)));
         let mut f = OpenOptions::new().create(true).append(true).open(&path)?;
         let line = encode_record(rec);
         f.write_all(line.as_bytes())?;
@@ -526,7 +544,13 @@ fn now_ms() -> u64 {
 /// Restrict an app id to filesystem-safe characters (dots + alphanumerics + underscores + dashes).
 fn sanitize_app_id(id: &str) -> String {
     id.chars()
-        .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect()
 }
 
@@ -553,10 +577,7 @@ fn default_appops_dir() -> PathBuf {
 fn encode_record(rec: &Record) -> String {
     let modifier = rec.key.modifier.as_deref().unwrap_or("-");
     let scope = rec.scope.map(|s| s.to_str()).unwrap_or("-");
-    let input = rec
-        .input
-        .map(|i| i.as_str())
-        .unwrap_or("-");
+    let input = rec.input.map(|i| i.as_str()).unwrap_or("-");
     let note = rec.supervisor_note.as_deref().unwrap_or("-");
     format!(
         "ts_ms={ts_ms}\tevent={event}\tapp={app}\tcap={cap}\tmodifier={modifier}\top_id={op_id}\tscope={scope}\task_id={ask_id}\tinput={input}\tsupervisor_note={note}",
@@ -591,9 +612,7 @@ fn parse_record(line: &str) -> Result<Record, String> {
             .ok_or_else(|| format!("field '{field}' has no '='"))?;
         match k {
             "ts_ms" => ts_ms = Some(v.parse().map_err(|e| format!("ts_ms: {e}"))?),
-            "event" => {
-                event = Some(EventKind::parse(v).ok_or_else(|| format!("bad event '{v}'"))?)
-            }
+            "event" => event = Some(EventKind::parse(v).ok_or_else(|| format!("bad event '{v}'"))?),
             "app" => app = Some(unescape(v)?),
             "cap" => cap = Some(unescape(v)?),
             "modifier" => {
@@ -602,11 +621,19 @@ fn parse_record(line: &str) -> Result<Record, String> {
             }
             "op_id" => op_id = Some(v.parse().map_err(|e| format!("op_id: {e}"))?),
             "scope" => {
-                scope = if v == "-" { None } else { Some(Scope::parse(v).ok_or_else(|| format!("bad scope '{v}'"))?) };
+                scope = if v == "-" {
+                    None
+                } else {
+                    Some(Scope::parse(v).ok_or_else(|| format!("bad scope '{v}'"))?)
+                };
             }
             "ask_id" => ask_id = Some(v.parse().map_err(|e| format!("ask_id: {e}"))?),
             "input" => {
-                input = if v == "-" { None } else { Some(AskInput::parse(v).ok_or_else(|| format!("bad input '{v}'"))?) };
+                input = if v == "-" {
+                    None
+                } else {
+                    Some(AskInput::parse(v).ok_or_else(|| format!("bad input '{v}'"))?)
+                };
             }
             "supervisor_note" => {
                 let u = unescape(v)?;
@@ -697,13 +724,24 @@ kind = "gnss"
     fn manifest_for(app_id: &str, uses: &[&str], desc: &Descriptor) -> ValidatedManifest {
         let toml = format!(
             "[app]\nid = \"{app_id}\"\nuse = [{}]\n",
-            uses.iter().map(|u| format!("\"{u}\"")).collect::<Vec<_>>().join(", ")
+            uses.iter()
+                .map(|u| format!("\"{u}\""))
+                .collect::<Vec<_>>()
+                .join(", ")
         );
-        AppManifest::from_toml(&toml).unwrap().validate(desc).unwrap()
+        AppManifest::from_toml(&toml)
+            .unwrap()
+            .validate(desc)
+            .unwrap()
     }
 
     fn tmp_dir(tag: &str) -> PathBuf {
-        let p = std::env::temp_dir().join(format!("pf-appops-{}-{}-{}", tag, std::process::id(), now_ms()));
+        let p = std::env::temp_dir().join(format!(
+            "pf-appops-{}-{}-{}",
+            tag,
+            std::process::id(),
+            now_ms()
+        ));
         std::fs::create_dir_all(&p).unwrap();
         p
     }
@@ -716,7 +754,15 @@ kind = "gnss"
         // Manifest declares ONLY location — vibration is outside the ceiling.
         let m = manifest_for("com.test.app", &["location:approximate"], &desc);
         let err = ledger
-            .record_grant(&m, "vibration", None, Scope::Always, 1, AskInput::AOnAllowAlways, None)
+            .record_grant(
+                &m,
+                "vibration",
+                None,
+                Scope::Always,
+                1,
+                AskInput::AOnAllowAlways,
+                None,
+            )
             .unwrap_err();
         match err {
             LedgerError::OutsideCeiling { cap, app_id } => {
@@ -741,14 +787,33 @@ kind = "gnss"
         let m = manifest_for("com.test.weather", &["location:approximate"], &desc);
         {
             let l1 = AppOpsLedger::open(&dir).unwrap();
-            l1.record_grant(&m, "location", Some("approximate"), Scope::Always, 42, AskInput::AOnAllowAlways, None)
-                .unwrap();
-            assert_eq!(l1.check(&GrantKey::new("com.test.weather", "location", Some("approximate"))), GrantCheck::Always);
+            l1.record_grant(
+                &m,
+                "location",
+                Some("approximate"),
+                Scope::Always,
+                42,
+                AskInput::AOnAllowAlways,
+                None,
+            )
+            .unwrap();
+            assert_eq!(
+                l1.check(&GrantKey::new(
+                    "com.test.weather",
+                    "location",
+                    Some("approximate")
+                )),
+                GrantCheck::Always
+            );
         }
         // Reopen — the Always grant must replay.
         let l2 = AppOpsLedger::open(&dir).unwrap();
         assert_eq!(
-            l2.check(&GrantKey::new("com.test.weather", "location", Some("approximate"))),
+            l2.check(&GrantKey::new(
+                "com.test.weather",
+                "location",
+                Some("approximate")
+            )),
             GrantCheck::Always,
             "Always grant must survive a fresh ledger open (restart)"
         );
@@ -760,8 +825,16 @@ kind = "gnss"
         let desc = gnss_descriptor();
         let m = manifest_for("com.test.once", &["location:approximate"], &desc);
         let l = AppOpsLedger::open(&dir).unwrap();
-        l.record_grant(&m, "location", Some("approximate"), Scope::Once, 1, AskInput::AOnAllowOnce, None)
-            .unwrap();
+        l.record_grant(
+            &m,
+            "location",
+            Some("approximate"),
+            Scope::Once,
+            1,
+            AskInput::AOnAllowOnce,
+            None,
+        )
+        .unwrap();
         let key = GrantKey::new("com.test.once", "location", Some("approximate"));
         assert_eq!(l.check(&key), GrantCheck::OnceAvailable);
         l.consume_once(&key).unwrap();
@@ -769,7 +842,11 @@ kind = "gnss"
         // Replay confirms the used flag.
         drop(l);
         let l2 = AppOpsLedger::open(&dir).unwrap();
-        assert_eq!(l2.check(&key), GrantCheck::OnceUsed, "once-consumed state must survive replay");
+        assert_eq!(
+            l2.check(&key),
+            GrantCheck::OnceUsed,
+            "once-consumed state must survive replay"
+        );
     }
 
     #[test]
@@ -778,8 +855,16 @@ kind = "gnss"
         let desc = gnss_descriptor();
         let m = manifest_for("com.test.rev", &["location:approximate"], &desc);
         let l = AppOpsLedger::open(&dir).unwrap();
-        l.record_grant(&m, "location", Some("approximate"), Scope::Always, 7, AskInput::AOnAllowAlways, None)
-            .unwrap();
+        l.record_grant(
+            &m,
+            "location",
+            Some("approximate"),
+            Scope::Always,
+            7,
+            AskInput::AOnAllowAlways,
+            None,
+        )
+        .unwrap();
         let key = GrantKey::new("com.test.rev", "location", Some("approximate"));
         assert_eq!(l.check(&key), GrantCheck::Always);
         l.record_revoke(&key).unwrap();
@@ -787,19 +872,43 @@ kind = "gnss"
         // Fresh open sees Revoked (never-granted is Revoked here because revoke is last-wins).
         drop(l);
         let l2 = AppOpsLedger::open(&dir).unwrap();
-        assert_eq!(l2.check(&key), GrantCheck::Revoked, "revoke must survive replay");
+        assert_eq!(
+            l2.check(&key),
+            GrantCheck::Revoked,
+            "revoke must survive replay"
+        );
     }
 
     #[test]
     fn orphaned_grants_surface_when_ceiling_shrinks() {
         let dir = tmp_dir("orphan");
         let desc = gnss_descriptor();
-        let wide = manifest_for("com.test.orphan", &["location:approximate", "egress:tile.example"], &desc);
+        let wide = manifest_for(
+            "com.test.orphan",
+            &["location:approximate", "egress:tile.example"],
+            &desc,
+        );
         let l = AppOpsLedger::open(&dir).unwrap();
-        l.record_grant(&wide, "location", Some("approximate"), Scope::Always, 1, AskInput::AOnAllowAlways, None)
-            .unwrap();
-        l.record_grant(&wide, "egress", Some("tile.example"), Scope::Always, 2, AskInput::AOnAllowAlways, None)
-            .unwrap();
+        l.record_grant(
+            &wide,
+            "location",
+            Some("approximate"),
+            Scope::Always,
+            1,
+            AskInput::AOnAllowAlways,
+            None,
+        )
+        .unwrap();
+        l.record_grant(
+            &wide,
+            "egress",
+            Some("tile.example"),
+            Scope::Always,
+            2,
+            AskInput::AOnAllowAlways,
+            None,
+        )
+        .unwrap();
         // Ceiling shrinks — a new manifest without egress leaves the egress grant orphaned.
         let narrow = manifest_for("com.test.orphan", &["location:approximate"], &desc);
         let orphaned = l.orphaned_grants(&narrow);

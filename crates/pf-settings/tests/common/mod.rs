@@ -36,8 +36,7 @@ pub fn descriptor(id: &str) -> Descriptor {
 /// bleeds in. Callers pair this with [`cleanup`] on the happy path — a failed test intentionally
 /// leaves the directory for post-mortem inspection.
 pub fn scratch_prefs_dir(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir()
-        .join(format!("pf-xubv4-e2e-{}-{}", std::process::id(), tag));
+    let dir = std::env::temp_dir().join(format!("pf-xubv4-e2e-{}-{}", std::process::id(), tag));
     let _ = std::fs::remove_dir_all(&dir);
     dir
 }

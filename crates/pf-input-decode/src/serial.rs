@@ -15,7 +15,12 @@ pub fn open_19200_8n1(path: &str) -> io::Result<File> {
     let cpath = std::ffi::CString::new(path)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "nul in device path"))?;
     // SAFETY: valid C string; read-only, no controlling tty, close-on-exec.
-    let raw = unsafe { libc::open(cpath.as_ptr(), libc::O_RDONLY | libc::O_NOCTTY | libc::O_CLOEXEC) };
+    let raw = unsafe {
+        libc::open(
+            cpath.as_ptr(),
+            libc::O_RDONLY | libc::O_NOCTTY | libc::O_CLOEXEC,
+        )
+    };
     if raw < 0 {
         return Err(io::Error::last_os_error());
     }

@@ -29,7 +29,12 @@ pub fn eviocgbit(ev: u16, len: usize) -> Ioctl {
 
 /// `EVIOCSFF` — upload (send) an FF effect (`struct ff_effect`).
 pub fn eviocsff() -> Ioctl {
-    ioc(IOC_WRITE, EV, 0x80, std::mem::size_of::<libc::ff_effect>() as c_ulong)
+    ioc(
+        IOC_WRITE,
+        EV,
+        0x80,
+        std::mem::size_of::<libc::ff_effect>() as c_ulong,
+    )
 }
 
 /// `EVIOCRMFF` — remove an FF effect by id (`int`).
@@ -45,7 +50,10 @@ pub fn device_name(fd: RawFd) -> String {
         return String::new();
     }
     let n = r as usize;
-    let end = buf[..n.min(buf.len())].iter().position(|&b| b == 0).unwrap_or(n.min(buf.len()));
+    let end = buf[..n.min(buf.len())]
+        .iter()
+        .position(|&b| b == 0)
+        .unwrap_or(n.min(buf.len()));
     String::from_utf8_lossy(&buf[..end]).trim_end().to_string()
 }
 

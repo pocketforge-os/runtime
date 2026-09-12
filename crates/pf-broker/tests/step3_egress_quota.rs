@@ -44,7 +44,10 @@ fn desc_gnss_and_rumble() -> Descriptor {
 fn manifest(uses: &[&str]) -> AppManifest {
     let toml = format!(
         "[app]\nid = \"com.test.step3\"\nuse = [{}]\n",
-        uses.iter().map(|u| format!("\"{u}\"")).collect::<Vec<_>>().join(", ")
+        uses.iter()
+            .map(|u| format!("\"{u}\""))
+            .collect::<Vec<_>>()
+            .join(", ")
     );
     AppManifest::from_toml(&toml).expect("parse app.toml")
 }
@@ -101,7 +104,10 @@ fn step3_1_location_reads_throttle_then_refill_under_wall_clock() {
     // Reads succeed again — the throttle heals over wall time, matching the token-bucket
     // contract.
     for _ in 0..5 {
-        assert!(eb.acquire("location").is_ok(), "post-refill acquire succeeds");
+        assert!(
+            eb.acquire("location").is_ok(),
+            "post-refill acquire succeeds"
+        );
     }
     assert_eq!(
         eb.acquire("location").err(),
@@ -124,7 +130,9 @@ fn step3_2_location_read_never_touches_egress_bucket() {
     let desc = Arc::new(desc_gnss_and_rumble());
     let inner = InProcessBackend::shared(desc.clone());
     inner.set_consent("location", PermissionState::Granted);
-    let validated = manifest(&["location:approximate", "egress:tile.example"]).validate(&desc).unwrap();
+    let validated = manifest(&["location:approximate", "egress:tile.example"])
+        .validate(&desc)
+        .unwrap();
     let clock = ManualClock::new();
     let quotas = Arc::new(QuotaLedger::with_clock(clock.clone()));
     let eb = EnforcingBackend::with_quotas(inner.clone(), &validated, quotas.clone());
@@ -146,15 +154,14 @@ fn step3_2_location_read_never_touches_egress_bucket() {
     // enforce-path acquire is a per-op consume too, but the STEP-3 focus is the read≠send
     // independence at the ledger).
     let log = Arc::new(EgressLog::open(tmp_dir("step3-2")).unwrap());
-    let acct = EgressManager::accounting(
-        "com.test.step3",
-        ["tile.example".to_string()],
-        log.clone(),
-    );
+    let acct =
+        EgressManager::accounting("com.test.step3", ["tile.example".to_string()], log.clone());
     let em = EgressManager::with_accounting(quotas.clone(), acct);
     let loc_before = quotas.remaining("location");
-    em.send("tile.example", 128).expect("declared send accounts");
-    em.send("tile.example", 256).expect("declared send accounts");
+    em.send("tile.example", 128)
+        .expect("declared send accounts");
+    em.send("tile.example", 256)
+        .expect("declared send accounts");
     assert_eq!(
         quotas.remaining("location"),
         loc_before,
@@ -177,11 +184,7 @@ fn step3_3_egress_undeclared_host_refused_and_logged_declared_host_accounted() {
     let quotas = Arc::new(QuotaLedger::new());
     let em = EgressManager::with_accounting(
         quotas.clone(),
-        EgressManager::accounting(
-            "com.test.step3",
-            ["tile.example".to_string()],
-            log.clone(),
-        ),
+        EgressManager::accounting("com.test.step3", ["tile.example".to_string()], log.clone()),
     );
 
     // (a) UNDECLARED host: refused with typed PolicyBlocked; NO op-token consumed; a `refused`
@@ -199,7 +202,9 @@ fn step3_3_egress_undeclared_host_refused_and_logged_declared_host_accounted() {
     );
 
     // (b) DECLARED host: accepted; op token consumed; `send` row appended with the byte count.
-    let receipt = em.send("tile.example", 1500).expect("declared send accounts");
+    let receipt = em
+        .send("tile.example", 1500)
+        .expect("declared send accounts");
     assert_eq!(receipt.host, "tile.example");
     assert_eq!(receipt.bytes, 1500);
     assert_eq!(quotas.remaining("egress"), EGRESS_QUOTA - 1);
@@ -252,7 +257,10 @@ fn step3_4_ledger_and_egress_log_dumps_survive_a_reopen() {
     let log = EgressLog::open(&dir).unwrap();
     let events = log.snapshot_for("com.test.step3").unwrap();
     assert_eq!(events.len(), 4, "3 sends + 1 refused survived replay");
-    let sends: Vec<_> = events.iter().filter(|e| e.event == EgressEventKind::Send).collect();
+    let sends: Vec<_> = events
+        .iter()
+        .filter(|e| e.event == EgressEventKind::Send)
+        .collect();
     assert_eq!(sends.len(), 3);
     // Rollup — the surface pf-permissions egress prints.
     let totals = pocketforge::managers::egress_log::total_bytes_per_host(&events);
@@ -260,7 +268,11 @@ fn step3_4_ledger_and_egress_log_dumps_survive_a_reopen() {
     assert_eq!(totals.get("api.map.example"), Some(&250));
     let refusals = pocketforge::managers::egress_log::refusals_per_host(&events);
     assert_eq!(refusals.get("evil.example"), Some(&1));
-    assert_eq!(refusals.get("tile.example"), None, "declared host is never in refusals");
+    assert_eq!(
+        refusals.get("tile.example"),
+        None,
+        "declared host is never in refusals"
+    );
 
     // The rate + capacity constants are the printed contract (guards silent tuning drifts).
     assert_eq!(EGRESS_QUOTA, 16);

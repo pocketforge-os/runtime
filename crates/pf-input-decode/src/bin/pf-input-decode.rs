@@ -23,7 +23,10 @@ extern "C" fn on_signal(_sig: c_int) {
 }
 
 fn arg(args: &[String], flag: &str) -> Option<String> {
-    args.iter().position(|a| a == flag).and_then(|i| args.get(i + 1)).cloned()
+    args.iter()
+        .position(|a| a == flag)
+        .and_then(|i| args.get(i + 1))
+        .cloned()
 }
 
 /// Read `dev` forever, decode its frames for `side`, and emit onto the shared uinput device.

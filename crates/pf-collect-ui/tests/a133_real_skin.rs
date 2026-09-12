@@ -65,12 +65,24 @@ fn real_a133_skin_loads_and_maps_engine_ids_to_skin_parts() {
     let skin = load_a133(&platform);
 
     // The engine-id -> skin_part map came out of the committed [[inputs]] table.
-    assert_eq!(skin.part_for("south"), Some("btn_south"), "engine id 'south' must map to skin part 'btn_south'");
-    assert_eq!(skin.part_for("ltrig"), Some("trig_l"), "engine id 'ltrig' must map to skin part 'trig_l'");
+    assert_eq!(
+        skin.part_for("south"),
+        Some("btn_south"),
+        "engine id 'south' must map to skin part 'btn_south'"
+    );
+    assert_eq!(
+        skin.part_for("ltrig"),
+        Some("trig_l"),
+        "engine id 'ltrig' must map to skin part 'trig_l'"
+    );
 
     // The atlases decoded to their real 1480x640 dimensions (the current a133 render).
     let (w, h) = skin.size();
-    assert_eq!((w, h), (1480, 640), "a133 front body dimensions changed unexpectedly (got {w}x{h})");
+    assert_eq!(
+        (w, h),
+        (1480, 640),
+        "a133 front body dimensions changed unexpectedly (got {w}x{h})"
+    );
 }
 
 #[test]
@@ -114,7 +126,11 @@ fn compose_south_blits_the_lit_atlas_over_the_btn_south_rect() {
 
     // Every pixel OUTSIDE the rect must be identical (proving the blit is scoped to the rect).
     // Spot-check a corner far from any part rect (top-left).
-    assert_eq!(neutral.get(0, 0), active.get(0, 0), "outside-rect pixel changed — blit is not rect-scoped");
+    assert_eq!(
+        neutral.get(0, 0),
+        active.get(0, 0),
+        "outside-rect pixel changed — blit is not rect-scoped"
+    );
 }
 
 #[test]
@@ -129,8 +145,10 @@ fn compose_ltrig_chooses_the_top_view_and_blits_top_lit_atlas() {
     let skin = load_a133(&platform);
 
     // Ground-truth atlases loaded independently — this test asserts SkinSet::compose matches them.
-    let top_body = load_png(&platform.join("skins/a133/body_top.png")).expect("body_top.png decodes");
-    let top_lit = load_png(&platform.join("skins/a133/body_lit_top.png")).expect("body_lit_top.png decodes");
+    let top_body =
+        load_png(&platform.join("skins/a133/body_top.png")).expect("body_top.png decodes");
+    let top_lit =
+        load_png(&platform.join("skins/a133/body_lit_top.png")).expect("body_lit_top.png decodes");
     let front_body = load_png(&platform.join("skins/a133/body.png")).expect("body.png decodes");
 
     let active = skin.compose(Some("ltrig"));
@@ -144,8 +162,10 @@ fn compose_ltrig_chooses_the_top_view_and_blits_top_lit_atlas() {
     'scan: for y in 0..top_body.h {
         for x in 0..top_body.w {
             // Skip the top trig_l rect — that region carries the lit blit, not the neutral top body.
-            let inside_trig_l =
-                (x as i64) >= tx && (x as i64) < tx + tw && (y as i64) >= ty && (y as i64) < ty + th;
+            let inside_trig_l = (x as i64) >= tx
+                && (x as i64) < tx + tw
+                && (y as i64) >= ty
+                && (y as i64) < ty + th;
             if inside_trig_l {
                 continue;
             }
@@ -177,9 +197,7 @@ fn compose_ltrig_chooses_the_top_view_and_blits_top_lit_atlas() {
     for yy in ry..ry + rh {
         for xx in rx..rx + rw {
             let (x, y) = (xx as usize, yy as usize);
-            if top_lit.get(x, y) != top_body.get(x, y)
-                && active.get(x, y) == top_lit.get(x, y)
-            {
+            if top_lit.get(x, y) != top_body.get(x, y) && active.get(x, y) == top_lit.get(x, y) {
                 lit_landed = true;
                 break;
             }

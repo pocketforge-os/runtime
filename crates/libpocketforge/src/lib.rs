@@ -385,10 +385,7 @@ sdl_guid = "00000000000000000000000000000000"
     fn assert_c_values(backend: &InProcessBackend, session: &PfSession) {
         unsafe {
             assert_eq!(pf_appearance(session), PfAppearance::Dark);
-            assert_eq!(
-                pf_appearance_source(session),
-                PfAppearanceSource::Default
-            );
+            assert_eq!(pf_appearance_source(session), PfAppearanceSource::Default);
             backend.set_preference("appearance", PrefValue::Enum("light"));
             assert_eq!(pf_appearance(session), PfAppearance::Light);
             assert_eq!(pf_appearance_source(session), PfAppearanceSource::User);

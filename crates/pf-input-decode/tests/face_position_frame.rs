@@ -94,14 +94,47 @@ struct Face {
 /// The four face buttons. `bit` is derived in the header; `canonical` is the kernel ABI;
 /// `glyph_keyed` is the measured pre-fix behaviour from the `tsp-bwrg.6` artifact.
 const FACES: &[Face] = &[
-    Face { position: "south (BOTTOM)", glyph: "B", bit: 0x20, canonical: 0x130, glyph_keyed: 0x131 },
-    Face { position: "east (RIGHT)", glyph: "A", bit: 0x10, canonical: 0x131, glyph_keyed: 0x130 },
-    Face { position: "west (LEFT)", glyph: "Y", bit: 0x08, canonical: 0x134, glyph_keyed: 0x134 },
-    Face { position: "north (TOP)", glyph: "X", bit: 0x04, canonical: 0x133, glyph_keyed: 0x133 },
+    Face {
+        position: "south (BOTTOM)",
+        glyph: "B",
+        bit: 0x20,
+        canonical: 0x130,
+        glyph_keyed: 0x131,
+    },
+    Face {
+        position: "east (RIGHT)",
+        glyph: "A",
+        bit: 0x10,
+        canonical: 0x131,
+        glyph_keyed: 0x130,
+    },
+    Face {
+        position: "west (LEFT)",
+        glyph: "Y",
+        bit: 0x08,
+        canonical: 0x134,
+        glyph_keyed: 0x134,
+    },
+    Face {
+        position: "north (TOP)",
+        glyph: "X",
+        bit: 0x04,
+        canonical: 0x133,
+        glyph_keyed: 0x133,
+    },
 ];
 
 fn wire(buttons: u8, x: u16, y: u16) -> [u8; 8] {
-    [0xFF, 0x01, buttons, (x >> 8) as u8, x as u8, (y >> 8) as u8, y as u8, 0xFE]
+    [
+        0xFF,
+        0x01,
+        buttons,
+        (x >> 8) as u8,
+        x as u8,
+        (y >> 8) as u8,
+        y as u8,
+        0xFE,
+    ]
 }
 
 /// Press `bit` on the right cluster from a released baseline and return the `EV_KEY` events, via
@@ -115,7 +148,10 @@ fn press(bit: u8) -> Vec<(u16, i32)> {
             last = decoder.apply(f);
         }
     }
-    last.iter().filter(|e| e.ev_type == codes::EV_KEY).map(|e| (e.code, e.value)).collect()
+    last.iter()
+        .filter(|e| e.ev_type == codes::EV_KEY)
+        .map(|e| (e.code, e.value))
+        .collect()
 }
 
 /// **THE BAR.** Each physical face position emits the kernel-canonical code for THAT POSITION.
@@ -164,7 +200,12 @@ fn south_and_east_are_not_glyph_keyed() {
             f.glyph,
             f.canonical,
         );
-        assert_eq!(got, vec![(f.canonical, 1)], "{} must emit canonical", f.position);
+        assert_eq!(
+            got,
+            vec![(f.canonical, 1)],
+            "{} must emit canonical",
+            f.position
+        );
     }
 }
 
@@ -183,7 +224,11 @@ fn the_four_faces_are_a_bijection_onto_the_canonical_face_codes() {
         .collect();
     emitted.sort_unstable();
     // BTN_SOUTH, BTN_EAST, BTN_NORTH, BTN_WEST — literals, per the header.
-    assert_eq!(emitted, vec![0x130, 0x131, 0x133, 0x134], "the four canonical face codes, each once");
+    assert_eq!(
+        emitted,
+        vec![0x130, 0x131, 0x133, 0x134],
+        "the four canonical face codes, each once"
+    );
 }
 
 /// The crate's positional constants really do carry the kernel ABI numbers. Cheap, and it stops a
