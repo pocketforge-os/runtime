@@ -298,3 +298,29 @@ fn sigterm_removes_socket_and_socket_is_owner_only() {
     assert!(child.wait().unwrap().success());
     assert!(!socket.exists(), "socket guard did not remove socket");
 }
+
+#[test]
+fn first_start_creates_missing_state_and_socket_parents() {
+    let scratch = Scratch::new("first-start");
+    let state = scratch.0.join("state/missing");
+    let socket = scratch.0.join("run/missing/prefsd.sock");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_pf-prefsd"))
+        .args(["--state-dir", state.to_str().unwrap(), "--socket"])
+        .arg(&socket)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while !socket.exists() && Instant::now() < deadline {
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "daemon exited on first start"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(state.is_dir(), "daemon did not create its state directory");
+    assert!(socket.exists(), "daemon did not create its socket");
+    assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGTERM) }, 0);
+    assert!(child.wait().unwrap().success());
+}

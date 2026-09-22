@@ -26,11 +26,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
     let args = parse_args(raw_args.into_iter())?;
-    fs::create_dir_all(&args.state_dir)?;
-    prepare_socket(&args.socket)?;
-    let listener = UnixListener::bind(&args.socket)?;
+    create_dir_all(&args.state_dir, "state directory")?;
+    prepare_socket(&args.socket)
+        .map_err(|error| path_error("prepare socket", &args.socket, error))?;
+    let listener = UnixListener::bind(&args.socket)
+        .map_err(|error| path_error("bind socket", &args.socket, error))?;
     let _socket_guard = SocketGuard(args.socket.clone());
-    fs::set_permissions(&args.socket, fs::Permissions::from_mode(0o600))?;
+    fs::set_permissions(&args.socket, fs::Permissions::from_mode(0o600))
+        .map_err(|error| path_error("set socket permissions", &args.socket, error))?;
 
     // SAFETY: handlers perform only an atomic store, which is async-signal-safe.
     let handler = on_signal as extern "C" fn(c_int) as libc::sighandler_t;
@@ -49,9 +52,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+fn create_dir_all(path: &Path, description: &str) -> io::Result<()> {
+    fs::create_dir_all(path)
+        .map_err(|error| path_error(&format!("create {description}"), path, error))
+}
+
+fn path_error(operation: &str, path: &Path, error: io::Error) -> io::Error {
+    io::Error::new(
+        error.kind(),
+        format!("{operation} {}: {error}", path.display()),
+    )
+}
+
 fn prepare_socket(path: &Path) -> io::Result<()> {
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
+        create_dir_all(parent, "socket parent directory")?;
     }
     match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_socket() => {
@@ -116,5 +131,17 @@ mod tests {
         .unwrap();
         assert_eq!(args.socket, PathBuf::from("/tmp/prefs.sock"));
         assert_eq!(args.state_dir, PathBuf::from("/tmp/prefs"));
+    }
+
+    #[test]
+    fn path_errors_name_the_failed_path() {
+        let path = Path::new("/run/pocketforge/prefsd.sock");
+        let error = path_error(
+            "bind socket",
+            path,
+            io::Error::from(io::ErrorKind::PermissionDenied),
+        );
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(error.to_string().contains(path.to_str().unwrap()));
     }
 }
