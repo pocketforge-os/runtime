@@ -6,7 +6,7 @@ use pf_scene::{Insets, Orientation, Scene, SurfaceMetrics};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Seek, SeekFrom, Write};
 use std::os::fd::{AsRawFd, RawFd};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 pub struct OffscreenHost {
     metrics: SurfaceMetrics,
@@ -349,9 +349,9 @@ fn resolve_rotation(
 fn panel_orientation_rotation(name: &str) -> Option<PresentRotation> {
     match name {
         "Normal" => Some(PresentRotation::Rotate0),
-        "Left Side Up" => Some(PresentRotation::Rotate270),
+        "Left Side Up" => Some(PresentRotation::Rotate90),
         "Upside Down" => Some(PresentRotation::Rotate180),
-        "Right Side Up" => Some(PresentRotation::Rotate90),
+        "Right Side Up" => Some(PresentRotation::Rotate270),
         _ => None,
     }
 }
@@ -429,22 +429,53 @@ const DRM_IOCTL_MODE_GETCONNECTOR: libc::Ioctl = 0xc050_64a7_u32 as libc::Ioctl;
 const DRM_IOCTL_MODE_GETPROPERTY: libc::Ioctl = 0xc040_64aa_u32 as libc::Ioctl;
 
 fn drm_panel_orientation(fbdev: &Path) -> io::Result<Option<PresentRotation>> {
+    drm_panel_orientation_from(
+        fbdev,
+        Path::new("/sys/class/graphics"),
+        Path::new("/dev/dri"),
+        |path| {
+            let file = File::open(path)?;
+            drm_panel_orientation_fd(file.as_raw_fd())
+        },
+    )
+}
+
+fn drm_panel_orientation_from<F>(
+    fbdev: &Path,
+    graphics_root: &Path,
+    dri_root: &Path,
+    mut read_card: F,
+) -> io::Result<Option<PresentRotation>>
+where
+    F: FnMut(&Path) -> io::Result<Option<PresentRotation>>,
+{
     let fb_name = fbdev
         .file_name()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "fbdev has no basename"))?;
-    let drm_dir = Path::new("/sys/class/graphics")
-        .join(fb_name)
-        .join("device/drm");
-    let card = std::fs::read_dir(drm_dir)?
-        .filter_map(Result::ok)
-        .map(|entry| entry.file_name())
-        .find(|name| {
-            let name = name.to_string_lossy();
-            name.starts_with("card") && !name.contains('-')
-        })
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "fbdev DRM card not found"))?;
-    let file = File::open(PathBuf::from("/dev/dri").join(card))?;
-    drm_panel_orientation_fd(file.as_raw_fd())
+    let mut cards = Vec::new();
+    let backing_dir = graphics_root.join(fb_name).join("device/drm");
+    if let Ok(entries) = std::fs::read_dir(backing_dir) {
+        cards.extend(
+            entries
+                .filter_map(Result::ok)
+                .map(|entry| entry.file_name())
+                .filter(|name| {
+                    let name = name.to_string_lossy();
+                    name.starts_with("card") && !name.contains('-')
+                }),
+        );
+    }
+    let card0 = "card0".into();
+    if !cards.contains(&card0) {
+        cards.push(card0);
+    }
+
+    for card in cards {
+        if let Ok(Some(rotation)) = read_card(&dri_root.join(card)) {
+            return Ok(Some(rotation));
+        }
+    }
+    Ok(None)
 }
 
 fn drm_panel_orientation_fd(fd: RawFd) -> io::Result<Option<PresentRotation>> {
@@ -1111,14 +1142,14 @@ mod tests {
             ),
             (
                 "Left Side Up",
-                PresentRotation::Rotate270,
-                (0, 1279),
+                PresentRotation::Rotate90,
+                (719, 0),
                 (720, 1280),
             ),
             (
                 "Right Side Up",
-                PresentRotation::Rotate90,
-                (719, 0),
+                PresentRotation::Rotate270,
+                (0, 1279),
                 (720, 1280),
             ),
         ] {
@@ -1144,6 +1175,66 @@ mod tests {
             fixture.write_all(value.as_bytes()).unwrap();
             assert_eq!(read_fbcon_rotation(fixture.path()).unwrap(), Some(expected));
         }
+    }
+
+    #[test]
+    fn drm_discovery_uses_card0_when_fb_sysfs_has_no_card_link() {
+        let fixture = tempfile::tempdir().unwrap();
+        let graphics = fixture.path().join("graphics");
+        let dri = fixture.path().join("dri");
+        std::fs::create_dir_all(&graphics).unwrap();
+        std::fs::create_dir_all(&dri).unwrap();
+        let mut visited = Vec::new();
+        let rotation = drm_panel_orientation_from(Path::new("/dev/fb0"), &graphics, &dri, |path| {
+            visited.push(path.to_path_buf());
+            Ok(Some(PresentRotation::Rotate90))
+        })
+        .unwrap();
+        assert_eq!(rotation, Some(PresentRotation::Rotate90));
+        assert_eq!(visited, [dri.join("card0")]);
+    }
+
+    fn assert_unknown_drm_result_falls_through(result: io::Result<Option<PresentRotation>>) {
+        let fixture = tempfile::tempdir().unwrap();
+        let graphics = fixture.path().join("graphics");
+        let dri = fixture.path().join("dri");
+        std::fs::create_dir_all(&graphics).unwrap();
+        let mut result = Some(result);
+        assert_eq!(
+            drm_panel_orientation_from(Path::new("/dev/fb0"), &graphics, &dri, |_| {
+                result.take().unwrap()
+            })
+            .unwrap(),
+            None
+        );
+        assert_eq!(
+            resolve_rotation(None, None, Some(PresentRotation::Rotate0), 720, 1280),
+            (PresentRotation::Rotate0, RotationSource::Fbcon)
+        );
+    }
+
+    #[test]
+    fn missing_drm_card_falls_through() {
+        assert_unknown_drm_result_falls_through(Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "missing card",
+        )));
+    }
+
+    #[test]
+    fn missing_drm_connector_falls_through() {
+        assert_unknown_drm_result_falls_through(Ok(None));
+    }
+
+    #[test]
+    fn missing_drm_property_falls_through() {
+        assert_unknown_drm_result_falls_through(Ok(None));
+    }
+
+    #[test]
+    fn unknown_drm_property_value_falls_through() {
+        assert_eq!(panel_orientation_rotation("Future Orientation"), None);
+        assert_unknown_drm_result_falls_through(Ok(None));
     }
 
     #[test]
