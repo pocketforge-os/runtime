@@ -465,9 +465,8 @@ where
                 }),
         );
     }
-    let card0 = "card0".into();
-    if !cards.contains(&card0) {
-        cards.push(card0);
+    if cards.is_empty() {
+        cards.push("card0".into());
     }
 
     for card in cards {
@@ -1192,6 +1191,38 @@ mod tests {
         .unwrap();
         assert_eq!(rotation, Some(PresentRotation::Rotate90));
         assert_eq!(visited, [dri.join("card0")]);
+    }
+
+    fn assert_discovered_card_does_not_fall_back_to_card0(
+        card1_result: io::Result<Option<PresentRotation>>,
+    ) {
+        let fixture = tempfile::tempdir().unwrap();
+        let graphics = fixture.path().join("graphics");
+        let dri = fixture.path().join("dri");
+        std::fs::create_dir_all(graphics.join("fb0/device/drm/card1")).unwrap();
+        std::fs::create_dir_all(&dri).unwrap();
+        let mut visited = Vec::new();
+        let mut card1_result = Some(card1_result);
+        let rotation = drm_panel_orientation_from(Path::new("/dev/fb0"), &graphics, &dri, |path| {
+            visited.push(path.to_path_buf());
+            card1_result.take().unwrap()
+        })
+        .unwrap();
+        assert_eq!(rotation, None);
+        assert_eq!(visited, [dri.join("card1")]);
+    }
+
+    #[test]
+    fn discovered_card_without_orientation_does_not_consult_card0() {
+        assert_discovered_card_does_not_fall_back_to_card0(Ok(None));
+    }
+
+    #[test]
+    fn unreadable_discovered_card_does_not_consult_card0() {
+        assert_discovered_card_does_not_fall_back_to_card0(Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "unreadable card",
+        )));
     }
 
     fn assert_unknown_drm_result_falls_through(result: io::Result<Option<PresentRotation>>) {
