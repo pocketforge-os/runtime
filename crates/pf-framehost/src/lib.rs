@@ -349,9 +349,9 @@ fn resolve_rotation(
 fn panel_orientation_rotation(name: &str) -> Option<PresentRotation> {
     match name {
         "Normal" => Some(PresentRotation::Rotate0),
-        "Left Side Up" => Some(PresentRotation::Rotate90),
+        "Left Side Up" => Some(PresentRotation::Rotate270),
         "Upside Down" => Some(PresentRotation::Rotate180),
-        "Right Side Up" => Some(PresentRotation::Rotate270),
+        "Right Side Up" => Some(PresentRotation::Rotate90),
         _ => None,
     }
 }
@@ -1101,13 +1101,36 @@ mod tests {
 
     #[test]
     fn orientation_fixtures_map_to_rotations() {
-        for (name, expected) in [
-            ("Normal", PresentRotation::Rotate0),
-            ("Upside Down", PresentRotation::Rotate180),
-            ("Left Side Up", PresentRotation::Rotate90),
-            ("Right Side Up", PresentRotation::Rotate270),
+        for (name, expected, buffer_position, buffer_size) in [
+            ("Normal", PresentRotation::Rotate0, (0, 0), (1280, 720)),
+            (
+                "Upside Down",
+                PresentRotation::Rotate180,
+                (1279, 719),
+                (1280, 720),
+            ),
+            (
+                "Left Side Up",
+                PresentRotation::Rotate270,
+                (0, 1279),
+                (720, 1280),
+            ),
+            (
+                "Right Side Up",
+                PresentRotation::Rotate90,
+                (719, 0),
+                (720, 1280),
+            ),
         ] {
             assert_eq!(panel_orientation_rotation(name), Some(expected), "{name}");
+            let (x, y) = buffer_position;
+            let (buffer_width, buffer_height) = buffer_size;
+            assert!(x < buffer_width && y < buffer_height, "{name}");
+            assert_eq!(
+                source_coordinates(expected, x, y, 1280, 720),
+                (0, 0),
+                "scene origin placement for {name}"
+            );
         }
         assert_eq!(panel_orientation_rotation("Bottom Up"), None);
 
