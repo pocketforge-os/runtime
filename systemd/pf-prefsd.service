@@ -1,0 +1,15 @@
+[Unit]
+Description=PocketForge preference state authority
+After=local-fs.target
+
+[Service]
+Type=simple
+User=gamer
+Group=gamer
+ExecStart=/usr/bin/pf-prefsd --state-dir /var/lib/pocketforge/shell --socket /run/pocketforge/prefsd.sock
+StateDirectory=pocketforge/shell
+Restart=on-failure
+RestartSec=1s
+
+[Install]
+WantedBy=multi-user.target

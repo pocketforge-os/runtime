@@ -7,7 +7,6 @@ ConditionPathExists=/dev/uinput
 [Service]
 Type=notify
 ExecStart=/usr/bin/pf-input-broker --descriptor /usr/share/pocketforge/devices/a133/capabilities.toml --acquire-sock /run/pocketforge/input-broker.sock
-RuntimeDirectory=pocketforge
 Restart=on-failure
 RestartSec=2
 KillSignal=SIGTERM

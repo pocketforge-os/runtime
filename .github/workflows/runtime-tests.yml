@@ -10,6 +10,7 @@ on:
       - 'crates/**'
       - 'ctest/**'
       - 'include/**'
+      - 'systemd/**'
       - 'wire/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
