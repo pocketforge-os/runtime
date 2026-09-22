@@ -106,3 +106,21 @@ fn different_users_are_detected() {
     assert_eq!(conflicts.len(), 1);
     assert!(conflicts[0].contains("RuntimeDirectory=shared"));
 }
+
+#[test]
+fn missing_user_is_treated_as_root() {
+    let conflicts = runtime_directory_conflicts([
+        (
+            "gamer.service",
+            "[Service]\nUser=gamer\nRuntimeDirectory=shared\n",
+        ),
+        (
+            "default-root.service",
+            "[Service]\nRuntimeDirectory=shared\n",
+        ),
+    ]);
+
+    assert_eq!(conflicts.len(), 1);
+    assert!(conflicts[0].contains("gamer.service (User=gamer)"));
+    assert!(conflicts[0].contains("default-root.service (User=root)"));
+}
