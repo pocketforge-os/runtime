@@ -424,9 +424,9 @@ struct DrmPropertyEnum {
     name: [libc::c_char; 32],
 }
 
-const DRM_IOCTL_MODE_GETRESOURCES: libc::Ioctl = 0xc040_64a0;
-const DRM_IOCTL_MODE_GETCONNECTOR: libc::Ioctl = 0xc050_64a7;
-const DRM_IOCTL_MODE_GETPROPERTY: libc::Ioctl = 0xc040_64aa;
+const DRM_IOCTL_MODE_GETRESOURCES: libc::Ioctl = 0xc040_64a0_u32 as libc::Ioctl;
+const DRM_IOCTL_MODE_GETCONNECTOR: libc::Ioctl = 0xc050_64a7_u32 as libc::Ioctl;
+const DRM_IOCTL_MODE_GETPROPERTY: libc::Ioctl = 0xc040_64aa_u32 as libc::Ioctl;
 
 fn drm_panel_orientation(fbdev: &Path) -> io::Result<Option<PresentRotation>> {
     let fb_name = fbdev
