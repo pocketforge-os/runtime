@@ -1,0 +1,23 @@
+[Unit]
+Description=PocketForge durable session authority
+After=local-fs.target
+Before=pf-shell-selected.service
+
+[Service]
+Type=simple
+User=root
+Group=gamer
+ExecStart=/usr/bin/pf-session-authorityd --state-dir /var/lib/pocketforge/session-authority --socket /run/pocketforge/session-authority.sock
+StateDirectory=pocketforge/session-authority
+UMask=0007
+Restart=on-failure
+RestartSec=1s
+TimeoutStopSec=5s
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadWritePaths=/var/lib/pocketforge/session-authority /run/pocketforge
+
+[Install]
+WantedBy=multi-user.target
