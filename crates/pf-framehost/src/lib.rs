@@ -6,6 +6,7 @@ use pf_scene::{Insets, Orientation, Scene, SurfaceMetrics};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Seek, SeekFrom, Write};
 use std::os::fd::{AsRawFd, RawFd};
+use std::path::{Path, PathBuf};
 
 pub struct OffscreenHost {
     metrics: SurfaceMetrics,
@@ -71,6 +72,61 @@ pub struct FbInfo {
     pub yoffset: u32,
 }
 
+/// Clockwise rotation applied while copying the logical scene to the framebuffer.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum PresentRotation {
+    #[default]
+    Rotate0,
+    Rotate90,
+    Rotate180,
+    Rotate270,
+}
+
+impl PresentRotation {
+    pub fn from_degrees(value: &str) -> Option<Self> {
+        match value {
+            "0" => Some(Self::Rotate0),
+            "90" => Some(Self::Rotate90),
+            "180" => Some(Self::Rotate180),
+            "270" => Some(Self::Rotate270),
+            _ => None,
+        }
+    }
+
+    pub fn degrees(self) -> u16 {
+        match self {
+            Self::Rotate0 => 0,
+            Self::Rotate90 => 90,
+            Self::Rotate180 => 180,
+            Self::Rotate270 => 270,
+        }
+    }
+
+    fn swaps_axes(self) -> bool {
+        matches!(self, Self::Rotate90 | Self::Rotate270)
+    }
+}
+
+/// Input which selected the fbdev presentation rotation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RotationSource {
+    Flag,
+    DrmPanelOrientation,
+    Fbcon,
+    Geometry,
+}
+
+impl RotationSource {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Flag => "flag",
+            Self::DrmPanelOrientation => "drm-panel-orientation",
+            Self::Fbcon => "fbcon",
+            Self::Geometry => "geometry",
+        }
+    }
+}
+
 trait Pan: Send {
     fn pan(&mut self, fd: RawFd, yoffset: u32) -> io::Result<()>;
 }
@@ -93,17 +149,42 @@ pub struct FbdevHost {
     sequence: u64,
     last_frame: Option<RasterFrame>,
     pending_damage: [Option<DamageRect>; 2],
+    rotation: PresentRotation,
+    rotation_source: RotationSource,
 }
 
 impl FbdevHost {
     pub fn open(path: &str) -> Result<Self, PresentFailure> {
+        Self::open_with_rotation(path, None)
+    }
+
+    pub fn open_with_rotation(
+        path: &str,
+        requested: Option<PresentRotation>,
+    ) -> Result<Self, PresentFailure> {
         let file = OpenOptions::new()
             .read(true)
             .write(true)
             .open(path)
             .map_err(backend)?;
         let info = query_info(file.as_raw_fd()).map_err(backend)?;
-        Self::from_parts(file, info, Box::new(IoctlPan))
+        let (rotation, source) = resolve_rotation(
+            requested,
+            drm_panel_orientation(Path::new(path)).ok().flatten(),
+            read_fbcon_rotation(Path::new("/sys/class/graphics/fbcon/rotate"))
+                .ok()
+                .flatten(),
+            info.width,
+            info.height,
+        );
+        eprintln!(
+            "fbdev {}x{} present={} source={}",
+            info.width,
+            info.height,
+            rotation.degrees(),
+            source.label()
+        );
+        Self::from_parts_with_rotation(file, info, Box::new(IoctlPan), rotation, source)
     }
 
     pub fn from_file(file: File, info: FbInfo) -> Result<Self, PresentFailure> {
@@ -111,18 +192,39 @@ impl FbdevHost {
     }
 
     fn from_parts(file: File, info: FbInfo, pan: Box<dyn Pan>) -> Result<Self, PresentFailure> {
+        Self::from_parts_with_rotation(
+            file,
+            info,
+            pan,
+            PresentRotation::Rotate0,
+            RotationSource::Flag,
+        )
+    }
+
+    fn from_parts_with_rotation(
+        file: File,
+        info: FbInfo,
+        pan: Box<dyn Pan>,
+        rotation: PresentRotation,
+        rotation_source: RotationSource,
+    ) -> Result<Self, PresentFailure> {
         if info.width == 0
             || info.height == 0
             || info.stride < info.width * bytes_per_pixel(info.format) as u32
         {
             return Err(PresentFailure::Rejected);
         }
+        let (logical_width, logical_height) = if rotation.swaps_axes() {
+            (info.height, info.width)
+        } else {
+            (info.width, info.height)
+        };
         let metrics = SurfaceMetrics {
-            logical_width: info.width as f32,
-            logical_height: info.height as f32,
+            logical_width: logical_width as f32,
+            logical_height: logical_height as f32,
             scale: 1.0,
             safe_insets: Insets::default(),
-            orientation: if info.width >= info.height {
+            orientation: if logical_width >= logical_height {
                 Orientation::Landscape
             } else {
                 Orientation::Portrait
@@ -143,6 +245,8 @@ impl FbdevHost {
             sequence: 0,
             last_frame: None,
             pending_damage: [None, None],
+            rotation,
+            rotation_source,
         })
     }
 
@@ -152,6 +256,10 @@ impl FbdevHost {
 
     pub fn set_text_scale(&mut self, factor: f32) -> Result<(), RenderError> {
         self.renderer.set_text_scale(factor)
+    }
+
+    pub fn presentation_rotation(&self) -> (PresentRotation, RotationSource) {
+        (self.rotation, self.rotation_source)
     }
 
     fn write_frame(&mut self, frame: &RasterFrame) -> io::Result<()> {
@@ -171,16 +279,24 @@ impl FbdevHost {
         };
         let page_bytes = self.info.stride as u64 * self.info.height as u64;
         let bpp = bytes_per_pixel(self.info.format);
-        let mut row = vec![0; damage.width as usize * bpp];
-        for y in damage.y as usize..(damage.y + damage.height) as usize {
-            for x in damage.x as usize..(damage.x + damage.width) as usize {
-                let rgba = &frame.rgba[(y * self.info.width as usize + x) * 4..][..4];
-                let row_x = (x - damage.x as usize) * bpp;
+        // Rotated logical damage is not a contiguous framebuffer row range, so
+        // copy the complete changed frame. On the target this is 3.7 MB/present.
+        let _ = damage;
+        let mut row = vec![0; self.info.width as usize * bpp];
+        for y in 0..self.info.height as usize {
+            for x in 0..self.info.width as usize {
+                let (u, v) = source_coordinates(
+                    self.rotation,
+                    x,
+                    y,
+                    frame.width as usize,
+                    frame.height as usize,
+                );
+                let rgba = &frame.rgba[(v * frame.width as usize + u) * 4..][..4];
+                let row_x = x * bpp;
                 pack(self.info.format, rgba, &mut row[row_x..row_x + bpp]);
             }
-            let offset = page_bytes * self.page as u64
-                + y as u64 * self.info.stride as u64
-                + damage.x as u64 * bpp as u64;
+            let offset = page_bytes * self.page as u64 + y as u64 * self.info.stride as u64;
             self.file.seek(SeekFrom::Start(offset))?;
             self.file.write_all(&row)?;
         }
@@ -188,6 +304,237 @@ impl FbdevHost {
         self.pan
             .pan(self.file.as_raw_fd(), self.page * self.info.height)
     }
+}
+
+fn source_coordinates(
+    rotation: PresentRotation,
+    x: usize,
+    y: usize,
+    scene_width: usize,
+    scene_height: usize,
+) -> (usize, usize) {
+    match rotation {
+        PresentRotation::Rotate0 => (x, y),
+        PresentRotation::Rotate90 => (y, scene_height - 1 - x),
+        PresentRotation::Rotate180 => (scene_width - 1 - x, scene_height - 1 - y),
+        PresentRotation::Rotate270 => (scene_width - 1 - y, x),
+    }
+}
+
+fn resolve_rotation(
+    flag: Option<PresentRotation>,
+    panel_orientation: Option<PresentRotation>,
+    fbcon: Option<PresentRotation>,
+    width: u32,
+    height: u32,
+) -> (PresentRotation, RotationSource) {
+    if let Some(rotation) = flag {
+        (rotation, RotationSource::Flag)
+    } else if let Some(rotation) = panel_orientation {
+        (rotation, RotationSource::DrmPanelOrientation)
+    } else if let Some(rotation) = fbcon {
+        (rotation, RotationSource::Fbcon)
+    } else {
+        (
+            if height > width {
+                PresentRotation::Rotate90
+            } else {
+                PresentRotation::Rotate0
+            },
+            RotationSource::Geometry,
+        )
+    }
+}
+
+fn panel_orientation_rotation(name: &str) -> Option<PresentRotation> {
+    match name {
+        "Normal" => Some(PresentRotation::Rotate0),
+        "Left Side Up" => Some(PresentRotation::Rotate270),
+        "Upside Down" => Some(PresentRotation::Rotate180),
+        "Right Side Up" => Some(PresentRotation::Rotate90),
+        _ => None,
+    }
+}
+
+fn read_fbcon_rotation(path: &Path) -> io::Result<Option<PresentRotation>> {
+    let value = std::fs::read_to_string(path)?;
+    Ok(match value.trim() {
+        "0" => Some(PresentRotation::Rotate0),
+        "1" => Some(PresentRotation::Rotate90),
+        "2" => Some(PresentRotation::Rotate180),
+        "3" => Some(PresentRotation::Rotate270),
+        _ => None,
+    })
+}
+
+#[repr(C)]
+#[derive(Default)]
+struct DrmResources {
+    fb_id_ptr: u64,
+    crtc_id_ptr: u64,
+    connector_id_ptr: u64,
+    encoder_id_ptr: u64,
+    count_fbs: u32,
+    count_crtcs: u32,
+    count_connectors: u32,
+    count_encoders: u32,
+    min_width: u32,
+    max_width: u32,
+    min_height: u32,
+    max_height: u32,
+}
+
+#[repr(C)]
+#[derive(Default)]
+struct DrmConnector {
+    encoders_ptr: u64,
+    modes_ptr: u64,
+    props_ptr: u64,
+    prop_values_ptr: u64,
+    count_modes: u32,
+    count_props: u32,
+    count_encoders: u32,
+    encoder_id: u32,
+    connector_id: u32,
+    connector_type: u32,
+    connector_type_id: u32,
+    connection: u32,
+    mm_width: u32,
+    mm_height: u32,
+    subpixel: u32,
+    pad: u32,
+}
+
+#[repr(C)]
+#[derive(Default)]
+struct DrmProperty {
+    values_ptr: u64,
+    enum_blob_ptr: u64,
+    prop_id: u32,
+    flags: u32,
+    name: [libc::c_char; 32],
+    count_values: u32,
+    count_enum_blobs: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct DrmPropertyEnum {
+    value: u64,
+    name: [libc::c_char; 32],
+}
+
+const DRM_IOCTL_MODE_GETRESOURCES: libc::Ioctl = 0xc040_64a0_u32 as libc::Ioctl;
+const DRM_IOCTL_MODE_GETCONNECTOR: libc::Ioctl = 0xc050_64a7_u32 as libc::Ioctl;
+const DRM_IOCTL_MODE_GETPROPERTY: libc::Ioctl = 0xc040_64aa_u32 as libc::Ioctl;
+
+fn drm_panel_orientation(fbdev: &Path) -> io::Result<Option<PresentRotation>> {
+    let fb_name = fbdev
+        .file_name()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "fbdev has no basename"))?;
+    let drm_dir = Path::new("/sys/class/graphics")
+        .join(fb_name)
+        .join("device/drm");
+    let card = std::fs::read_dir(drm_dir)?
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name())
+        .find(|name| {
+            let name = name.to_string_lossy();
+            name.starts_with("card") && !name.contains('-')
+        })
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "fbdev DRM card not found"))?;
+    let file = File::open(PathBuf::from("/dev/dri").join(card))?;
+    drm_panel_orientation_fd(file.as_raw_fd())
+}
+
+fn drm_panel_orientation_fd(fd: RawFd) -> io::Result<Option<PresentRotation>> {
+    let mut resources = DrmResources::default();
+    if unsafe { libc::ioctl(fd, DRM_IOCTL_MODE_GETRESOURCES, &mut resources) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut connectors = vec![0_u32; resources.count_connectors as usize];
+    resources.connector_id_ptr = connectors.as_mut_ptr() as u64;
+    if unsafe { libc::ioctl(fd, DRM_IOCTL_MODE_GETRESOURCES, &mut resources) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    connectors.truncate(resources.count_connectors as usize);
+    for connector_id in connectors {
+        if let Some(rotation) = drm_connector_orientation(fd, connector_id)? {
+            return Ok(Some(rotation));
+        }
+    }
+    Ok(None)
+}
+
+fn drm_connector_orientation(fd: RawFd, connector_id: u32) -> io::Result<Option<PresentRotation>> {
+    let mut connector = DrmConnector {
+        connector_id,
+        ..DrmConnector::default()
+    };
+    if unsafe { libc::ioctl(fd, DRM_IOCTL_MODE_GETCONNECTOR, &mut connector) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if connector.connection != 1 || connector.count_props == 0 {
+        return Ok(None);
+    }
+    let mut property_ids = vec![0_u32; connector.count_props as usize];
+    let mut property_values = vec![0_u64; connector.count_props as usize];
+    connector.props_ptr = property_ids.as_mut_ptr() as u64;
+    connector.prop_values_ptr = property_values.as_mut_ptr() as u64;
+    if unsafe { libc::ioctl(fd, DRM_IOCTL_MODE_GETCONNECTOR, &mut connector) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let count = connector.count_props as usize;
+    property_ids.truncate(count);
+    property_values.truncate(count);
+    for (&property_id, &value) in property_ids.iter().zip(&property_values) {
+        if let Some(rotation) = drm_property_orientation(fd, property_id, value)? {
+            return Ok(Some(rotation));
+        }
+    }
+    Ok(None)
+}
+
+fn drm_property_orientation(
+    fd: RawFd,
+    property_id: u32,
+    current_value: u64,
+) -> io::Result<Option<PresentRotation>> {
+    let mut property = DrmProperty {
+        prop_id: property_id,
+        ..DrmProperty::default()
+    };
+    if unsafe { libc::ioctl(fd, DRM_IOCTL_MODE_GETPROPERTY, &mut property) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if c_name(&property.name) != "panel orientation" {
+        return Ok(None);
+    }
+    let blank = DrmPropertyEnum {
+        value: 0,
+        name: [0; 32],
+    };
+    let mut enums = vec![blank; property.count_enum_blobs as usize];
+    property.enum_blob_ptr = enums.as_mut_ptr() as u64;
+    if unsafe { libc::ioctl(fd, DRM_IOCTL_MODE_GETPROPERTY, &mut property) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    enums.truncate(property.count_enum_blobs as usize);
+    Ok(enums
+        .iter()
+        .find(|entry| entry.value == current_value)
+        .and_then(|entry| panel_orientation_rotation(&c_name(&entry.name))))
+}
+
+fn c_name(bytes: &[libc::c_char]) -> String {
+    let end = bytes
+        .iter()
+        .position(|&byte| byte == 0)
+        .unwrap_or(bytes.len());
+    bytes[..end]
+        .iter()
+        .map(|&byte| byte as u8 as char)
+        .collect()
 }
 
 fn union_damage(a: Option<DamageRect>, b: Option<DamageRect>) -> Option<DamageRect> {
@@ -602,6 +949,201 @@ mod tests {
         let mut r = [0; 2];
         pack(PixelFormat::Rgb565, &[255, 255, 255, 255], &mut r);
         assert_eq!(r, [0xff, 0xff]);
+    }
+
+    fn pixel_frame(width: u32, height: u32) -> RasterFrame {
+        let mut rgba = Vec::with_capacity(width as usize * height as usize * 4);
+        for v in 0..height {
+            for u in 0..width {
+                rgba.extend_from_slice(&[(u + 1) as u8, (v + 1) as u8, (u + v + 1) as u8, 255]);
+            }
+        }
+        RasterFrame {
+            width,
+            height,
+            rgba,
+            damage: Some(DamageRect {
+                x: 0,
+                y: 0,
+                width,
+                height,
+            }),
+            notes: vec![],
+        }
+    }
+
+    fn pixel(frame: &RasterFrame, u: usize, v: usize) -> &[u8] {
+        &frame.rgba[(v * frame.width as usize + u) * 4..][..4]
+    }
+
+    #[test]
+    fn clockwise_present_maps_landscape_scene_into_portrait_buffer() {
+        let info = FbInfo {
+            width: 720,
+            height: 1280,
+            virtual_height: 1280,
+            stride: 720 * 4,
+            format: PixelFormat::Xrgb8888,
+            yoffset: 0,
+        };
+        let file = tempfile::tempfile().unwrap();
+        file.set_len(u64::from(info.stride * info.virtual_height))
+            .unwrap();
+        let calls = Arc::new(Mutex::new(vec![]));
+        let mut host = FbdevHost::from_parts_with_rotation(
+            file,
+            info,
+            Box::new(FakePan { calls, fail: false }),
+            PresentRotation::Rotate90,
+            RotationSource::DrmPanelOrientation,
+        )
+        .unwrap();
+        assert_eq!(host.metrics().logical_width, 1280.0);
+        assert_eq!(host.metrics().logical_height, 720.0);
+        assert_eq!(
+            host.presentation_rotation(),
+            (
+                PresentRotation::Rotate90,
+                RotationSource::DrmPanelOrientation
+            )
+        );
+        let frame = pixel_frame(1280, 720);
+        host.write_frame(&frame).unwrap();
+        let mut bytes = vec![0; info.stride as usize * info.height as usize];
+        host.file.seek(SeekFrom::Start(0)).unwrap();
+        host.file.read_exact(&mut bytes).unwrap();
+        for ((u, v), (x, y)) in [
+            ((0, 0), (719, 0)),
+            ((1279, 719), (0, 1279)),
+            ((835, 417), (302, 835)),
+        ] {
+            let mut expected = [0; 4];
+            pack(PixelFormat::Xrgb8888, pixel(&frame, u, v), &mut expected);
+            let offset = y * info.stride as usize + x * 4;
+            assert_eq!(&bytes[offset..offset + 4], &expected, "scene ({u},{v})");
+        }
+    }
+
+    #[test]
+    fn unrotated_present_is_byte_identical_to_row_packing() {
+        let info = FbInfo {
+            width: 1280,
+            height: 720,
+            virtual_height: 720,
+            stride: 1280 * 4,
+            format: PixelFormat::Xrgb8888,
+            yoffset: 0,
+        };
+        let file = tempfile::tempfile().unwrap();
+        file.set_len(u64::from(info.stride * info.virtual_height))
+            .unwrap();
+        let calls = Arc::new(Mutex::new(vec![]));
+        let mut host = FbdevHost::from_parts_with_rotation(
+            file,
+            info,
+            Box::new(FakePan { calls, fail: false }),
+            PresentRotation::Rotate0,
+            RotationSource::Flag,
+        )
+        .unwrap();
+        let frame = pixel_frame(1280, 720);
+        host.write_frame(&frame).unwrap();
+        let mut actual = vec![0; info.stride as usize * info.height as usize];
+        host.file.seek(SeekFrom::Start(0)).unwrap();
+        host.file.read_exact(&mut actual).unwrap();
+        let mut expected = Vec::with_capacity(actual.len());
+        for rgba in frame.rgba.chunks_exact(4) {
+            let mut packed = [0; 4];
+            pack(PixelFormat::Xrgb8888, rgba, &mut packed);
+            expected.extend_from_slice(&packed);
+        }
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn rotation_resolver_honors_priority_and_geometry() {
+        assert_eq!(
+            resolve_rotation(
+                Some(PresentRotation::Rotate180),
+                Some(PresentRotation::Rotate270),
+                Some(PresentRotation::Rotate90),
+                720,
+                1280,
+            ),
+            (PresentRotation::Rotate180, RotationSource::Flag)
+        );
+        assert_eq!(
+            resolve_rotation(
+                None,
+                Some(PresentRotation::Rotate270),
+                Some(PresentRotation::Rotate90),
+                720,
+                1280,
+            ),
+            (
+                PresentRotation::Rotate270,
+                RotationSource::DrmPanelOrientation
+            )
+        );
+        assert_eq!(
+            resolve_rotation(None, None, Some(PresentRotation::Rotate180), 720, 1280),
+            (PresentRotation::Rotate180, RotationSource::Fbcon)
+        );
+        assert_eq!(
+            resolve_rotation(None, None, None, 720, 1280),
+            (PresentRotation::Rotate90, RotationSource::Geometry)
+        );
+        assert_eq!(
+            resolve_rotation(None, None, None, 1280, 720),
+            (PresentRotation::Rotate0, RotationSource::Geometry)
+        );
+    }
+
+    #[test]
+    fn orientation_fixtures_map_to_rotations() {
+        for (name, expected, buffer_position, buffer_size) in [
+            ("Normal", PresentRotation::Rotate0, (0, 0), (1280, 720)),
+            (
+                "Upside Down",
+                PresentRotation::Rotate180,
+                (1279, 719),
+                (1280, 720),
+            ),
+            (
+                "Left Side Up",
+                PresentRotation::Rotate270,
+                (0, 1279),
+                (720, 1280),
+            ),
+            (
+                "Right Side Up",
+                PresentRotation::Rotate90,
+                (719, 0),
+                (720, 1280),
+            ),
+        ] {
+            assert_eq!(panel_orientation_rotation(name), Some(expected), "{name}");
+            let (x, y) = buffer_position;
+            let (buffer_width, buffer_height) = buffer_size;
+            assert!(x < buffer_width && y < buffer_height, "{name}");
+            assert_eq!(
+                source_coordinates(expected, x, y, 1280, 720),
+                (0, 0),
+                "scene origin placement for {name}"
+            );
+        }
+        assert_eq!(panel_orientation_rotation("Bottom Up"), None);
+
+        for (value, expected) in [
+            ("0\n", PresentRotation::Rotate0),
+            ("1\n", PresentRotation::Rotate90),
+            ("2\n", PresentRotation::Rotate180),
+            ("3\n", PresentRotation::Rotate270),
+        ] {
+            let mut fixture = tempfile::NamedTempFile::new().unwrap();
+            fixture.write_all(value.as_bytes()).unwrap();
+            assert_eq!(read_fbcon_rotation(fixture.path()).unwrap(), Some(expected));
+        }
     }
 
     #[test]
