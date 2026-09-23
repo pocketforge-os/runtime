@@ -1,11 +1,8 @@
 use super::*;
 
-const A133: &str =
-    include_str!("../../platform-fixtures/shell-input-contract/trimui-smart-pro.json");
-const A523: &str =
-    include_str!("../../platform-fixtures/shell-input-contract/trimui-smart-pro-s.json");
-const BUTTONLESS: &str =
-    include_str!("../../platform-fixtures/shell-input-contract/fixture-buttonless.json");
+const A133: &str = include_str!("../tests/fixtures/trimui-smart-pro.json");
+const A523: &str = include_str!("../tests/fixtures/trimui-smart-pro-s.json");
+const BUTTONLESS: &str = include_str!("../tests/fixtures/fixture-buttonless.json");
 
 fn contract(json: &str) -> DeviceContract {
     DeviceContract::parse_json(json).unwrap()
