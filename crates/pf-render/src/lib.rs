@@ -1938,7 +1938,7 @@ mod tests {
             .letter_spacing(style.tracking_em)
     }
 
-    const IMAGE_PNG: &[u8] = include_bytes!("../../../spikes/consent-ui/baseline/s01-initial.png");
+    const IMAGE_PNG: &[u8] = include_bytes!("../tests/fixtures/s01-initial.png");
     const CORRUPT_PNG: &[u8] = include_bytes!("../tests/fixtures/corrupt.png");
     fn fixture(label: &str) -> Scene {
         let caption = Node::new(
