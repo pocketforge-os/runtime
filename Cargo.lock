@@ -387,6 +387,7 @@ name = "pf-broker"
 version = "0.0.1"
 dependencies = [
  "libc",
+ "pf-app-manifest",
  "pocketforge",
  "serde",
  "toml",

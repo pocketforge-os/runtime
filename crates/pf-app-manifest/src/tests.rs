@@ -26,12 +26,27 @@ fn platform(path: &Path) -> PathBuf {
 }
 
 fn install_app(root: &Path, id: &str, manifest_id: &str, exec: &str) -> PathBuf {
+    install_app_with_capabilities(root, id, manifest_id, exec, &["audio", "input"])
+}
+
+fn install_app_with_capabilities(
+    root: &Path,
+    id: &str,
+    manifest_id: &str,
+    exec: &str,
+    capabilities: &[&str],
+) -> PathBuf {
     let app = root.join(id);
     fs::create_dir_all(app.join("bin")).unwrap();
+    let capabilities = capabilities
+        .iter()
+        .map(|capability| format!("{capability:?}"))
+        .collect::<Vec<_>>()
+        .join(", ");
     fs::write(
         app.join("app.toml"),
         format!(
-            "[app]\nid = \"{manifest_id}\"\nname = \"Test\"\nuse = [\"audio\", \"input\"]\n\
+            "[app]\nid = \"{manifest_id}\"\nname = \"Test\"\nuse = [{capabilities}]\n\
              [runtime]\nfamily = \"pocketforge/a133-powervr\"\nabi = \"1\"\nplatform-version = \"20\"\n\
              [launch]\nexec = \"{exec}\"\n"
         ),
@@ -173,6 +188,44 @@ fn stable_reason_code_spellings_are_frozen() {
             "unsorted_capabilities",
         ]
     );
+}
+
+#[test]
+fn semantic_capability_duplicates_and_positive_share_one_invocation() {
+    let dir = scratch("capability-duplicates");
+    let root = dir.join("apps");
+    fs::create_dir_all(&root).unwrap();
+    let contract = platform(&dir);
+    install_app_with_capabilities(
+        &root,
+        "org.example.good",
+        "org.example.good",
+        "bin/app",
+        &["audio"],
+    );
+    install_app_with_capabilities(
+        &root,
+        "org.example.optional",
+        "org.example.optional",
+        "bin/app",
+        &["audio", "audio?"],
+    );
+    install_app_with_capabilities(
+        &root,
+        "org.example.modifiers",
+        "org.example.modifiers",
+        "bin/app",
+        &["location:approximate", "location:precise"],
+    );
+
+    let resolver = Resolver::new(&root, contract);
+    assert!(resolver.resolve("org.example.good").is_ok());
+    for id in ["org.example.optional", "org.example.modifiers"] {
+        let error = resolver.resolve(id).unwrap_err();
+        assert_eq!(error.reason, ReasonCode::DescriptorInvalid, "{id}");
+        assert_eq!(error.detail, "invalid or duplicate capability", "{id}");
+    }
+    fs::remove_dir_all(dir).unwrap();
 }
 
 #[test]

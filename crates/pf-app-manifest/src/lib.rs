@@ -30,6 +30,39 @@ pub const KNOWN_CAPABILITIES: &[&str] = &[
     "leds",
 ];
 
+/// One normalized `use = [...]` requirement.
+///
+/// Parsing deliberately matches the capability-policy parser: trim the token, remove one
+/// trailing optional marker, split the first modifier separator, trim both components, and
+/// normalize only the base capability to lowercase. Semantic validation remains the caller's
+/// responsibility.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CapabilityRequirement {
+    pub base: String,
+    pub modifier: Option<String>,
+    pub optional: bool,
+}
+
+pub fn parse_capability_requirement(token: &str) -> CapabilityRequirement {
+    let token = token.trim();
+    let (token, optional) = match token.strip_suffix('?') {
+        Some(stripped) => (stripped, true),
+        None => (token, false),
+    };
+    let (base, modifier) = match token.split_once(':') {
+        Some((base, modifier)) => (
+            base.trim().to_ascii_lowercase(),
+            Some(modifier.trim().to_owned()),
+        ),
+        None => (token.trim().to_ascii_lowercase(), None),
+    };
+    CapabilityRequirement {
+        base,
+        modifier,
+        optional,
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Manifest {
@@ -190,7 +223,11 @@ fn validate_manifest(manifest: &Manifest) -> Result<(), ManifestError> {
 
     let mut capabilities = BTreeSet::new();
     for capability in &manifest.app.capabilities {
-        if !capabilities.insert(capability) || validate_requirement(capability).is_err() {
+        let requirement = parse_capability_requirement(capability);
+        if requirement.base.is_empty() || !capabilities.insert(requirement.base.clone()) {
+            return invalid_manifest("invalid or duplicate capability");
+        }
+        if validate_requirement(&requirement).is_err() {
             return invalid_manifest("invalid or duplicate capability");
         }
     }
@@ -281,31 +318,27 @@ fn decimal_version(value: &str) -> bool {
     !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit())
 }
 
-fn validate_requirement(value: &str) -> Result<(), ()> {
-    let value = value.strip_suffix('?').unwrap_or(value);
-    if value.is_empty() || value.bytes().any(|byte| byte.is_ascii_whitespace()) {
-        return Err(());
-    }
-    let (base, modifier) = match value.split_once(':') {
-        Some(parts) => parts,
-        None => (value, ""),
-    };
-    if base == "egress" {
-        return if !modifier.is_empty() && !modifier.contains(':') {
+fn validate_requirement(requirement: &CapabilityRequirement) -> Result<(), ()> {
+    if requirement.base == "egress" {
+        return if requirement
+            .modifier
+            .as_deref()
+            .is_some_and(|modifier| !modifier.is_empty())
+        {
             Ok(())
         } else {
             Err(())
         };
     }
-    if !modifier.is_empty()
-        && !matches!(
-            (base, modifier),
+    if let Some(modifier) = requirement.modifier.as_deref() {
+        if !matches!(
+            (requirement.base.as_str(), modifier),
             ("location" | "gnss", "approximate" | "precise")
-        )
-    {
-        return Err(());
+        ) {
+            return Err(());
+        }
     }
-    if KNOWN_CAPABILITIES.contains(&base) {
+    if KNOWN_CAPABILITIES.contains(&requirement.base.as_str()) {
         Ok(())
     } else {
         Err(())
