@@ -12,14 +12,29 @@ fn scratch(name: &str) -> PathBuf {
 }
 
 fn platform(path: &Path) -> PathBuf {
-    let contract = path.join("platform.toml");
+    platform_with_capabilities(
+        path,
+        "platform.toml",
+        &["audio", "entropy", "input", "settings"],
+    )
+}
+
+fn platform_with_capabilities(path: &Path, filename: &str, capabilities: &[&str]) -> PathBuf {
+    let contract = path.join(filename);
+    let capabilities = capabilities
+        .iter()
+        .map(|capability| format!("{capability:?}"))
+        .collect::<Vec<_>>()
+        .join(", ");
     fs::write(
         &contract,
-        "schema_version = 1\n\
-         runtime_family = \"pocketforge/a133-powervr\"\n\
-         runtime_abi = \"1\"\n\
-         platform_version = \"20\"\n\
-         supported_capabilities = [\"audio\", \"entropy\", \"input\", \"settings\"]\n",
+        format!(
+            "schema_version = 1\n\
+             runtime_family = \"pocketforge/a133-powervr\"\n\
+             runtime_abi = \"1\"\n\
+             platform_version = \"20\"\n\
+             supported_capabilities = [{capabilities}]\n"
+        ),
     )
     .unwrap();
     contract
@@ -225,6 +240,42 @@ fn semantic_capability_duplicates_and_positive_share_one_invocation() {
         assert_eq!(error.reason, ReasonCode::DescriptorInvalid, "{id}");
         assert_eq!(error.detail, "invalid or duplicate capability", "{id}");
     }
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn normalized_capability_compatibility_and_controls_share_one_invocation() {
+    let dir = scratch("normalized-capability-compatibility");
+    let root = dir.join("apps");
+    fs::create_dir_all(&root).unwrap();
+    let supported_contract =
+        platform_with_capabilities(&dir, "platform-supported.toml", &["audio"]);
+    let unsupported_contract = platform_with_capabilities(&dir, "platform-unsupported.toml", &[]);
+
+    for (id, capabilities) in [
+        ("org.example.control", &["audio"][..]),
+        ("org.example.uppercase", &["Audio"][..]),
+        ("org.example.spaced", &[" audio "][..]),
+        ("org.example.optional", &["audio?"][..]),
+    ] {
+        install_app_with_capabilities(&root, id, id, "bin/app", capabilities);
+    }
+
+    let supported = Resolver::new(&root, supported_contract);
+    for id in [
+        "org.example.control",
+        "org.example.uppercase",
+        "org.example.spaced",
+    ] {
+        assert!(supported.resolve(id).is_ok(), "{id}");
+    }
+
+    let unsupported = Resolver::new(&root, unsupported_contract);
+    assert!(unsupported.resolve("org.example.optional").is_ok());
+    let error = unsupported.resolve("org.example.control").unwrap_err();
+    assert_eq!(error.reason, ReasonCode::UnsupportedCapability);
+    assert_eq!(error.detail, "unsupported required capability audio");
+
     fs::remove_dir_all(dir).unwrap();
 }
 

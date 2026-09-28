@@ -867,23 +867,19 @@ fn check_compatibility(
             "application platform version does not match platform",
         ));
     }
-    for requirement in &manifest.app.capabilities {
-        let required = !requirement.ends_with('?');
-        let normalized = requirement.strip_suffix('?').unwrap_or(requirement);
-        let base = normalized
-            .split_once(':')
-            .map_or(normalized, |parts| parts.0);
-        if required
-            && base != "egress"
+    for capability in &manifest.app.capabilities {
+        let requirement = parse_capability_requirement(capability);
+        if !requirement.optional
+            && requirement.base != "egress"
             && !platform
                 .supported_capabilities
                 .iter()
-                .any(|capability| capability == base)
+                .any(|capability| capability == &requirement.base)
         {
             return Err(resolve_error(
                 ReasonCode::UnsupportedCapability,
                 65,
-                format!("unsupported required capability {base}"),
+                format!("unsupported required capability {}", requirement.base),
             ));
         }
     }
