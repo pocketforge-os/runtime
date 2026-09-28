@@ -16,6 +16,7 @@
 //! sessions with marker files under the daemon state directory while exercising the same
 //! [`CommandTemplates`] substitution and execution path as the device commands.
 
+use pf_app_manifest::{validate_app_id, ReasonCode, Resolver};
 use pf_ports::{
     Clock, LaunchRequest, LaunchResult, MonotonicTime, ObservedSessionState, RecoveryRequired,
     SessionEvent, TerminalReceipt,
@@ -91,21 +92,31 @@ pub enum Phase {
     },
     Running {
         session_id: String,
+        #[serde(default)]
+        item_id: String,
     },
     StoppingGracefully {
         session_id: String,
+        #[serde(default)]
+        item_id: String,
         boot_marker: String,
     },
     ForceStopping {
         session_id: String,
+        #[serde(default)]
+        item_id: String,
     },
     Restoring {
         session_id: String,
+        #[serde(default)]
+        item_id: String,
         receipt: Receipt,
         rung: RestorationRung,
     },
     RecoveryRequired {
         session_id: String,
+        #[serde(default)]
+        item_id: String,
         reason: String,
     },
 }
@@ -240,6 +251,19 @@ impl StateStore for FileStore {
 /// Executes one configured command. Kept injectable so tests never invoke the host service manager.
 pub trait CommandExecutor {
     fn execute(&mut self, program: &str, args: &[String]) -> Result<i32, String>;
+
+    fn query(&mut self, program: &str, args: &[String]) -> Result<CommandOutput, String> {
+        self.execute(program, args).map(|code| CommandOutput {
+            code,
+            stdout: String::new(),
+        })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CommandOutput {
+    pub code: i32,
+    pub stdout: String,
 }
 
 #[derive(Default)]
@@ -252,6 +276,17 @@ impl CommandExecutor for ProcessExecutor {
             .map_err(|e| e.to_string())
             .map(|status| status.code().unwrap_or(1))
     }
+
+    fn query(&mut self, program: &str, args: &[String]) -> Result<CommandOutput, String> {
+        let output = Command::new(program)
+            .args(args)
+            .output()
+            .map_err(|error| error.to_string())?;
+        Ok(CommandOutput {
+            code: output.status.code().unwrap_or(1),
+            stdout: String::from_utf8(output.stdout).map_err(|error| error.to_string())?,
+        })
+    }
 }
 
 /// Command templates used by [`CommandSystem`]. Tokens support `{item_id}` and `{session_id}`.
@@ -261,17 +296,17 @@ pub struct CommandTemplates {
     pub request_graceful_stop: Vec<String>,
     pub enforce_termination: Vec<String>,
     pub activate_selected_owner: Vec<String>,
+    systemd_reconciliation: bool,
 }
 
 impl Default for CommandTemplates {
     fn default() -> Self {
         Self {
-            start_foreground: words("systemctl start pf-foreground@{session_id}.service"),
-            request_graceful_stop: words("systemctl stop pf-foreground@{session_id}.service"),
-            enforce_termination: words(
-                "systemctl kill --kill-who=all pf-foreground@{session_id}.service",
-            ),
+            start_foreground: words("systemctl start pf-app@{item_id}.service"),
+            request_graceful_stop: words("systemctl stop pf-app@{item_id}.service"),
+            enforce_termination: words("systemctl kill --kill-who=all pf-app@{item_id}.service"),
             activate_selected_owner: words("systemctl start pf-shell-selected.service"),
+            systemd_reconciliation: true,
         }
     }
 }
@@ -287,6 +322,7 @@ impl CommandTemplates {
             request_graceful_stop: words(graceful),
             enforce_termination: words(terminate),
             activate_selected_owner: words(activate),
+            systemd_reconciliation: false,
         }
     }
 
@@ -314,6 +350,7 @@ impl CommandTemplates {
                 "pf-session-authorityd".into(),
                 state_dir,
             ],
+            systemd_reconciliation: false,
         }
     }
 }
@@ -370,18 +407,61 @@ impl<E: CommandExecutor> CommandSystem<E> {
             .ok_or_else(|| "empty command template".to_owned())?;
         self.executor.execute(program, args)
     }
+
+    fn query(&mut self, args: &[&str]) -> Result<CommandOutput, String> {
+        self.executor.query(
+            "systemctl",
+            &args
+                .iter()
+                .map(|value| (*value).to_owned())
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    fn property(&mut self, unit: &str, property: &str) -> Result<String, String> {
+        let output = self.query(&["show", "--property", property, "--value", unit])?;
+        if output.code != 0 {
+            return Err(format!(
+                "systemctl show {property} {unit} exited {}",
+                output.code
+            ));
+        }
+        Ok(output.stdout.trim().to_owned())
+    }
+
+    fn is_active(&mut self, unit: &str) -> Result<bool, String> {
+        match self.query(&["is-active", "--quiet", unit])?.code {
+            0 => Ok(true),
+            3 => Ok(false),
+            code => Err(format!("systemctl is-active {unit} exited {code}")),
+        }
+    }
 }
 
 /// Trait-shaped image/service integration. F13 supplies the real systemd implementation.
 pub trait SessionSystem {
-    fn start_foreground(
-        &mut self,
-        request: &LaunchRequest,
-        session_id: &str,
-    ) -> Result<bool, String>;
-    fn request_graceful_stop(&mut self, session_id: &str) -> Result<(), String>;
-    fn enforce_termination(&mut self, session_id: &str) -> Result<(), String>;
+    fn start_foreground(&mut self, request: &LaunchRequest, session_id: &str)
+        -> Result<(), String>;
+    fn request_graceful_stop(&mut self, item_id: &str, session_id: &str) -> Result<(), String>;
+    fn enforce_termination(&mut self, item_id: &str, session_id: &str) -> Result<(), String>;
     fn activate_selected_owner(&mut self) -> Result<(), String>;
+    fn lifecycle(&mut self, _item_id: &str) -> Result<Option<SystemLifecycle>, String> {
+        Ok(None)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AppUnitState {
+    Active,
+    InactiveSuccess,
+    InactiveFailure { summary: String },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SystemLifecycle {
+    pub app: AppUnitState,
+    pub foreground_target_active: bool,
+    pub selected_owner_active: bool,
 }
 
 impl<E: CommandExecutor> SessionSystem for CommandSystem<E> {
@@ -389,25 +469,48 @@ impl<E: CommandExecutor> SessionSystem for CommandSystem<E> {
         &mut self,
         request: &LaunchRequest,
         session_id: &str,
-    ) -> Result<bool, String> {
+    ) -> Result<(), String> {
         let template = self.templates.start_foreground.clone();
-        match self.run(&template, &request.item_id, session_id)? {
-            0 => Ok(true),
-            3 => Ok(false),
-            code => Err(format!("start command exited {code}")),
-        }
+        command_ok(self.run(&template, &request.item_id, session_id)?)
     }
-    fn request_graceful_stop(&mut self, session_id: &str) -> Result<(), String> {
+    fn request_graceful_stop(&mut self, item_id: &str, session_id: &str) -> Result<(), String> {
         let template = self.templates.request_graceful_stop.clone();
-        command_ok(self.run(&template, "", session_id)?)
+        command_ok(self.run(&template, item_id, session_id)?)
     }
-    fn enforce_termination(&mut self, session_id: &str) -> Result<(), String> {
+    fn enforce_termination(&mut self, item_id: &str, session_id: &str) -> Result<(), String> {
         let template = self.templates.enforce_termination.clone();
-        command_ok(self.run(&template, "", session_id)?)
+        command_ok(self.run(&template, item_id, session_id)?)
     }
     fn activate_selected_owner(&mut self) -> Result<(), String> {
         let template = self.templates.activate_selected_owner.clone();
         command_ok(self.run(&template, "", "")?)
+    }
+
+    fn lifecycle(&mut self, item_id: &str) -> Result<Option<SystemLifecycle>, String> {
+        if !self.templates.systemd_reconciliation {
+            return Ok(None);
+        }
+        let unit = format!("pf-app@{item_id}.service");
+        let active_state = self.property(&unit, "ActiveState")?;
+        let app = match active_state.as_str() {
+            "active" | "activating" | "reloading" | "deactivating" => AppUnitState::Active,
+            "inactive" | "failed" => {
+                let result = self.property(&unit, "Result")?;
+                if active_state == "inactive" && (result.is_empty() || result == "success") {
+                    AppUnitState::InactiveSuccess
+                } else {
+                    AppUnitState::InactiveFailure {
+                        summary: format!("systemd result: {result}"),
+                    }
+                }
+            }
+            state => return Err(format!("unknown ActiveState {state:?} for {unit}")),
+        };
+        Ok(Some(SystemLifecycle {
+            app,
+            foreground_target_active: self.is_active("pocketforge-foreground.target")?,
+            selected_owner_active: self.is_active("pf-shell-selected.service")?,
+        }))
     }
 }
 
@@ -439,6 +542,17 @@ pub enum FailureRung {
     OwnerActivation,
     OwnerActive,
     Presentation,
+}
+
+impl FailureRung {
+    const fn reason_code(self) -> ReasonCode {
+        match self {
+            Self::Termination | Self::UnitInactive => ReasonCode::AppExitFailed,
+            Self::TargetReleased => ReasonCode::TargetNotReleased,
+            Self::OwnerActivation | Self::OwnerActive => ReasonCode::OwnerNotActive,
+            Self::Presentation => ReasonCode::PresentationNotAcknowledged,
+        }
+    }
 }
 
 pub trait AuthorityApi {
@@ -583,11 +697,14 @@ fn handle_rpc<S: StateStore, B: SessionSystem, C: Clock>(
             RpcResponse::Ok
         }
         RpcRequest::Events { client_id } => RpcResponse::Events {
-            events: authority
-                .events_for(&client_id)
-                .into_iter()
-                .map(|(s, e)| (s, e.into()))
-                .collect(),
+            events: {
+                authority.reconcile()?;
+                authority
+                    .events_for(&client_id)
+                    .into_iter()
+                    .map(|(s, e)| (s, e.into()))
+                    .collect()
+            },
         },
         RpcRequest::Acknowledge {
             client_id,
@@ -614,6 +731,7 @@ pub struct Authority<S, B, C> {
     store: S,
     system: B,
     clock: C,
+    resolver: Resolver,
     state: PersistedState,
     recent_bound: usize,
     grace: Duration,
@@ -629,7 +747,15 @@ impl<S: StateStore, B: SessionSystem, C: Clock> Authority<S, B, C> {
         recent_bound: usize,
         grace: Duration,
     ) -> Result<Self, AuthorityError> {
-        Self::open_with_now_fn(store, system, clock, recent_bound, grace, SystemTime::now)
+        Self::open_with_resolver_and_now_fn(
+            store,
+            system,
+            clock,
+            recent_bound,
+            grace,
+            Resolver::fixed(),
+            SystemTime::now,
+        )
     }
 
     pub fn open_with_now_fn(
@@ -640,11 +766,52 @@ impl<S: StateStore, B: SessionSystem, C: Clock> Authority<S, B, C> {
         grace: Duration,
         now_fn: fn() -> SystemTime,
     ) -> Result<Self, AuthorityError> {
+        Self::open_with_resolver_and_now_fn(
+            store,
+            system,
+            clock,
+            recent_bound,
+            grace,
+            Resolver::fixed(),
+            now_fn,
+        )
+    }
+
+    /// Open with injected filesystem roots for hermetic tests.
+    pub fn open_with_resolver(
+        store: S,
+        system: B,
+        clock: C,
+        recent_bound: usize,
+        grace: Duration,
+        resolver: Resolver,
+    ) -> Result<Self, AuthorityError> {
+        Self::open_with_resolver_and_now_fn(
+            store,
+            system,
+            clock,
+            recent_bound,
+            grace,
+            resolver,
+            SystemTime::now,
+        )
+    }
+
+    pub fn open_with_resolver_and_now_fn(
+        store: S,
+        system: B,
+        clock: C,
+        recent_bound: usize,
+        grace: Duration,
+        resolver: Resolver,
+        now_fn: fn() -> SystemTime,
+    ) -> Result<Self, AuthorityError> {
         let state = store.load()?.unwrap_or_default();
         Ok(Self {
             store,
             system,
             clock,
+            resolver,
             state,
             recent_bound: recent_bound.max(1),
             grace,
@@ -665,11 +832,22 @@ impl<S: StateStore, B: SessionSystem, C: Clock> Authority<S, B, C> {
         match &self.state.phase {
             Phase::Idle => None,
             Phase::Starting { session_id, .. }
-            | Phase::Running { session_id }
+            | Phase::Running { session_id, .. }
             | Phase::StoppingGracefully { session_id, .. }
-            | Phase::ForceStopping { session_id }
+            | Phase::ForceStopping { session_id, .. }
             | Phase::Restoring { session_id, .. }
             | Phase::RecoveryRequired { session_id, .. } => Some(session_id.clone()),
+        }
+    }
+    fn item_id(&self) -> Option<String> {
+        match &self.state.phase {
+            Phase::Idle => None,
+            Phase::Starting { item_id, .. }
+            | Phase::Running { item_id, .. }
+            | Phase::StoppingGracefully { item_id, .. }
+            | Phase::ForceStopping { item_id, .. }
+            | Phase::Restoring { item_id, .. }
+            | Phase::RecoveryRequired { item_id, .. } => Some(item_id.clone()),
         }
     }
     fn publish(&mut self, event: WireEvent) {
@@ -696,8 +874,10 @@ impl<S: StateStore, B: SessionSystem, C: Clock> Authority<S, B, C> {
         let session_id = self
             .session_id()
             .ok_or(AuthorityError::InvalidObservation)?;
+        let item_id = self.item_id().unwrap_or_default();
         self.state.phase = Phase::RecoveryRequired {
             session_id: session_id.clone(),
+            item_id,
             reason: reason.clone(),
         };
         self.publish(WireEvent::RecoveryRequired { session_id, reason });
@@ -716,23 +896,83 @@ impl<S: StateStore, B: SessionSystem, C: Clock> Authority<S, B, C> {
         self.persist()
     }
     pub fn reconcile(&mut self) -> Result<(), AuthorityError> {
-        if matches!(
-            self.state.phase,
-            Phase::Starting {
-                start_invoked: false,
-                ..
+        if let Some(item_id) = self.item_id() {
+            if !matches!(self.state.phase, Phase::RecoveryRequired { .. })
+                && validate_app_id(&item_id).is_err()
+            {
+                return self.recover(format!(
+                    "{}: invalid persisted item id",
+                    ReasonCode::SystemdStateUnknown.as_str()
+                ));
             }
-        ) {
-            return self
-                .recover("interrupted start intent: no foreground unit was observed".into());
         }
-        if let Phase::StoppingGracefully { session_id, .. } = self.state.phase.clone() {
-            if self.graceful_deadline.is_none() {
-                if let Err(reason) = self.system.enforce_termination(&session_id) {
-                    return self.recover(format!("termination: {reason}"));
+        if let Phase::Starting {
+            session_id,
+            item_id,
+            start_invoked: false,
+        } = self.state.phase.clone()
+        {
+            let snapshot = match self.system.lifecycle(&item_id) {
+                Ok(Some(snapshot)) => snapshot,
+                Ok(None) => {
+                    return self.recover(format!(
+                        "{}: interrupted start intent was not observable",
+                        ReasonCode::SystemdStateUnknown.as_str()
+                    ));
                 }
-                self.state.phase = Phase::ForceStopping { session_id };
-                return self.persist();
+                Err(reason) => {
+                    return self.recover(format!(
+                        "{}: {reason}",
+                        ReasonCode::SystemdStateUnknown.as_str()
+                    ));
+                }
+            };
+            if !matches!(snapshot.app, AppUnitState::Active) {
+                return self.recover(format!(
+                    "{}: interrupted start intent has no active app unit",
+                    ReasonCode::SystemdStartFailed.as_str()
+                ));
+            }
+            self.state.phase = Phase::Starting {
+                session_id: session_id.clone(),
+                item_id: item_id.clone(),
+                start_invoked: true,
+            };
+            if !self
+                .state
+                .history
+                .iter()
+                .any(|entry| entry.session_id == session_id)
+            {
+                self.state.history.push_front(HistoryEntry {
+                    session_id,
+                    item_id,
+                    receipt: None,
+                    started_at: None,
+                    ended_at: None,
+                });
+                self.state.history.truncate(self.recent_bound);
+                self.publish(WireEvent::ObservedStarting);
+            }
+            self.persist()?;
+            self.observe(Observation::SessionRunning)?;
+        }
+        if let Phase::StoppingGracefully {
+            session_id,
+            item_id,
+            ..
+        } = self.state.phase.clone()
+        {
+            if self.graceful_deadline.is_none() {
+                if let Err(reason) = self.system.enforce_termination(&item_id, &session_id) {
+                    return self
+                        .recover(format!("{}: {reason}", ReasonCode::AppExitFailed.as_str()));
+                }
+                self.state.phase = Phase::ForceStopping {
+                    session_id,
+                    item_id,
+                };
+                self.persist()?;
             }
         }
         if self.state.safe_return_queue > 0
@@ -743,39 +983,128 @@ impl<S: StateStore, B: SessionSystem, C: Clock> Authority<S, B, C> {
         {
             self.state.safe_return_queue -= 1;
             let id = self.session_id().unwrap();
-            match self.system.request_graceful_stop(&id) {
+            let item_id = self.item_id().unwrap();
+            match self.system.request_graceful_stop(&item_id, &id) {
                 Ok(()) => {
                     self.graceful_deadline = Some(self.clock.deadline_after(self.grace).0);
                     self.state.phase = Phase::StoppingGracefully {
                         session_id: id,
+                        item_id,
                         boot_marker: boot_marker(),
                     }
                 }
                 Err(_) => {
-                    if let Err(reason) = self.system.enforce_termination(&id) {
-                        return self.recover(format!("termination: {reason}"));
+                    if let Err(reason) = self.system.enforce_termination(&item_id, &id) {
+                        return self
+                            .recover(format!("{}: {reason}", ReasonCode::AppExitFailed.as_str()));
                     }
-                    self.state.phase = Phase::ForceStopping { session_id: id };
+                    self.state.phase = Phase::ForceStopping {
+                        session_id: id,
+                        item_id,
+                    };
                 }
             }
             self.persist()?;
         }
-        Ok(())
+        self.reconcile_systemd()
     }
     pub fn tick(&mut self) -> Result<(), AuthorityError> {
         self.reconcile()?;
-        if let Phase::StoppingGracefully { session_id, .. } = self.state.phase.clone() {
+        if let Phase::StoppingGracefully {
+            session_id,
+            item_id,
+            ..
+        } = self.state.phase.clone()
+        {
             if self
                 .graceful_deadline
                 .is_some_and(|deadline| self.clock.now() >= deadline)
             {
-                if let Err(reason) = self.system.enforce_termination(&session_id) {
-                    return self.recover(format!("termination: {reason}"));
+                if let Err(reason) = self.system.enforce_termination(&item_id, &session_id) {
+                    return self
+                        .recover(format!("{}: {reason}", ReasonCode::AppExitFailed.as_str()));
                 }
-                self.state.phase = Phase::ForceStopping { session_id };
+                self.state.phase = Phase::ForceStopping {
+                    session_id,
+                    item_id,
+                };
                 self.graceful_deadline = None;
                 self.persist()?;
             }
+        }
+        self.reconcile_systemd()
+    }
+    fn reconcile_systemd(&mut self) -> Result<(), AuthorityError> {
+        for _ in 0..8 {
+            let Some(item_id) = self.item_id() else {
+                return Ok(());
+            };
+            if matches!(self.state.phase, Phase::RecoveryRequired { .. }) {
+                return Ok(());
+            }
+            let snapshot = match self.system.lifecycle(&item_id) {
+                Ok(Some(snapshot)) => snapshot,
+                Ok(None) => return Ok(()),
+                Err(reason) => {
+                    return self.recover(format!(
+                        "{}: {reason}",
+                        ReasonCode::SystemdStateUnknown.as_str()
+                    ));
+                }
+            };
+            let observation = match (&self.state.phase, snapshot.app) {
+                (
+                    Phase::Starting {
+                        start_invoked: true,
+                        ..
+                    },
+                    AppUnitState::Active,
+                ) => Some(Observation::SessionRunning),
+                (
+                    Phase::Starting {
+                        start_invoked: true,
+                        ..
+                    }
+                    | Phase::Running { .. },
+                    AppUnitState::InactiveSuccess,
+                ) => Some(Observation::SessionExitedCleanly),
+                (
+                    Phase::Starting {
+                        start_invoked: true,
+                        ..
+                    }
+                    | Phase::Running { .. },
+                    AppUnitState::InactiveFailure { summary },
+                ) => Some(Observation::SessionCrashed { summary }),
+                (
+                    Phase::StoppingGracefully { .. }
+                    | Phase::ForceStopping { .. }
+                    | Phase::Restoring {
+                        rung: RestorationRung::UnitInactive,
+                        ..
+                    },
+                    AppUnitState::InactiveSuccess | AppUnitState::InactiveFailure { .. },
+                ) => Some(Observation::UnitInactive),
+                (
+                    Phase::Restoring {
+                        rung: RestorationRung::TargetReleased,
+                        ..
+                    },
+                    _,
+                ) if !snapshot.foreground_target_active => Some(Observation::TargetReleased),
+                (
+                    Phase::Restoring {
+                        rung: RestorationRung::OwnerActive,
+                        ..
+                    },
+                    _,
+                ) if snapshot.selected_owner_active => Some(Observation::SelectedOwnerActive),
+                _ => None,
+            };
+            let Some(observation) = observation else {
+                return Ok(());
+            };
+            self.observe(observation)?;
         }
         Ok(())
     }
@@ -783,8 +1112,10 @@ impl<S: StateStore, B: SessionSystem, C: Clock> Authority<S, B, C> {
         let session_id = self
             .session_id()
             .ok_or(AuthorityError::InvalidObservation)?;
+        let item_id = self.item_id().ok_or(AuthorityError::InvalidObservation)?;
         self.state.phase = Phase::Restoring {
             session_id,
+            item_id,
             receipt,
             rung: RestorationRung::UnitInactive,
         };
@@ -794,6 +1125,7 @@ impl<S: StateStore, B: SessionSystem, C: Clock> Authority<S, B, C> {
         let session_id = self
             .session_id()
             .ok_or(AuthorityError::InvalidObservation)?;
+        let item_id = self.item_id().ok_or(AuthorityError::InvalidObservation)?;
         if let Some(entry) = self
             .state
             .history
@@ -807,6 +1139,7 @@ impl<S: StateStore, B: SessionSystem, C: Clock> Authority<S, B, C> {
         }
         self.state.phase = Phase::Restoring {
             session_id,
+            item_id,
             receipt,
             rung: RestorationRung::TargetReleased,
         };
@@ -814,15 +1147,19 @@ impl<S: StateStore, B: SessionSystem, C: Clock> Authority<S, B, C> {
     }
     pub fn observe(&mut self, observation: Observation) -> Result<(), AuthorityError> {
         if let Observation::Failed { rung, reason } = observation {
-            return self.recover(format!("{rung:?}: {reason}"));
+            return self.recover(format!("{}: {reason}", rung.reason_code().as_str()));
         }
         match (&self.state.phase, observation) {
             (Phase::Starting { .. }, Observation::SessionRunning) => {
                 let id = self.session_id().unwrap();
+                let item_id = self.item_id().unwrap();
                 if let Some(entry) = self.state.history.iter_mut().find(|e| e.session_id == id) {
                     entry.started_at = Some((self.now_fn)());
                 }
-                self.state.phase = Phase::Running { session_id: id };
+                self.state.phase = Phase::Running {
+                    session_id: id,
+                    item_id,
+                };
                 self.publish(WireEvent::ObservedRunning);
                 self.persist()
             }
@@ -858,6 +1195,7 @@ impl<S: StateStore, B: SessionSystem, C: Clock> Authority<S, B, C> {
             (
                 Phase::Restoring {
                     session_id,
+                    item_id,
                     receipt,
                     rung: RestorationRung::UnitInactive,
                 },
@@ -865,6 +1203,7 @@ impl<S: StateStore, B: SessionSystem, C: Clock> Authority<S, B, C> {
             ) => {
                 self.state.phase = Phase::Restoring {
                     session_id: session_id.clone(),
+                    item_id: item_id.clone(),
                     receipt: receipt.clone(),
                     rung: RestorationRung::TargetReleased,
                 };
@@ -873,18 +1212,22 @@ impl<S: StateStore, B: SessionSystem, C: Clock> Authority<S, B, C> {
             (
                 Phase::Restoring {
                     session_id,
+                    item_id,
                     receipt,
                     rung: RestorationRung::TargetReleased,
                 },
                 Observation::TargetReleased,
             ) => {
                 let session_id = session_id.clone();
+                let item_id = item_id.clone();
                 let receipt = receipt.clone();
                 if let Err(reason) = self.system.activate_selected_owner() {
-                    return self.recover(format!("owner activation: {reason}"));
+                    return self
+                        .recover(format!("{}: {reason}", ReasonCode::OwnerNotActive.as_str()));
                 }
                 self.state.phase = Phase::Restoring {
                     session_id,
+                    item_id,
                     receipt,
                     rung: RestorationRung::OwnerActive,
                 };
@@ -893,6 +1236,7 @@ impl<S: StateStore, B: SessionSystem, C: Clock> Authority<S, B, C> {
             (
                 Phase::Restoring {
                     session_id,
+                    item_id,
                     receipt,
                     rung: RestorationRung::OwnerActive,
                 },
@@ -900,6 +1244,7 @@ impl<S: StateStore, B: SessionSystem, C: Clock> Authority<S, B, C> {
             ) => {
                 self.state.phase = Phase::Restoring {
                     session_id: session_id.clone(),
+                    item_id: item_id.clone(),
                     receipt: receipt.clone(),
                     rung: RestorationRung::PresentationAcknowledged,
                 };
@@ -910,6 +1255,7 @@ impl<S: StateStore, B: SessionSystem, C: Clock> Authority<S, B, C> {
                     session_id,
                     receipt,
                     rung: RestorationRung::PresentationAcknowledged,
+                    ..
                 },
                 Observation::PresentationAcknowledged,
             ) => {
@@ -936,6 +1282,13 @@ impl<S: StateStore, B: SessionSystem, C: Clock> AuthorityApi for Authority<S, B,
         if !matches!(self.state.phase, Phase::Idle) {
             return Ok(LaunchResult::RejectedBusy);
         }
+        if let Err(error) = self.resolver.resolve(&request.item_id) {
+            eprintln!(
+                "{}",
+                launch_refusal_line(error.reason.as_str(), &request.item_id)
+            );
+            return Ok(LaunchResult::ItemUnavailable);
+        }
         let id = format!("session-{}", self.state.next_session);
         let before_intent = self.state.clone();
         self.state.next_session += 1;
@@ -948,15 +1301,7 @@ impl<S: StateStore, B: SessionSystem, C: Clock> AuthorityApi for Authority<S, B,
             self.state = before_intent;
             return Err(error);
         }
-        let available = self
-            .system
-            .start_foreground(&request, &id)
-            .map_err(AuthorityError::Backend)?;
-        if !available {
-            self.state.phase = Phase::Idle;
-            self.persist()?;
-            return Ok(LaunchResult::ItemUnavailable);
-        }
+        let start_result = self.system.start_foreground(&request, &id);
         self.state.phase = Phase::Starting {
             session_id: id.clone(),
             item_id: request.item_id.clone(),
@@ -972,6 +1317,21 @@ impl<S: StateStore, B: SessionSystem, C: Clock> AuthorityApi for Authority<S, B,
         self.state.history.truncate(self.recent_bound);
         self.publish(WireEvent::ObservedStarting);
         self.persist()?;
+        match start_result {
+            Ok(()) => self.observe(Observation::SessionRunning)?,
+            Err(reason) => {
+                eprintln!(
+                    "pf-session-authorityd: lifecycle_failure reason={} item_id={} detail={}",
+                    ReasonCode::SystemdStartFailed.as_str(),
+                    serde_json::to_string(self.item_id().as_deref().unwrap_or_default())
+                        .expect("string serialization cannot fail"),
+                    serde_json::to_string(&reason).expect("string serialization cannot fail")
+                );
+                self.observe(Observation::SessionCrashed {
+                    summary: format!("{}: {reason}", ReasonCode::SystemdStartFailed.as_str()),
+                })?;
+            }
+        }
         Ok(LaunchResult::Accepted { session_id: id })
     }
     fn events_for(&self, client_id: &str) -> Vec<(u64, SessionEvent)> {
@@ -1015,6 +1375,13 @@ impl<S: StateStore, B: SessionSystem, C: Clock> AuthorityApi for Authority<S, B,
     fn history_entries(&self) -> Vec<HistoryEntry> {
         self.state.history.iter().cloned().collect()
     }
+}
+
+fn launch_refusal_line(reason: &str, item_id: &str) -> String {
+    format!(
+        "pf-session-authorityd: launch_refused reason={reason} item_id={}",
+        serde_json::to_string(item_id).expect("string serialization cannot fail")
+    )
 }
 
 fn boot_marker() -> String {

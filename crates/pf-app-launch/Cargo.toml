@@ -1,5 +1,6 @@
 [package]
-name = "pf-session-authority"
+name = "pf-app-launch"
+description = "Path-confined launcher for image-installed PocketForge applications"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,10 +10,11 @@ authors.workspace = true
 
 [dependencies]
 pf-app-manifest.workspace = true
-pf-ports.workspace = true
-pf-wire.workspace = true
-serde.workspace = true
 serde_json.workspace = true
 
-[dev-dependencies]
-pf-app-launch = { path = "../pf-app-launch" }
+[lib]
+name = "pf_app_launch"
+
+[[bin]]
+name = "pf-app-launch"
+path = "src/main.rs"

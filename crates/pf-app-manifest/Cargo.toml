@@ -1,5 +1,6 @@
 [package]
-name = "pf-session-client"
+name = "pf-app-manifest"
+description = "Strict shared PocketForge application descriptor parser and fixed-root resolver"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,11 +9,5 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
-pf-ports.workspace = true
-pf-session-authority.workspace = true
-pf-wire.workspace = true
 serde.workspace = true
-serde_json.workspace = true
-
-[dev-dependencies]
-pf-app-manifest.workspace = true
+toml.workspace = true

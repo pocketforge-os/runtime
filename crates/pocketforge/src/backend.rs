@@ -236,21 +236,8 @@ pub const DEFAULT_DENY: &[&str] = &["location", "gnss"];
 
 /// Capability names the platform/runtime supports (the API surface). Distinguishes
 /// `HardwareAbsent` (known cap, no hardware) from `Unsupported` (no such cap at all).
-pub const KNOWN_CAPS: &[&str] = &[
-    "input",
-    "vibration",
-    "rumble",
-    "imu",
-    "accelerometer",
-    "gyroscope",
-    "magnetometer",
-    "entropy",
-    "location",
-    "gnss",
-    "audio",
-    "settings",
-    "leds",
-];
+/// The shared app-manifest crate owns the vocabulary used by the platform-support parser.
+pub use pf_app_manifest::KNOWN_CAPABILITIES as KNOWN_CAPS;
 
 /// True if `name` is a capability the platform knows about at all.
 pub fn is_known(name: &str) -> bool {
