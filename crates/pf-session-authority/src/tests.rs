@@ -778,12 +778,14 @@ fn restart_mid_ladder_resumes_without_double_publication() {
 
 #[test]
 fn interrupted_start_intent_reconciles_from_the_exact_active_app_unit() {
-    let mut persisted = PersistedState::default();
-    persisted.next_session = 2;
-    persisted.phase = Phase::Starting {
-        session_id: "session-1".into(),
-        item_id: APP_ID.into(),
-        start_invoked: false,
+    let persisted = PersistedState {
+        next_session: 2,
+        phase: Phase::Starting {
+            session_id: "session-1".into(),
+            item_id: APP_ID.into(),
+            start_invoked: false,
+        },
+        ..PersistedState::default()
     };
     let mut store = MemoryStore::default();
     store.save(&persisted).unwrap();
