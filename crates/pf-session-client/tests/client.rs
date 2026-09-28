@@ -3,8 +3,41 @@ use pf_session_authority::{serve_connection, Authority, FileStore, Observation, 
 use pf_session_authority::{AuthorityApi, AuthorityError};
 use pf_session_client::SessionClient;
 use pf_session_client::SocketTransport;
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixListener;
+use std::path::Path;
 use std::time::Duration;
+
+const APP_ID: &str = "org.example.game";
+
+fn resolver(dir: &Path) -> pf_app_manifest::Resolver {
+    let root = dir.join("apps");
+    let app = root.join(APP_ID);
+    std::fs::create_dir_all(app.join("bin")).unwrap();
+    std::fs::write(
+        app.join("app.toml"),
+        "[app]\nid = \"org.example.game\"\nuse = [\"input\"]\n\
+         [runtime]\nfamily = \"pocketforge/a133-powervr\"\nabi = \"1\"\nplatform-version = \"20\"\n\
+         [launch]\nexec = \"bin/app\"\n",
+    )
+    .unwrap();
+    let executable = app.join("bin/app");
+    std::fs::write(&executable, b"#!/bin/sh\n").unwrap();
+    let mut permissions = std::fs::metadata(&executable).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(executable, permissions).unwrap();
+    let platform = dir.join("platform.toml");
+    std::fs::write(
+        &platform,
+        "schema_version = 1\n\
+         runtime_family = \"pocketforge/a133-powervr\"\n\
+         runtime_abi = \"1\"\n\
+         platform_version = \"20\"\n\
+         supported_capabilities = [\"input\"]\n",
+    )
+    .unwrap();
+    pf_app_manifest::Resolver::new(root, platform)
+}
 
 struct Transport {
     events: Vec<(u64, SessionEvent)>,
@@ -119,13 +152,13 @@ fn acknowledged_cursor_survives_client_restart_and_unconsumed_event_remains() {
 #[derive(Default)]
 struct SocketSystem;
 impl SessionSystem for SocketSystem {
-    fn start_foreground(&mut self, _: &LaunchRequest, _: &str) -> Result<bool, String> {
-        Ok(true)
-    }
-    fn request_graceful_stop(&mut self, _: &str) -> Result<(), String> {
+    fn start_foreground(&mut self, _: &LaunchRequest, _: &str) -> Result<(), String> {
         Ok(())
     }
-    fn enforce_termination(&mut self, _: &str) -> Result<(), String> {
+    fn request_graceful_stop(&mut self, _: &str, _: &str) -> Result<(), String> {
+        Ok(())
+    }
+    fn enforce_termination(&mut self, _: &str, _: &str) -> Result<(), String> {
         Ok(())
     }
     fn activate_selected_owner(&mut self) -> Result<(), String> {
@@ -140,20 +173,19 @@ fn socket_transport_orders_receipt_and_resumes_durable_cursor() {
     std::fs::create_dir_all(&dir).unwrap();
     let socket = dir.join("authority.sock");
     let state = dir.join("authority.json");
+    let launch_resolver = resolver(&dir);
     let listener = UnixListener::bind(&socket).unwrap();
     let thread = std::thread::spawn(move || {
-        let mut authority = Authority::open(
+        let mut authority = Authority::open_with_resolver(
             FileStore::new(&state),
             SocketSystem,
             TestClock::new(),
             4,
             Duration::from_secs(1),
+            launch_resolver,
         )
         .unwrap();
         for step in 0..10 {
-            if step == 2 {
-                authority.observe(Observation::SessionRunning).unwrap();
-            }
             if step == 5 {
                 authority = Authority::open(
                     FileStore::new(&state),
@@ -182,7 +214,7 @@ fn socket_transport_orders_receipt_and_resumes_durable_cursor() {
     assert!(matches!(
         client
             .launch(LaunchRequest {
-                item_id: "game".into()
+                item_id: APP_ID.into()
             })
             .unwrap(),
         LaunchResult::Accepted { .. }
@@ -213,7 +245,7 @@ fn socket_transport_orders_receipt_and_resumes_durable_cursor() {
     restarted.acknowledge_last().unwrap();
     let entries = restarted.transport_mut().history_entries().unwrap();
     assert_eq!(entries.len(), 1);
-    assert_eq!(entries[0].item_id, "game");
+    assert_eq!(entries[0].item_id, APP_ID);
     assert!(entries[0].started_at.is_some());
     assert!(entries[0].ended_at.is_some());
     thread.join().unwrap();

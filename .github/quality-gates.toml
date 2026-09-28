@@ -140,7 +140,7 @@ origin = "tsp-bwrg.8"
 
 [[gate]]
 id = "musl-cross-build"
-invariant = "The a133 device binaries (pf-input-collect, pf-collect-ui) link for aarch64-unknown-linux-musl with NO per-invocation RUSTFLAGS override — proving the workspace .cargo/config.toml linker pin works on a stock runner."
+invariant = "The a133 device binaries (pf-app-launch, pf-input-collect, pf-collect-ui) link for aarch64-unknown-linux-musl with NO per-invocation RUSTFLAGS override — proving the workspace .cargo/config.toml linker pin works on a stock runner."
 workflow = ".github/workflows/runtime-tests.yml"
 job = "rust"
 # Accepted fork-skip posture: self-hosted CI skips fork PRs, never same-repo code PRs.

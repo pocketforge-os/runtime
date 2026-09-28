@@ -22,6 +22,7 @@ path = "src/bin/pf-permissions.rs"
 
 [dependencies]
 pocketforge = { workspace = true }
+pf-app-manifest = { workspace = true }
 libc = { workspace = true }
 serde = { workspace = true }
 toml = { workspace = true }

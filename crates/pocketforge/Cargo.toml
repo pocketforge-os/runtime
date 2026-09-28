@@ -12,6 +12,7 @@ authors.workspace = true
 name = "pocketforge"
 
 [dependencies]
+pf-app-manifest = { workspace = true }
 pf-wire = { workspace = true }
 pf-prefs = { workspace = true }
 pf-prefsd = { workspace = true }

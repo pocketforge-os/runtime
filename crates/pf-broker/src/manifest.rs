@@ -17,6 +17,7 @@
 
 use std::collections::BTreeSet;
 
+use pf_app_manifest::parse_capability_requirement;
 use pocketforge::backend::is_known;
 use pocketforge::Descriptor;
 use serde::Deserialize;
@@ -38,19 +39,11 @@ impl UseEntry {
     /// Parse one `use` token: `"<cap>[:<modifier>][?]"`.
     pub fn parse(token: &str) -> UseEntry {
         let raw = token.to_string();
-        let t = token.trim();
-        let (t, optional) = match t.strip_suffix('?') {
-            Some(stripped) => (stripped, true),
-            None => (t, false),
-        };
-        let (cap, modifier) = match t.split_once(':') {
-            Some((c, m)) => (c.trim().to_ascii_lowercase(), Some(m.trim().to_string())),
-            None => (t.trim().to_ascii_lowercase(), None),
-        };
+        let requirement = parse_capability_requirement(token);
         UseEntry {
-            cap,
-            modifier,
-            optional,
+            cap: requirement.base,
+            modifier: requirement.modifier,
+            optional: requirement.optional,
             raw,
         }
     }
@@ -535,6 +528,19 @@ mod tests {
         }
     }
 
+    fn shared_manifest(uses: &[&str]) -> String {
+        let uses = uses
+            .iter()
+            .map(|capability| format!("{capability:?}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            "[app]\nid = \"com.test.app\"\nuse = [{uses}]\n\
+             [runtime]\nfamily = \"pocketforge/a133-powervr\"\nabi = \"1\"\n\
+             [launch]\nexec = \"bin/app\"\n"
+        )
+    }
+
     #[test]
     fn parse_handles_modifier_and_optional() {
         assert_eq!(
@@ -558,6 +564,32 @@ mod tests {
             (eg.cap.as_str(), eg.modifier.as_deref()),
             ("egress", Some("steampowered.com"))
         );
+    }
+
+    #[test]
+    fn shared_manifest_and_broker_requirement_verdicts_match() {
+        let descriptor = desc("a133");
+        for (uses, accepted, duplicate) in [
+            (&["audio"][..], true, None),
+            (
+                &["audio", "audio?"][..],
+                false,
+                Some(Violation::DuplicateCapability("audio".into())),
+            ),
+            (
+                &["location:approximate", "location:precise"][..],
+                false,
+                Some(Violation::DuplicateCapability("location".into())),
+            ),
+        ] {
+            let shared_accepted = pf_app_manifest::parse_manifest(&shared_manifest(uses)).is_ok();
+            let broker_result = manifest(uses).validate(&descriptor);
+            assert_eq!(shared_accepted, accepted, "shared parser: {uses:?}");
+            assert_eq!(broker_result.is_ok(), accepted, "broker parser: {uses:?}");
+            if let Some(duplicate) = duplicate {
+                assert!(broker_result.unwrap_err().contains(&duplicate), "{uses:?}");
+            }
+        }
     }
 
     #[test]

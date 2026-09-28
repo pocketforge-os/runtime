@@ -1,8 +1,14 @@
 use super::*;
 use pf_ports::{SessionEvent, TestClock};
 use std::cell::Cell;
-use std::path::PathBuf;
+use std::io;
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
+
+const APP_ID: &str = "org.example.game";
+static RESOLVER_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 thread_local! {
     static WALL_TIME_SECS: Cell<u64> = const { Cell::new(1_234) };
@@ -19,27 +25,81 @@ fn set_wall_time(seconds: u64) {
 #[derive(Default)]
 struct FakeSystem {
     calls: Vec<String>,
-    start_available: bool,
     fail_force: bool,
     fail_graceful: bool,
     fail_owner: bool,
     fail_start: bool,
+    lifecycle: Option<SystemLifecycle>,
 }
 
 #[derive(Default)]
 struct FakeExecutor {
     calls: Vec<(String, Vec<String>)>,
     codes: VecDeque<i32>,
+    outputs: VecDeque<CommandOutput>,
 }
 impl CommandExecutor for FakeExecutor {
     fn execute(&mut self, program: &str, args: &[String]) -> Result<i32, String> {
         self.calls.push((program.to_owned(), args.to_vec()));
         Ok(self.codes.pop_front().unwrap_or(0))
     }
+
+    fn query(&mut self, program: &str, args: &[String]) -> Result<CommandOutput, String> {
+        self.calls.push((program.to_owned(), args.to_vec()));
+        self.outputs
+            .pop_front()
+            .ok_or_else(|| "missing fake query output".into())
+    }
 }
 
 fn scratch(name: &str) -> PathBuf {
-    std::env::temp_dir().join(format!("pf-authority-{name}-{}", std::process::id()))
+    std::env::temp_dir().join(format!(
+        "pf-authority-{name}-{}-{}",
+        std::process::id(),
+        RESOLVER_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    ))
+}
+
+fn test_resolver() -> Resolver {
+    test_resolver_fixture().0
+}
+
+fn test_resolver_fixture() -> (Resolver, PathBuf) {
+    let dir = scratch("resolver");
+    let root = dir.join("apps");
+    fs::create_dir_all(&root).unwrap();
+    let mut ids = vec![APP_ID.to_owned(), "org.example.never-running".to_owned()];
+    ids.extend((0..5).map(|n| format!("org.example.g{n}")));
+    for id in &ids {
+        let app = root.join(id);
+        fs::create_dir_all(app.join("bin")).unwrap();
+        fs::write(
+            app.join("app.toml"),
+            format!(
+                "[app]\nid = \"{id}\"\nuse = [\"input\"]\n\
+                 [runtime]\nfamily = \"pocketforge/a133-powervr\"\nabi = \"1\"\nplatform-version = \"20\"\n\
+                 [launch]\nexec = \"bin/app\"\n"
+            ),
+        )
+        .unwrap();
+        let executable = app.join("bin/app");
+        fs::write(&executable, b"#!/bin/sh\n").unwrap();
+        let mut permissions = fs::metadata(&executable).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(executable, permissions).unwrap();
+    }
+    let platform = dir.join("platform.toml");
+    fs::write(
+        &platform,
+        "schema_version = 1\n\
+         runtime_family = \"pocketforge/a133-powervr\"\n\
+         runtime_abi = \"1\"\n\
+         platform_version = \"20\"\n\
+         supported_capabilities = [\"input\"]\n",
+    )
+    .unwrap();
+    let executable = root.join(APP_ID).join("bin/app");
+    (Resolver::new(root, platform), executable)
 }
 
 #[test]
@@ -77,7 +137,7 @@ fn file_store_loads_pre_timestamp_history_fixture() {
 }
 
 #[test]
-fn command_system_expands_templates_and_classifies_unavailable() {
+fn command_system_expands_templates_and_reports_start_failure() {
     let executor = FakeExecutor {
         codes: VecDeque::from([0, 3]),
         ..FakeExecutor::default()
@@ -89,24 +149,25 @@ fn command_system_expands_templates_and_classifies_unavailable() {
         "shim owner",
     );
     let mut system = CommandSystem::with_executor(templates, executor);
-    assert!(system
+    system
         .start_foreground(
             &LaunchRequest {
-                item_id: "game".into()
+                item_id: APP_ID.into(),
             },
-            "s1"
+            "s1",
         )
-        .unwrap());
-    assert!(!system
-        .start_foreground(
+        .unwrap();
+    assert_eq!(
+        system.start_foreground(
             &LaunchRequest {
-                item_id: "missing".into()
+                item_id: "org.example.missing".into()
             },
             "s2"
-        )
-        .unwrap());
+        ),
+        Err("command exited 3".into())
+    );
     let executor = system.into_executor();
-    assert_eq!(executor.calls[0].1, ["start", "game", "s1"]);
+    assert_eq!(executor.calls[0].1, ["start", APP_ID, "s1"]);
 }
 
 #[test]
@@ -114,12 +175,12 @@ fn default_command_templates_use_one_session_keyed_unit_for_the_lifecycle() {
     let mut system =
         CommandSystem::with_executor(CommandTemplates::default(), FakeExecutor::default());
     let request = LaunchRequest {
-        item_id: "game".into(),
+        item_id: APP_ID.into(),
     };
 
-    assert!(system.start_foreground(&request, "session-1").unwrap());
-    system.request_graceful_stop("session-1").unwrap();
-    system.enforce_termination("session-1").unwrap();
+    system.start_foreground(&request, "session-1").unwrap();
+    system.request_graceful_stop(APP_ID, "session-1").unwrap();
+    system.enforce_termination(APP_ID, "session-1").unwrap();
 
     let executor = system.into_executor();
     let units: Vec<&str> = executor
@@ -130,9 +191,89 @@ fn default_command_templates_use_one_session_keyed_unit_for_the_lifecycle() {
     assert_eq!(
         units,
         vec![
-            "pf-foreground@session-1.service",
-            "pf-foreground@session-1.service",
-            "pf-foreground@session-1.service",
+            "pf-app@org.example.game.service",
+            "pf-app@org.example.game.service",
+            "pf-app@org.example.game.service",
+        ]
+    );
+}
+
+#[test]
+fn command_system_queries_the_exact_app_target_and_selected_owner_units() {
+    let executor = FakeExecutor {
+        outputs: VecDeque::from([
+            CommandOutput {
+                code: 0,
+                stdout: "inactive\n".into(),
+            },
+            CommandOutput {
+                code: 0,
+                stdout: "exit-code\n".into(),
+            },
+            CommandOutput {
+                code: 3,
+                stdout: String::new(),
+            },
+            CommandOutput {
+                code: 0,
+                stdout: String::new(),
+            },
+        ]),
+        ..FakeExecutor::default()
+    };
+    let mut system = CommandSystem::with_executor(CommandTemplates::default(), executor);
+
+    assert_eq!(
+        system.lifecycle(APP_ID).unwrap(),
+        Some(SystemLifecycle {
+            app: AppUnitState::InactiveFailure {
+                summary: "systemd result: exit-code".into(),
+            },
+            foreground_target_active: false,
+            selected_owner_active: true,
+        })
+    );
+
+    let calls = system.into_executor().calls;
+    assert_eq!(
+        calls,
+        [
+            (
+                "systemctl".into(),
+                vec![
+                    "show".into(),
+                    "--property".into(),
+                    "ActiveState".into(),
+                    "--value".into(),
+                    "pf-app@org.example.game.service".into(),
+                ]
+            ),
+            (
+                "systemctl".into(),
+                vec![
+                    "show".into(),
+                    "--property".into(),
+                    "Result".into(),
+                    "--value".into(),
+                    "pf-app@org.example.game.service".into(),
+                ]
+            ),
+            (
+                "systemctl".into(),
+                vec![
+                    "is-active".into(),
+                    "--quiet".into(),
+                    "pocketforge-foreground.target".into(),
+                ]
+            ),
+            (
+                "systemctl".into(),
+                vec![
+                    "is-active".into(),
+                    "--quiet".into(),
+                    "pf-shell-selected.service".into(),
+                ]
+            ),
         ]
     );
 }
@@ -144,16 +285,16 @@ fn desktop_sim_templates_create_and_remove_session_markers() {
     fs::create_dir_all(&dir).unwrap();
     let mut system = CommandSystem::new(CommandTemplates::desktop_sim(&dir));
     let request = LaunchRequest {
-        item_id: "game".into(),
+        item_id: APP_ID.into(),
     };
     let marker = dir.join("sessions/session-1.running");
 
-    assert!(system.start_foreground(&request, "session-1").unwrap());
+    system.start_foreground(&request, "session-1").unwrap();
     assert!(marker.is_file());
-    system.request_graceful_stop("session-1").unwrap();
+    system.request_graceful_stop(APP_ID, "session-1").unwrap();
     assert!(!marker.exists());
-    system.request_graceful_stop("session-1").unwrap();
-    system.enforce_termination("session-1").unwrap();
+    system.request_graceful_stop(APP_ID, "session-1").unwrap();
+    system.enforce_termination(APP_ID, "session-1").unwrap();
     system.activate_selected_owner().unwrap();
     assert!(dir.join("shell-selected").is_file());
 
@@ -161,22 +302,19 @@ fn desktop_sim_templates_create_and_remove_session_markers() {
 }
 impl FakeSystem {
     fn available() -> Self {
-        Self {
-            start_available: true,
-            ..Self::default()
-        }
+        Self::default()
     }
 }
 impl SessionSystem for FakeSystem {
-    fn start_foreground(&mut self, _: &LaunchRequest, _: &str) -> Result<bool, String> {
+    fn start_foreground(&mut self, _: &LaunchRequest, _: &str) -> Result<(), String> {
         self.calls.push("start".into());
         if self.fail_start {
             Err("start failed".into())
         } else {
-            Ok(self.start_available)
+            Ok(())
         }
     }
-    fn request_graceful_stop(&mut self, _: &str) -> Result<(), String> {
+    fn request_graceful_stop(&mut self, _: &str, _: &str) -> Result<(), String> {
         self.calls.push("graceful".into());
         if self.fail_graceful {
             Err("unavailable".into())
@@ -184,7 +322,7 @@ impl SessionSystem for FakeSystem {
             Ok(())
         }
     }
-    fn enforce_termination(&mut self, _: &str) -> Result<(), String> {
+    fn enforce_termination(&mut self, _: &str, _: &str) -> Result<(), String> {
         self.calls.push("force".into());
         if self.fail_force {
             Err("refused".into())
@@ -200,28 +338,31 @@ impl SessionSystem for FakeSystem {
             Ok(())
         }
     }
+    fn lifecycle(&mut self, _: &str) -> Result<Option<SystemLifecycle>, String> {
+        Ok(self.lifecycle.clone())
+    }
 }
 
 fn authority() -> Authority<MemoryStore, FakeSystem, TestClock> {
-    Authority::open(
+    Authority::open_with_resolver(
         MemoryStore::default(),
         FakeSystem::available(),
         TestClock::new(),
         3,
         Duration::from_millis(10),
+        test_resolver(),
     )
     .unwrap()
 }
 fn launch_running(a: &mut Authority<MemoryStore, FakeSystem, TestClock>) -> String {
     let LaunchResult::Accepted { session_id } = a
         .launch(LaunchRequest {
-            item_id: "game".into(),
+            item_id: APP_ID.into(),
         })
         .unwrap()
     else {
         panic!()
     };
-    a.observe(Observation::SessionRunning).unwrap();
     session_id
 }
 fn restore(a: &mut Authority<MemoryStore, FakeSystem, TestClock>) {
@@ -243,13 +384,12 @@ fn graceful_safe_return_observes_every_rung_before_returned() {
     let mut a = authority();
     let LaunchResult::Accepted { session_id: id } = a
         .launch(LaunchRequest {
-            item_id: "game".into(),
+            item_id: APP_ID.into(),
         })
         .unwrap()
     else {
         panic!()
     };
-    a.observe(Observation::SessionRunning).unwrap();
     a.intake_safe_return().unwrap();
     a.tick().unwrap();
     assert!(matches!(a.state.phase, Phase::StoppingGracefully { .. }));
@@ -263,6 +403,112 @@ fn graceful_safe_return_observes_every_rung_before_returned() {
     assert_eq!(
         events.last().unwrap().1,
         SessionEvent::Terminal(TerminalReceipt::Returned { session_id: id })
+    );
+}
+
+#[test]
+fn events_reconcile_systemd_ladder_but_return_waits_for_presentation_ack() {
+    for app in [
+        AppUnitState::InactiveSuccess,
+        AppUnitState::InactiveFailure {
+            summary: "systemd result: signal".into(),
+        },
+    ] {
+        let mut a = authority();
+        let LaunchResult::Accepted { session_id } = a
+            .launch(LaunchRequest {
+                item_id: APP_ID.into(),
+            })
+            .unwrap()
+        else {
+            panic!()
+        };
+        a.system.lifecycle = Some(SystemLifecycle {
+            app: app.clone(),
+            foreground_target_active: false,
+            selected_owner_active: true,
+        });
+
+        let response = handle_rpc(
+            &mut a,
+            RpcRequest::Events {
+                client_id: "restored-shell".into(),
+            },
+        )
+        .unwrap();
+        let RpcResponse::Events { events } = response else {
+            panic!()
+        };
+        assert!(matches!(
+            a.state.phase,
+            Phase::Restoring {
+                rung: RestorationRung::PresentationAcknowledged,
+                ..
+            }
+        ));
+        assert!(!events
+            .iter()
+            .any(|(_, event)| matches!(event, RpcEvent::Returned { .. } | RpcEvent::Crash { .. })));
+        assert_eq!(
+            a.system
+                .calls
+                .iter()
+                .filter(|call| *call == "owner")
+                .count(),
+            1
+        );
+
+        handle_rpc(
+            &mut a,
+            RpcRequest::Observe {
+                observation: RpcObservation::PresentationAcknowledged,
+            },
+        )
+        .unwrap();
+        let terminal: Vec<_> = a
+            .events_for("restored-shell")
+            .into_iter()
+            .filter_map(|(_, event)| match event {
+                SessionEvent::Terminal(receipt) => Some(receipt),
+                _ => None,
+            })
+            .collect();
+        match app {
+            AppUnitState::InactiveSuccess => {
+                assert_eq!(terminal, [TerminalReceipt::Returned { session_id }])
+            }
+            AppUnitState::InactiveFailure { .. } => assert!(matches!(
+                terminal.as_slice(),
+                [TerminalReceipt::Crash {
+                    session_id: id,
+                    summary
+                }] if id == &session_id && summary == "systemd result: signal"
+            )),
+            AppUnitState::Active => unreachable!(),
+        }
+    }
+}
+
+#[test]
+fn invalid_and_unknown_ids_are_unavailable_without_any_system_command() {
+    let mut a = authority();
+    assert_eq!(
+        a.launch(LaunchRequest {
+            item_id: "../outside".into(),
+        }),
+        Ok(LaunchResult::ItemUnavailable)
+    );
+    assert_eq!(
+        a.launch(LaunchRequest {
+            item_id: "org.example.unknown".into(),
+        }),
+        Ok(LaunchResult::ItemUnavailable)
+    );
+    assert!(a.system.calls.is_empty());
+    assert_eq!(a.state.next_session, 1);
+    assert_eq!(
+        launch_refusal_line("app_not_found", "org.example.unknown"),
+        "pf-session-authorityd: launch_refused reason=app_not_found item_id=\"org.example.unknown\""
     );
 }
 
@@ -301,12 +547,12 @@ fn rpc_safe_return_while_idle_does_not_affect_subsequent_launch() {
 
     assert!(matches!(
         a.launch(LaunchRequest {
-            item_id: "game".into(),
+            item_id: APP_ID.into(),
         })
         .unwrap(),
         LaunchResult::Accepted { .. }
     ));
-    assert!(matches!(a.state.phase, Phase::Starting { .. }));
+    assert!(matches!(a.state.phase, Phase::Running { .. }));
     assert_eq!(a.state.safe_return_queue, 0);
     assert_eq!(a.system.calls, ["start"]);
 }
@@ -372,12 +618,13 @@ fn clean_exit_and_crash_are_typed_and_wait_for_presentation() {
 fn fixed_wall_clock_stamps_end_observation_not_restoration_completion() {
     let make = || {
         set_wall_time(1_234);
-        Authority::open_with_now_fn(
+        Authority::open_with_resolver_and_now_fn(
             MemoryStore::default(),
             FakeSystem::available(),
             TestClock::new(),
             3,
             Duration::from_millis(10),
+            test_resolver(),
             fixed_wall_time,
         )
         .unwrap()
@@ -436,21 +683,6 @@ fn fixed_wall_clock_stamps_end_observation_not_restoration_completion() {
     );
     crashed.observe(Observation::UnitInactive).unwrap();
     restore(&mut crashed);
-
-    let mut never_running = make();
-    never_running
-        .launch(LaunchRequest {
-            item_id: "never-running".into(),
-        })
-        .unwrap();
-    never_running
-        .observe(Observation::SessionExitedCleanly)
-        .unwrap();
-    never_running.observe(Observation::UnitInactive).unwrap();
-    restore(&mut never_running);
-    let entry = never_running.state.history.front().unwrap();
-    assert_eq!(entry.started_at, None);
-    assert_eq!(entry.ended_at.unwrap().precision, EndPrecision::Observed);
 }
 
 #[test]
@@ -545,6 +777,59 @@ fn restart_mid_ladder_resumes_without_double_publication() {
 }
 
 #[test]
+fn interrupted_start_intent_reconciles_from_the_exact_active_app_unit() {
+    let persisted = PersistedState {
+        next_session: 2,
+        phase: Phase::Starting {
+            session_id: "session-1".into(),
+            item_id: APP_ID.into(),
+            start_invoked: false,
+        },
+        ..PersistedState::default()
+    };
+    let mut store = MemoryStore::default();
+    store.save(&persisted).unwrap();
+    let system = FakeSystem {
+        lifecycle: Some(SystemLifecycle {
+            app: AppUnitState::Active,
+            foreground_target_active: true,
+            selected_owner_active: false,
+        }),
+        ..FakeSystem::available()
+    };
+    let mut authority = Authority::open_with_resolver(
+        store,
+        system,
+        TestClock::new(),
+        3,
+        Duration::from_millis(10),
+        test_resolver(),
+    )
+    .unwrap();
+
+    authority.reconcile().unwrap();
+
+    assert!(matches!(
+        authority.state.phase,
+        Phase::Running {
+            ref session_id,
+            ref item_id,
+        } if session_id == "session-1" && item_id == APP_ID
+    ));
+    assert!(authority.system.calls.is_empty());
+    assert_eq!(authority.state.history.len(), 1);
+    assert_eq!(authority.state.history[0].item_id, APP_ID);
+    let events = authority.events_for("restored-shell");
+    assert!(matches!(
+        events.as_slice(),
+        [
+            (_, SessionEvent::Observed(ObservedSessionState::Starting)),
+            (_, SessionEvent::Observed(ObservedSessionState::Running))
+        ]
+    ));
+}
+
+#[test]
 fn recent_is_bounded_busy_is_rejected_and_binding_updates_persist() {
     let mut a = authority();
     a.update_safe_return_binding(4).unwrap();
@@ -553,14 +838,14 @@ fn recent_is_bounded_busy_is_rejected_and_binding_updates_persist() {
     for n in 0..5 {
         assert!(matches!(
             a.launch(LaunchRequest {
-                item_id: format!("g{n}")
+                item_id: format!("org.example.g{n}")
             })
             .unwrap(),
             LaunchResult::Accepted { .. }
         ));
         assert_eq!(
             a.launch(LaunchRequest {
-                item_id: "busy".into()
+                item_id: "org.example.busy".into()
             })
             .unwrap(),
             LaunchResult::RejectedBusy
@@ -570,7 +855,7 @@ fn recent_is_bounded_busy_is_rejected_and_binding_updates_persist() {
         restore(&mut a);
     }
     assert_eq!(a.state.history.len(), 3);
-    assert_eq!(a.state.history.front().unwrap().item_id, "g4");
+    assert_eq!(a.state.history.front().unwrap().item_id, "org.example.g4");
 }
 
 #[test]
@@ -596,23 +881,23 @@ fn file_store_survives_a_real_atomic_restart() {
         std::process::id()
     ));
     let _ = std::fs::remove_file(&path);
-    let mut a = Authority::open(
+    let mut a = Authority::open_with_resolver(
         FileStore::new(&path),
         FakeSystem::available(),
         TestClock::new(),
         3,
         Duration::from_millis(10),
+        test_resolver(),
     )
     .unwrap();
     let LaunchResult::Accepted { session_id: id } = a
         .launch(LaunchRequest {
-            item_id: "game".into(),
+            item_id: APP_ID.into(),
         })
         .unwrap()
     else {
         panic!()
     };
-    a.observe(Observation::SessionRunning).unwrap();
     drop(a);
     let restarted = Authority::open(
         FileStore::new(&path),
@@ -627,43 +912,112 @@ fn file_store_survives_a_real_atomic_restart() {
 }
 
 #[test]
-fn interrupted_write_ahead_start_intent_reconciles_to_typed_recovery() {
+fn authority_accepts_then_start_failure_is_recorded_as_crash_drift() {
     let mut system = FakeSystem::available();
     system.fail_start = true;
-    let mut a = Authority::open(
+    let mut a = Authority::open_with_resolver(
         MemoryStore::default(),
         system,
         TestClock::new(),
         3,
         Duration::from_millis(10),
+        test_resolver(),
     )
     .unwrap();
     assert_eq!(
         a.launch(LaunchRequest {
-            item_id: "game".into()
+            item_id: APP_ID.into()
         }),
-        Err(AuthorityError::Backend("start failed".into()))
+        Ok(LaunchResult::Accepted {
+            session_id: "session-1".into()
+        })
     );
     assert!(matches!(
         a.store.snapshot().unwrap().phase,
-        Phase::Starting {
-            start_invoked: false,
+        Phase::Restoring {
+            receipt: Receipt::Crash { ref summary },
+            rung: RestorationRung::UnitInactive,
             ..
-        }
+        } if summary.contains("systemd_start_failed")
     ));
+    assert_eq!(a.system.calls, ["start"]);
+}
 
-    let (store, system, clock) = a.into_parts();
-    let mut reopened = Authority::open(store, system, clock, 3, Duration::from_millis(10)).unwrap();
-    reopened.reconcile().unwrap();
+#[derive(Default)]
+struct MustNotExec;
+
+impl pf_app_launch::Exec for MustNotExec {
+    fn exec(&mut self, _: &Path, _: &Path) -> io::Result<()> {
+        panic!("mutated application must fail before exec")
+    }
+}
+
+struct MutatingHelperSystem {
+    resolver: Resolver,
+    executable: PathBuf,
+}
+
+impl SessionSystem for MutatingHelperSystem {
+    fn start_foreground(&mut self, request: &LaunchRequest, _: &str) -> Result<(), String> {
+        fs::remove_file(&self.executable).map_err(|error| error.to_string())?;
+        let xdg = self.executable.parent().unwrap().join("xdg");
+        let error = pf_app_launch::launch_with(
+            &self.resolver,
+            &request.item_id,
+            &xdg.join("config"),
+            &xdg.join("state"),
+            &mut MustNotExec,
+        )
+        .unwrap_err();
+        Err(format!(
+            "{}: helper exit {}",
+            error.reason().as_str(),
+            error.exit_code()
+        ))
+    }
+    fn request_graceful_stop(&mut self, _: &str, _: &str) -> Result<(), String> {
+        Ok(())
+    }
+    fn enforce_termination(&mut self, _: &str, _: &str) -> Result<(), String> {
+        Ok(())
+    }
+    fn activate_selected_owner(&mut self) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+#[test]
+fn helper_revalidation_fails_closed_after_authority_acceptance_and_records_crash() {
+    let (resolver, executable) = test_resolver_fixture();
+    let system = MutatingHelperSystem {
+        resolver: resolver.clone(),
+        executable,
+    };
+    let mut authority = Authority::open_with_resolver(
+        MemoryStore::default(),
+        system,
+        TestClock::new(),
+        3,
+        Duration::from_millis(10),
+        resolver,
+    )
+    .unwrap();
+
     assert!(matches!(
-        reopened.state.phase,
-        Phase::RecoveryRequired { ref reason, .. }
-            if reason.contains("interrupted start intent")
+        authority
+            .launch(LaunchRequest {
+                item_id: APP_ID.into(),
+            })
+            .unwrap(),
+        LaunchResult::Accepted { .. }
     ));
-    assert!(reopened
-        .events_for("launcher")
-        .iter()
-        .any(|(_, event)| matches!(event, SessionEvent::RecoveryRequired(_))));
+    assert!(matches!(
+        authority.state.phase,
+        Phase::Restoring {
+            receipt: Receipt::Crash { ref summary },
+            ..
+        } if summary.contains("exec_missing") && summary.contains("helper exit 66")
+    ));
 }
 
 #[derive(Default)]
@@ -682,17 +1036,18 @@ impl StateStore for RefusingStore {
 
 #[test]
 fn start_is_never_invoked_when_write_ahead_intent_save_fails() {
-    let mut a = Authority::open(
+    let mut a = Authority::open_with_resolver(
         RefusingStore::default(),
         FakeSystem::available(),
         TestClock::new(),
         3,
         Duration::from_millis(10),
+        test_resolver(),
     )
     .unwrap();
     assert_eq!(
         a.launch(LaunchRequest {
-            item_id: "game".into()
+            item_id: APP_ID.into()
         }),
         Err(AuthorityError::Persistence("refused".into()))
     );
