@@ -5,11 +5,10 @@
 //! prompt sequence headlessly via `collect::run`, and asserts:
 //!   1. the emitted `[[inputs]]` rows match the a133 ground-truth code map — the `tsp-ozbp.2` UART
 //!      decode + the owner-verified frozen evdev baseline (17/17), i.e. the DECODER's real output.
-//!      (Note: `platform/devices/a133/capabilities.toml` still models L2/R2 as `ABS_Z`/`ABS_RZ`
-//!      analog axes — stale vs the decoder's button output; that descriptor correction is
-//!      tsp-e1b-coord's lane, see the tsp-bwrg.6 validation report.)
-//!   2. the L2/R2 triggers are BINARY triggers realized as BUTTONS (`BTN_TL2`/`BTN_TR2`,
-//!      `semantics="binary"`) — the a133 MCU reports them as bits in the button bitmask;
+//!   2. the L2/R2 triggers are BINARY trigger AXES (`ABS_Z`/`ABS_RZ`, endpoint-only `0`/`255`,
+//!      `semantics="binary"`) — the a133 MCU reports them as bits in the button bitmask and the
+//!      decoder emits each as its trigger axis at an endpoint (`tsp-f3fm.217`), which is exactly
+//!      the shape `platform/devices/a133/capabilities.toml` declares for `ltrig`/`rtrig`;
 //!   3. stick axis ranges + the derived SDL GUID + identity match;
 //!   4. (when a `platform` checkout is discoverable) the emitted candidate PASSES the real
 //!      `platform/core/caps.py validate` — in a self-contained temp tree, so it neither needs
@@ -34,13 +33,12 @@ const BTN_START: u16 = 0x13b;
 const BTN_MODE: u16 = 0x13c;
 const BTN_TL: u16 = 0x136;
 const BTN_TR: u16 = 0x137;
-const BTN_TL2: u16 = 0x138; // L2 — the a133 left trigger, emitted as a BUTTON by the decoder
-const BTN_TR2: u16 = 0x139; // R2 — the a133 right trigger, emitted as a BUTTON by the decoder
 const ABS_X: u16 = 0x00;
 const ABS_Y: u16 = 0x01;
-const ABS_Z: u16 = 0x02;
+const ABS_Z: u16 = 0x02; // L2 — the decoder's endpoint-only binary trigger axis (tsp-f3fm.217)
 const ABS_RX: u16 = 0x03;
 const ABS_RY: u16 = 0x04;
+const ABS_RZ: u16 = 0x05; // R2 — the decoder's endpoint-only binary trigger axis (tsp-f3fm.217)
 const ABS_HAT0X: u16 = 0x10;
 const ABS_HAT0Y: u16 = 0x11;
 
@@ -99,14 +97,16 @@ fn a133_source() -> ScriptedSource {
         pid: 0x028e, // Xbox 360 wired
         version: 0x0110,
     };
-    // The real a133 decoder (pf-input-decode, tsp-ozbp.9) advertises ONLY these axes — the two
-    // sticks + the dpad hat. It does NOT advertise ABS_Z/ABS_RZ: L2/R2 come over the UART as
-    // BINARY BITS in the button bitmask and are emitted as BTN_TL2/BTN_TR2 buttons, never axes.
+    // The real a133 decoder (pf-input-decode) advertises the two sticks, the two binary trigger
+    // AXES ABS_Z/ABS_RZ (0..255; L2/R2 come over the UART as bits and are emitted at an endpoint,
+    // tsp-f3fm.217 — never as BTN_TL2/BTN_TR2), and the dpad hat.
     let mut s = ScriptedSource::new(ident)
         .with_abs(ABS_X, STICK)
         .with_abs(ABS_Y, STICK)
         .with_abs(ABS_RX, STICK)
         .with_abs(ABS_RY, STICK)
+        .with_abs(ABS_Z, TRIG)
+        .with_abs(ABS_RZ, TRIG)
         // The decoder advertises the dpad hat axes (range -1..1); declare them so the engine's
         // midpoint-deviation activity test can read their absinfo (tsp-bwrg.6 continuous-stream fix).
         .with_abs(ABS_HAT0X, HAT)
@@ -164,13 +164,14 @@ fn a133_source() -> ScriptedSource {
         gap(&mut s);
     }
 
-    // ltrig — a BINARY trigger realized as a BUTTON: the a133 L2 fires BTN_TL2 (no analog axis).
-    // Completes on key-down, like the face buttons.
-    s.push_batch(vec![key(BTN_TL2, 1), key(BTN_TL2, 0)]);
+    // ltrig — a BINARY trigger AXIS: the decoder emits ABS_Z 255 on press, 0 on release, and
+    // nothing in between (endpoint-only). Reaching the full press completes it after the settle.
+    s.push_batch(vec![abs(ABS_Z, 255), abs(ABS_Z, 0)]);
     gap(&mut s);
 
-    // rtrig — R2 fires BTN_TR2.
-    s.push_batch(vec![key(BTN_TR2, 1), key(BTN_TR2, 0)]);
+    // rtrig — R2: ABS_RZ 255 then 0.
+    s.push_batch(vec![abs(ABS_RZ, 255), abs(ABS_RZ, 0)]);
+    gap(&mut s);
 
     s
 }
@@ -229,11 +230,10 @@ fn emitted_inputs_match_the_a133_ground_truth_code_map() {
         ("dpad", ("hat", "EV_ABS", "ABS_HAT0X,ABS_HAT0Y", None)),
         ("lstick", ("stick", "EV_ABS", "ABS_X,ABS_Y", None)),
         ("rstick", ("stick", "EV_ABS", "ABS_RX,ABS_RY", None)),
-        // L2/R2: binary triggers realized as buttons — kind=trigger (intent), EV_KEY BTN_TL2/TR2
-        // (the decoder's real output), semantics=binary. This is the owner-verified reality
-        // (tsp-ozbp.2 + frozen evdev baseline 17/17), NOT the stale ABS_Z/RZ analog model.
-        ("ltrig", ("trigger", "EV_KEY", "BTN_TL2", Some("binary"))),
-        ("rtrig", ("trigger", "EV_KEY", "BTN_TR2", Some("binary"))),
+        // L2/R2: binary trigger axes — kind=trigger, EV_ABS ABS_Z/ABS_RZ, semantics=binary: the
+        // decoder's real output since tsp-f3fm.217 AND the a133 descriptor's ltrig/rtrig rows.
+        ("ltrig", ("trigger", "EV_ABS", "ABS_Z", Some("binary"))),
+        ("rtrig", ("trigger", "EV_ABS", "ABS_RZ", Some("binary"))),
     ]);
 
     let got: BTreeMap<String, (String, String, String, Option<String>)> = caps
@@ -296,16 +296,17 @@ fn identity_sdl_guid_and_stick_ranges_are_correct() {
     assert_eq!((x.min, x.max, x.fuzz, x.flat), (-32768, 32767, 16, 128));
     assert!(lstick.y.is_some());
 
-    // The a133 trigger is a BUTTON on the wire (BTN_TL2), so it carries NO analog range — but it
-    // is still marked semantics=binary (a binary trigger realized as a button).
-    let ltrig = caps.inputs.iter().find(|i| i.id == "ltrig").unwrap();
-    assert_eq!(ltrig.ev_type, "EV_KEY");
-    assert_eq!(ltrig.code, "BTN_TL2");
-    assert!(
-        ltrig.range.is_none(),
-        "a button-realized trigger has no analog range"
-    );
-    assert_eq!(ltrig.semantics.as_deref(), Some("binary"));
+    // The a133 triggers are endpoint-only AXES (ABS_Z/ABS_RZ): each carries the declared 0..255
+    // range and is classified semantics=binary from the observed endpoint-only values — the exact
+    // row the a133 descriptor declares and pf-input-broker requires (tsp-f3fm.217).
+    for (id, code) in [("ltrig", "ABS_Z"), ("rtrig", "ABS_RZ")] {
+        let t = caps.inputs.iter().find(|i| i.id == id).unwrap();
+        assert_eq!(t.ev_type, "EV_ABS", "{id}");
+        assert_eq!(t.code, code, "{id}");
+        let r = t.range.expect("a trigger axis carries its range");
+        assert_eq!((r.min, r.max), (0, 255), "{id} range");
+        assert_eq!(t.semantics.as_deref(), Some("binary"), "{id}");
+    }
 }
 
 #[test]

@@ -64,9 +64,9 @@ pub enum Recorded {
         semantics: Semantics,
     },
     /// A trigger that manifests as a single EV_KEY button — a binary switch on the wire, never an
-    /// analog axis (the a133 L2/R2: the MCU reports them as a bit in the button bitmask, and the
-    /// decoder emits `BTN_TL2`/`BTN_TR2`, per `tsp-ozbp.2` + the owner-verified decoder output).
-    /// It is a `trigger` by intent but a button on the wire, so it emits an `EV_KEY` row carrying
+    /// analog axis (some pads report L2/R2 as `BTN_TL2`/`BTN_TR2`; the a133 decoder did until
+    /// `tsp-f3fm.217` and now emits endpoint-only `ABS_Z`/`ABS_RZ`, captured as [`Recorded::Trigger`]
+    /// with binary semantics). It is a `trigger` by intent but a button on the wire, so it emits an `EV_KEY` row carrying
     /// `semantics="binary"` (the exact `kind=trigger` + button-code shape caps.py already maps to
     /// SDL `lefttrigger`/`righttrigger`).
     TriggerButton {
@@ -671,12 +671,12 @@ fn finalize(
             })
         }
         Kind::Trigger => {
-            // A trigger manifests one of two ways, and the a133 is the second:
+            // A trigger manifests one of two ways:
             //  (1) an ANALOG axis (`ABS_Z`/`ABS_RZ`) that travels to a full press — a genuine
-            //      proportional trigger (or an analog-wire switch that only hits its endpoints); or
-            //  (2) a single EV_KEY BUTTON (`BTN_TL2`/`BTN_TR2`) — the a133 L2/R2, which the MCU
-            //      reports as a binary bit and the decoder emits as a button (tsp-ozbp.2 + the
-            //      owner-verified decoder output). There is NO analog value on the wire for it.
+            //      proportional trigger, or an analog-wire switch that only hits its endpoints (the
+            //      a133 L2/R2 since tsp-f3fm.217: the decoder emits `ABS_Z`/`ABS_RZ` = 0/255); or
+            //  (2) a single EV_KEY BUTTON (`BTN_TL2`/`BTN_TR2`) — a pad that reports the trigger as
+            //      a button (the a133 decoder before tsp-f3fm.217). No analog value on the wire.
             // Prefer an axis ONLY if one actually reached a full press; otherwise a resting
             // neighbour axis (e.g. the same-side stick still streaming its centre value while the
             // owner squeezes the trigger) must NOT be mistaken for the trigger — fall back to the
@@ -1020,8 +1020,8 @@ impl Window {
                     Coverage::None
                 }
             }
-            // Two shapes on the wire. A binary trigger realized as a BUTTON (the a133 L2/R2, which
-            // the MCU reports as a bit and the decoder emits as `BTN_TL2`/`BTN_TR2`) is discrete. A
+            // Two shapes on the wire. A binary trigger realized as a BUTTON (`BTN_TL2`/`BTN_TR2` on
+            // a pad that reports it that way) is discrete. A
             // genuinely ANALOG trigger must actually REACH a full press — a partial squeeze followed
             // by a human pause used to close the window at partial travel, and `finalize` then
             // failed the whole run with "never reached a full press" (tsp-bwrg.12).
@@ -1126,7 +1126,7 @@ pub fn drain_between_controls<S: EventSource>(src: &mut S, cfg: &RunConfig) -> i
 /// Whether one event counts as a real actuation of a control of `kind` — used by the pump to drive
 /// activity/settle. A button/stick-click actuates on a key-DOWN. A hat/stick/trigger actuates on a
 /// SIGNIFICANT abs deviation (midpoint-relative, so the a133's continuous at-rest stick stream does
-/// NOT read as activity) OR, for a trigger, a key-down (the a133 L2/R2 button-triggers).
+/// NOT read as activity) OR, for a trigger, a key-down (a pad's button-realized triggers).
 fn poll_event_active(
     kind: Kind,
     e: &RawEvent,

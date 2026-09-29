@@ -43,7 +43,8 @@ pub mod scm;
 pub mod uinput;
 
 pub use broker::{
-    acquire_input_fd, handle_acquire, read_events_raw, serve_acquire, serve_client, InputBroker,
+    acquire_input_fd, handle_acquire, missing_source_capabilities, read_events_raw, serve_acquire,
+    serve_client, InputBroker, MissingCapabilities, SourceCapabilities,
 };
 pub use policy::TokenBucket;
 pub use remap::{Remap, RemapError};

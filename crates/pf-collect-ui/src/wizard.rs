@@ -620,10 +620,13 @@ fn synth_events_for(id: &str) -> Vec<RawEvent> {
         ],
         "lstick" => stick(0x0, 0x1),
         "rstick" => stick(0x3, 0x4),
-        // Left trigger realized as a binary BUTTON — the real a133 L2/R2 shape (the MCU reports it
-        // as a bit; the decoder emits BTN_TL2). Exercises the button-trigger path on the panel.
         "guide" => btn(0x13c), // BTN_MODE (the MENU button; SDL `guide`)
-        "ltrig" => btn(0x138), // BTN_TL2
+        // Left trigger as the real a133 L2 shape: the MCU reports a bit and pf-input-decode emits
+        // the endpoint-only binary axis ABS_Z = 255 then 0 (tsp-f3fm.217). Classifies `binary`.
+        "ltrig" => vec![
+            RawEvent::new(EV_ABS, 0x2, 255),
+            RawEvent::new(EV_ABS, 0x2, 0),
+        ],
         // Right trigger ANALOG (intermediate travel) — shows the other classification.
         "rtrig" => vec![
             RawEvent::new(EV_ABS, 0x5, 0),
@@ -641,6 +644,16 @@ mod tests {
     use crate::image::Rgb;
     use crate::skin::{Rect, View};
     use std::collections::HashMap;
+
+    /// The GENERIC button-realized trigger codes (`BTN_TL2`/`BTN_TR2`) the drive fixtures below feed
+    /// to ltrig/rtrig. Deliberately NOT the a133 decoder's shape — it emits endpoint-only
+    /// `ABS_Z`/`ABS_RZ` since tsp-f3fm.217 (covered by pf-input-collect's a133 tests and the demo
+    /// source above). These fixtures test the wizard's ack/drain/re-prompt boundaries, and a
+    /// button-trigger completes on its discrete key-down, which is what makes the no-cushion
+    /// ltrig→rtrig boundary a clean wrong-code regression; the collector must keep supporting that
+    /// trigger shape for pads that have it.
+    const BUTTON_TRIGGER_L: u16 = 0x138;
+    const BUTTON_TRIGGER_R: u16 = 0x139;
 
     // A tiny synthetic skin covering every a133 engine id so compose() never no-ops in the drive.
     fn demo_skin() -> SkinSet {
@@ -771,8 +784,8 @@ mod tests {
     #[test]
     fn drive_live_reprompts_a_fumbled_control_and_keeps_prior_captures() {
         use pf_input_decode::codes::{
-            BTN_EAST, BTN_MODE, BTN_NORTH, BTN_SELECT, BTN_SOUTH, BTN_START, BTN_TL, BTN_TL2,
-            BTN_TR, BTN_TR2, BTN_WEST,
+            BTN_EAST, BTN_MODE, BTN_NORTH, BTN_SELECT, BTN_SOUTH, BTN_START, BTN_TL, BTN_TR,
+            BTN_WEST,
         };
         const EV_ABS: u16 = 0x03;
         const QUIET: usize = 12; // per-control trailing quiet: the settle, THEN the fixed drain
@@ -851,7 +864,7 @@ mod tests {
             src.push_batch(abs2(cx, cy, 0));
             quiet(&mut src, QUIET);
         }
-        for code in [BTN_TL2, BTN_TR2] {
+        for code in [BUTTON_TRIGGER_L, BUTTON_TRIGGER_R] {
             src.push_batch(press(code)); // binary triggers, realized as buttons
             quiet(&mut src, QUIET);
         }
@@ -932,8 +945,8 @@ mod tests {
         pad: usize,
     ) -> ScriptedSource {
         use pf_input_decode::codes::{
-            BTN_EAST, BTN_MODE, BTN_NORTH, BTN_SELECT, BTN_SOUTH, BTN_START, BTN_TL, BTN_TL2,
-            BTN_TR, BTN_TR2, BTN_WEST,
+            BTN_EAST, BTN_MODE, BTN_NORTH, BTN_SELECT, BTN_SOUTH, BTN_START, BTN_TL, BTN_TR,
+            BTN_WEST,
         };
         const EV_ABS: u16 = 0x03;
         let stick = AbsInfo {
@@ -1005,9 +1018,9 @@ mod tests {
             quiet(&mut src, quiet_gap);
         }
         // ltrig -> rtrig is the tested boundary: ltrig's cushion is `ltrig_gap` (tight = drain_polls).
-        src.push_batch(press(BTN_TL2));
+        src.push_batch(press(BUTTON_TRIGGER_L));
         quiet(&mut src, ltrig_gap);
-        src.push_batch(press(BTN_TR2));
+        src.push_batch(press(BUTTON_TRIGGER_R));
         quiet(&mut src, quiet_gap);
         for _ in 0..pad {
             src.push_batch(press(BTN_SOUTH));
@@ -1134,8 +1147,6 @@ mod tests {
     #[test]
     fn no_event_is_lost_across_the_positive_ack() {
         use pf_input_collect::codes::key_name;
-        use pf_input_decode::codes::{BTN_TL2, BTN_TR2};
-
         let timing = fast_test_timing();
         let drain = timing.drain_polls; // the gap the inter-control drain consumes (engine default 8)
         const QUIET: usize = 12;
@@ -1169,7 +1180,7 @@ mod tests {
         // ltrig recorded its own press...
         assert_eq!(
             code_of("ltrig").as_deref(),
-            key_name(BTN_TL2),
+            key_name(BUTTON_TRIGGER_L),
             "ltrig lost or shifted its capture; got {:?}",
             code_of("ltrig")
         );
@@ -1177,7 +1188,7 @@ mod tests {
         // poll-consuming ack would have swallowed rtrig's press and rtrig would carry the pad's code.
         assert_eq!(
             code_of("rtrig").as_deref(),
-            key_name(BTN_TR2),
+            key_name(BUTTON_TRIGGER_R),
             "rtrig did NOT record its own press across the no-cushion ack boundary — the ack swallowed \
              rtrig's event (a blocking/poll-consuming ack). rtrig got {:?}",
             code_of("rtrig")

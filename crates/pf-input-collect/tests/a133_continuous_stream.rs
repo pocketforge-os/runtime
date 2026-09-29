@@ -21,6 +21,9 @@ use pf_input_collect::Collector;
 // Nintendo-arranged, so the glyph and the kernel's letter alias agree on west/north and are INVERTED
 // on south/east, which makes a glyph-keyed fixture look correct exactly half the time.
 use pf_input_decode::codes::{BTN_EAST, BTN_SOUTH};
+// The decoder's binary trigger AXES and their range, consumed the same way (tsp-f3fm.217): L2/R2 are
+// `ABS_Z`/`ABS_RZ` at an endpoint, never `BTN_TL2`/`BTN_TR2` (which that module no longer defines).
+use pf_input_decode::codes::{ABS_RZ, ABS_Z, TRIGGER_MAX, TRIGGER_MIN};
 
 const EV_KEY: u16 = 0x01;
 const EV_ABS: u16 = 0x03;
@@ -33,6 +36,13 @@ const ABS_HAT0Y: u16 = 0x11;
 const STICK: AbsInfo = AbsInfo {
     min: 0,
     max: 4095,
+    fuzz: 0,
+    flat: 0,
+    resolution: 0,
+};
+const TRIG: AbsInfo = AbsInfo {
+    min: TRIGGER_MIN,
+    max: TRIGGER_MAX,
     fuzz: 0,
     flat: 0,
     resolution: 0,
@@ -72,6 +82,8 @@ fn dut() -> ScriptedSource {
         .with_abs(ABS_Y, STICK)
         .with_abs(ABS_RX, STICK)
         .with_abs(ABS_RY, STICK)
+        .with_abs(ABS_Z, TRIG)
+        .with_abs(ABS_RZ, TRIG)
         .with_abs(ABS_HAT0X, HAT)
         .with_abs(ABS_HAT0Y, HAT)
 }
@@ -723,7 +735,7 @@ fn four_dpad_direction_steps_merge_to_one_hat_row() {
 fn full_17_prompt_plan_walks_to_completion() {
     use pf_input_collect::plan::a133_gamepad_plan;
     use pf_input_decode::codes::{
-        BTN_MODE, BTN_NORTH, BTN_SELECT, BTN_START, BTN_TL, BTN_TL2, BTN_TR, BTN_TR2, BTN_WEST,
+        BTN_MODE, BTN_NORTH, BTN_SELECT, BTN_START, BTN_TL, BTN_TR, BTN_WEST,
     };
     let key = |code: u16| {
         let mut f = rest_frame();
@@ -826,11 +838,12 @@ fn full_17_prompt_plan_walks_to_completion() {
     src.push_batch(ry(4095));
     src.push_batch(ry(0));
     gap(&mut src, HUMAN_GAP);
-    // ltrig, rtrig — binary buttons (BTN_TL2 / BTN_TR2)
-    src.push_batch(key(BTN_TL2));
-    gap(&mut src, HUMAN_GAP);
-    src.push_batch(key(BTN_TR2));
-    gap(&mut src, HUMAN_GAP);
+    // ltrig, rtrig — the decoder's endpoint-only binary trigger AXES (ABS_Z / ABS_RZ: full press,
+    // then release, over the continuous rest-stick stream), tsp-f3fm.217.
+    for code in [ABS_Z, ABS_RZ] {
+        src.push_batch(dir(code, TRIGGER_MAX));
+        gap(&mut src, HUMAN_GAP);
+    }
     src.push_batch(vec![]);
     src.push_batch(vec![]);
 
@@ -874,6 +887,17 @@ fn full_17_prompt_plan_walks_to_completion() {
                     Some(&Recorded::Button { code }),
                     "{id} must record the code its own physical position emitted"
                 );
+            }
+            // Each trigger recorded ITS OWN axis, classified binary (endpoint-only) — the a133
+            // descriptor's ltrig/rtrig shape.
+            for (id, want) in [("ltrig", "ABS_Z"), ("rtrig", "ABS_RZ")] {
+                let row = cap.inputs.iter().find(|i| i.id == id).unwrap();
+                assert_eq!(
+                    (row.ev_type.as_str(), row.code.as_str()),
+                    ("EV_ABS", want),
+                    "{id} must record its own trigger axis"
+                );
+                assert_eq!(row.semantics.as_deref(), Some("binary"), "{id} semantics");
             }
         }
         Err(e) => panic!("the full 17-prompt plan must walk to completion, not abort: {e}"),

@@ -334,10 +334,14 @@ impl Remap {
         &self.spec
     }
 
-    pub(crate) fn required_source_keys(&self) -> &[u16] {
+    /// The `EV_KEY` codes the SOURCE must advertise: each non-system `EV_KEY` row's wire code.
+    pub fn required_source_keys(&self) -> &[u16] {
         &self.source_keys
     }
-    pub(crate) fn required_source_abs(&self) -> &[u16] {
+    /// The `EV_ABS` codes the SOURCE must advertise: every non-system `EV_ABS` row's wire code(s),
+    /// INCLUDING `semantics="binary"` triggers (the a133 `ltrig`/`rtrig` `ABS_Z`/`ABS_RZ`), which
+    /// the broker reads as axes and re-emits as buttons.
+    pub fn required_source_abs(&self) -> &[u16] {
         &self.source_abs
     }
 

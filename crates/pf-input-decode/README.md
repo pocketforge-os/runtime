@@ -30,7 +30,7 @@ Sticks are 12-bit: `X = (Xhi<<8)|Xlo`, `Y = (Yhi<<8)|Ylo` (masked to `0..=4095`)
 | `byte2` bit | ttyS3 = **RIGHT** | ttyS4 = **LEFT** |
 |-------------|-------------------|------------------|
 | `0x01` | R1 → `BTN_TR` | L1 → `BTN_TL` |
-| `0x02` | R2 → `BTN_TR2` | L2 → `BTN_TL2` |
+| `0x02` | R2 → `ABS_RZ` = 255 / 0 | L2 → `ABS_Z` = 255 / 0 |
 | `0x04` | **north** (top, printed "X") → `BTN_NORTH` | D-up → `ABS_HAT0Y = -1` |
 | `0x08` | **west** (left, printed "Y") → `BTN_WEST` | D-left → `ABS_HAT0X = -1` |
 | `0x10` | **east** (right, printed "A") → `BTN_EAST` | D-right → `ABS_HAT0X = +1` |
@@ -66,9 +66,14 @@ mirror is `tests/face_position_frame.rs`; read its header before changing any fa
 
 ### Mapping decisions
 
-- **L2/R2 are physically binary → buttons** (`BTN_TL2`/`BTN_TR2`), matching `pf-input-broker`'s
-  `semantics="binary"` mapping. Both layers agree so the `tsp-bwrg` validation gate sees one
-  consistent story.
+- **L2/R2 are trigger AXES `ABS_Z`/`ABS_RZ`, range `0..255`, endpoint-only** (255 pressed,
+  0 released; no fuzz/flat), and `BTN_TL2`/`BTN_TR2` are not advertised (`tsp-f3fm.217`). This is
+  what the a133 descriptor's `ltrig`/`rtrig` rows declare (`EV_ABS`, `semantics="binary"`), what
+  the X360 `045e:028e` identity promises, and what the vendor inputd emitted. `pf-input-broker`
+  refuses a source that lacks any descriptor-required capability, so emitting buttons here made it
+  refuse this node; the broker itself translates the binary axes to `BTN_TL2`/`BTN_TR2` for apps.
+  `pf-input-broker/tests/decoder_descriptor_contract.rs` runs the broker's capability check
+  against this crate's real uinput setup.
 - **Face buttons emit their like-named code** (A→`BTN_A`, B→`BTN_B`, X→`BTN_X`, Y→`BTN_Y`) — the
   exact wire codes the a133 descriptor declares. We are fresh owned source, so we do **not**
   replicate the vendor X360 driver's west↔north code quirk; the descriptor's positional remap is
