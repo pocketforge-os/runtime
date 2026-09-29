@@ -1,6 +1,8 @@
 use pf_ports::{Clock, MonotonicTime};
 use pf_session_authority::{
-    serve_connection, Authority, CommandSystem, CommandTemplates, FileStore,
+    dispatch_rpc, run_service_loop, spawn_rpc_acceptor, Authority, CommandSystem, CommandTemplates,
+    FileStore, PendingRpc, DEFAULT_CONNECTION_LIMITS, DEFAULT_PRESENTATION_TIMEOUT,
+    DEFAULT_TICK_INTERVAL,
 };
 use std::env;
 use std::fs;
@@ -8,6 +10,7 @@ use std::io;
 use std::os::unix::fs::FileTypeExt;
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 struct SystemClock(Instant);
@@ -40,15 +43,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         SystemClock(Instant::now()),
         32,
         Duration::from_secs(10),
-    )?;
+    )?
+    .with_presentation_timeout(DEFAULT_PRESENTATION_TIMEOUT);
     authority.reconcile()?;
-    for connection in listener.incoming() {
-        let mut stream = connection?;
-        let mut writer = stream.try_clone()?;
-        if let Err(error) = serve_connection(&mut authority, &mut stream, &mut writer) {
-            eprintln!("pf-session-authorityd: connection error: {error:?}");
-        }
-    }
+    // Connection threads own all socket I/O (bounded by DEFAULT_CONNECTION_LIMITS) and forward
+    // only complete requests, so the single-threaded authority blocks only in the loop's channel
+    // wait and its self-driven tick keeps firing during a slow or silent client.
+    let (requests, incoming) = mpsc::channel();
+    spawn_rpc_acceptor(listener, requests, DEFAULT_CONNECTION_LIMITS);
+    run_service_loop(
+        &mut authority,
+        &incoming,
+        DEFAULT_TICK_INTERVAL,
+        |authority, pending: PendingRpc| {
+            let response = dispatch_rpc(authority, pending.request.clone());
+            pending.respond(response);
+            Ok(())
+        },
+    )?;
     Ok(())
 }
 

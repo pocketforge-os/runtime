@@ -15,6 +15,14 @@
 //! simulator runs can select its `desktop-sim` command preset, which represents running
 //! sessions with marker files under the daemon state directory while exercising the same
 //! [`CommandTemplates`] substitution and execution path as the device commands.
+//!
+//! The authority never waits on a client to make progress: [`run_service_loop`] drives
+//! [`Authority::tick`] at least once per tick interval between RPCs, so crash/exit detection,
+//! the restoration ladder and its deadlines advance while no shell is connected. The
+//! presentation-acknowledgement rung has a deadline ([`DEFAULT_PRESENTATION_TIMEOUT`]); on expiry
+//! the authority records `RecoveryRequired` with reason `presentation_not_acknowledged` and keeps
+//! the owed receipt, so a late acknowledgement still completes the ladder truthfully. That is the
+//! only recovery a client can complete; every other `RecoveryRequired` reason stays terminal.
 
 use pf_app_manifest::{validate_app_id, ReasonCode, Resolver};
 use pf_ports::{
@@ -26,9 +34,36 @@ use std::collections::{BTreeMap, VecDeque};
 use std::fs;
 use std::io;
 use std::io::Write;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{Duration, SystemTime};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{mpsc, Arc};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime};
+
+/// Default deadline for the restored shell to acknowledge its first presentation.
+pub const DEFAULT_PRESENTATION_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Default cadence of the daemon's self-driven reconcile/deadline tick.
+pub const DEFAULT_TICK_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Bounds for the daemon's connection I/O, which runs off the authority loop.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ConnectionLimits {
+    /// Read timeout for one complete request frame, and write timeout for the response.
+    pub io_timeout: Duration,
+    /// Longest a connection waits for the authority loop's response.
+    pub response_timeout: Duration,
+    /// Connections served concurrently; further connections are closed immediately.
+    pub max_connections: usize,
+}
+
+pub const DEFAULT_CONNECTION_LIMITS: ConnectionLimits = ConnectionLimits {
+    io_timeout: Duration::from_secs(5),
+    response_timeout: Duration::from_secs(30),
+    max_connections: 16,
+};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AuthorityError {
@@ -118,7 +153,27 @@ pub enum Phase {
         #[serde(default)]
         item_id: String,
         reason: String,
+        /// Receipt still owed to history. Present only when the presentation-acknowledgement
+        /// deadline expired: a late acknowledgement then completes the ladder with it. Absent for
+        /// every other (terminal) recovery reason.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pending_receipt: Option<Receipt>,
     },
+}
+
+impl Phase {
+    /// Stable snake_case phase name used in diagnostics.
+    pub const fn name(&self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::Starting { .. } => "starting",
+            Self::Running { .. } => "running",
+            Self::StoppingGracefully { .. } => "stopping_gracefully",
+            Self::ForceStopping { .. } => "force_stopping",
+            Self::Restoring { .. } => "restoring",
+            Self::RecoveryRequired { .. } => "recovery_required",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -661,6 +716,9 @@ impl From<SessionEvent> for RpcEvent {
     }
 }
 
+/// Serves one request synchronously on the caller's thread (in-process tests and simulators).
+/// It blocks on the peer's framing, so the daemon never calls it from the authority loop; see
+/// [`spawn_rpc_acceptor`].
 pub fn serve_connection<S: StateStore, B: SessionSystem, C: Clock>(
     authority: &mut Authority<S, B, C>,
     stream: &mut impl io::Read,
@@ -674,6 +732,97 @@ pub fn serve_connection<S: StateStore, B: SessionSystem, C: Clock>(
     });
     let body = serde_json::to_vec(&response).map_err(|e| AuthorityError::Backend(e.to_string()))?;
     pf_wire::write_frame(writer, &body).map_err(|e| AuthorityError::Backend(e.to_string()))
+}
+
+/// Runs one complete, decoded request against the authority. Never touches a socket.
+pub fn dispatch_rpc<S: StateStore, B: SessionSystem, C: Clock>(
+    authority: &mut Authority<S, B, C>,
+    request: RpcRequest,
+) -> RpcResponse {
+    handle_rpc(authority, request).unwrap_or_else(|error| RpcResponse::Error {
+        message: format!("{error:?}"),
+    })
+}
+
+/// A complete request read and decoded by a connection thread, with its response channel.
+pub struct PendingRpc {
+    pub request: RpcRequest,
+    reply: mpsc::Sender<RpcResponse>,
+}
+
+impl PendingRpc {
+    /// Hands the response back to the connection thread; a vanished client is not an error.
+    pub fn respond(self, response: RpcResponse) {
+        let _ = self.reply.send(response);
+    }
+}
+
+/// Accepts connections on a helper thread and serves each on its own bounded thread.
+///
+/// Framing never runs on the authority loop: a connection thread reads and decodes one request
+/// under `io_timeout`, forwards only the complete request, waits at most `response_timeout` for
+/// the reply and writes it under `io_timeout`. A silent, partial or non-reading client therefore
+/// costs one bounded connection thread, never an authority tick. An accept error is forwarded and
+/// ends the acceptor.
+pub fn spawn_rpc_acceptor(
+    listener: UnixListener,
+    requests: mpsc::Sender<io::Result<PendingRpc>>,
+    limits: ConnectionLimits,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        let active = Arc::new(AtomicUsize::new(0));
+        for connection in listener.incoming() {
+            let stream = match connection {
+                Ok(stream) => stream,
+                Err(error) => {
+                    let _ = requests.send(Err(error));
+                    return;
+                }
+            };
+            if active.fetch_add(1, Ordering::AcqRel) >= limits.max_connections {
+                active.fetch_sub(1, Ordering::AcqRel);
+                eprintln!(
+                    "pf-session-authorityd: connection_refused reason=too_many_connections limit={}",
+                    limits.max_connections
+                );
+                continue;
+            }
+            let (requests, active) = (requests.clone(), active.clone());
+            thread::spawn(move || {
+                if let Err(error) = serve_rpc_connection(stream, &requests, limits) {
+                    eprintln!("pf-session-authorityd: connection error: {error:?}");
+                }
+                active.fetch_sub(1, Ordering::AcqRel);
+            });
+        }
+    })
+}
+
+fn serve_rpc_connection(
+    mut stream: UnixStream,
+    requests: &mpsc::Sender<io::Result<PendingRpc>>,
+    limits: ConnectionLimits,
+) -> Result<(), AuthorityError> {
+    let backend = |error: &dyn std::fmt::Display| AuthorityError::Backend(error.to_string());
+    stream
+        .set_read_timeout(Some(limits.io_timeout))
+        .and_then(|()| stream.set_write_timeout(Some(limits.io_timeout)))
+        .map_err(|e| backend(&e))?;
+    let body = pf_wire::read_frame(&mut stream).map_err(|e| backend(&e))?;
+    let response = match serde_json::from_slice::<RpcRequest>(&body) {
+        Ok(request) => {
+            let (reply, response) = mpsc::channel();
+            if requests.send(Ok(PendingRpc { request, reply })).is_err() {
+                return Err(AuthorityError::Backend("authority loop stopped".into()));
+            }
+            response
+                .recv_timeout(limits.response_timeout)
+                .map_err(|e| backend(&e))?
+        }
+        Err(error) => return Err(backend(&error)),
+    };
+    let body = serde_json::to_vec(&response).map_err(|e| backend(&e))?;
+    pf_wire::write_frame(&mut stream, &body).map_err(|e| backend(&e))
 }
 
 fn handle_rpc<S: StateStore, B: SessionSystem, C: Clock>(
@@ -727,6 +876,13 @@ fn handle_rpc<S: StateStore, B: SessionSystem, C: Clock>(
     })
 }
 
+/// Receives one complete diagnostic line (no trailing newline).
+pub type LogSink = Box<dyn FnMut(&str) + Send>;
+
+fn stderr_log_sink() -> LogSink {
+    Box::new(|line: &str| eprintln!("{line}"))
+}
+
 pub struct Authority<S, B, C> {
     store: S,
     system: B,
@@ -736,6 +892,9 @@ pub struct Authority<S, B, C> {
     recent_bound: usize,
     grace: Duration,
     graceful_deadline: Option<MonotonicTime>,
+    presentation_timeout: Duration,
+    presentation_deadline: Option<MonotonicTime>,
+    log: LogSink,
     now_fn: fn() -> SystemTime,
 }
 
@@ -816,8 +975,25 @@ impl<S: StateStore, B: SessionSystem, C: Clock> Authority<S, B, C> {
             recent_bound: recent_bound.max(1),
             grace,
             graceful_deadline: None,
+            presentation_timeout: DEFAULT_PRESENTATION_TIMEOUT,
+            presentation_deadline: None,
+            log: stderr_log_sink(),
             now_fn,
         })
+    }
+    /// Overrides [`DEFAULT_PRESENTATION_TIMEOUT`], the deadline for the restored shell to
+    /// acknowledge presentation before the authority records `presentation_not_acknowledged`.
+    pub fn with_presentation_timeout(mut self, timeout: Duration) -> Self {
+        self.presentation_timeout = timeout;
+        self
+    }
+    /// Replaces the default stderr diagnostic sink (tests capture lines with this).
+    pub fn with_log_sink(mut self, sink: impl FnMut(&str) + Send + 'static) -> Self {
+        self.log = Box::new(sink);
+        self
+    }
+    fn log(&mut self, line: &str) {
+        (self.log)(line);
     }
     pub fn state(&self) -> &PersistedState {
         &self.state
@@ -871,14 +1047,23 @@ impl<S: StateStore, B: SessionSystem, C: Clock> Authority<S, B, C> {
         }
     }
     fn recover(&mut self, reason: String) -> Result<(), AuthorityError> {
+        self.recover_owing(reason, None)
+    }
+    fn recover_owing(
+        &mut self,
+        reason: String,
+        pending_receipt: Option<Receipt>,
+    ) -> Result<(), AuthorityError> {
         let session_id = self
             .session_id()
             .ok_or(AuthorityError::InvalidObservation)?;
         let item_id = self.item_id().unwrap_or_default();
+        self.presentation_deadline = None;
         self.state.phase = Phase::RecoveryRequired {
             session_id: session_id.clone(),
             item_id,
             reason: reason.clone(),
+            pending_receipt,
         };
         self.publish(WireEvent::RecoveryRequired { session_id, reason });
         self.persist()
@@ -1030,9 +1215,44 @@ impl<S: StateStore, B: SessionSystem, C: Clock> Authority<S, B, C> {
                 };
                 self.graceful_deadline = None;
                 self.persist()?;
+                // reconcile() already drove systemd observations to a fixed point; only a phase
+                // change here needs another pass. This keeps the self-driven 1 s tick at one
+                // systemd snapshot while an app runs.
+                self.reconcile_systemd()?;
             }
         }
-        self.reconcile_systemd()
+        self.enforce_presentation_deadline()
+    }
+    /// Expires the presentation-acknowledgement rung. A deadline lost to a daemon restart is
+    /// re-armed for a full timeout rather than failing immediately: unlike an overdue graceful
+    /// stop, an early expiry here would only record a spurious recovery.
+    fn enforce_presentation_deadline(&mut self) -> Result<(), AuthorityError> {
+        let Phase::Restoring {
+            item_id,
+            receipt,
+            rung: RestorationRung::PresentationAcknowledged,
+            ..
+        } = &self.state.phase
+        else {
+            self.presentation_deadline = None;
+            return Ok(());
+        };
+        let (item_id, receipt) = (item_id.clone(), receipt.clone());
+        let now = self.clock.now();
+        let timeout = self.presentation_timeout;
+        let deadline = *self
+            .presentation_deadline
+            .get_or_insert_with(|| now.saturating_add(timeout));
+        if now < deadline {
+            return Ok(());
+        }
+        let code = ReasonCode::PresentationNotAcknowledged.as_str();
+        let detail = format!(
+            "presentation not acknowledged within {} ms",
+            timeout.as_millis()
+        );
+        self.log(&lifecycle_failure_line(code, &item_id, &detail));
+        self.recover_owing(format!("{code}: {detail}"), Some(receipt))
     }
     fn reconcile_systemd(&mut self) -> Result<(), AuthorityError> {
         for _ in 0..8 {
@@ -1248,6 +1468,8 @@ impl<S: StateStore, B: SessionSystem, C: Clock> Authority<S, B, C> {
                     receipt: receipt.clone(),
                     rung: RestorationRung::PresentationAcknowledged,
                 };
+                self.presentation_deadline =
+                    Some(self.clock.deadline_after(self.presentation_timeout).0);
                 self.persist()
             }
             (
@@ -1259,20 +1481,122 @@ impl<S: StateStore, B: SessionSystem, C: Clock> Authority<S, B, C> {
                 },
                 Observation::PresentationAcknowledged,
             ) => {
-                let id = session_id.clone();
-                let receipt = receipt.clone();
-                if let Some(entry) = self.state.history.iter_mut().find(|e| e.session_id == id) {
-                    entry.receipt = Some(receipt.clone());
-                }
-                self.publish(WireEvent::ObservationComplete);
-                self.publish(WireEvent::Terminal {
-                    session_id: id,
-                    receipt,
-                });
-                self.state.phase = Phase::Idle;
-                self.persist()
+                let (id, receipt) = (session_id.clone(), receipt.clone());
+                self.complete_restoration(id, receipt)
+            }
+            // A late acknowledgement after the presentation deadline expired: the only
+            // self-healing exit from RecoveryRequired. The owed receipt becomes history now.
+            (
+                Phase::RecoveryRequired {
+                    session_id,
+                    reason,
+                    pending_receipt: Some(receipt),
+                    ..
+                },
+                Observation::PresentationAcknowledged,
+            ) if is_presentation_timeout(reason) => {
+                let (id, receipt) = (session_id.clone(), receipt.clone());
+                self.complete_restoration(id, receipt)
             }
             _ => Err(AuthorityError::InvalidObservation),
+        }
+    }
+    fn complete_restoration(&mut self, id: String, receipt: Receipt) -> Result<(), AuthorityError> {
+        if let Some(entry) = self.state.history.iter_mut().find(|e| e.session_id == id) {
+            entry.receipt = Some(receipt.clone());
+        }
+        self.publish(WireEvent::ObservationComplete);
+        self.publish(WireEvent::Terminal {
+            session_id: id,
+            receipt,
+        });
+        self.presentation_deadline = None;
+        self.state.phase = Phase::Idle;
+        self.persist()
+    }
+    /// Pending observed Starting/Running events with a sequence below this bound belong to a
+    /// session that has already ended and are never delivered. While a session is Starting or
+    /// Running, every earlier session ended at its last Terminal/RecoveryRequired event; in any
+    /// other phase every published Starting/Running belongs to an ended session. Filtering at
+    /// delivery leaves `pending`, sequences, cursors and compaction untouched (cursor-safe) and
+    /// also covers state persisted by an older daemon.
+    fn ended_session_observation_bound(&self) -> u64 {
+        if !matches!(
+            self.state.phase,
+            Phase::Starting { .. } | Phase::Running { .. }
+        ) {
+            return u64::MAX;
+        }
+        self.state
+            .pending
+            .iter()
+            .rev()
+            .find(|e| {
+                matches!(
+                    e.event,
+                    WireEvent::Terminal { .. } | WireEvent::RecoveryRequired { .. }
+                )
+            })
+            .map_or(0, |e| e.sequence)
+    }
+}
+
+fn is_presentation_timeout(reason: &str) -> bool {
+    reason
+        .strip_prefix(ReasonCode::PresentationNotAcknowledged.as_str())
+        .is_some_and(|rest| rest.starts_with(':'))
+}
+
+/// Runs the daemon's single-threaded service loop until `connections` disconnects.
+///
+/// Each received connection is handed to `serve`; between connections the loop calls
+/// [`Authority::tick`] at least once per `tick_interval`, so the authority reconciles systemd and
+/// enforces its deadlines with no client RPC. Waiting uses a channel timeout, never a spin; a tick
+/// that overruns the interval is followed by a full idle interval. A tick error is logged once
+/// until it changes or clears. A connection-source error or a `serve` error ends the loop.
+pub fn run_service_loop<S, B, C, T>(
+    authority: &mut Authority<S, B, C>,
+    connections: &mpsc::Receiver<io::Result<T>>,
+    tick_interval: Duration,
+    mut serve: impl FnMut(&mut Authority<S, B, C>, T) -> io::Result<()>,
+) -> io::Result<()>
+where
+    S: StateStore,
+    B: SessionSystem,
+    C: Clock,
+{
+    let tick_interval = tick_interval.max(Duration::from_millis(1));
+    let mut next_tick = Instant::now() + tick_interval;
+    let mut last_error: Option<String> = None;
+    loop {
+        let wait = next_tick.saturating_duration_since(Instant::now());
+        match connections.recv_timeout(wait) {
+            Ok(Ok(connection)) => serve(authority, connection)?,
+            Ok(Err(error)) => return Err(error),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
+        }
+        let started = Instant::now();
+        if started < next_tick {
+            continue;
+        }
+        match authority.tick() {
+            Ok(()) => last_error = None,
+            Err(error) => {
+                let message = format!("{error:?}");
+                if last_error.as_deref() != Some(message.as_str()) {
+                    authority.log(&format!(
+                        "pf-session-authorityd: tick_error detail={}",
+                        json_string(&message)
+                    ));
+                }
+                last_error = Some(message);
+            }
+        }
+        next_tick = started + tick_interval;
+        let finished = Instant::now();
+        if next_tick <= finished {
+            next_tick = finished + tick_interval;
         }
     }
 }
@@ -1280,13 +1604,13 @@ impl<S: StateStore, B: SessionSystem, C: Clock> Authority<S, B, C> {
 impl<S: StateStore, B: SessionSystem, C: Clock> AuthorityApi for Authority<S, B, C> {
     fn launch(&mut self, request: LaunchRequest) -> Result<LaunchResult, AuthorityError> {
         if !matches!(self.state.phase, Phase::Idle) {
+            let line = launch_busy_line(&request.item_id, &self.state.phase);
+            self.log(&line);
             return Ok(LaunchResult::RejectedBusy);
         }
         if let Err(error) = self.resolver.resolve(&request.item_id) {
-            eprintln!(
-                "{}",
-                launch_refusal_line(error.reason.as_str(), &request.item_id)
-            );
+            let line = launch_refusal_line(error.reason.as_str(), &request.item_id);
+            self.log(&line);
             return Ok(LaunchResult::ItemUnavailable);
         }
         let id = format!("session-{}", self.state.next_session);
@@ -1320,13 +1644,12 @@ impl<S: StateStore, B: SessionSystem, C: Clock> AuthorityApi for Authority<S, B,
         match start_result {
             Ok(()) => self.observe(Observation::SessionRunning)?,
             Err(reason) => {
-                eprintln!(
-                    "pf-session-authorityd: lifecycle_failure reason={} item_id={} detail={}",
+                let line = lifecycle_failure_line(
                     ReasonCode::SystemdStartFailed.as_str(),
-                    serde_json::to_string(self.item_id().as_deref().unwrap_or_default())
-                        .expect("string serialization cannot fail"),
-                    serde_json::to_string(&reason).expect("string serialization cannot fail")
+                    self.item_id().as_deref().unwrap_or_default(),
+                    &reason,
                 );
+                self.log(&line);
                 self.observe(Observation::SessionCrashed {
                     summary: format!("{}: {reason}", ReasonCode::SystemdStartFailed.as_str()),
                 })?;
@@ -1336,10 +1659,17 @@ impl<S: StateStore, B: SessionSystem, C: Clock> AuthorityApi for Authority<S, B,
     }
     fn events_for(&self, client_id: &str) -> Vec<(u64, SessionEvent)> {
         let sequence = self.state.acknowledged.get(client_id).copied().unwrap_or(0);
+        let ended_bound = self.ended_session_observation_bound();
         self.state
             .pending
             .iter()
             .filter(|e| e.sequence > sequence)
+            .filter(|e| {
+                !(matches!(
+                    e.event,
+                    WireEvent::ObservedStarting | WireEvent::ObservedRunning
+                ) && e.sequence < ended_bound)
+            })
             .map(|e| (e.sequence, wire_to_port(&e.event)))
             .collect()
     }
@@ -1377,10 +1707,30 @@ impl<S: StateStore, B: SessionSystem, C: Clock> AuthorityApi for Authority<S, B,
     }
 }
 
+fn json_string(value: &str) -> String {
+    serde_json::to_string(value).expect("string serialization cannot fail")
+}
+
 fn launch_refusal_line(reason: &str, item_id: &str) -> String {
     format!(
         "pf-session-authorityd: launch_refused reason={reason} item_id={}",
-        serde_json::to_string(item_id).expect("string serialization cannot fail")
+        json_string(item_id)
+    )
+}
+
+fn launch_busy_line(item_id: &str, phase: &Phase) -> String {
+    format!(
+        "{} phase={}",
+        launch_refusal_line("busy", item_id),
+        phase.name()
+    )
+}
+
+fn lifecycle_failure_line(reason: &str, item_id: &str, detail: &str) -> String {
+    format!(
+        "pf-session-authorityd: lifecycle_failure reason={reason} item_id={} detail={}",
+        json_string(item_id),
+        json_string(detail)
     )
 }
 
