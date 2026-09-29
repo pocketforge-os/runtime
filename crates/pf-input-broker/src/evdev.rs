@@ -38,7 +38,13 @@ impl Evdev {
     /// Take the exclusive `EVIOCGRAB`. After this, no other opener of the node receives events.
     pub fn grab(&mut self) -> io::Result<()> {
         // SAFETY: EVIOCGRAB takes an int by value (1 = grab); fd is valid.
-        let rc = unsafe { libc::ioctl(self.fd.as_raw_fd(), ioc::EVIOCGRAB, 1 as libc::c_int) };
+        let rc = unsafe {
+            libc::ioctl(
+                self.fd.as_raw_fd(),
+                ioc::EVIOCGRAB as libc::Ioctl,
+                1 as libc::c_int,
+            )
+        };
         if rc < 0 {
             return Err(io::Error::last_os_error());
         }
@@ -52,7 +58,13 @@ impl Evdev {
             return Ok(());
         }
         // SAFETY: EVIOCGRAB with 0 releases; fd is valid.
-        let rc = unsafe { libc::ioctl(self.fd.as_raw_fd(), ioc::EVIOCGRAB, 0 as libc::c_int) };
+        let rc = unsafe {
+            libc::ioctl(
+                self.fd.as_raw_fd(),
+                ioc::EVIOCGRAB as libc::Ioctl,
+                0 as libc::c_int,
+            )
+        };
         self.grabbed = false;
         if rc < 0 {
             return Err(io::Error::last_os_error());
@@ -67,7 +79,7 @@ impl Evdev {
         let n = unsafe {
             libc::ioctl(
                 self.fd.as_raw_fd(),
-                ioc::eviocgname(buf.len()),
+                ioc::eviocgname(buf.len()) as libc::Ioctl,
                 buf.as_mut_ptr(),
             )
         };
@@ -85,7 +97,7 @@ impl Evdev {
         let rc = unsafe {
             libc::ioctl(
                 self.fd.as_raw_fd(),
-                ioc::eviocgid(),
+                ioc::eviocgid() as libc::Ioctl,
                 &mut id as *mut libc::input_id,
             )
         };
@@ -106,7 +118,7 @@ impl Evdev {
         let rc = unsafe {
             libc::ioctl(
                 self.fd.as_raw_fd(),
-                ioc::eviocgbit(event_type, bits.len()),
+                ioc::eviocgbit(event_type, bits.len()) as libc::Ioctl,
                 bits.as_mut_ptr(),
             )
         };
@@ -128,7 +140,7 @@ impl Evdev {
         let rc = unsafe {
             libc::ioctl(
                 self.fd.as_raw_fd(),
-                ioc::eviocgkey(bits.len()),
+                ioc::eviocgkey(bits.len()) as libc::Ioctl,
                 bits.as_mut_ptr(),
             )
         };
@@ -149,7 +161,7 @@ impl Evdev {
         let rc = unsafe {
             libc::ioctl(
                 self.fd.as_raw_fd(),
-                ioc::eviocgabs(code),
+                ioc::eviocgabs(code) as libc::Ioctl,
                 &mut info as *mut libc::input_absinfo,
             )
         };

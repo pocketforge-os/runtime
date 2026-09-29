@@ -451,8 +451,14 @@ name = "pf-input-broker"
 version = "0.0.1"
 dependencies = [
  "libc",
+ "pf-app-manifest",
+ "pf-ports",
+ "pf-prefs",
+ "pf-prefsd",
+ "pf-session-authority",
  "pf-wire",
  "pocketforge",
+ "serde_json",
 ]
 
 [[package]]

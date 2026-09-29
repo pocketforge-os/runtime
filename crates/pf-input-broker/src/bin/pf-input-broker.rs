@@ -6,6 +6,16 @@
 //!
 //! Usage:
 //!   pf-input-broker --descriptor <caps.toml> [--source <event-node>] [--acquire-sock <path>]
+//!                   [--safe-return-sock <authority.sock>]
+//!
+//! Each `--acquire-sock` connection is a persistent PFW1 session: repeated `Acquire("input")`
+//! (each answered with a fresh re-emit fd), `GetAppearance` (prefsd via `$PF_PREFSD_SOCK`), and a
+//! typed `Unsupported` for everything else.
+//!
+//! `--safe-return-sock` makes the broker the protected SafeReturn intake: guide/`BTN_MODE` never
+//! reaches the app, and each guide press sends one `{"method":"safe_return"}` to the session
+//! authority from a worker thread. The pump never waits on the authority. Without the flag the
+//! re-emit stream is unchanged.
 //!
 //! `--no-grab` is the R-C blessed-binary path (Steam Link): re-emit + hand the fd WITHOUT the
 //! exclusive grab (so a `uinput`-producing consumer is not broken).
@@ -13,9 +23,11 @@
 use std::os::raw::c_int;
 use std::os::unix::net::UnixListener;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
-use pf_input_broker::{handle_acquire, InputBroker};
-use pocketforge::Descriptor;
+use pf_input_broker::{serve_client, InputBroker, SafeReturnIntake};
+use pocketforge::backends::InProcessBackend;
+use pocketforge::{Backend, Descriptor};
 
 static STOP: AtomicBool = AtomicBool::new(false);
 
@@ -36,6 +48,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .or_else(|| std::env::var("PF_DESCRIPTOR").ok())
         .ok_or("need --descriptor <caps.toml> (or PF_DESCRIPTOR)")?;
     let acquire_sock = arg(&args, "--acquire-sock");
+    let safe_return_sock = arg(&args, "--safe-return-sock");
     let grab = !args.iter().any(|a| a == "--no-grab");
 
     let descriptor = Descriptor::load(&desc_path)?;
@@ -44,6 +57,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         None => discover_with_timeout(&descriptor)?,
     };
     let mut broker = InputBroker::start_with(&source, &descriptor, grab)?;
+    if let Some(sock) = safe_return_sock.as_deref() {
+        broker = broker.with_safe_return(SafeReturnIntake::spawn(sock)?);
+    }
+    // GetAppearance fallback when $PF_PREFSD_SOCK is unset: the store-less in-process default.
+    let backend: Arc<dyn Backend> = Arc::new(InProcessBackend::new(Arc::new(descriptor)));
     let node = broker
         .node_path()
         .ok_or("could not resolve the re-emit event node")?;
@@ -70,6 +88,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(sock) = acquire_sock.as_deref() {
         println!("acquire-sock={sock}");
     }
+    if let Some(sock) = safe_return_sock.as_deref() {
+        eprintln!("pf-input-broker: safe-return intake -> {sock} (guide withheld from the app)");
+    }
     // Bind before readiness: READY means both the event node and acquisition endpoint exist.
     let listener = if let Some(sock) = acquire_sock.as_deref() {
         let _ = std::fs::remove_file(sock);
@@ -90,7 +111,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let _ = pump_tx.send(broker.run(&STOP));
     });
 
-    let result = supervise(listener.as_ref(), &node, &pump_rx, &STOP);
+    let result = supervise(listener.as_ref(), &node, &backend, &pump_rx, &STOP);
     STOP.store(true, Ordering::Release);
     let _ = pump.join();
     result.map_err(Into::into)
@@ -99,6 +120,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 fn supervise(
     listener: Option<&UnixListener>,
     node: &str,
+    backend: &Arc<dyn Backend>,
     pump_rx: &std::sync::mpsc::Receiver<std::io::Result<()>>,
     stop: &AtomicBool,
 ) -> std::io::Result<()> {
@@ -113,10 +135,12 @@ fn supervise(
             match listener.accept() {
                 Ok((stream, _)) => {
                     let node = node.to_owned();
-                    // A silent acquisition client must never hold up pump-failure or signal
-                    // observation. The handler also carries a finite I/O deadline.
+                    let backend = backend.clone();
+                    // A persistent (or silent) client must never hold up pump-failure or signal
+                    // observation: each session runs on its own thread, and every request
+                    // carries a finite I/O deadline once it starts.
                     std::thread::spawn(move || {
-                        let _ = handle_acquire(stream, &node);
+                        let _ = serve_client(stream, &node, &*backend);
                     });
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
@@ -199,6 +223,12 @@ fn send_ready(socket: &str) -> std::io::Result<()> {
 mod tests {
     use super::*;
 
+    fn test_backend() -> Arc<dyn Backend> {
+        Arc::new(InProcessBackend::new(Arc::new(
+            pocketforge::test_support::gnss_descriptor(),
+        )))
+    }
+
     #[test]
     fn explicit_source_override_is_accepted() {
         let args = vec!["--source".to_owned(), "/dev/input/event-test".to_owned()];
@@ -239,7 +269,7 @@ mod tests {
         let stop = AtomicBool::new(false);
         let started = std::time::Instant::now();
         assert_eq!(
-            supervise(Some(&listener), "/unused", &rx, &stop)
+            supervise(Some(&listener), "/unused", &test_backend(), &rx, &stop)
                 .unwrap_err()
                 .kind(),
             std::io::ErrorKind::BrokenPipe
@@ -261,7 +291,7 @@ mod tests {
         let (_tx, rx) = std::sync::mpsc::channel();
         let stop = AtomicBool::new(true);
         let started = std::time::Instant::now();
-        supervise(Some(&listener), "/unused", &rx, &stop).unwrap();
+        supervise(Some(&listener), "/unused", &test_backend(), &rx, &stop).unwrap();
         assert!(started.elapsed() < std::time::Duration::from_secs(1));
         std::fs::remove_file(path).unwrap();
     }

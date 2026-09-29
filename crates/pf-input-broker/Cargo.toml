@@ -24,3 +24,15 @@ path = "src/bin/pf-input-read.rs"
 pocketforge = { workspace = true }
 pf-wire = { workspace = true }
 libc = { workspace = true }
+# Reads the session authority's JSON reply to the SafeReturn frame (--safe-return-sock).
+serde_json = { workspace = true }
+
+[dev-dependencies]
+# Hermetic proof that the broker's SafeReturn frame drives the REAL authority RPC path
+# (tests/safe_return_authority.rs) and that GetAppearance reaches a real prefsd
+# (tests/prefsd_passthrough.rs). Test-only: the daemon links none of these.
+pf-session-authority = { workspace = true }
+pf-app-manifest = { workspace = true }
+pf-ports = { workspace = true }
+pf-prefs = { workspace = true }
+pf-prefsd = { workspace = true }
