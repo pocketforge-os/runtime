@@ -452,6 +452,7 @@ version = "0.0.1"
 dependencies = [
  "libc",
  "pf-app-manifest",
+ "pf-input-decode",
  "pf-ports",
  "pf-prefs",
  "pf-prefsd",
@@ -459,6 +460,7 @@ dependencies = [
  "pf-wire",
  "pocketforge",
  "serde_json",
+ "sha2",
 ]
 
 [[package]]

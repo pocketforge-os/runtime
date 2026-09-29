@@ -32,6 +32,34 @@ pub struct UinputSpec {
     pub abs: Vec<(u16, AbsInfo)>,
 }
 
+/// One capability bit the uinput setup sets on the device before `UI_DEV_CREATE`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetBit {
+    /// `UI_SET_EVBIT` — an event type (`EV_SYN`/`EV_KEY`/`EV_ABS`).
+    Ev(u16),
+    /// `UI_SET_KEYBIT` — a key/button code.
+    Key(u16),
+    /// `UI_SET_ABSBIT` — an absolute-axis code.
+    Abs(u16),
+}
+
+/// The exact capability bits [`Uinput::create`] sets for `spec`, in the order it issues the
+/// `UI_SET_*BIT` ioctls. `create` iterates THIS list, so it is the single source of the node's
+/// `EVIOCGBIT` bitmaps: a hermetic contract test can derive the advertised capability set from it
+/// instead of from a hand-written list (`tsp-f3fm.217`).
+pub fn setup_bits(spec: &UinputSpec) -> Vec<SetBit> {
+    let mut bits = vec![SetBit::Ev(codes::EV_SYN)];
+    if !spec.keys.is_empty() {
+        bits.push(SetBit::Ev(codes::EV_KEY));
+        bits.extend(spec.keys.iter().map(|&k| SetBit::Key(k)));
+    }
+    if !spec.abs.is_empty() {
+        bits.push(SetBit::Ev(codes::EV_ABS));
+        bits.extend(spec.abs.iter().map(|&(code, _)| SetBit::Abs(code)));
+    }
+    bits
+}
+
 /// A live uinput virtual device. `Drop` destroys it.
 pub struct Uinput {
     fd: OwnedFd,
@@ -57,18 +85,13 @@ impl Uinput {
         let dev = Uinput { fd, node: None };
         let f = dev.fd.as_raw_fd();
 
-        dev.set_bit(ioc::UI_SET_EVBIT, codes::EV_SYN as libc::c_int)?;
-        if !spec.keys.is_empty() {
-            dev.set_bit(ioc::UI_SET_EVBIT, codes::EV_KEY as libc::c_int)?;
-            for &k in &spec.keys {
-                dev.set_bit(ioc::UI_SET_KEYBIT, k as libc::c_int)?;
-            }
-        }
-        if !spec.abs.is_empty() {
-            dev.set_bit(ioc::UI_SET_EVBIT, codes::EV_ABS as libc::c_int)?;
-            for &(code, _) in &spec.abs {
-                dev.set_bit(ioc::UI_SET_ABSBIT, code as libc::c_int)?;
-            }
+        for bit in setup_bits(spec) {
+            let (req, code) = match bit {
+                SetBit::Ev(c) => (ioc::UI_SET_EVBIT, c),
+                SetBit::Key(c) => (ioc::UI_SET_KEYBIT, c),
+                SetBit::Abs(c) => (ioc::UI_SET_ABSBIT, c),
+            };
+            dev.set_bit(req, code as libc::c_int)?;
         }
 
         // Legacy setup: write a uinput_user_dev, then UI_DEV_CREATE.

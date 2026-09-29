@@ -64,16 +64,15 @@ pub const BTN_NORTH: u16 = 0x133;
 /// The **LEFT** face button (`BTN_WEST`; kernel alias `BTN_Y`; printed **Y** on this chassis).
 pub const BTN_WEST: u16 = 0x134;
 
-// --- shoulders + triggers --------------------------------------------------------------------
+// --- shoulders -------------------------------------------------------------------------------
 /// **L1** shoulder.
 pub const BTN_TL: u16 = 0x136;
 /// **R1** shoulder.
 pub const BTN_TR: u16 = 0x137;
-/// **L2** — physically BINARY on this pad, so emitted as the digital lower-trigger button
-/// (matches `pf-input-broker`'s `semantics="binary"` → `BTN_TL2` mapping — agree, don't reinvent).
-pub const BTN_TL2: u16 = 0x138;
-/// **R2** — physically BINARY, emitted as the digital lower-trigger button (`BTN_TR2`).
-pub const BTN_TR2: u16 = 0x139;
+// L2/R2 are NOT buttons on this node — see the trigger AXES below (`tsp-f3fm.217`). The
+// `BTN_TL2`/`BTN_TR2` spellings are deliberately NOT defined in this crate: this module is the
+// vocabulary of what the decoder EMITS, and a defined-but-unemitted trigger button is exactly the
+// plausible one-line edit that re-breaks the broker's descriptor capability check.
 
 // --- system buttons --------------------------------------------------------------------------
 /// **Select**.
@@ -92,6 +91,17 @@ pub const ABS_Y: u16 = 0x01;
 pub const ABS_RX: u16 = 0x03;
 /// Right stick Y (`ttyS3`).
 pub const ABS_RY: u16 = 0x04;
+/// **L2** trigger axis (`ttyS4` bit `0x02`). The a133 descriptor (`platform/devices/a133/
+/// capabilities.toml`, `id="ltrig"`) declares `EV_ABS ABS_Z`, range `0..255`,
+/// `semantics="binary"` — the Xbox-360 trigger-AXIS shape this node's `045e:028e` identity
+/// promises, which the stock vendor inputd also emitted (`tsp-v19s`). The switch is physically
+/// binary, so the axis only ever carries [`TRIGGER_RELEASED`] or [`TRIGGER_PRESSED`]
+/// (endpoint-only). `pf-input-broker` requires this axis from its source and re-emits it to apps
+/// as the button `BTN_TL2` with hysteresis; apps never see this axis.
+pub const ABS_Z: u16 = 0x02;
+/// **R2** trigger axis (`ttyS3` bit `0x02`); descriptor `id="rtrig"` `EV_ABS ABS_RZ`. Same
+/// endpoint-only binary contract as [`ABS_Z`]; the broker re-emits it as `BTN_TR2`.
+pub const ABS_RZ: u16 = 0x05;
 /// D-pad X (hat: -1 left, +1 right).
 pub const ABS_HAT0X: u16 = 0x10;
 /// D-pad Y (hat: -1 up, +1 down).
@@ -103,3 +113,13 @@ pub const ABS_HAT0Y: u16 = 0x11;
 pub const STICK_MIN: i32 = 0;
 /// See [`STICK_MIN`].
 pub const STICK_MAX: i32 = 4095;
+
+/// Trigger axis minimum (`absinfo.min`) — matches the descriptor's `range.min` for ltrig/rtrig.
+pub const TRIGGER_MIN: i32 = 0;
+/// Trigger axis maximum (`absinfo.max`) — matches the descriptor's `range.max` for ltrig/rtrig.
+pub const TRIGGER_MAX: i32 = 255;
+/// The value a released trigger reports: the axis minimum (also the uinput initial value, so a
+/// released trigger at startup needs no event).
+pub const TRIGGER_RELEASED: i32 = TRIGGER_MIN;
+/// The value a pressed trigger reports: the axis maximum (a full-scale press, never partial).
+pub const TRIGGER_PRESSED: i32 = TRIGGER_MAX;

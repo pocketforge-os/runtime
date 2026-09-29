@@ -64,7 +64,6 @@ fn abses(evs: &[Ev]) -> Vec<(u16, i32)> {
 fn right_cluster_every_button() {
     let table = [
         (0x01u8, codes::BTN_TR, "R1"),
-        (0x02, codes::BTN_TR2, "R2"),
         (0x04, codes::BTN_NORTH, "north (top)"),
         (0x08, codes::BTN_WEST, "west (left)"),
         (0x10, codes::BTN_EAST, "east (right)"),
@@ -91,12 +90,12 @@ fn right_cluster_every_button() {
     }
 }
 
-/// EVERY left-cluster button (ttyS4): L1, L2, Menu.
+/// EVERY left-cluster button (ttyS4): L1, Menu. (L2 is the trigger axis — see
+/// `both_triggers_are_endpoint_only_axes`.)
 #[test]
 fn left_cluster_every_button() {
     let table = [
         (0x01u8, codes::BTN_TL, "L1"),
-        (0x02, codes::BTN_TL2, "L2"),
         (0x80, codes::BTN_MODE, "Menu"),
     ];
     for (mask, code, label) in table {
@@ -105,6 +104,25 @@ fn left_cluster_every_button() {
             &[wire(0x00, CENTER, CENTER), wire(mask, CENTER, CENTER)],
         );
         assert_eq!(keys(&press), vec![(code, 1)], "{label} press → {code:#05x}");
+    }
+}
+
+/// L2 (ttyS4 bit 0x02) and R2 (ttyS3 bit 0x02), press then release, through the real scanner +
+/// decoder: the descriptor's `ltrig`/`rtrig` axes `ABS_Z`/`ABS_RZ` at their endpoints only
+/// (255 pressed, 0 released), and no button at all (`tsp-f3fm.217`).
+#[test]
+fn both_triggers_are_endpoint_only_axes() {
+    for (side, axis, label) in [
+        (Side::Left, codes::ABS_Z, "L2"),
+        (Side::Right, codes::ABS_RZ, "R2"),
+    ] {
+        let base = wire(0x00, CENTER, CENTER);
+        let held = wire(0x02, CENTER, CENTER);
+        let press = run(side, &[base, held]);
+        assert_eq!(keys(&press), vec![], "{label} emits no button");
+        assert_eq!(abses(&press), vec![(axis, 255)], "{label} press → 255");
+        let release = run(side, &[base, held, base]);
+        assert_eq!(abses(&release), vec![(axis, 0)], "{label} release → 0");
     }
 }
 

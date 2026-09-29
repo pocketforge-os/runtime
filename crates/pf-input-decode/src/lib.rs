@@ -58,7 +58,7 @@ pub mod uinput;
 
 pub use decode::{Ev, Side, SideDecoder};
 pub use frame::{Frame, FrameScanner};
-pub use uinput::{AbsInfo, Uinput, UinputSpec};
+pub use uinput::{setup_bits, AbsInfo, SetBit, Uinput, UinputSpec};
 
 /// The compatibility identity the virtual gamepad advertises.
 ///
@@ -119,7 +119,7 @@ mod tests {
         let s = a133_spec();
         // Identity is the X360 compatibility identity.
         assert_eq!((s.bus, s.vendor, s.product), (0x03, 0x045e, 0x028e));
-        // 11 buttons: the four face positions, L1 R1, L2 R2 (as buttons), Select Start Menu.
+        // 9 buttons: the four face positions, L1 R1, Select Start Menu. L2/R2 are NOT buttons.
         let expect_keys = [
             codes::BTN_SOUTH,
             codes::BTN_EAST,
@@ -127,8 +127,6 @@ mod tests {
             codes::BTN_WEST,
             codes::BTN_TL,
             codes::BTN_TR,
-            codes::BTN_TL2,
-            codes::BTN_TR2,
             codes::BTN_SELECT,
             codes::BTN_START,
             codes::BTN_MODE,
@@ -141,19 +139,28 @@ mod tests {
             );
         }
         assert_eq!(s.keys.len(), expect_keys.len(), "no extra/missing buttons");
-        // Axes: both sticks (raw 12-bit) + the hat.
+        for trigger_button in [0x138u16, 0x139] {
+            assert!(
+                !s.keys.contains(&trigger_button),
+                "BTN_TL2/BTN_TR2 ({trigger_button:#05x}) must not be advertised (tsp-f3fm.217)"
+            );
+        }
+        // Axes: both sticks (raw 12-bit), both binary trigger axes (0..255), and the hat.
         for (code, min, max) in [
             (codes::ABS_X, 0, 4095),
             (codes::ABS_Y, 0, 4095),
             (codes::ABS_RX, 0, 4095),
             (codes::ABS_RY, 0, 4095),
+            (codes::ABS_Z, 0, 255),
+            (codes::ABS_RZ, 0, 255),
             (codes::ABS_HAT0X, -1, 1),
             (codes::ABS_HAT0Y, -1, 1),
         ] {
             let ai = s.abs.iter().find(|(c, _)| *c == code).map(|(_, a)| *a);
             let ai = ai.unwrap_or_else(|| panic!("axis {code:#x} advertised"));
             assert_eq!((ai.min, ai.max), (min, max), "axis {code:#x} range");
+            assert_eq!((ai.fuzz, ai.flat), (0, 0), "axis {code:#x} fuzz/flat");
         }
-        assert_eq!(s.abs.len(), 6, "exactly six axes");
+        assert_eq!(s.abs.len(), 8, "exactly eight axes");
     }
 }

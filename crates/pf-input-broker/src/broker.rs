@@ -26,6 +26,77 @@ use crate::uinput::Uinput;
 const MAX_REPORT_EVENTS: usize = 256;
 const ACQUIRE_CLIENT_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
 
+/// A source that can answer the `EVIOCGBIT` question the broker's capability check asks: does it
+/// advertise every one of `codes` for `event_type`? [`Evdev`] answers from the opened fd; a
+/// hermetic test answers from a device's uinput setup (`tsp-f3fm.217`), so the check the daemon
+/// runs and the check the contract test runs are one function, [`missing_source_capabilities`].
+pub trait SourceCapabilities {
+    /// Whether every code in `codes` is advertised for `event_type` (`EV_KEY` / `EV_ABS`).
+    fn supports(&self, event_type: u16, codes: &[u16]) -> io::Result<bool>;
+}
+
+impl SourceCapabilities for Evdev {
+    fn supports(&self, event_type: u16, codes: &[u16]) -> io::Result<bool> {
+        Evdev::supports(self, event_type, codes)
+    }
+}
+
+/// The descriptor-required source codes a source does NOT advertise. Empty means the source
+/// satisfies the descriptor.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct MissingCapabilities {
+    /// Required `EV_KEY` codes the source lacks.
+    pub keys: Vec<u16>,
+    /// Required `EV_ABS` codes the source lacks.
+    pub abs: Vec<u16>,
+}
+
+impl MissingCapabilities {
+    /// True when nothing required is missing.
+    pub fn is_empty(&self) -> bool {
+        self.keys.is_empty() && self.abs.is_empty()
+    }
+}
+
+impl std::fmt::Display for MissingCapabilities {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let hex = |v: &[u16]| {
+            v.iter()
+                .map(|c| format!("{c:#x}"))
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        write!(
+            f,
+            "EV_KEY [{}] EV_ABS [{}]",
+            hex(&self.keys),
+            hex(&self.abs)
+        )
+    }
+}
+
+/// The broker's source capability check: every `EV_KEY`/`EV_ABS` code the descriptor's
+/// non-system rows require ([`Remap::required_source_keys`] / [`Remap::required_source_abs`]),
+/// minus what `source` advertises. `class = "system"` rows (VOL±, read from their own `source`
+/// node) never enter the required set, so they can never make a pad source fail.
+pub fn missing_source_capabilities(
+    source: &impl SourceCapabilities,
+    remap: &Remap,
+) -> io::Result<MissingCapabilities> {
+    let mut missing = MissingCapabilities::default();
+    for &code in remap.required_source_keys() {
+        if !source.supports(ioc::EV_KEY, &[code])? {
+            missing.keys.push(code);
+        }
+    }
+    for &code in remap.required_source_abs() {
+        if !source.supports(ioc::EV_ABS, &[code])? {
+            missing.abs.push(code);
+        }
+    }
+    Ok(missing)
+}
+
 fn wire_err(e: pf_wire::WireError) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, e.to_string())
 }
@@ -204,12 +275,13 @@ impl InputBroker {
                 "opened source identity mismatch",
             ));
         }
-        if !source.supports(ioc::EV_KEY, remap.required_source_keys())?
-            || !source.supports(ioc::EV_ABS, remap.required_source_abs())?
-        {
+        let missing = missing_source_capabilities(source, remap)?;
+        if !missing.is_empty() {
+            // The prefix is kept verbatim (journal greps key on it); the suffix names the codes,
+            // which the tsp-f3fm.215 bench had to reconstruct from bitmaps.
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "opened source lacks descriptor-required capabilities",
+                format!("opened source lacks descriptor-required capabilities: missing {missing}"),
             ));
         }
         Ok(())
@@ -236,8 +308,7 @@ impl InputBroker {
         discover_candidates(candidates, |path| {
             let dev = Evdev::open(path)?;
             Ok(expected.matches(&dev.name()?, dev.id()?)
-                && dev.supports(ioc::EV_KEY, remap.required_source_keys())?
-                && dev.supports(ioc::EV_ABS, remap.required_source_abs())?)
+                && missing_source_capabilities(&dev, &remap)?.is_empty())
         })
     }
 

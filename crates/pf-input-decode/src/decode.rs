@@ -8,10 +8,10 @@
 //! ## Ground truth (`tsp-ozbp.2`, with the face bits re-anchored by `tsp-ozbp.14`)
 //!
 //! - **`ttyS3` = RIGHT** stick + these `byte2` bits:
-//!   `0x01`=R1 `0x02`=R2 `0x04`=**north** `0x08`=**west** `0x10`=**east** `0x20`=**south**
+//!   `0x01`=R1 `0x02`=R2(trigger axis) `0x04`=**north** `0x08`=**west** `0x10`=**east** `0x20`=**south**
 //!   `0x40`=Select `0x80`=Start.
 //! - **`ttyS4` = LEFT** stick + these `byte2` bits:
-//!   `0x01`=L1 `0x02`=L2 `0x04`=Dup `0x08`=Dleft `0x10`=Dright `0x20`=Ddown `0x40`=unused(Pro-S)
+//!   `0x01`=L1 `0x02`=L2(trigger axis) `0x04`=Dup `0x08`=Dleft `0x10`=Dright `0x20`=Ddown `0x40`=unused(Pro-S)
 //!   `0x80`=Menu.
 //!
 //! ⚠ The `tsp-ozbp.2` map wrote the four face bits as bare LETTERS (`0x10`=A, `0x20`=B). A letter
@@ -31,7 +31,13 @@
 //! `BTN_X == BTN_NORTH` / `BTN_Y == BTN_WEST`, a glyph-keyed table is *coincidentally correct*
 //! on west/north here, so it looks half-right and reads as a typo rather than a frame error.
 //!
-//! L2/R2 are physically binary → BUTTONS (`BTN_TL2`/`BTN_TR2`), matching `pf-input-broker`.
+//! L2/R2 (bit `0x02` on each side) are emitted as the trigger AXES `ABS_Z` (left) / `ABS_RZ`
+//! (right), range `0..255`, carrying only the endpoints `0` (released) and `255` (pressed) — the
+//! descriptor's `ltrig`/`rtrig` rows (`EV_ABS`, `semantics="binary"`) and the X360 identity's
+//! trigger shape. They are NOT buttons on this node: `pf-input-broker` requires the axes from its
+//! source and does the binary-axis → `BTN_TL2`/`BTN_TR2` translation for apps (`tsp-f3fm.217`;
+//! emitting the buttons here made the broker refuse this node).
+//!
 //! The d-pad (LEFT only) is emitted as an `ABS_HAT0X`/`ABS_HAT0Y` hat, per the descriptor's
 //! `id="dpad" kind="hat"`. `event0`/LRADC VOL± is NOT on this transport — we never touch it.
 
@@ -77,31 +83,36 @@ impl Ev {
 }
 
 // --- per-side button bit → code tables -------------------------------------------------------
-// ONLY genuine buttons appear here. The LEFT d-pad bits (0x04/0x08/0x10/0x20) and the unused
-// Pro-S bit (0x40) are deliberately ABSENT — the d-pad is handled as a hat below, and iterating
-// the table (rather than XOR-ing the raw byte) means those bits can never leak out as buttons.
+// ONLY genuine buttons appear here. The trigger bit (0x02, both sides), the LEFT d-pad bits
+// (0x04/0x08/0x10/0x20) and the unused Pro-S bit (0x40) are deliberately ABSENT — the trigger is
+// an axis and the d-pad a hat (both handled below), and iterating the table (rather than XOR-ing
+// the raw byte) means those bits can never leak out as buttons.
 
 /// RIGHT UART (`ttyS3`) `byte2` bit → evdev button code.
 ///
 /// The four face rows are keyed on PHYSICAL POSITION (Frame C) — the glyph printed on each is
 /// noted only so a human at the bench can find the button. Do not re-key this on the glyph.
 const RIGHT_BTN: &[(u8, u16)] = &[
-    (0x01, codes::BTN_TR),     // R1
-    (0x02, codes::BTN_TR2),    // R2 (binary trigger → button)
-    (0x04, codes::BTN_NORTH),  // TOP face button    (printed "X")
-    (0x08, codes::BTN_WEST),   // LEFT face button   (printed "Y")
-    (0x10, codes::BTN_EAST),   // RIGHT face button  (printed "A")
-    (0x20, codes::BTN_SOUTH),  // BOTTOM face button (printed "B")
+    (0x01, codes::BTN_TR), // R1 (0x02 = R2 is the ABS_RZ trigger axis, see TRIGGER_BIT)
+    (0x04, codes::BTN_NORTH), // TOP face button    (printed "X")
+    (0x08, codes::BTN_WEST), // LEFT face button   (printed "Y")
+    (0x10, codes::BTN_EAST), // RIGHT face button  (printed "A")
+    (0x20, codes::BTN_SOUTH), // BOTTOM face button (printed "B")
     (0x40, codes::BTN_SELECT), // Select
-    (0x80, codes::BTN_START),  // Start
+    (0x80, codes::BTN_START), // Start
 ];
 
-/// LEFT UART (`ttyS4`) `byte2` bit → evdev button code (d-pad + unused bit handled separately).
+/// LEFT UART (`ttyS4`) `byte2` bit → evdev button code (trigger, d-pad + unused bit handled
+/// separately).
 const LEFT_BTN: &[(u8, u16)] = &[
-    (0x01, codes::BTN_TL),   // L1
-    (0x02, codes::BTN_TL2),  // L2 (binary trigger → button)
+    (0x01, codes::BTN_TL), // L1 (0x02 = L2 is the ABS_Z trigger axis, see TRIGGER_BIT)
     (0x80, codes::BTN_MODE), // Menu (the descriptor's "guide")
 ];
+
+/// The trigger bit — the same position on both UARTs: R2 on `ttyS3`, L2 on `ttyS4`. Emitted as
+/// the side's trigger AXIS ([`codes::ABS_RZ`] / [`codes::ABS_Z`]) at an endpoint value, never as a
+/// button.
+const TRIGGER_BIT: u8 = 0x02;
 
 // LEFT d-pad bits.
 const D_UP: u8 = 0x04;
@@ -119,13 +130,16 @@ pub fn all_button_codes() -> Vec<u16> {
 }
 
 /// The full set of `(abs_code, min, max)` this device advertises. Sticks are the honest raw
-/// 12-bit range; the two hats are `-1..=1`.
+/// 12-bit range; the two binary trigger axes are `0..=255` (endpoint-only); the two hats are
+/// `-1..=1`.
 pub fn all_axes() -> Vec<(u16, i32, i32)> {
     vec![
         (codes::ABS_X, codes::STICK_MIN, codes::STICK_MAX),
         (codes::ABS_Y, codes::STICK_MIN, codes::STICK_MAX),
         (codes::ABS_RX, codes::STICK_MIN, codes::STICK_MAX),
         (codes::ABS_RY, codes::STICK_MIN, codes::STICK_MAX),
+        (codes::ABS_Z, codes::TRIGGER_MIN, codes::TRIGGER_MAX),
+        (codes::ABS_RZ, codes::TRIGGER_MIN, codes::TRIGGER_MAX),
         (codes::ABS_HAT0X, -1, 1),
         (codes::ABS_HAT0Y, -1, 1),
     ]
@@ -170,6 +184,14 @@ impl SideDecoder {
         }
     }
 
+    /// This side's trigger axis: `ABS_RZ` (R2) on the right UART, `ABS_Z` (L2) on the left.
+    fn trigger_code(&self) -> u16 {
+        match self.side {
+            Side::Right => codes::ABS_RZ,
+            Side::Left => codes::ABS_Z,
+        }
+    }
+
     fn button_table(&self) -> &'static [(u8, u16)] {
         match self.side {
             Side::Right => RIGHT_BTN,
@@ -191,6 +213,20 @@ impl SideDecoder {
             if now != was {
                 out.push(Ev::key(code, now));
             }
+        }
+
+        // Trigger axis: the same edge detection as a button (all-released baseline on the first
+        // frame, which is also the uinput initial value 0 = TRIGGER_RELEASED), but emitted as the
+        // side's ABS trigger axis at an ENDPOINT — 255 pressed, 0 released, nothing in between.
+        let trig_now = f.buttons & TRIGGER_BIT != 0;
+        let trig_was = !first && (self.last_buttons & TRIGGER_BIT != 0);
+        if trig_now != trig_was {
+            let value = if trig_now {
+                codes::TRIGGER_PRESSED
+            } else {
+                codes::TRIGGER_RELEASED
+            };
+            out.push(Ev::abs(self.trigger_code(), value));
         }
 
         // D-pad hat (LEFT UART only). Opposite bits held simultaneously cancel to centre.
@@ -285,7 +321,6 @@ mod tests {
     fn every_right_button_maps_to_its_ground_truth_code() {
         let cases = [
             (0x01u8, codes::BTN_TR),
-            (0x02, codes::BTN_TR2),
             (0x04, codes::BTN_NORTH),
             (0x08, codes::BTN_WEST),
             (0x10, codes::BTN_EAST),
@@ -313,11 +348,7 @@ mod tests {
 
     #[test]
     fn every_left_button_maps_to_its_ground_truth_code() {
-        let cases = [
-            (0x01u8, codes::BTN_TL),
-            (0x02, codes::BTN_TL2),
-            (0x80, codes::BTN_MODE),
-        ];
+        let cases = [(0x01u8, codes::BTN_TL), (0x80, codes::BTN_MODE)];
         for (mask, code) in cases {
             let mut d = SideDecoder::new(Side::Left);
             d.apply(f(0x00, 2048, 2048));
@@ -326,6 +357,50 @@ mod tests {
                 keys(&evs),
                 vec![(code, 1)],
                 "left bit {mask:#04x} → {code:#05x}"
+            );
+        }
+    }
+
+    /// L2/R2 (bit 0x02 on each side) are the trigger AXES at their endpoints — never a button, and
+    /// never an intermediate value (`tsp-f3fm.217`).
+    #[test]
+    fn trigger_bit_is_an_endpoint_only_axis_not_a_button() {
+        for (side, axis) in [(Side::Left, codes::ABS_Z), (Side::Right, codes::ABS_RZ)] {
+            let mut d = SideDecoder::new(side);
+            d.apply(f(0x00, 2048, 2048)); // baseline released
+            let evs = d.apply(f(TRIGGER_BIT, 2048, 2048));
+            assert_eq!(keys(&evs), vec![], "{side:?} trigger emits no button");
+            assert_eq!(abses(&evs), vec![(axis, 255)], "{side:?} press → 255");
+            let evs = d.apply(f(TRIGGER_BIT, 2048, 2048));
+            assert_eq!(evs, vec![], "{side:?} held trigger does not repeat");
+            let evs = d.apply(f(0x00, 2048, 2048));
+            assert_eq!(abses(&evs), vec![(axis, 0)], "{side:?} release → 0");
+        }
+    }
+
+    #[test]
+    fn trigger_held_at_startup_registers_and_released_one_is_silent() {
+        let mut d = SideDecoder::new(Side::Left);
+        let evs = d.apply(f(TRIGGER_BIT, 2048, 2048));
+        assert!(
+            evs.contains(&Ev::abs(codes::ABS_Z, 255)),
+            "held L2 at startup"
+        );
+        let mut d = SideDecoder::new(Side::Right);
+        let evs = d.apply(f(0x00, 2048, 2048));
+        assert!(
+            !evs.iter()
+                .any(|e| e.code == codes::ABS_RZ && e.ev_type == codes::EV_ABS),
+            "released R2 at startup emits nothing (the uinput initial value is already 0)"
+        );
+    }
+
+    #[test]
+    fn no_button_table_carries_the_trigger_bit() {
+        for table in [RIGHT_BTN, LEFT_BTN] {
+            assert!(
+                table.iter().all(|&(mask, _)| mask & TRIGGER_BIT == 0),
+                "bit 0x02 is the trigger axis, never a button"
             );
         }
     }

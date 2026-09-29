@@ -36,3 +36,8 @@ pf-app-manifest = { workspace = true }
 pf-ports = { workspace = true }
 pf-prefs = { workspace = true }
 pf-prefsd = { workspace = true }
+# The decoder↔descriptor capability contract (tests/decoder_descriptor_contract.rs, tsp-f3fm.217):
+# the broker's own capability check is run against pf-input-decode's REAL uinput setup bits, and
+# the sha256 of the real a133 descriptor it scored is printed. Test-only; the daemon links neither.
+pf-input-decode = { path = "../pf-input-decode", version = "0.0.1" }
+sha2 = "0.10"
