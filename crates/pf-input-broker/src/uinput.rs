@@ -100,7 +100,7 @@ impl Uinput {
             return Err(io::Error::last_os_error());
         }
         // SAFETY: UI_DEV_CREATE takes no argument.
-        if unsafe { libc::ioctl(f, ioc::UI_DEV_CREATE) } < 0 {
+        if unsafe { libc::ioctl(f, ioc::UI_DEV_CREATE as libc::Ioctl) } < 0 {
             return Err(io::Error::last_os_error());
         }
 
@@ -111,7 +111,7 @@ impl Uinput {
 
     fn set_bit(&self, req: libc::c_ulong, bit: libc::c_int) -> io::Result<()> {
         // SAFETY: UI_SET_* take an int by value; fd is valid.
-        if unsafe { libc::ioctl(self.fd.as_raw_fd(), req, bit) } < 0 {
+        if unsafe { libc::ioctl(self.fd.as_raw_fd(), req as libc::Ioctl, bit) } < 0 {
             return Err(io::Error::last_os_error());
         }
         Ok(())
@@ -125,7 +125,7 @@ impl Uinput {
         let n = unsafe {
             libc::ioctl(
                 self.fd.as_raw_fd(),
-                ioc::ui_get_sysname(buf.len()),
+                ioc::ui_get_sysname(buf.len()) as libc::Ioctl,
                 buf.as_mut_ptr(),
             )
         };
@@ -206,7 +206,7 @@ impl Drop for Uinput {
     fn drop(&mut self) {
         // SAFETY: UI_DEV_DESTROY takes no argument; fd valid until the OwnedFd drops next.
         unsafe {
-            libc::ioctl(self.fd.as_raw_fd(), ioc::UI_DEV_DESTROY);
+            libc::ioctl(self.fd.as_raw_fd(), ioc::UI_DEV_DESTROY as libc::Ioctl);
         }
     }
 }
