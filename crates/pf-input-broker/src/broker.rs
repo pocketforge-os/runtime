@@ -12,11 +12,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use pf_wire::{recv_request, send_response, Op, Request, Response, Status};
 use pocketforge::descriptor::Descriptor;
+use pocketforge::server::handle_request;
+use pocketforge::Backend;
 
 use crate::evdev::Evdev;
 use crate::ioc;
 use crate::policy::TokenBucket;
 use crate::remap::{AbsAction, Remap};
+use crate::safe_return::{SafeReturnGate, SafeReturnIntake, GUIDE_CODE};
 use crate::scm;
 use crate::uinput::Uinput;
 
@@ -48,14 +51,38 @@ pub fn read_events_raw(fd: RawFd, out: &mut [libc::input_event]) -> io::Result<u
 pub struct InputBroker {
     source: Evdev,
     sink: Uinput,
+    start: std::time::Instant,
+    pump: ReportPump,
+}
+
+/// Authoritative source state the pump consults after `SYN_DROPPED`: the grabbed evdev source in
+/// production, a fixture in hermetic tests.
+pub(crate) trait SourceState {
+    fn pressed_keys(&self, codes: &[u16]) -> io::Result<Vec<u16>>;
+    fn abs_value(&self, code: u16) -> io::Result<i32>;
+}
+
+impl SourceState for Evdev {
+    fn pressed_keys(&self, codes: &[u16]) -> io::Result<Vec<u16>> {
+        Evdev::pressed_keys(self, codes)
+    }
+    fn abs_value(&self, code: u16) -> io::Result<i32> {
+        Evdev::abs_value(self, code)
+    }
+}
+
+/// The device-free report pipeline: descriptor remap, rate-limit policy, report framing,
+/// `SYN_DROPPED` resync and (with `--safe-return-sock`) the protected guide gate.
+pub(crate) struct ReportPump {
     remap: Remap,
     bucket: TokenBucket,
-    start: std::time::Instant,
     pending_report: Vec<(u16, u16, i32)>,
     pending_report_oversized: bool,
     resynchronizing: bool,
     pressed: HashSet<u16>,
     abs_state: HashMap<u16, i32>,
+    /// `None` (no `--safe-return-sock`) leaves the stream exactly as before: guide passes through.
+    safe_return: Option<SafeReturnGate>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -153,25 +180,20 @@ impl InputBroker {
             },
             |_| Uinput::create(remap.spec()),
         )?;
-        // The legacy uinput setup initializes every advertised ABS value to zero.
-        let abs_state = remap
-            .spec()
-            .abs
-            .iter()
-            .map(|(code, _)| (*code, 0))
-            .collect();
         Ok(InputBroker {
             source,
             sink,
-            remap,
-            bucket: TokenBucket::default_broker(),
             start: std::time::Instant::now(),
-            pending_report: Vec::new(),
-            pending_report_oversized: false,
-            resynchronizing: false,
-            pressed: HashSet::new(),
-            abs_state,
+            pump: ReportPump::new(remap),
         })
+    }
+
+    /// Make this broker the protected SafeReturn intake (`--safe-return-sock`): guide/`BTN_MODE`
+    /// press and release are dropped from the re-emit stream, and each press edge asks
+    /// `intake` to send one SafeReturn to the session authority.
+    pub fn with_safe_return(mut self, intake: SafeReturnIntake) -> InputBroker {
+        self.pump.safe_return = Some(SafeReturnGate::new(intake));
+        self
     }
 
     fn validate_source(source: &Evdev, descriptor: &Descriptor, remap: &Remap) -> io::Result<()> {
@@ -248,101 +270,11 @@ impl InputBroker {
         let mut buf: [libc::input_event; 64] = unsafe { std::mem::zeroed() };
         let n = self.source.read_events(&mut buf)?;
         let now = self.start.elapsed().as_secs_f64();
-        let mut emitted = 0usize;
-        for ev in &buf[..n] {
-            let t = ev.type_;
-            if t == ioc::EV_SYN && ev.code == ioc::SYN_DROPPED {
-                self.pending_report.clear();
-                self.pending_report_oversized = false;
-                self.resynchronizing = true;
-            } else if self.resynchronizing {
-                // Events following SYN_DROPPED belong to the unreliable tail of the overrun.
-                // Once its boundary arrives, query authoritative state before accepting reports.
-                if t == ioc::EV_SYN && ev.code == ioc::SYN_REPORT {
-                    let out = self.resynchronize_source_state()?;
-                    for (ty, code, value) in out {
-                        self.sink.emit(ty, code, value)?;
-                        emitted += 1;
-                    }
-                    self.resynchronizing = false;
-                }
-            } else if t == ioc::EV_SYN && ev.code == ioc::SYN_REPORT {
-                let allowed = self.bucket.allow(now);
-                let out = finish_report(
-                    &mut self.pending_report,
-                    &mut self.pending_report_oversized,
-                    &mut self.pressed,
-                    allowed,
-                );
-                for (ty, code, value) in out {
-                    self.sink.emit(ty, code, value)?;
-                    if ty == ioc::EV_ABS {
-                        self.abs_state.insert(code, value);
-                    }
-                    emitted += 1;
-                }
-            } else if t == ioc::EV_KEY {
-                push_report_event(
-                    &mut self.pending_report,
-                    &mut self.pending_report_oversized,
-                    (t, self.remap.remap_key(ev.code), ev.value),
-                );
-            } else if t == ioc::EV_ABS {
-                // Analog axes pass through; a physically-binary trigger (semantics="binary") is
-                // reclassified to an EV_KEY press/release on its canonical button (descriptor-driven).
-                match self.remap.classify_abs(ev.code, ev.value) {
-                    AbsAction::Passthrough => {
-                        push_report_event(
-                            &mut self.pending_report,
-                            &mut self.pending_report_oversized,
-                            (t, ev.code, ev.value),
-                        );
-                    }
-                    AbsAction::Button { code, value } => {
-                        push_report_event(
-                            &mut self.pending_report,
-                            &mut self.pending_report_oversized,
-                            (ioc::EV_KEY, code, value),
-                        );
-                    }
-                    AbsAction::None => {} // inside the hysteresis band / no state change — drop
-                }
-            }
-            // Other event types are outside the descriptor-controlled input surface.
-        }
-        Ok(emitted)
-    }
-
-    fn resynchronize_source_state(&mut self) -> io::Result<Vec<(u16, u16, i32)>> {
-        let actual_pressed: HashSet<u16> = self
-            .source
-            .pressed_keys(self.remap.required_source_keys())?
-            .into_iter()
-            .map(|code| self.remap.remap_key(code))
-            .collect();
-        let abs_values = self
-            .remap
-            .required_source_abs()
-            .iter()
-            .copied()
-            .map(|code| self.source.abs_value(code).map(|value| (code, value)))
-            .collect::<io::Result<Vec<_>>>()?;
-        let mut actual_abs = Vec::new();
-        let mut actual_binary = Vec::new();
-        for (code, value) in abs_values {
-            match self.remap.resync_abs(code, value) {
-                AbsAction::Passthrough => actual_abs.push((code, value)),
-                AbsAction::Button { code, value } => actual_binary.push((code, value != 0)),
-                AbsAction::None => unreachable!("resync_abs always yields authoritative state"),
-            }
-        }
-        Ok(diff_resynchronized_state(
-            &mut self.pressed,
-            &mut self.abs_state,
-            actual_pressed,
-            actual_abs,
-            actual_binary,
-        ))
+        let sink = &self.sink;
+        self.pump
+            .process(&buf[..n], now, &self.source, &mut |ty, code, value| {
+                sink.emit(ty, code, value)
+            })
     }
 
     /// Block up to `timeout_ms` for the source to become readable. `true` if events are pending.
@@ -386,6 +318,158 @@ impl InputBroker {
             .node_path()
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "re-emit node not resolved"))?;
         open_read_fd(&node)
+    }
+}
+
+impl ReportPump {
+    fn new(remap: Remap) -> ReportPump {
+        // The legacy uinput setup initializes every advertised ABS value to zero.
+        let abs_state = remap
+            .spec()
+            .abs
+            .iter()
+            .map(|(code, _)| (*code, 0))
+            .collect();
+        ReportPump {
+            remap,
+            bucket: TokenBucket::default_broker(),
+            pending_report: Vec::new(),
+            pending_report_oversized: false,
+            resynchronizing: false,
+            pressed: HashSet::new(),
+            abs_state,
+            safe_return: None,
+        }
+    }
+
+    /// `true` when the SafeReturn gate owns this canonical key transition (guide, flag set).
+    fn consumed_by_safe_return(&mut self, code: u16, value: i32) -> bool {
+        self.safe_return
+            .as_mut()
+            .is_some_and(|gate| gate.consume_key(code, value))
+    }
+
+    /// Route one batch of source events through remap + policy + the guide gate into `emit`.
+    /// Returns events emitted.
+    pub(crate) fn process(
+        &mut self,
+        events: &[libc::input_event],
+        now: f64,
+        source: &impl SourceState,
+        emit: &mut impl FnMut(u16, u16, i32) -> io::Result<()>,
+    ) -> io::Result<usize> {
+        let mut emitted = 0usize;
+        for ev in events {
+            let t = ev.type_;
+            if t == ioc::EV_SYN && ev.code == ioc::SYN_DROPPED {
+                self.pending_report.clear();
+                self.pending_report_oversized = false;
+                self.resynchronizing = true;
+            } else if self.resynchronizing {
+                // Events following SYN_DROPPED belong to the unreliable tail of the overrun.
+                // Once its boundary arrives, query authoritative state before accepting reports.
+                if t == ioc::EV_SYN && ev.code == ioc::SYN_REPORT {
+                    let out = self.resynchronize_source_state(source)?;
+                    for (ty, code, value) in out {
+                        emit(ty, code, value)?;
+                        emitted += 1;
+                    }
+                    self.resynchronizing = false;
+                }
+            } else if t == ioc::EV_SYN && ev.code == ioc::SYN_REPORT {
+                let allowed = self.bucket.allow(now);
+                let out = finish_report(
+                    &mut self.pending_report,
+                    &mut self.pending_report_oversized,
+                    &mut self.pressed,
+                    allowed,
+                );
+                for (ty, code, value) in out {
+                    emit(ty, code, value)?;
+                    if ty == ioc::EV_ABS {
+                        self.abs_state.insert(code, value);
+                    }
+                    emitted += 1;
+                }
+            } else if t == ioc::EV_KEY {
+                let code = self.remap.remap_key(ev.code);
+                if !self.consumed_by_safe_return(code, ev.value) {
+                    push_report_event(
+                        &mut self.pending_report,
+                        &mut self.pending_report_oversized,
+                        (t, code, ev.value),
+                    );
+                }
+            } else if t == ioc::EV_ABS {
+                // Analog axes pass through; a physically-binary trigger (semantics="binary") is
+                // reclassified to an EV_KEY press/release on its canonical button (descriptor-driven).
+                match self.remap.classify_abs(ev.code, ev.value) {
+                    AbsAction::Passthrough => {
+                        push_report_event(
+                            &mut self.pending_report,
+                            &mut self.pending_report_oversized,
+                            (t, ev.code, ev.value),
+                        );
+                    }
+                    AbsAction::Button { code, value } => {
+                        if !self.consumed_by_safe_return(code, value) {
+                            push_report_event(
+                                &mut self.pending_report,
+                                &mut self.pending_report_oversized,
+                                (ioc::EV_KEY, code, value),
+                            );
+                        }
+                    }
+                    AbsAction::None => {} // inside the hysteresis band / no state change — drop
+                }
+            }
+            // Other event types are outside the descriptor-controlled input surface.
+        }
+        Ok(emitted)
+    }
+
+    fn resynchronize_source_state(
+        &mut self,
+        source: &impl SourceState,
+    ) -> io::Result<Vec<(u16, u16, i32)>> {
+        let mut actual_pressed: HashSet<u16> = source
+            .pressed_keys(self.remap.required_source_keys())?
+            .into_iter()
+            .map(|code| self.remap.remap_key(code))
+            .collect();
+        let abs_values = self
+            .remap
+            .required_source_abs()
+            .iter()
+            .copied()
+            .map(|code| source.abs_value(code).map(|value| (code, value)))
+            .collect::<io::Result<Vec<_>>>()?;
+        let mut actual_abs = Vec::new();
+        let mut actual_binary = Vec::new();
+        for (code, value) in abs_values {
+            match self.remap.resync_abs(code, value) {
+                AbsAction::Passthrough => actual_abs.push((code, value)),
+                AbsAction::Button { code, value } => actual_binary.push((code, value != 0)),
+                AbsAction::None => unreachable!("resync_abs always yields authoritative state"),
+            }
+        }
+        if let Some(gate) = self.safe_return.as_mut() {
+            // The guide key never enters the visible state; its authoritative level feeds the
+            // gate instead, so a press lost inside the overrun still returns to the launcher.
+            let binary_guide = actual_binary
+                .iter()
+                .any(|&(code, down)| code == GUIDE_CODE && down);
+            actual_binary.retain(|&(code, _)| code != GUIDE_CODE);
+            let key_guide = actual_pressed.remove(&GUIDE_CODE);
+            gate.set_down(key_guide || binary_guide);
+        }
+        Ok(diff_resynchronized_state(
+            &mut self.pressed,
+            &mut self.abs_state,
+            actual_pressed,
+            actual_abs,
+            actual_binary,
+        ))
     }
 }
 
@@ -561,6 +645,90 @@ pub fn handle_acquire(mut stream: UnixStream, app_fd_path: &str) -> io::Result<(
         let _ = send_response(&mut stream, &Response::err(Status::Unsupported));
     }
     Ok(())
+}
+
+/// Serve one app connection as a persistent PFW1 request/response loop (`tsp-f3fm.202.1`).
+///
+/// * `Acquire("input")` replies `Ok` plus a fresh re-emit read fd over `SCM_RIGHTS`, as many
+///   times as the client asks, so a client that dropped its fd can re-acquire on the same session
+///   connection.
+/// * `GetAppearance` goes through [`pocketforge::server::handle_request`]: prefsd at
+///   `$PF_PREFSD_SOCK` when set, otherwise `backend`.
+/// * Every other op gets a typed `Unsupported`.
+///
+/// The client (the app's `BrokerClientBackend`) holds this connection for its whole session, so
+/// the idle wait between requests is unbounded. Once a request's first byte arrives, the request
+/// and its reply are each bounded by the acquisition I/O deadline, so a client that stalls
+/// mid-frame cannot pin the thread. EOF, a hangup or a protocol error ends the loop.
+pub fn serve_client(
+    stream: UnixStream,
+    app_fd_path: &str,
+    backend: &dyn Backend,
+) -> io::Result<()> {
+    stream.set_nonblocking(false)?;
+    stream.set_read_timeout(Some(ACQUIRE_CLIENT_TIMEOUT))?;
+    stream.set_write_timeout(Some(ACQUIRE_CLIENT_TIMEOUT))?;
+    while wait_for_request(&stream)? {
+        let req = match recv_request(&mut &stream) {
+            Ok(r) => r,
+            Err(_) => return Ok(()), // closed / malformed / stalled mid-frame → drop
+        };
+        respond(&stream, &req, app_fd_path, backend)?;
+    }
+    Ok(())
+}
+
+/// Block until the client sends something (`true`) or hangs up (`false`).
+fn wait_for_request(stream: &UnixStream) -> io::Result<bool> {
+    loop {
+        let mut pfd = libc::pollfd {
+            fd: stream.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: one valid pollfd; -1 waits until readable or hung up.
+        let rc = unsafe { libc::poll(&mut pfd, 1, -1) };
+        if rc < 0 {
+            let e = io::Error::last_os_error();
+            if e.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            return Err(e);
+        }
+        // Pending bytes win over a simultaneous hangup: a request written just before close
+        // is still answered (or fails cleanly at EOF).
+        return Ok(pfd.revents & libc::POLLIN != 0);
+    }
+}
+
+fn respond(
+    stream: &UnixStream,
+    req: &Request,
+    app_fd_path: &str,
+    backend: &dyn Backend,
+) -> io::Result<()> {
+    let mut writer = stream;
+    match req.op {
+        Op::Acquire if req.name.eq_ignore_ascii_case("input") => {
+            let fd = match open_read_fd(app_fd_path) {
+                Ok(fd) => fd,
+                Err(e) => {
+                    // Keep the session connection: a typed refusal, never a fabricated fd.
+                    eprintln!("pf-input-broker: re-emit node {app_fd_path} unavailable: {e}");
+                    return send_response(&mut writer, &Response::err(Status::HardwareAbsent))
+                        .map_err(wire_err);
+                }
+            };
+            let mut framed = Vec::new();
+            send_response(&mut framed, &Response::ok()).map_err(wire_err)?;
+            scm::send_fd(stream.as_raw_fd(), &framed, fd.as_raw_fd())
+        }
+        Op::GetAppearance => {
+            send_response(&mut writer, &handle_request(backend, req)).map_err(wire_err)
+        }
+        // This socket vends the input fd and the appearance read; nothing else.
+        _ => send_response(&mut writer, &Response::err(Status::Unsupported)).map_err(wire_err),
+    }
 }
 
 /// Client side: `Acquire("input")` from the broker at `sock_path`, returning the PFW1 response +
@@ -777,5 +945,459 @@ mod readiness_tests {
             !created.get(),
             "sink factory must not run before successful acquisition"
         );
+    }
+}
+
+/// Hermetic tests for the tsp-f3fm.202.1 additions: the persistent PFW1 session loop, the
+/// GetAppearance pass-through, and the protected SafeReturn gate inside the report pump.
+#[cfg(test)]
+mod session_and_safe_return_tests {
+    use super::*;
+    use crate::safe_return::{SafeReturnIntake, CONNECT_TIMEOUT, IO_TIMEOUT, SAFE_RETURN_BODY};
+    use pocketforge::backends::{BrokerClientBackend, InProcessBackend};
+    use std::io::Write;
+    use std::sync::mpsc::{channel, Receiver};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    const SOUTH: u16 = 0x130;
+
+    fn descriptor() -> Descriptor {
+        Descriptor::from_toml(
+            r#"
+[identity]
+id = "synthguide"
+manufacturer = "PocketForge"
+model = "Guide Rig (synthetic test descriptor)"
+sdl_guid = "030000005e0400008e02000010010000"
+
+[[inputs]]
+id = "south"
+kind = "button"
+ev_type = "EV_KEY"
+code = "BTN_A"
+
+[[inputs]]
+id = "guide"
+kind = "button"
+ev_type = "EV_KEY"
+code = "BTN_MODE"
+
+[[inputs]]
+id = "ltrig"
+kind = "trigger"
+ev_type = "EV_ABS"
+code = "ABS_Z"
+range = { min = 0, max = 255, fuzz = 0, flat = 0 }
+"#,
+        )
+        .unwrap()
+    }
+
+    fn pump(intake: Option<SafeReturnIntake>) -> ReportPump {
+        let mut pump = ReportPump::new(Remap::from_descriptor(&descriptor()).unwrap());
+        pump.safe_return = intake.map(SafeReturnGate::new);
+        pump
+    }
+
+    #[derive(Default)]
+    struct FakeSource {
+        pressed: Vec<u16>,
+    }
+    impl SourceState for FakeSource {
+        fn pressed_keys(&self, codes: &[u16]) -> io::Result<Vec<u16>> {
+            Ok(codes
+                .iter()
+                .copied()
+                .filter(|c| self.pressed.contains(c))
+                .collect())
+        }
+        fn abs_value(&self, _code: u16) -> io::Result<i32> {
+            Ok(0)
+        }
+    }
+
+    fn ev(ty: u16, code: u16, value: i32) -> libc::input_event {
+        // SAFETY: input_event is plain old data.
+        let mut e: libc::input_event = unsafe { std::mem::zeroed() };
+        e.type_ = ty;
+        e.code = code;
+        e.value = value;
+        e
+    }
+    fn key(code: u16, value: i32) -> libc::input_event {
+        ev(ioc::EV_KEY, code, value)
+    }
+    fn syn() -> libc::input_event {
+        ev(ioc::EV_SYN, ioc::SYN_REPORT, 0)
+    }
+
+    fn run(pump: &mut ReportPump, events: &[libc::input_event]) -> Vec<(u16, u16, i32)> {
+        run_with(pump, events, &FakeSource::default())
+    }
+    fn run_with(
+        pump: &mut ReportPump,
+        events: &[libc::input_event],
+        source: &FakeSource,
+    ) -> Vec<(u16, u16, i32)> {
+        let mut out = Vec::new();
+        pump.process(events, 0.0, source, &mut |t, c, v| {
+            out.push((t, c, v));
+            Ok(())
+        })
+        .unwrap();
+        out
+    }
+
+    fn scratch(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("pf-input-broker-{tag}-{}", std::process::id()))
+    }
+
+    fn intake(sock: &Path) -> (SafeReturnIntake, Receiver<String>) {
+        let (tx, rx) = channel();
+        let intake = SafeReturnIntake::spawn_with(
+            sock,
+            CONNECT_TIMEOUT,
+            IO_TIMEOUT,
+            Box::new(move |line| {
+                let _ = tx.send(line.to_owned());
+            }),
+        )
+        .unwrap();
+        (intake, rx)
+    }
+
+    fn guide_press_release() -> Vec<libc::input_event> {
+        vec![key(GUIDE_CODE, 1), syn(), key(GUIDE_CODE, 0), syn()]
+    }
+
+    #[test]
+    fn without_flag_guide_passes_through_unchanged() {
+        let mut p = pump(None);
+        assert_eq!(
+            run(&mut p, &guide_press_release()),
+            vec![
+                (ioc::EV_KEY, GUIDE_CODE, 1),
+                (ioc::EV_SYN, ioc::SYN_REPORT, 0),
+                (ioc::EV_KEY, GUIDE_CODE, 0),
+                (ioc::EV_SYN, ioc::SYN_REPORT, 0),
+            ]
+        );
+    }
+
+    #[test]
+    fn guide_is_suppressed_while_other_codes_pass_through() {
+        let sock = scratch("suppress-absent.sock");
+        let _ = std::fs::remove_file(&sock);
+        let (intake, _log) = intake(&sock);
+        let mut p = pump(Some(intake));
+        let out = run(
+            &mut p,
+            &[
+                key(SOUTH, 1),
+                key(GUIDE_CODE, 1),
+                syn(),
+                key(GUIDE_CODE, 2),
+                syn(),
+                key(GUIDE_CODE, 0),
+                key(SOUTH, 0),
+                syn(),
+            ],
+        );
+        assert_eq!(
+            out,
+            vec![
+                (ioc::EV_KEY, SOUTH, 1),
+                (ioc::EV_SYN, ioc::SYN_REPORT, 0),
+                (ioc::EV_SYN, ioc::SYN_REPORT, 0),
+                (ioc::EV_KEY, SOUTH, 0),
+                (ioc::EV_SYN, ioc::SYN_REPORT, 0),
+            ]
+        );
+        assert!(!out.iter().any(|&(_, code, _)| code == GUIDE_CODE));
+        assert!(!p.pressed.contains(&GUIDE_CODE));
+    }
+
+    #[test]
+    fn fake_authority_receives_exactly_one_frame_per_press() {
+        let sock = scratch("one-frame.sock");
+        let _ = std::fs::remove_file(&sock);
+        let listener = UnixListener::bind(&sock).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let (frames_tx, frames) = channel();
+        let stop = Arc::new(AtomicBool::new(false));
+        let server_stop = stop.clone();
+        let server = std::thread::spawn(move || {
+            while !server_stop.load(Ordering::Acquire) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        stream.set_nonblocking(false).unwrap();
+                        let body = pf_wire::read_frame(&mut stream).unwrap();
+                        pf_wire::write_frame(&mut stream, br#"{"result":"ok"}"#).unwrap();
+                        frames_tx.send(body).unwrap();
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5))
+                    }
+                    Err(e) => panic!("{e}"),
+                }
+            }
+        });
+        let (intake, log) = intake(&sock);
+        let mut p = pump(Some(intake));
+        for press in 1..=2 {
+            // A press, autorepeat and release are one press edge.
+            run(
+                &mut p,
+                &[
+                    key(GUIDE_CODE, 1),
+                    syn(),
+                    key(GUIDE_CODE, 2),
+                    syn(),
+                    key(GUIDE_CODE, 0),
+                    syn(),
+                ],
+            );
+            let line = log.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert!(line.ends_with(": ok"), "press {press}: {line}");
+            assert_eq!(
+                frames.recv_timeout(Duration::from_secs(1)).unwrap(),
+                SAFE_RETURN_BODY
+            );
+        }
+        assert!(
+            frames.recv_timeout(Duration::from_millis(300)).is_err(),
+            "no frame beyond one per press"
+        );
+        stop.store(true, Ordering::Release);
+        server.join().unwrap();
+        let _ = std::fs::remove_file(sock);
+    }
+
+    #[test]
+    fn stalled_authority_never_blocks_the_input_pump() {
+        // Bound but never accepting or answering: a single-threaded authority stuck in
+        // `systemctl stop`. The worker waits out its full production 5 s read timeout.
+        let sock = scratch("stalled.sock");
+        let _ = std::fs::remove_file(&sock);
+        let listener = UnixListener::bind(&sock).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let (intake, _log) = intake(&sock);
+        let mut p = pump(Some(intake));
+        let mut events = Vec::new();
+        for _ in 0..50 {
+            events.extend(guide_press_release());
+            events.extend([key(SOUTH, 1), syn(), key(SOUTH, 0), syn()]);
+        }
+        let started = Instant::now();
+        let out = run(&mut p, &events);
+        let elapsed = started.elapsed();
+        assert!(elapsed < Duration::from_secs(1), "pump took {elapsed:?}");
+        let south: Vec<_> = out.iter().filter(|e| e.1 == SOUTH).collect();
+        assert_eq!(south.len(), 100, "every non-guide event still flows");
+        assert!(!out.iter().any(|&(_, code, _)| code == GUIDE_CODE));
+        assert!(
+            p.safe_return.as_ref().unwrap().intake().in_flight(),
+            "the first press is still waiting on the authority"
+        );
+        // 50 presses while that request is in flight coalesce into exactly one connection.
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let first = loop {
+            match listener.accept() {
+                Ok(conn) => break conn,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock && Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(5))
+                }
+                Err(e) => panic!("no SafeReturn connection: {e}"),
+            }
+        };
+        drop(first);
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            io::ErrorKind::WouldBlock,
+            "coalesced presses must not open more connections"
+        );
+        let _ = std::fs::remove_file(sock);
+    }
+
+    #[test]
+    fn absent_authority_is_logged_and_the_pump_continues() {
+        let sock = scratch("absent.sock");
+        let _ = std::fs::remove_file(&sock);
+        let (intake, log) = intake(&sock);
+        let mut p = pump(Some(intake));
+        let out = run(&mut p, &guide_press_release());
+        let line = log.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(
+            line.contains("safe_return") && line.contains("failed") && line.contains("NotFound"),
+            "{line}"
+        );
+        assert!(!out.iter().any(|&(_, code, _)| code == GUIDE_CODE));
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while p.safe_return.as_ref().unwrap().intake().in_flight() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let out = run(&mut p, &[key(SOUTH, 1), syn()]);
+        assert_eq!(
+            out,
+            vec![(ioc::EV_KEY, SOUTH, 1), (ioc::EV_SYN, ioc::SYN_REPORT, 0)]
+        );
+        run(&mut p, &guide_press_release());
+        let again = log.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(again.contains("failed"), "the next press retries: {again}");
+    }
+
+    #[test]
+    fn syn_dropped_resync_withholds_guide_and_counts_its_press() {
+        let sock = scratch("resync-absent.sock");
+        let _ = std::fs::remove_file(&sock);
+        let (intake, log) = intake(&sock);
+        let mut p = pump(Some(intake));
+        let source = FakeSource {
+            pressed: vec![SOUTH, GUIDE_CODE],
+        };
+        let out = run_with(
+            &mut p,
+            &[
+                ev(ioc::EV_SYN, ioc::SYN_DROPPED, 0),
+                key(GUIDE_CODE, 1),
+                syn(),
+            ],
+            &source,
+        );
+        assert_eq!(
+            out,
+            vec![(ioc::EV_KEY, SOUTH, 1), (ioc::EV_SYN, ioc::SYN_REPORT, 0)]
+        );
+        assert!(!p.pressed.contains(&GUIDE_CODE));
+        assert!(
+            log.recv_timeout(Duration::from_secs(2)).is_ok(),
+            "press edge requested"
+        );
+    }
+
+    // --- the persistent PFW1 session loop -----------------------------------------------------
+
+    fn node_file(tag: &str) -> PathBuf {
+        let path = scratch(tag);
+        std::fs::write(&path, b"re-emit-node").unwrap();
+        path
+    }
+
+    fn backend() -> Arc<dyn Backend> {
+        Arc::new(InProcessBackend::new(Arc::new(descriptor())))
+    }
+
+    fn serve_pair(node: &Path) -> (UnixStream, std::thread::JoinHandle<io::Result<()>>) {
+        let (client, server) = UnixStream::pair().unwrap();
+        let node = node.to_str().unwrap().to_owned();
+        let backend = backend();
+        let handle = std::thread::spawn(move || serve_client(server, &node, &*backend));
+        (client, handle)
+    }
+
+    fn acquire_on(client: &UnixStream) -> (Response, Option<OwnedFd>) {
+        pf_wire::send_request(&mut &*client, &Request::new(Op::Acquire, "input")).unwrap();
+        let mut buf = [0u8; 256];
+        let (n, fd) = scm::recv_fd(client.as_raw_fd(), &mut buf).unwrap();
+        let resp = pf_wire::recv_response(&mut io::Cursor::new(&buf[..n])).unwrap();
+        (resp, fd)
+    }
+
+    fn call(client: &UnixStream, op: Op, name: &str) -> Response {
+        pf_wire::send_request(&mut &*client, &Request::new(op, name)).unwrap();
+        pf_wire::recv_response(&mut &*client).unwrap()
+    }
+
+    #[test]
+    fn two_acquires_on_one_connection_both_return_fds() {
+        let node = node_file("two-acquires.node");
+        let (client, server) = serve_pair(&node);
+        let (first, fd1) = acquire_on(&client);
+        let (second, fd2) = acquire_on(&client);
+        assert_eq!(first.status, Status::Ok);
+        assert_eq!(second.status, Status::Ok);
+        let (fd1, fd2) = (fd1.expect("first fd"), fd2.expect("second fd"));
+        assert_ne!(fd1.as_raw_fd(), fd2.as_raw_fd());
+        for fd in [&fd1, &fd2] {
+            let mut buf = [0u8; 12];
+            let n = unsafe { libc::read(fd.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
+            assert_eq!(&buf[..n as usize], b"re-emit-node");
+        }
+        drop(client);
+        server.join().unwrap().unwrap();
+        let _ = std::fs::remove_file(node);
+    }
+
+    #[test]
+    fn get_appearance_is_served_and_other_ops_stay_unsupported() {
+        let node = node_file("appearance.node");
+        let (client, server) = serve_pair(&node);
+        let appearance = call(&client, Op::GetAppearance, "");
+        assert_eq!(appearance.status, Status::Ok);
+        assert!(
+            appearance.flag <= 2,
+            "a valid Appearance: {}",
+            appearance.flag
+        );
+        for (op, name) in [
+            (Op::IsPresent, "input"),
+            (Op::GetAppearanceSource, ""),
+            (Op::GetPreference, ""),
+            (Op::Acquire, "imu"),
+        ] {
+            assert_eq!(
+                call(&client, op, name).status,
+                Status::Unsupported,
+                "{op:?}"
+            );
+        }
+        // The session survives all of that: input can still be acquired.
+        assert!(acquire_on(&client).1.is_some());
+        drop(client);
+        server.join().unwrap().unwrap();
+        let _ = std::fs::remove_file(node);
+    }
+
+    #[test]
+    fn broker_client_backend_reacquires_after_dropping_its_fd() {
+        let node = node_file("reacquire.node");
+        let (client, server) = serve_pair(&node);
+        let be = BrokerClientBackend::from_stream(client);
+        let fd = be.acquire_input_fd().expect("first acquire");
+        drop(fd);
+        let _ = be.appearance(); // a facade poll between acquisitions keeps the session
+        let fd = be.acquire_input_fd().expect("re-acquire after drop");
+        let mut buf = [0u8; 12];
+        let n = unsafe { libc::read(fd.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
+        assert_eq!(&buf[..n as usize], b"re-emit-node");
+        drop(be);
+        server.join().unwrap().unwrap();
+        let _ = std::fs::remove_file(node);
+    }
+
+    #[test]
+    fn missing_node_is_a_typed_refusal_and_the_session_survives() {
+        let node = scratch("missing.node");
+        let _ = std::fs::remove_file(&node);
+        let (client, server) = serve_pair(&node);
+        pf_wire::send_request(&mut &client, &Request::new(Op::Acquire, "input")).unwrap();
+        let resp = pf_wire::recv_response(&mut &client).unwrap();
+        assert_eq!(resp.status, Status::HardwareAbsent);
+        assert_eq!(call(&client, Op::GetAppearance, "").status, Status::Ok);
+        drop(client);
+        server.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn client_stalled_mid_frame_is_deadline_bounded() {
+        let node = node_file("stalled-frame.node");
+        let (mut client, server) = serve_pair(&node);
+        client.write_all(&[0, 0]).unwrap(); // half a length prefix, then silence
+        let started = Instant::now();
+        server.join().unwrap().unwrap();
+        assert!(started.elapsed() < Duration::from_secs(1));
+        let _ = std::fs::remove_file(node);
     }
 }
