@@ -1098,3 +1098,367 @@ fn acknowledged_client_cursor_survives_authority_restart_and_compacts_pending() 
     let reopened = Authority::open(store, system, clock, 3, Duration::from_millis(10)).unwrap();
     assert!(reopened.events_for("launcher").is_empty());
 }
+
+// ---- tsp-f3fm.219: a crash/failed start must never wedge the authority silently ----
+
+type Log = std::sync::Arc<std::sync::Mutex<Vec<String>>>;
+
+fn logged_authority(
+    lifecycle: Option<SystemLifecycle>,
+) -> (Authority<MemoryStore, FakeSystem, TestClock>, Log) {
+    let log = Log::default();
+    let sink = log.clone();
+    let authority = Authority::open_with_resolver(
+        MemoryStore::default(),
+        FakeSystem {
+            lifecycle,
+            ..FakeSystem::available()
+        },
+        TestClock::new(),
+        3,
+        Duration::from_millis(10),
+        test_resolver(),
+    )
+    .unwrap()
+    .with_log_sink(move |line| sink.lock().unwrap().push(line.to_owned()));
+    (authority, log)
+}
+
+/// systemd after P3's Poolsuite start crash: unit failed, target released, shell restarted.
+fn crashed_unit_restored_owner() -> Option<SystemLifecycle> {
+    Some(SystemLifecycle {
+        app: AppUnitState::InactiveFailure {
+            summary: "systemd result: exit-code".into(),
+        },
+        foreground_target_active: false,
+        selected_owner_active: true,
+    })
+}
+
+fn observed_running_or_starting(events: &[(u64, SessionEvent)]) -> Vec<u64> {
+    events
+        .iter()
+        .filter(|(_, e)| {
+            matches!(
+                e,
+                SessionEvent::Observed(
+                    ObservedSessionState::Starting | ObservedSessionState::Running
+                )
+            )
+        })
+        .map(|(sequence, _)| *sequence)
+        .collect()
+}
+
+#[test]
+fn ended_session_starting_and_running_are_never_delivered_to_a_cursor_zero_client() {
+    let mut a = authority();
+    let first = launch_running(&mut a);
+    // Positive control in the same run: while the session is live, a fresh client sees it.
+    assert_eq!(
+        observed_running_or_starting(&a.events_for("fresh")).len(),
+        2
+    );
+
+    a.observe(Observation::SessionCrashed {
+        summary: "systemd result: exit-code".into(),
+    })
+    .unwrap();
+    assert!(a.state.history[0].ended_at.is_some());
+    assert!(observed_running_or_starting(&a.events_for("restarted-shell")).is_empty());
+
+    // Through the RPC the restarted shell uses, with reconcile advancing the ladder (P3 shape).
+    a.system.lifecycle = crashed_unit_restored_owner();
+    let RpcResponse::Events { events } = handle_rpc(
+        &mut a,
+        RpcRequest::Events {
+            client_id: "pf-shell".into(),
+        },
+    )
+    .unwrap() else {
+        panic!()
+    };
+    assert!(matches!(
+        a.state.phase,
+        Phase::Restoring {
+            rung: RestorationRung::PresentationAcknowledged,
+            ..
+        }
+    ));
+    assert!(!events
+        .iter()
+        .any(|(_, e)| matches!(e, RpcEvent::Starting | RpcEvent::Running)));
+
+    // Cursor safety: sequences are untouched, so the shell's later ack still validates/compacts.
+    a.observe(Observation::PresentationAcknowledged).unwrap();
+    a.system.lifecycle = None;
+    let second = launch_running(&mut a);
+    assert_ne!(first, second);
+    let events = a.events_for("pf-shell");
+    let live = observed_running_or_starting(&events);
+    assert_eq!(
+        live.len(),
+        2,
+        "the new session's Starting/Running are delivered"
+    );
+    let terminal = events
+        .iter()
+        .find(|(_, e)| matches!(e, SessionEvent::Terminal(_)))
+        .unwrap()
+        .0;
+    assert!(live.iter().all(|sequence| *sequence > terminal));
+    // Delivery filters; it never rewrites the queue, so the ended session's events are still
+    // pending under their original sequences.
+    assert!(a.state.pending.iter().any(|e| {
+        matches!(
+            e.event,
+            WireEvent::ObservedStarting | WireEvent::ObservedRunning
+        ) && e.sequence < terminal
+    }));
+    let last = events.last().unwrap().0;
+    a.acknowledge("pf-shell", last).unwrap();
+    assert!(a.events_for("pf-shell").is_empty());
+    assert!(a.state.pending.is_empty());
+}
+
+#[test]
+fn presentation_deadline_expires_on_tick_without_rpc_into_logged_recovery() {
+    let (mut a, log) = logged_authority(None);
+    launch_running(&mut a);
+    a.system.lifecycle = crashed_unit_restored_owner();
+
+    a.tick().unwrap();
+    assert!(matches!(
+        a.state.phase,
+        Phase::Restoring {
+            rung: RestorationRung::PresentationAcknowledged,
+            ..
+        }
+    ));
+    a.clock
+        .advance(DEFAULT_PRESENTATION_TIMEOUT - Duration::from_millis(1));
+    a.tick().unwrap();
+    assert!(matches!(a.state.phase, Phase::Restoring { .. }));
+    assert!(log.lock().unwrap().is_empty());
+
+    a.clock.advance(Duration::from_millis(1));
+    a.tick().unwrap();
+    let Phase::RecoveryRequired {
+        ref reason,
+        ref pending_receipt,
+        ..
+    } = a.store.snapshot().unwrap().phase
+    else {
+        panic!("expected durable RecoveryRequired, got {:?}", a.state.phase)
+    };
+    assert_eq!(
+        reason,
+        "presentation_not_acknowledged: presentation not acknowledged within 10000 ms"
+    );
+    assert_eq!(
+        pending_receipt,
+        &Some(Receipt::Crash {
+            summary: "systemd result: exit-code".into()
+        })
+    );
+    assert!(a.events_for("pf-shell").iter().any(|(_, e)| matches!(
+        e,
+        SessionEvent::RecoveryRequired(RecoveryRequired { reason, .. })
+            if reason.starts_with("presentation_not_acknowledged:")
+    )));
+    assert_eq!(
+        *log.lock().unwrap(),
+        [
+            "pf-session-authorityd: lifecycle_failure reason=presentation_not_acknowledged \
+          item_id=\"org.example.game\" detail=\"presentation not acknowledged within 10000 ms\""
+        ]
+    );
+    // The receipt is written only at Idle: history still reads "restoration pending".
+    assert!(a.state.history[0].ended_at.is_some());
+    assert_eq!(a.state.history[0].receipt, None);
+}
+
+#[test]
+fn late_presentation_ack_after_timeout_reaches_idle_with_receipt_in_history() {
+    let (mut a, _log) = logged_authority(None);
+    let id = launch_running(&mut a);
+    a.system.lifecycle = crashed_unit_restored_owner();
+    a.tick().unwrap();
+    a.clock.advance(DEFAULT_PRESENTATION_TIMEOUT);
+    a.tick().unwrap();
+    assert!(matches!(a.state.phase, Phase::RecoveryRequired { .. }));
+
+    handle_rpc(
+        &mut a,
+        RpcRequest::Observe {
+            observation: RpcObservation::PresentationAcknowledged,
+        },
+    )
+    .unwrap();
+    assert!(matches!(a.store.snapshot().unwrap().phase, Phase::Idle));
+    let receipt = Receipt::Crash {
+        summary: "systemd result: exit-code".into(),
+    };
+    assert_eq!(a.state.history[0].receipt, Some(receipt));
+    assert_eq!(
+        a.history(),
+        [SessionEvent::Terminal(TerminalReceipt::Crash {
+            session_id: id,
+            summary: "systemd result: exit-code".into(),
+        })]
+    );
+    a.system.lifecycle = None;
+    assert!(matches!(
+        a.launch(LaunchRequest {
+            item_id: APP_ID.into()
+        })
+        .unwrap(),
+        LaunchResult::Accepted { .. }
+    ));
+}
+
+#[test]
+fn every_other_recovery_reason_stays_terminal_for_a_late_ack() {
+    for rung in [
+        FailureRung::Presentation,
+        FailureRung::OwnerActive,
+        FailureRung::TargetReleased,
+    ] {
+        let mut a = authority();
+        launch_running(&mut a);
+        a.observe(Observation::SessionExitedCleanly).unwrap();
+        a.observe(Observation::Failed {
+            rung,
+            reason: "fault".into(),
+        })
+        .unwrap();
+        assert_eq!(
+            a.observe(Observation::PresentationAcknowledged),
+            Err(AuthorityError::InvalidObservation)
+        );
+        assert!(matches!(a.state.phase, Phase::RecoveryRequired { .. }));
+        assert_eq!(a.state.history[0].receipt, None);
+    }
+}
+
+#[test]
+fn restarted_daemon_rearms_a_full_presentation_deadline() {
+    let (mut a, _log) = logged_authority(None);
+    launch_running(&mut a);
+    a.system.lifecycle = crashed_unit_restored_owner();
+    a.tick().unwrap();
+    a.clock.advance(DEFAULT_PRESENTATION_TIMEOUT * 2);
+    let (store, system, clock) = a.into_parts();
+    let log = Log::default();
+    let sink = log.clone();
+    let mut reopened = Authority::open(store, system, clock, 3, Duration::from_millis(10))
+        .unwrap()
+        .with_log_sink(move |line| sink.lock().unwrap().push(line.to_owned()));
+    reopened.tick().unwrap();
+    assert!(matches!(reopened.state.phase, Phase::Restoring { .. }));
+    reopened.clock.advance(DEFAULT_PRESENTATION_TIMEOUT);
+    reopened.tick().unwrap();
+    assert!(matches!(
+        reopened.state.phase,
+        Phase::RecoveryRequired { .. }
+    ));
+    assert_eq!(log.lock().unwrap().len(), 1);
+}
+
+#[test]
+fn busy_launch_is_refused_with_a_logged_reason_never_silently() {
+    let (mut a, log) = logged_authority(None);
+    launch_running(&mut a);
+    let busy = LaunchRequest {
+        item_id: "org.example.busy".into(),
+    };
+    assert_eq!(a.launch(busy.clone()), Ok(LaunchResult::RejectedBusy));
+
+    a.system.lifecycle = crashed_unit_restored_owner();
+    a.tick().unwrap();
+    let response = handle_rpc(
+        &mut a,
+        RpcRequest::Launch {
+            item_id: "org.example.busy".into(),
+        },
+    )
+    .unwrap();
+    assert!(matches!(response, RpcResponse::RejectedBusy));
+    assert_eq!(
+        *log.lock().unwrap(),
+        [
+            "pf-session-authorityd: launch_refused reason=busy item_id=\"org.example.busy\" \
+             phase=running",
+            "pf-session-authorityd: launch_refused reason=busy item_id=\"org.example.busy\" \
+             phase=restoring",
+        ]
+    );
+    // Refuse, never queue: the refused request left no trace in the session state.
+    assert_eq!(a.state.next_session, 2);
+    assert_eq!(a.state.history.len(), 1);
+}
+
+#[test]
+fn service_loop_ticks_the_ladder_with_no_client_rpc() {
+    let (a, log) = logged_authority(None);
+    let mut a = a.with_presentation_timeout(Duration::ZERO);
+    launch_running(&mut a);
+    a.system.lifecycle = crashed_unit_restored_owner();
+
+    let (connections, incoming) = std::sync::mpsc::channel::<io::Result<u32>>();
+    connections.send(Ok(7)).unwrap();
+    let closer = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(200));
+        drop(connections);
+    });
+    let mut served = Vec::new();
+    run_service_loop(
+        &mut a,
+        &incoming,
+        Duration::from_millis(5),
+        |_, connection| {
+            served.push(connection);
+            Ok(())
+        },
+    )
+    .unwrap();
+    closer.join().unwrap();
+
+    assert_eq!(served, [7], "only the one queued connection was served");
+    assert!(matches!(
+        a.state.phase,
+        Phase::RecoveryRequired { ref reason, .. } if is_presentation_timeout(reason)
+    ));
+    assert_eq!(a.system.calls.iter().filter(|c| *c == "owner").count(), 1);
+    assert!(
+        log.lock().unwrap()[0].contains("lifecycle_failure reason=presentation_not_acknowledged")
+    );
+}
+
+#[test]
+fn service_loop_ends_on_a_connection_source_error() {
+    let mut a = authority();
+    let (connections, incoming) = std::sync::mpsc::channel::<io::Result<u32>>();
+    connections
+        .send(Err(io::Error::other("accept failed")))
+        .unwrap();
+    let error =
+        run_service_loop(&mut a, &incoming, Duration::from_secs(60), |_, _| Ok(())).unwrap_err();
+    assert_eq!(error.to_string(), "accept failed");
+}
+
+#[test]
+fn recovery_required_json_without_a_pending_receipt_is_unchanged() {
+    let phase = Phase::RecoveryRequired {
+        session_id: "session-1".into(),
+        item_id: APP_ID.into(),
+        reason: "owner_not_active: fault".into(),
+        pending_receipt: None,
+    };
+    let json = serde_json::to_string(&phase).unwrap();
+    assert_eq!(
+        json,
+        r#"{"RecoveryRequired":{"session_id":"session-1","item_id":"org.example.game","reason":"owner_not_active: fault"}}"#
+    );
+    assert_eq!(serde_json::from_str::<Phase>(&json).unwrap(), phase);
+}

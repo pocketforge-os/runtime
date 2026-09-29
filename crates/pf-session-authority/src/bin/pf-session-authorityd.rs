@@ -1,6 +1,7 @@
 use pf_ports::{Clock, MonotonicTime};
 use pf_session_authority::{
-    serve_connection, Authority, CommandSystem, CommandTemplates, FileStore,
+    run_service_loop, serve_connection, Authority, CommandSystem, CommandTemplates, FileStore,
+    DEFAULT_PRESENTATION_TIMEOUT, DEFAULT_TICK_INTERVAL,
 };
 use std::env;
 use std::fs;
@@ -8,6 +9,8 @@ use std::io;
 use std::os::unix::fs::FileTypeExt;
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
+use std::thread;
 use std::time::{Duration, Instant};
 
 struct SystemClock(Instant);
@@ -40,15 +43,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         SystemClock(Instant::now()),
         32,
         Duration::from_secs(10),
-    )?;
+    )?
+    .with_presentation_timeout(DEFAULT_PRESENTATION_TIMEOUT);
     authority.reconcile()?;
-    for connection in listener.incoming() {
-        let mut stream = connection?;
-        let mut writer = stream.try_clone()?;
-        if let Err(error) = serve_connection(&mut authority, &mut stream, &mut writer) {
-            eprintln!("pf-session-authorityd: connection error: {error:?}");
+    // Accept on a helper thread so the authority itself stays single-threaded and can run its
+    // self-driven tick between RPCs (the device has no other periodic driver).
+    let (connections, incoming) = mpsc::channel();
+    thread::spawn(move || {
+        for connection in listener.incoming() {
+            let failed = connection.is_err();
+            if connections.send(connection).is_err() || failed {
+                break;
+            }
         }
-    }
+    });
+    run_service_loop(
+        &mut authority,
+        &incoming,
+        DEFAULT_TICK_INTERVAL,
+        |authority, mut stream| {
+            let mut writer = stream.try_clone()?;
+            if let Err(error) = serve_connection(authority, &mut stream, &mut writer) {
+                eprintln!("pf-session-authorityd: connection error: {error:?}");
+            }
+            Ok(())
+        },
+    )?;
     Ok(())
 }
 
