@@ -1462,3 +1462,109 @@ fn recovery_required_json_without_a_pending_receipt_is_unchanged() {
     );
     assert_eq!(serde_json::from_str::<Phase>(&json).unwrap(), phase);
 }
+
+fn short_socket_dir(name: &str) -> PathBuf {
+    let dir = PathBuf::from("/tmp").join(format!(
+        "pfsa-{name}-{}-{}",
+        std::process::id(),
+        RESOLVER_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    ));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+fn raw_rpc(socket: &Path, request: &RpcRequest) -> RpcResponse {
+    let mut stream = std::os::unix::net::UnixStream::connect(socket).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    pf_wire::write_frame(&mut stream, &serde_json::to_vec(request).unwrap()).unwrap();
+    serde_json::from_slice(&pf_wire::read_frame(&mut stream).unwrap()).unwrap()
+}
+
+#[test]
+fn stalled_clients_never_block_the_service_loop_tick() {
+    use std::io::Write as _;
+    let dir = short_socket_dir("stall");
+    let socket = dir.join("a.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    // Generous I/O timeout: the tick must survive by structure, not by the timeout expiring.
+    let limits = ConnectionLimits {
+        io_timeout: Duration::from_secs(60),
+        ..DEFAULT_CONNECTION_LIMITS
+    };
+    let (requests, incoming) = std::sync::mpsc::channel();
+    spawn_rpc_acceptor(listener, requests, limits);
+    let silent = std::os::unix::net::UnixStream::connect(&socket).unwrap();
+    let mut partial = std::os::unix::net::UnixStream::connect(&socket).unwrap();
+    partial.write_all(&[0, 0]).unwrap();
+
+    let (a, log) = logged_authority(None);
+    // TestClock does not advance on its own: a zero deadline expires on the first tick that
+    // reaches the rung, so RecoveryRequired proves the loop ticked while both clients stalled.
+    let mut a = a.with_presentation_timeout(Duration::ZERO);
+    launch_running(&mut a);
+    a.system.lifecycle = crashed_unit_restored_owner();
+    let client_socket = socket.clone();
+    let client = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(300));
+        raw_rpc(&client_socket, &RpcRequest::History)
+    });
+    let mut phase_when_served = None;
+    let stopped = run_service_loop(
+        &mut a,
+        &incoming,
+        Duration::from_millis(5),
+        |authority, pending: PendingRpc| {
+            phase_when_served = Some(authority.state().phase.clone());
+            let response = dispatch_rpc(authority, pending.request.clone());
+            pending.respond(response);
+            Err(io::Error::other("test served its request"))
+        },
+    );
+
+    assert_eq!(stopped.unwrap_err().to_string(), "test served its request");
+    assert!(matches!(
+        client.join().unwrap(),
+        RpcResponse::History { .. }
+    ));
+    assert!(
+        matches!(
+            phase_when_served,
+            Some(Phase::RecoveryRequired { ref reason, .. }) if is_presentation_timeout(reason)
+        ),
+        "the deadline fired while two clients stalled: {phase_when_served:?}"
+    );
+    assert!(log.lock().unwrap()[0].contains("presentation_not_acknowledged"));
+    drop((silent, partial));
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn acceptor_closes_connections_beyond_its_bound() {
+    use std::io::Read as _;
+    let dir = short_socket_dir("bound");
+    let socket = dir.join("a.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    let limits = ConnectionLimits {
+        io_timeout: Duration::from_secs(60),
+        response_timeout: Duration::from_secs(60),
+        max_connections: 1,
+    };
+    let (requests, _incoming) = std::sync::mpsc::channel();
+    spawn_rpc_acceptor(listener, requests, limits);
+    let _occupying = std::os::unix::net::UnixStream::connect(&socket).unwrap();
+    std::thread::sleep(Duration::from_millis(100));
+    let mut refused = std::os::unix::net::UnixStream::connect(&socket).unwrap();
+    refused
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let mut byte = [0; 1];
+    assert_eq!(
+        refused.read(&mut byte).unwrap(),
+        0,
+        "closed without service"
+    );
+    fs::remove_dir_all(dir).unwrap();
+}

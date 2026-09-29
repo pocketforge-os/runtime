@@ -34,9 +34,12 @@ use std::collections::{BTreeMap, VecDeque};
 use std::fs;
 use std::io;
 use std::io::Write;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{mpsc, Arc};
+use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
 /// Default deadline for the restored shell to acknowledge its first presentation.
@@ -44,6 +47,23 @@ pub const DEFAULT_PRESENTATION_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Default cadence of the daemon's self-driven reconcile/deadline tick.
 pub const DEFAULT_TICK_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Bounds for the daemon's connection I/O, which runs off the authority loop.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ConnectionLimits {
+    /// Read timeout for one complete request frame, and write timeout for the response.
+    pub io_timeout: Duration,
+    /// Longest a connection waits for the authority loop's response.
+    pub response_timeout: Duration,
+    /// Connections served concurrently; further connections are closed immediately.
+    pub max_connections: usize,
+}
+
+pub const DEFAULT_CONNECTION_LIMITS: ConnectionLimits = ConnectionLimits {
+    io_timeout: Duration::from_secs(5),
+    response_timeout: Duration::from_secs(30),
+    max_connections: 16,
+};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AuthorityError {
@@ -696,6 +716,9 @@ impl From<SessionEvent> for RpcEvent {
     }
 }
 
+/// Serves one request synchronously on the caller's thread (in-process tests and simulators).
+/// It blocks on the peer's framing, so the daemon never calls it from the authority loop; see
+/// [`spawn_rpc_acceptor`].
 pub fn serve_connection<S: StateStore, B: SessionSystem, C: Clock>(
     authority: &mut Authority<S, B, C>,
     stream: &mut impl io::Read,
@@ -709,6 +732,97 @@ pub fn serve_connection<S: StateStore, B: SessionSystem, C: Clock>(
     });
     let body = serde_json::to_vec(&response).map_err(|e| AuthorityError::Backend(e.to_string()))?;
     pf_wire::write_frame(writer, &body).map_err(|e| AuthorityError::Backend(e.to_string()))
+}
+
+/// Runs one complete, decoded request against the authority. Never touches a socket.
+pub fn dispatch_rpc<S: StateStore, B: SessionSystem, C: Clock>(
+    authority: &mut Authority<S, B, C>,
+    request: RpcRequest,
+) -> RpcResponse {
+    handle_rpc(authority, request).unwrap_or_else(|error| RpcResponse::Error {
+        message: format!("{error:?}"),
+    })
+}
+
+/// A complete request read and decoded by a connection thread, with its response channel.
+pub struct PendingRpc {
+    pub request: RpcRequest,
+    reply: mpsc::Sender<RpcResponse>,
+}
+
+impl PendingRpc {
+    /// Hands the response back to the connection thread; a vanished client is not an error.
+    pub fn respond(self, response: RpcResponse) {
+        let _ = self.reply.send(response);
+    }
+}
+
+/// Accepts connections on a helper thread and serves each on its own bounded thread.
+///
+/// Framing never runs on the authority loop: a connection thread reads and decodes one request
+/// under `io_timeout`, forwards only the complete request, waits at most `response_timeout` for
+/// the reply and writes it under `io_timeout`. A silent, partial or non-reading client therefore
+/// costs one bounded connection thread, never an authority tick. An accept error is forwarded and
+/// ends the acceptor.
+pub fn spawn_rpc_acceptor(
+    listener: UnixListener,
+    requests: mpsc::Sender<io::Result<PendingRpc>>,
+    limits: ConnectionLimits,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        let active = Arc::new(AtomicUsize::new(0));
+        for connection in listener.incoming() {
+            let stream = match connection {
+                Ok(stream) => stream,
+                Err(error) => {
+                    let _ = requests.send(Err(error));
+                    return;
+                }
+            };
+            if active.fetch_add(1, Ordering::AcqRel) >= limits.max_connections {
+                active.fetch_sub(1, Ordering::AcqRel);
+                eprintln!(
+                    "pf-session-authorityd: connection_refused reason=too_many_connections limit={}",
+                    limits.max_connections
+                );
+                continue;
+            }
+            let (requests, active) = (requests.clone(), active.clone());
+            thread::spawn(move || {
+                if let Err(error) = serve_rpc_connection(stream, &requests, limits) {
+                    eprintln!("pf-session-authorityd: connection error: {error:?}");
+                }
+                active.fetch_sub(1, Ordering::AcqRel);
+            });
+        }
+    })
+}
+
+fn serve_rpc_connection(
+    mut stream: UnixStream,
+    requests: &mpsc::Sender<io::Result<PendingRpc>>,
+    limits: ConnectionLimits,
+) -> Result<(), AuthorityError> {
+    let backend = |error: &dyn std::fmt::Display| AuthorityError::Backend(error.to_string());
+    stream
+        .set_read_timeout(Some(limits.io_timeout))
+        .and_then(|()| stream.set_write_timeout(Some(limits.io_timeout)))
+        .map_err(|e| backend(&e))?;
+    let body = pf_wire::read_frame(&mut stream).map_err(|e| backend(&e))?;
+    let response = match serde_json::from_slice::<RpcRequest>(&body) {
+        Ok(request) => {
+            let (reply, response) = mpsc::channel();
+            if requests.send(Ok(PendingRpc { request, reply })).is_err() {
+                return Err(AuthorityError::Backend("authority loop stopped".into()));
+            }
+            response
+                .recv_timeout(limits.response_timeout)
+                .map_err(|e| backend(&e))?
+        }
+        Err(error) => return Err(backend(&error)),
+    };
+    let body = serde_json::to_vec(&response).map_err(|e| backend(&e))?;
+    pf_wire::write_frame(&mut stream, &body).map_err(|e| backend(&e))
 }
 
 fn handle_rpc<S: StateStore, B: SessionSystem, C: Clock>(
