@@ -35,8 +35,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = parse_args(raw_args.into_iter())?;
     fs::create_dir_all(&args.state_dir)?;
     prepare_socket(&args.socket)?;
-    let listener = UnixListener::bind(&args.socket)?;
-    let _socket_guard = SocketGuard(args.socket.clone());
     let mut authority = Authority::open(
         FileStore::new(args.state_dir.join("authority.json")),
         CommandSystem::new(args.templates),
@@ -46,6 +44,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?
     .with_presentation_timeout(DEFAULT_PRESENTATION_TIMEOUT);
     authority.reconcile()?;
+    // The socket is the daemon's readiness boundary. Publish or reconcile the
+    // complete durable state before clients can observe that boundary.
+    let listener = UnixListener::bind(&args.socket)?;
+    let _socket_guard = SocketGuard(args.socket.clone());
     // Connection threads own all socket I/O (bounded by DEFAULT_CONNECTION_LIMITS) and forward
     // only complete requests, so the single-threaded authority blocks only in the loop's channel
     // wait and its self-driven tick keeps firing during a slow or silent client.

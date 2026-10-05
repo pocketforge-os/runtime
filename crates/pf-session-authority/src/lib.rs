@@ -957,7 +957,7 @@ impl<S: StateStore, B: SessionSystem, C: Clock> Authority<S, B, C> {
     }
 
     pub fn open_with_resolver_and_now_fn(
-        store: S,
+        mut store: S,
         system: B,
         clock: C,
         recent_bound: usize,
@@ -965,7 +965,14 @@ impl<S: StateStore, B: SessionSystem, C: Clock> Authority<S, B, C> {
         resolver: Resolver,
         now_fn: fn() -> SystemTime,
     ) -> Result<Self, AuthorityError> {
-        let state = store.load()?.unwrap_or_default();
+        let state = match store.load()? {
+            Some(state) => state,
+            None => {
+                let state = PersistedState::default();
+                store.save(&state)?;
+                state
+            }
+        };
         Ok(Self {
             store,
             system,
