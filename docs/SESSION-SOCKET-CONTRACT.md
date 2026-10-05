@@ -55,6 +55,13 @@ fall back to a previous generation.
 <app-root>/run/pocketforge/session
 ```
 
+Each projection is first written as an immutable generation below the private
+`<app-root>/run/pocketforge/.session-projections/` store. The `session` path is then atomically
+replaced with a symlink to that complete projection. Endpoint links in the projection target the
+exact canonical session generation read during projection, not the moving canonical `session`
+symlink. Republish of the canonical session therefore cannot mix generations in an existing app
+projection; a consumer reconnects by requesting a new projection.
+
 Only the requested, published non-privileged capability names are projected. Contract metadata
 files are mode `0444`; contract directories are mode `0755`. Existing non-symlink files or
 directories at projection targets are rejected. The projection is deliberately rooted under the

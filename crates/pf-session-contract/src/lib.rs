@@ -12,6 +12,7 @@ use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::os::unix::fs::{symlink, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 pub const DEFAULT_SESSION_ROOT: &str = "/run/pocketforge/session";
 const GENERATIONS_DIR: &str = ".session-generations";
@@ -19,6 +20,7 @@ const READY: &str = "ready\n";
 const READONLY_MODE: u32 = 0o444;
 const DIRECTORY_MODE: u32 = 0o755;
 const PROJECTION_DIRECTORY_MODE: u32 = 0o755;
+static NEXT_PROJECTION_ID: AtomicU64 = AtomicU64::new(0);
 
 /// A complete compositor publication.  Endpoint paths may be sockets or regular files in a
 /// hermetic test; publication requires that they already exist and never takes ownership of
@@ -80,6 +82,7 @@ pub struct SessionSnapshot {
     pub display: Option<String>,
     pub xauthority: Option<PathBuf>,
     pub capabilities: BTreeMap<String, PathBuf>,
+    generation_root: PathBuf,
 }
 
 #[derive(Debug)]
@@ -279,6 +282,7 @@ impl SessionPublisher {
             display,
             xauthority,
             capabilities,
+            generation_root,
         })
     }
 
@@ -312,51 +316,95 @@ impl SessionPublisher {
                 )));
             }
         }
-        ensure_directory(app_root, PROJECTION_DIRECTORY_MODE)?;
+        let app_root = absolute_path(app_root);
+        ensure_directory(&app_root, PROJECTION_DIRECTORY_MODE)?;
         let run = app_root.join("run");
         ensure_directory(&run, PROJECTION_DIRECTORY_MODE)?;
         let pocketforge = run.join("pocketforge");
         ensure_directory(&pocketforge, PROJECTION_DIRECTORY_MODE)?;
         let projection = pocketforge.join("session");
-        ensure_directory(&projection, PROJECTION_DIRECTORY_MODE)?;
+        let projections = pocketforge.join(".session-projections");
+        ensure_directory(&projections, PROJECTION_DIRECTORY_MODE)?;
+        let projection_id = NEXT_PROJECTION_ID.fetch_add(1, Ordering::Relaxed);
+        let name = format!(
+            "{}.{}.{}",
+            snapshot.generation,
+            std::process::id(),
+            projection_id
+        );
+        let stage = projections.join(format!(".staging.{name}"));
+        let final_dir = projections.join(&name);
+        if stage.exists() || fs::symlink_metadata(&stage).is_ok() || final_dir.exists() {
+            return Err(SessionContractError::UnsafeExistingPath { path: stage });
+        }
+        fs::create_dir(&stage).map_err(|source| io_error("create projection", &stage, source))?;
+        set_mode(&stage, PROJECTION_DIRECTORY_MODE)?;
 
+        let result = self.write_projection(&stage, &projection, &snapshot, capabilities);
+        if let Err(error) = result {
+            let _ = fs::remove_dir_all(&stage);
+            return Err(error);
+        }
+        fs::rename(&stage, &final_dir)
+            .map_err(|source| io_error("commit projection", &final_dir, source))?;
+
+        let temporary_link = pocketforge.join(format!(".session-link.{name}"));
+        symlink(
+            Path::new(".session-projections").join(&name),
+            &temporary_link,
+        )
+        .map_err(|source| io_error("stage projection link", &temporary_link, source))?;
+        if let Err(error) = replace_public_link(&projection, &temporary_link) {
+            let _ = fs::remove_file(&temporary_link);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn write_projection(
+        &self,
+        projection_root: &Path,
+        public_projection: &Path,
+        snapshot: &SessionSnapshot,
+        capabilities: &[&str],
+    ) -> Result<(), SessionContractError> {
         write_readonly(
-            &projection.join("generation"),
+            &projection_root.join("generation"),
             &format!("{}\n", snapshot.generation),
         )?;
-        write_readonly(&projection.join("readiness"), READY)?;
         let mut environment = format!(
             "POCKETFORGE_SESSION={}\nPOCKETFORGE_SESSION_GENERATION={}\nWAYLAND_DISPLAY={}\n",
-            projection.display(),
+            public_projection.display(),
             snapshot.generation,
             snapshot.wayland_display
         );
         if let Some(display) = &snapshot.display {
             environment.push_str(&format!(
                 "DISPLAY={display}\nXAUTHORITY={}/xauthority\n",
-                projection.display()
+                public_projection.display()
             ));
         }
-        write_readonly(&projection.join("environment"), &environment)?;
-        link_entry(
-            &self.root.join(&snapshot.wayland_display),
-            &projection.join(&snapshot.wayland_display),
+        write_readonly(&projection_root.join("environment"), &environment)?;
+        link_entry_absolute(
+            &snapshot.generation_root.join(&snapshot.wayland_display),
+            &projection_root.join(&snapshot.wayland_display),
         )?;
         if snapshot.xauthority.is_some() {
-            link_entry(
-                &self.root.join("xauthority"),
-                &projection.join("xauthority"),
+            link_entry_absolute(
+                &snapshot.generation_root.join("xauthority"),
+                &projection_root.join("xauthority"),
             )?;
         }
-        let capability_dir = projection.join("capabilities");
+        let capability_dir = projection_root.join("capabilities");
         ensure_directory(&capability_dir, PROJECTION_DIRECTORY_MODE)?;
         for name in capabilities {
-            link_entry(
-                &self.root.join("capabilities").join(name),
+            link_entry_absolute(
+                &snapshot.generation_root.join("capabilities").join(name),
                 &capability_dir.join(name),
             )?;
         }
-        Ok(())
+        // Readiness is the final file in the immutable projection generation.
+        write_readonly(&projection_root.join("readiness"), READY)
     }
 
     fn parent_dir(&self) -> Result<PathBuf, SessionContractError> {

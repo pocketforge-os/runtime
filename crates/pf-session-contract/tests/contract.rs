@@ -162,6 +162,61 @@ fn app_root_projection_is_filtered_rooted_and_read_only() {
 }
 
 #[test]
+fn app_root_projection_remains_pinned_when_session_is_republished() {
+    let scratch = Scratch::new();
+    let root = scratch.path("session");
+    let app_root = scratch.path("app-root");
+    let publisher = SessionPublisher::new(&root);
+    let first_wayland = source_file(&scratch.path, "first-wayland.sock");
+    let first_generation = publisher
+        .publish(
+            &SessionPublication::new("wayland-0", &first_wayland)
+                .with_xwayland(":0", source_file(&scratch.path, "first-xauthority")),
+        )
+        .unwrap();
+
+    publisher.project_app_root(&app_root, &[]).unwrap();
+    let projected = app_root.join("run/pocketforge/session");
+    assert!(fs::symlink_metadata(&projected)
+        .unwrap()
+        .file_type()
+        .is_symlink());
+    assert_eq!(
+        fs::read_to_string(projected.join("generation")).unwrap(),
+        format!("{first_generation}\n")
+    );
+    assert_eq!(
+        fs::canonicalize(projected.join("wayland-0")).unwrap(),
+        fs::canonicalize(&first_wayland).unwrap()
+    );
+
+    let second_wayland = source_file(&scratch.path, "second-wayland.sock");
+    let second_generation = publisher
+        .publish(
+            &SessionPublication::new("wayland-0", &second_wayland)
+                .with_xwayland(":0", source_file(&scratch.path, "second-xauthority")),
+        )
+        .unwrap();
+    assert_eq!(second_generation, first_generation + 1);
+    assert_eq!(publisher.read().unwrap().generation, second_generation);
+
+    // The existing app projection is immutable and continues to resolve to the generation it
+    // published, even though the canonical session root now names a newer generation.
+    assert_eq!(
+        fs::read_to_string(projected.join("generation")).unwrap(),
+        format!("{first_generation}\n")
+    );
+    assert_eq!(
+        fs::canonicalize(projected.join("wayland-0")).unwrap(),
+        fs::canonicalize(first_wayland).unwrap()
+    );
+    assert_ne!(
+        fs::canonicalize(projected.join("wayland-0")).unwrap(),
+        fs::canonicalize(second_wayland).unwrap()
+    );
+}
+
+#[test]
 fn drm_and_protected_input_ownership_are_explicitly_denied() {
     let scratch = Scratch::new();
     let root = scratch.path("session");
