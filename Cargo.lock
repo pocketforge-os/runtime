@@ -570,6 +570,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "pf-session-contract"
+version = "0.0.1"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "pf-settings"
 version = "0.0.1"
 dependencies = [
