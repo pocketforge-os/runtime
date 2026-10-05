@@ -1026,12 +1026,41 @@ struct RefusingStore {
 }
 impl StateStore for RefusingStore {
     fn load(&self) -> Result<Option<PersistedState>, AuthorityError> {
-        Ok(None)
+        Ok(Some(PersistedState::default()))
     }
     fn save(&mut self, _: &PersistedState) -> Result<(), AuthorityError> {
         self.saves += 1;
         Err(AuthorityError::Persistence("refused".into()))
     }
+}
+
+#[test]
+fn initial_state_publication_failure_aborts_open() {
+    struct RefusingInitialStore;
+    impl StateStore for RefusingInitialStore {
+        fn load(&self) -> Result<Option<PersistedState>, AuthorityError> {
+            Ok(None)
+        }
+        fn save(&mut self, _: &PersistedState) -> Result<(), AuthorityError> {
+            Err(AuthorityError::Persistence(
+                "initial publication refused".into(),
+            ))
+        }
+    }
+
+    let result = Authority::open_with_resolver(
+        RefusingInitialStore,
+        FakeSystem::available(),
+        TestClock::new(),
+        3,
+        Duration::from_millis(10),
+        test_resolver(),
+    );
+
+    assert!(matches!(
+        result,
+        Err(AuthorityError::Persistence(reason)) if reason == "initial publication refused"
+    ));
 }
 
 #[test]
