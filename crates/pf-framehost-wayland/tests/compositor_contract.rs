@@ -527,22 +527,26 @@ fn fixture_scene() -> Scene {
     Scene::new(root, NodeId::new("contract-root").unwrap()).unwrap()
 }
 
-fn expected_rotated_xrgb(
+fn expected_rotated_ccw_xrgb(
     scene: &Scene,
     metrics: SurfaceMetrics,
-) -> (Vec<u8>, Option<DamageObservation>) {
+) -> (Vec<u8>, Vec<u8>, Option<DamageObservation>) {
     let mut rasterizer = Rasterizer::new();
     let frame = rasterizer
         .render(scene, metrics)
         .expect("render expected frame");
     let width = usize::try_from(frame.width).unwrap();
     let height = usize::try_from(frame.height).unwrap();
+    let mut logical_xrgb = Vec::with_capacity(frame.rgba.len());
+    for rgba in frame.rgba.chunks_exact(4) {
+        logical_xrgb.extend_from_slice(&[rgba[2], rgba[1], rgba[0], 0xff]);
+    }
     let mut xrgb = vec![0; frame.rgba.len()];
     for y in 0..height {
         for x in 0..width {
             let source = (y * width + x) * 4;
-            let target_x = height - y - 1;
-            let target_y = x;
+            let target_x = y;
+            let target_y = width - x - 1;
             let target = (target_y * height + target_x) * 4;
             xrgb[target..target + 4].copy_from_slice(&[
                 frame.rgba[source + 2],
@@ -554,13 +558,31 @@ fn expected_rotated_xrgb(
     }
     let damage = frame.damage.map(|damage| {
         (
-            i32::try_from(frame.height - damage.y - damage.height).unwrap(),
-            i32::try_from(damage.x).unwrap(),
+            i32::try_from(damage.y).unwrap(),
+            i32::try_from(frame.width - damage.x - damage.width).unwrap(),
             i32::try_from(damage.height).unwrap(),
             i32::try_from(damage.width).unwrap(),
         )
     });
-    (xrgb, damage)
+    (xrgb, logical_xrgb, damage)
+}
+
+fn compositor_surface_xrgb(frame: &FrameObservation) -> Vec<u8> {
+    assert_eq!(frame.transform, Some(wl_output::Transform::_90));
+    let buffer_width = usize::try_from(frame.width).unwrap();
+    let buffer_height = usize::try_from(frame.height).unwrap();
+    let surface_width = buffer_height;
+    let mut surface = vec![0; frame.xrgb.len()];
+    for y in 0..buffer_height {
+        for x in 0..buffer_width {
+            let source = (y * buffer_width + x) * 4;
+            let target_x = buffer_height - y - 1;
+            let target_y = x;
+            let target = (target_y * surface_width + target_x) * 4;
+            surface[target..target + 4].copy_from_slice(&frame.xrgb[source..source + 4]);
+        }
+    }
+    surface
 }
 
 fn drain_fixture_keys(host: &mut WaylandHost) -> Vec<KeyEvent> {
@@ -636,9 +658,17 @@ fn compositor_adapter_contract_matrix() {
         (720, 1280, 2880)
     );
     assert_eq!(frame_a.transform, Some(wl_output::Transform::_90));
-    let (expected_xrgb, expected_damage) = expected_rotated_xrgb(&scene, host.metrics());
+    let (expected_xrgb, expected_surface_xrgb, expected_damage) =
+        expected_rotated_ccw_xrgb(&scene, host.metrics());
     assert_eq!(frame_a.damage, expected_damage);
-    assert_eq!(frame_a.xrgb, expected_xrgb);
+    assert!(
+        frame_a.xrgb.as_slice() == expected_xrgb.as_slice(),
+        "submitted buffer pixels must contain the advertised counter-clockwise transform"
+    );
+    assert!(
+        compositor_surface_xrgb(frame_a).as_slice() == expected_surface_xrgb.as_slice(),
+        "the compositor's advertised inverse transform must reconstruct the logical surface"
+    );
 
     assert_eq!(
         drain_fixture_keys(&mut host),
@@ -683,7 +713,15 @@ fn compositor_adapter_contract_matrix() {
         (snapshot_b.frames[0].width, snapshot_b.frames[0].height),
         (720, 1280)
     );
-    assert_eq!(snapshot_b.frames[0].xrgb, expected_xrgb);
+    assert!(
+        snapshot_b.frames[0].xrgb.as_slice() == expected_xrgb.as_slice(),
+        "reconnected buffer pixels must retain the counter-clockwise transform"
+    );
+    assert!(
+        compositor_surface_xrgb(&snapshot_b.frames[0]).as_slice()
+            == expected_surface_xrgb.as_slice(),
+        "reconnected surface must retain the advertised inverse transform"
+    );
     server_b.stop();
 
     let socket_default = runtime.path().join("wayland-default");

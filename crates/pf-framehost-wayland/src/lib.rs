@@ -859,14 +859,13 @@ impl WaylandHost {
 fn rotate_rgba_90(rgba: &[u8], width: u32, height: u32) -> Vec<u8> {
     let source_width = usize::try_from(width).expect("validated width");
     let target_width = usize::try_from(height).expect("validated height");
-    let source_height = usize::try_from(height).expect("validated height");
     let mut rotated = vec![0; rgba.len()];
 
     for (source_index, pixel) in rgba.chunks_exact(4).enumerate() {
         let source_x = source_index % source_width;
         let source_y = source_index / source_width;
-        let target_x = source_height - source_y - 1;
-        let target_y = source_x;
+        let target_x = source_y;
+        let target_y = source_width - source_x - 1;
         let target_index = (target_y * target_width + target_x) * 4;
         rotated[target_index..target_index + 4].copy_from_slice(pixel);
     }
@@ -876,8 +875,8 @@ fn rotate_rgba_90(rgba: &[u8], width: u32, height: u32) -> Vec<u8> {
 
 fn rotate_damage_90(damage: DamageRect, logical_size: ValidatedSize) -> DamageRect {
     DamageRect {
-        x: logical_size.height - damage.y - damage.height,
-        y: damage.x,
+        x: damage.y,
+        y: logical_size.width - damage.x - damage.width,
         width: damage.height,
         height: damage.width,
     }
