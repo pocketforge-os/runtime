@@ -22,8 +22,16 @@ wayland-protocols = { version = "=0.32.9", features = ["client"] }
 libc = "=0.2.186"
 xkbcommon = { version = "=0.8.0", features = ["wayland"], optional = true }
 
+[dev-dependencies]
+wayland-protocols = { version = "=0.32.9", features = ["server"] }
+wayland-server = "=0.31.10"
+
 [[example]]
 name = "headless_fixture"
 
 [[example]]
 name = "reconnect_fixture"
+
+[[test]]
+name = "compositor_contract"
+required-features = ["keyboard"]

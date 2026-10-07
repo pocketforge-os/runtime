@@ -22,7 +22,11 @@ while IFS= read -r -d '' entry; do
 done < <(git status --porcelain=v1 -z --untracked-files=all)
 
 tmp="$(mktemp -d "${TMPDIR:-/tmp}/pocketforge-vendor.XXXXXX")"
-trap 'rm -rf "$tmp"' EXIT
+cleanup() {
+  find "$tmp" -mindepth 1 -delete
+  rmdir "$tmp"
+}
+trap cleanup EXIT
 
 # Run outside the repository so Cargo does not discover .cargo/config.toml's
 # deliberately offline crates-io replacement. Refresh is the sole networked
@@ -38,7 +42,8 @@ trap 'rm -rf "$tmp"' EXIT
 grep -Fq 'replace-with = "vendored-sources"' .cargo/config.toml
 grep -Fq 'directory = "vendor"' .cargo/config.toml
 
-rm -rf vendor
+find vendor -mindepth 1 -delete
+rmdir vendor
 mv "$tmp/vendor" vendor
 lock_sha="$(sha256sum Cargo.lock | cut -d' ' -f1)"
 cargo_version="$(cargo -V | tr -s ' ')"

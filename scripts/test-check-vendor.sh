@@ -4,7 +4,11 @@ set -euo pipefail
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
 tmp="$(mktemp -d "${TMPDIR:-/tmp}/pocketforge-vendor-check.XXXXXX")"
-trap 'rm -rf "$tmp"' EXIT
+cleanup() {
+  find "$tmp" -mindepth 1 -delete
+  rmdir "$tmp"
+}
+trap cleanup EXIT
 mkdir -p "$tmp/scripts" "$tmp/vendor"
 cp "$root/scripts/check-vendor.sh" "$tmp/scripts/"
 cp "$root/Cargo.lock" "$tmp/Cargo.lock"
