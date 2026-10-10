@@ -19,7 +19,7 @@ use crate::evdev::Evdev;
 use crate::ioc;
 use crate::policy::TokenBucket;
 use crate::remap::{AbsAction, Remap};
-use crate::safe_return::{SafeReturnGate, SafeReturnIntake, GUIDE_CODE};
+use crate::safe_return::{SystemMenuGate, SystemMenuRouter, GUIDE_CODE};
 use crate::scm;
 use crate::uinput::Uinput;
 
@@ -143,7 +143,7 @@ impl SourceState for Evdev {
 }
 
 /// The device-free report pipeline: descriptor remap, rate-limit policy, report framing,
-/// `SYN_DROPPED` resync and (with `--safe-return-sock`) the protected guide gate.
+/// `SYN_DROPPED` resync and (with `--safe-return-sock`) the protected System Menu gate.
 pub(crate) struct ReportPump {
     remap: Remap,
     bucket: TokenBucket,
@@ -153,7 +153,7 @@ pub(crate) struct ReportPump {
     pressed: HashSet<u16>,
     abs_state: HashMap<u16, i32>,
     /// `None` (no `--safe-return-sock`) leaves the stream exactly as before: guide passes through.
-    safe_return: Option<SafeReturnGate>,
+    system_menu: Option<SystemMenuGate>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -259,11 +259,10 @@ impl InputBroker {
         })
     }
 
-    /// Make this broker the protected SafeReturn intake (`--safe-return-sock`): guide/`BTN_MODE`
-    /// press and release are dropped from the re-emit stream, and each press edge asks
-    /// `intake` to send one SafeReturn to the session authority.
-    pub fn with_safe_return(mut self, intake: SafeReturnIntake) -> InputBroker {
-        self.pump.safe_return = Some(SafeReturnGate::new(intake));
+    /// Make this broker the protected System Menu intake: guide/`BTN_MODE` transitions are
+    /// withheld from apps, and each press routes through the provider/fallback policy.
+    pub fn with_system_menu(mut self, router: SystemMenuRouter) -> InputBroker {
+        self.pump.system_menu = Some(SystemMenuGate::new(router));
         self
     }
 
@@ -409,13 +408,13 @@ impl ReportPump {
             resynchronizing: false,
             pressed: HashSet::new(),
             abs_state,
-            safe_return: None,
+            system_menu: None,
         }
     }
 
-    /// `true` when the SafeReturn gate owns this canonical key transition (guide, flag set).
-    fn consumed_by_safe_return(&mut self, code: u16, value: i32) -> bool {
-        self.safe_return
+    /// `true` when the System Menu gate owns this canonical key transition.
+    fn consumed_by_system_menu(&mut self, code: u16, value: i32) -> bool {
+        self.system_menu
             .as_mut()
             .is_some_and(|gate| gate.consume_key(code, value))
     }
@@ -464,7 +463,7 @@ impl ReportPump {
                 }
             } else if t == ioc::EV_KEY {
                 let code = self.remap.remap_key(ev.code);
-                if !self.consumed_by_safe_return(code, ev.value) {
+                if !self.consumed_by_system_menu(code, ev.value) {
                     push_report_event(
                         &mut self.pending_report,
                         &mut self.pending_report_oversized,
@@ -483,7 +482,7 @@ impl ReportPump {
                         );
                     }
                     AbsAction::Button { code, value } => {
-                        if !self.consumed_by_safe_return(code, value) {
+                        if !self.consumed_by_system_menu(code, value) {
                             push_report_event(
                                 &mut self.pending_report,
                                 &mut self.pending_report_oversized,
@@ -524,9 +523,9 @@ impl ReportPump {
                 AbsAction::None => unreachable!("resync_abs always yields authoritative state"),
             }
         }
-        if let Some(gate) = self.safe_return.as_mut() {
+        if let Some(gate) = self.system_menu.as_mut() {
             // The guide key never enters the visible state; its authoritative level feeds the
-            // gate instead, so a press lost inside the overrun still returns to the launcher.
+            // gate instead, so a press lost inside the overrun still opens Menu or falls back.
             let binary_guide = actual_binary
                 .iter()
                 .any(|&(code, down)| code == GUIDE_CODE && down);
@@ -1019,12 +1018,14 @@ mod readiness_tests {
     }
 }
 
-/// Hermetic tests for the tsp-f3fm.202.1 additions: the persistent PFW1 session loop, the
-/// GetAppearance pass-through, and the protected SafeReturn gate inside the report pump.
+/// Hermetic tests for the persistent PFW1 session loop, GetAppearance pass-through, and the
+/// protected System Menu gate inside the report pump.
 #[cfg(test)]
-mod session_and_safe_return_tests {
+mod session_and_system_menu_tests {
     use super::*;
-    use crate::safe_return::{SafeReturnIntake, CONNECT_TIMEOUT, IO_TIMEOUT, SAFE_RETURN_BODY};
+    use crate::safe_return::{
+        SafeReturnIntake, SystemMenuRouter, CONNECT_TIMEOUT, IO_TIMEOUT, SAFE_RETURN_BODY,
+    };
     use pocketforge::backends::{BrokerClientBackend, InProcessBackend};
     use std::io::Write;
     use std::sync::mpsc::{channel, Receiver};
@@ -1067,7 +1068,8 @@ range = { min = 0, max = 255, fuzz = 0, flat = 0 }
 
     fn pump(intake: Option<SafeReturnIntake>) -> ReportPump {
         let mut pump = ReportPump::new(Remap::from_descriptor(&descriptor()).unwrap());
-        pump.safe_return = intake.map(SafeReturnGate::new);
+        pump.system_menu =
+            intake.map(|intake| SystemMenuGate::new(SystemMenuRouter::spawn(intake).unwrap()));
         pump
     }
 
@@ -1267,9 +1269,24 @@ range = { min = 0, max = 255, fuzz = 0, flat = 0 }
         let south: Vec<_> = out.iter().filter(|e| e.1 == SOUTH).collect();
         assert_eq!(south.len(), 100, "every non-guide event still flows");
         assert!(!out.iter().any(|&(_, code, _)| code == GUIDE_CODE));
+        let fallback_deadline = Instant::now() + Duration::from_secs(1);
+        while !p
+            .system_menu
+            .as_ref()
+            .unwrap()
+            .router()
+            .fallback_in_flight()
+            && Instant::now() < fallback_deadline
+        {
+            std::thread::sleep(Duration::from_millis(2));
+        }
         assert!(
-            p.safe_return.as_ref().unwrap().intake().in_flight(),
-            "the first press is still waiting on the authority"
+            p.system_menu
+                .as_ref()
+                .unwrap()
+                .router()
+                .fallback_in_flight(),
+            "the first press is still waiting on fallback return"
         );
         // 50 presses while that request is in flight coalesce into exactly one connection.
         let deadline = Instant::now() + Duration::from_secs(1);
@@ -1306,7 +1323,14 @@ range = { min = 0, max = 255, fuzz = 0, flat = 0 }
         );
         assert!(!out.iter().any(|&(_, code, _)| code == GUIDE_CODE));
         let deadline = Instant::now() + Duration::from_secs(1);
-        while p.safe_return.as_ref().unwrap().intake().in_flight() && Instant::now() < deadline {
+        while p
+            .system_menu
+            .as_ref()
+            .unwrap()
+            .router()
+            .fallback_in_flight()
+            && Instant::now() < deadline
+        {
             std::thread::sleep(Duration::from_millis(5));
         }
         let out = run(&mut p, &[key(SOUTH, 1), syn()]);

@@ -11,8 +11,8 @@ use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-const SCHEMA_VERSION: u32 = 1;
-const PROTECTED: [&str; 4] = ["Activate", "Back", "SafeReturn", "Start"];
+const SCHEMA_VERSION: u32 = 2;
+const PROTECTED: [&str; 4] = ["Activate", "Back", "SystemMenu", "Start"];
 const FACE_ACTIONS: [&str; 6] = [
     "Activate",
     "Back",
@@ -32,7 +32,7 @@ const ACTIONS: [&str; 12] = [
     "Search.open",
     "Search.submit",
     "Search.cancel",
-    "SafeReturn",
+    "SystemMenu",
     "Start",
 ];
 const POSITIONS: [&str; 12] = [
@@ -213,9 +213,9 @@ impl DeviceContract {
                 "unsupported schema or empty device identity".into(),
             ));
         }
-        if self.protected_actions != ["SafeReturn"] {
+        if self.protected_actions != ["SystemMenu"] {
             return Err(MapError::InvalidContract(
-                "protected_actions must contain only SafeReturn".into(),
+                "protected_actions must contain only SystemMenu".into(),
             ));
         }
         let controls: BTreeSet<_> = self
@@ -329,16 +329,11 @@ impl RemapStore for JsonRemapStore {
         let bytes = fs::read(&self.path).map_err(io_error)?;
         let doc: PersistedDocument =
             serde_json::from_slice(&bytes).map_err(|e| MapError::Persistence(e.to_string()))?;
-        if doc.schema_version != SCHEMA_VERSION {
-            return Err(MapError::UnsupportedVersion {
-                found: doc.schema_version,
-                supported: SCHEMA_VERSION,
-            });
-        }
+        let doc = migrate_persisted_document(doc)?;
         Ok(doc.devices.get(device_id).cloned())
     }
     fn save(&mut self, device_id: &str, mappings: &[Mapping]) -> Result<(), MapError> {
-        let mut doc = if self.path.exists() {
+        let doc = if self.path.exists() {
             serde_json::from_slice::<PersistedDocument>(&fs::read(&self.path).map_err(io_error)?)
                 .map_err(|e| MapError::Persistence(e.to_string()))?
         } else {
@@ -347,12 +342,7 @@ impl RemapStore for JsonRemapStore {
                 devices: BTreeMap::new(),
             }
         };
-        if doc.schema_version != SCHEMA_VERSION {
-            return Err(MapError::UnsupportedVersion {
-                found: doc.schema_version,
-                supported: SCHEMA_VERSION,
-            });
-        }
+        let mut doc = migrate_persisted_document(doc)?;
         doc.devices.insert(device_id.into(), mappings.to_vec());
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent).map_err(io_error)?;
@@ -364,6 +354,29 @@ impl RemapStore for JsonRemapStore {
         )
         .map_err(io_error)?;
         fs::rename(&temp, &self.path).map_err(io_error)
+    }
+}
+
+fn migrate_persisted_document(
+    mut document: PersistedDocument,
+) -> Result<PersistedDocument, MapError> {
+    match document.schema_version {
+        1 => {
+            for mappings in document.devices.values_mut() {
+                for mapping in mappings {
+                    if mapping.action == "SafeReturn" {
+                        mapping.action = "SystemMenu".into();
+                    }
+                }
+            }
+            document.schema_version = SCHEMA_VERSION;
+            Ok(document)
+        }
+        SCHEMA_VERSION => Ok(document),
+        found => Err(MapError::UnsupportedVersion {
+            found,
+            supported: SCHEMA_VERSION,
+        }),
     }
 }
 
@@ -429,7 +442,44 @@ impl EffectiveMap {
             .as_ref()
             .map(|(_, m)| m.clone())
             .unwrap_or_else(|| contract.effective_map.clone());
+        let mut events = VecDeque::new();
+        let stored_device = persisted
+            .as_ref()
+            .map(|(id, _)| id.as_str())
+            .unwrap_or(&contract.device_id);
         if persisted.is_some() {
+            let shipped_menu = contract
+                .effective_map
+                .iter()
+                .find(|mapping| mapping.action == "SystemMenu")
+                .expect("validated contract has exactly one SystemMenu")
+                .clone();
+            if let Some(index) = mappings
+                .iter()
+                .position(|mapping| mapping.action == "SystemMenu")
+            {
+                if mappings[index] != shipped_menu {
+                    let old = std::mem::replace(&mut mappings[index], shipped_menu.clone());
+                    events.push_back(MapEvent::BindingReResolved {
+                        action: "SystemMenu".into(),
+                        stored_device_id: stored_device.into(),
+                        current_device_id: contract.device_id.clone(),
+                        old_binding: old.binding,
+                        effective_binding: shipped_menu.binding.clone(),
+                    });
+                }
+                let mut kept_menu = false;
+                mappings.retain(|mapping| {
+                    if mapping.action != "SystemMenu" {
+                        true
+                    } else if kept_menu {
+                        false
+                    } else {
+                        kept_menu = true;
+                        true
+                    }
+                });
+            }
             for action in PROTECTED {
                 if !mappings.iter().any(|mapping| mapping.action == action) {
                     mappings.extend(
@@ -442,11 +492,6 @@ impl EffectiveMap {
                 }
             }
         }
-        let mut events = VecDeque::new();
-        let stored_device = persisted
-            .as_ref()
-            .map(|(id, _)| id.as_str())
-            .unwrap_or(&contract.device_id);
         for mapping in &mut mappings {
             mapping.binding.validate()?;
             if mapping
@@ -584,6 +629,9 @@ impl<S: RemapStore> RemapEngine<S> {
     ) -> Result<RemapPreview, MapError> {
         if self.pending.is_some() {
             return Err(MapError::TransactionActive);
+        }
+        if action == "SystemMenu" {
+            return Err(MapError::ProtectedActionImmutable(action.into()));
         }
         candidate.validate()?;
         if candidate
@@ -801,6 +849,7 @@ pub enum MapError {
     InvalidContract(String),
     InvalidBinding(String),
     AbsentControl { action: String },
+    ProtectedActionImmutable(String),
     ProtectedActionUnreachable(String),
     Collision { first: String, second: String },
     UnknownAction { context: String, action: String },

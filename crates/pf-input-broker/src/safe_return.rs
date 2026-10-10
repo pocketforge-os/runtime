@@ -1,12 +1,11 @@
-//! The broker as the **protected SafeReturn intake** (`tsp-f3fm.202.1`, option (i)).
+//! The broker as the protected System Menu router and SafeReturn fallback intake.
 //!
 //! While an app is foreground the broker holds the pad's `EVIOCGRAB`, so it is the one process
 //! that can see guide/Menu (`BTN_MODE`, `0x13c`) without trusting the app. With
-//! `--safe-return-sock PATH` the broker drops every guide press and release from the re-emit
-//! stream, so the app never observes it. On each guide PRESS edge it asks the session authority
-//! to return to the launcher by sending one pf-wire frame carrying `{"method":"safe_return"}`.
-//! That body is the authority's `RpcRequest::SafeReturn` serde form (`tag = "method"`,
-//! `snake_case`).
+//! `--safe-return-sock PATH` it drops every guide transition from the re-emit stream, so the app
+//! never observes it. A press is offered to the registered System Menu provider. Missing,
+//! disconnected, invalid, or unresponsive providers fall back to the existing SafeReturn intake
+//! after 250 ms. The menu's Return request enters that same intake.
 //!
 //! The authority is single-threaded, and while it runs `systemctl stop` it may block for 2 s or
 //! more. The input pump therefore never touches the socket:
@@ -27,7 +26,7 @@ use std::sync::mpsc::{sync_channel, SyncSender, TrySendError};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-/// The canonical guide/Menu key (`BTN_MODE`) the broker reserves for SafeReturn.
+/// The canonical guide/Menu key (`BTN_MODE`) the broker reserves for System Menu routing.
 pub const GUIDE_CODE: u16 = 0x13c;
 
 /// Connect deadline for the authority socket.
@@ -45,9 +44,238 @@ pub type LogSink = Box<dyn Fn(&str) + Send + 'static>;
 
 /// Handle to the SafeReturn worker. Cheap to call from the input pump: [`request`](Self::request)
 /// never blocks and never performs I/O.
+#[derive(Clone)]
 pub struct SafeReturnIntake {
     tx: SyncSender<()>,
     busy: Arc<AtomicBool>,
+}
+
+/// Maximum time a registered provider may take to acknowledge `system_menu` ownership.
+pub const SYSTEM_MENU_ACK_TIMEOUT: Duration = Duration::from_millis(250);
+
+/// Versioned v1 provider protocol frames. Unknown optional JSON fields are ignored; changing the
+/// meaning of these fields or making a new field mandatory requires a new major version.
+pub const SYSTEM_MENU_REGISTER_BODY: &[u8] = br#"{"version":1,"type":"register"}"#;
+pub const SYSTEM_MENU_REGISTERED_BODY: &[u8] = br#"{"version":1,"type":"registered"}"#;
+pub const SYSTEM_MENU_ACTION_BODY: &[u8] = br#"{"version":1,"type":"system_menu"}"#;
+pub const SYSTEM_MENU_ACK_BODY: &[u8] = br#"{"version":1,"type":"ack","action":"system_menu"}"#;
+pub const SYSTEM_MENU_RETURN_BODY: &[u8] = br#"{"version":1,"type":"return"}"#;
+pub const SYSTEM_MENU_RETURNED_BODY: &[u8] = br#"{"version":1,"type":"ack","action":"return"}"#;
+
+enum SystemMenuCommand {
+    Register {
+        provider: UnixStream,
+        ready: SyncSender<io::Result<()>>,
+    },
+    Press,
+}
+
+/// Routes protected Menu presses to one registered provider, with fail-safe return fallback.
+#[derive(Clone)]
+pub struct SystemMenuRouter {
+    safe_return: SafeReturnIntake,
+    tx: SyncSender<SystemMenuCommand>,
+    busy: Arc<AtomicBool>,
+}
+
+impl SystemMenuRouter {
+    pub fn spawn(safe_return: SafeReturnIntake) -> io::Result<Self> {
+        Self::spawn_with(
+            safe_return,
+            SYSTEM_MENU_ACK_TIMEOUT,
+            Box::new(|line| eprintln!("{line}")),
+        )
+    }
+
+    pub fn spawn_with(
+        safe_return: SafeReturnIntake,
+        ack_timeout: Duration,
+        log: LogSink,
+    ) -> io::Result<Self> {
+        let (tx, rx) = sync_channel(2);
+        let busy = Arc::new(AtomicBool::new(false));
+        let worker_busy = busy.clone();
+        let fallback = safe_return.clone();
+        std::thread::Builder::new()
+            .name("pf-system-menu".into())
+            .spawn(move || {
+                let mut provider: Option<UnixStream> = None;
+                while let Ok(command) = rx.recv() {
+                    match command {
+                        SystemMenuCommand::Register {
+                            provider: mut candidate,
+                            ready,
+                        } => {
+                            let result = (|| {
+                                candidate.set_read_timeout(Some(ack_timeout))?;
+                                candidate.set_write_timeout(Some(ack_timeout))?;
+                                pf_wire::write_frame(&mut candidate, SYSTEM_MENU_REGISTERED_BODY)
+                                    .map_err(wire_io)?;
+                                Ok(())
+                            })();
+                            if result.is_ok() {
+                                provider = Some(candidate);
+                            }
+                            let _ = ready.send(result);
+                        }
+                        SystemMenuCommand::Press => {
+                            let outcome = provider
+                                .as_mut()
+                                .ok_or_else(|| {
+                                    io::Error::new(
+                                        io::ErrorKind::NotConnected,
+                                        "no system-menu provider registered",
+                                    )
+                                })
+                                .and_then(send_system_menu);
+                            match outcome {
+                                Ok(()) => log("pf-input-broker: system_menu acknowledged"),
+                                Err(error) => {
+                                    provider = None;
+                                    let dispatched = fallback.request();
+                                    log(&format!(
+                                        "pf-input-broker: system_menu fallback to safe_return ({:?}): {error}; dispatched={dispatched}",
+                                        error.kind()
+                                    ));
+                                }
+                            }
+                            worker_busy.store(false, Ordering::Release);
+                        }
+                    }
+                }
+            })?;
+        Ok(Self {
+            safe_return,
+            tx,
+            busy,
+        })
+    }
+
+    /// Install one already-authenticated provider connection. A new provider replaces the old
+    /// one. The registration acknowledgement is written before this method returns.
+    pub fn register_provider(&self, provider: UnixStream) -> io::Result<()> {
+        let (ready_tx, ready_rx) = sync_channel(0);
+        self.tx
+            .send(SystemMenuCommand::Register {
+                provider,
+                ready: ready_tx,
+            })
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "system-menu worker stopped"))?;
+        ready_rx
+            .recv()
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "system-menu worker stopped"))?
+    }
+
+    /// Queue one protected Menu press without blocking the input pump. Concurrent presses are
+    /// coalesced. If the worker cannot accept the press, invoke the fail-safe path directly.
+    pub fn press(&self) -> bool {
+        if self.busy.swap(true, Ordering::AcqRel) {
+            return false;
+        }
+        match self.tx.try_send(SystemMenuCommand::Press) {
+            Ok(()) => true,
+            Err(TrySendError::Full(SystemMenuCommand::Press))
+            | Err(TrySendError::Disconnected(SystemMenuCommand::Press)) => {
+                self.busy.store(false, Ordering::Release);
+                self.safe_return.request()
+            }
+            Err(TrySendError::Full(SystemMenuCommand::Register { .. }))
+            | Err(TrySendError::Disconnected(SystemMenuCommand::Register { .. })) => {
+                unreachable!("press sends only Press")
+            }
+        }
+    }
+
+    /// The menu's Return item uses the exact same authority intake as fail-safe fallback.
+    pub fn return_item(&self) -> bool {
+        self.safe_return.request()
+    }
+
+    pub fn in_flight(&self) -> bool {
+        self.busy.load(Ordering::Acquire)
+    }
+
+    /// `true` while a fail-safe or menu-item return is queued at the authority intake.
+    pub fn fallback_in_flight(&self) -> bool {
+        self.safe_return.in_flight()
+    }
+}
+
+fn send_system_menu(provider: &mut UnixStream) -> io::Result<()> {
+    pf_wire::write_frame(provider, SYSTEM_MENU_ACTION_BODY).map_err(wire_io)?;
+    let reply = pf_wire::read_frame(provider).map_err(wire_io)?;
+    let value: serde_json::Value = serde_json::from_slice(&reply)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    let valid = value.get("version").and_then(serde_json::Value::as_u64) == Some(1)
+        && value.get("type").and_then(serde_json::Value::as_str) == Some("ack")
+        && value.get("action").and_then(serde_json::Value::as_str) == Some("system_menu");
+    if valid {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "invalid system_menu acknowledgement: {}",
+                String::from_utf8_lossy(&reply)
+            ),
+        ))
+    }
+}
+
+/// Handle one authenticated provider endpoint connection. `register` transfers the persistent
+/// connection to the router; `return` is a one-shot invocation of the shared return path.
+pub fn serve_system_menu_provider(
+    mut stream: UnixStream,
+    router: &SystemMenuRouter,
+    trusted_uid: u32,
+) -> io::Result<()> {
+    if peer_uid(&stream)? != trusted_uid {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "system-menu provider uid is not trusted",
+        ));
+    }
+    stream.set_read_timeout(Some(SYSTEM_MENU_ACK_TIMEOUT))?;
+    stream.set_write_timeout(Some(SYSTEM_MENU_ACK_TIMEOUT))?;
+    let request = pf_wire::read_frame(&mut stream).map_err(wire_io)?;
+    let value: serde_json::Value = serde_json::from_slice(&request)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    if value.get("version").and_then(serde_json::Value::as_u64) != Some(1) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "unsupported system-menu provider protocol version",
+        ));
+    }
+    match value.get("type").and_then(serde_json::Value::as_str) {
+        Some("register") => router.register_provider(stream),
+        Some("return") => {
+            let _ = router.return_item();
+            pf_wire::write_frame(&mut stream, SYSTEM_MENU_RETURNED_BODY).map_err(wire_io)
+        }
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "unknown system-menu provider request",
+        )),
+    }
+}
+
+pub fn peer_uid(stream: &UnixStream) -> io::Result<u32> {
+    let mut credentials: libc::ucred = unsafe { std::mem::zeroed() };
+    let mut length = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    let result = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            (&mut credentials as *mut libc::ucred).cast(),
+            &mut length,
+        )
+    };
+    if result < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(credentials.uid)
+    }
 }
 
 impl SafeReturnIntake {
@@ -110,17 +338,17 @@ impl SafeReturnIntake {
     }
 }
 
-/// Tracks the guide key's state and turns its press edges into SafeReturn requests. Every guide
-/// transition is consumed, so the app never observes it.
-pub struct SafeReturnGate {
-    intake: SafeReturnIntake,
+/// Tracks guide-key state and turns press edges into protected System Menu routing. Every guide
+/// transition is consumed, so the foreground app never observes it.
+pub struct SystemMenuGate {
+    router: SystemMenuRouter,
     down: bool,
 }
 
-impl SafeReturnGate {
-    pub fn new(intake: SafeReturnIntake) -> SafeReturnGate {
-        SafeReturnGate {
-            intake,
+impl SystemMenuGate {
+    pub fn new(router: SystemMenuRouter) -> SystemMenuGate {
+        SystemMenuGate {
+            router,
             down: false,
         }
     }
@@ -140,13 +368,13 @@ impl SafeReturnGate {
     /// up-to-down change is a press edge.
     pub fn set_down(&mut self, down: bool) {
         if down && !self.down {
-            self.intake.request();
+            self.router.press();
         }
         self.down = down;
     }
 
-    pub fn intake(&self) -> &SafeReturnIntake {
-        &self.intake
+    pub fn router(&self) -> &SystemMenuRouter {
+        &self.router
     }
 }
 
@@ -347,6 +575,220 @@ mod tests {
         (intake, rx)
     }
 
+    fn accept_safe_return(listener: &UnixListener, timeout: Duration) -> (Vec<u8>, Duration) {
+        listener.set_nonblocking(true).unwrap();
+        let started = Instant::now();
+        loop {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    stream.set_nonblocking(false).unwrap();
+                    let body = pf_wire::read_frame(&mut stream).unwrap();
+                    pf_wire::write_frame(&mut stream, br#"{"result":"ok"}"#).unwrap();
+                    return (body, started.elapsed());
+                }
+                Err(error)
+                    if error.kind() == io::ErrorKind::WouldBlock && started.elapsed() < timeout =>
+                {
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                Err(error) => panic!("safe_return was not received: {error}"),
+            }
+        }
+    }
+
+    fn register_test_provider(router: &SystemMenuRouter) -> UnixStream {
+        let (mut provider, broker) = UnixStream::pair().unwrap();
+        let router = router.clone();
+        let trusted_uid = unsafe { libc::geteuid() };
+        let server =
+            std::thread::spawn(move || serve_system_menu_provider(broker, &router, trusted_uid));
+        pf_wire::write_frame(
+            &mut provider,
+            br#"{"version":1,"type":"register","future_optional":true}"#,
+        )
+        .unwrap();
+        server.join().unwrap().unwrap();
+        assert_eq!(
+            pf_wire::read_frame(&mut provider).unwrap(),
+            SYSTEM_MENU_REGISTERED_BODY
+        );
+        provider
+    }
+
+    #[test]
+    fn menu_without_provider_uses_safe_return() {
+        let sock = scratch("menu-no-provider");
+        let _ = std::fs::remove_file(&sock);
+        let authority = UnixListener::bind(&sock).unwrap();
+        let (intake, _log) = logging_intake(&sock, IO_TIMEOUT);
+        let router =
+            SystemMenuRouter::spawn_with(intake, Duration::from_millis(50), Box::new(|_| {}))
+                .unwrap();
+
+        assert!(router.press());
+
+        let (body, _) = accept_safe_return(&authority, Duration::from_secs(1));
+        assert_eq!(body, SAFE_RETURN_BODY);
+        let _ = std::fs::remove_file(sock);
+    }
+
+    #[test]
+    fn acknowledging_provider_gets_system_menu_without_return() {
+        let sock = scratch("menu-acked-provider");
+        let _ = std::fs::remove_file(&sock);
+        let authority = UnixListener::bind(&sock).unwrap();
+        authority.set_nonblocking(true).unwrap();
+        let (intake, _log) = logging_intake(&sock, IO_TIMEOUT);
+        let router =
+            SystemMenuRouter::spawn_with(intake, Duration::from_millis(50), Box::new(|_| {}))
+                .unwrap();
+        let mut provider = register_test_provider(&router);
+        provider
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .unwrap();
+
+        assert!(router.press());
+        let action = pf_wire::read_frame(&mut provider).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&action).unwrap(),
+            serde_json::json!({"version": 1, "type": "system_menu"})
+        );
+        pf_wire::write_frame(
+            &mut provider,
+            br#"{"version":1,"type":"ack","action":"system_menu"}"#,
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while router.in_flight() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(
+            !router.in_flight(),
+            "provider acknowledgement was not observed"
+        );
+        assert_eq!(
+            authority.accept().unwrap_err().kind(),
+            io::ErrorKind::WouldBlock,
+            "an acknowledged provider must suppress fallback return"
+        );
+        let _ = std::fs::remove_file(sock);
+    }
+
+    #[test]
+    fn hung_provider_falls_back_after_ack_timeout() {
+        let sock = scratch("menu-hung-provider");
+        let _ = std::fs::remove_file(&sock);
+        let authority = UnixListener::bind(&sock).unwrap();
+        let (intake, _log) = logging_intake(&sock, IO_TIMEOUT);
+        let ack_timeout = Duration::from_millis(50);
+        let router = SystemMenuRouter::spawn_with(intake, ack_timeout, Box::new(|_| {})).unwrap();
+        let _hung_provider = register_test_provider(&router);
+
+        assert!(router.press());
+
+        let (body, elapsed) = accept_safe_return(&authority, Duration::from_secs(1));
+        assert_eq!(body, SAFE_RETURN_BODY);
+        assert!(
+            elapsed >= ack_timeout,
+            "fallback fired too early: {elapsed:?}"
+        );
+        let _ = std::fs::remove_file(sock);
+    }
+
+    #[test]
+    fn invalid_provider_ack_falls_back_and_unregisters_provider() {
+        let sock = scratch("menu-invalid-provider");
+        let _ = std::fs::remove_file(&sock);
+        let authority = UnixListener::bind(&sock).unwrap();
+        let (intake, _log) = logging_intake(&sock, IO_TIMEOUT);
+        let router =
+            SystemMenuRouter::spawn_with(intake, Duration::from_millis(50), Box::new(|_| {}))
+                .unwrap();
+        let mut provider = register_test_provider(&router);
+
+        assert!(router.press());
+        assert_eq!(
+            pf_wire::read_frame(&mut provider).unwrap(),
+            SYSTEM_MENU_ACTION_BODY
+        );
+        pf_wire::write_frame(
+            &mut provider,
+            br#"{"version":1,"type":"ack","action":"not_system_menu"}"#,
+        )
+        .unwrap();
+
+        let (body, _) = accept_safe_return(&authority, Duration::from_secs(1));
+        assert_eq!(body, SAFE_RETURN_BODY);
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while router.in_flight() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(!router.in_flight());
+        while router.fallback_in_flight() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(!router.fallback_in_flight());
+
+        assert!(router.press());
+        let (second_body, elapsed) = accept_safe_return(&authority, Duration::from_secs(1));
+        assert_eq!(second_body, SAFE_RETURN_BODY);
+        assert!(
+            elapsed < Duration::from_millis(50),
+            "invalid provider remained registered: {elapsed:?}"
+        );
+        let _ = std::fs::remove_file(sock);
+    }
+
+    #[test]
+    fn menu_return_item_uses_the_same_safe_return_path() {
+        let sock = scratch("menu-return-item");
+        let _ = std::fs::remove_file(&sock);
+        let authority = UnixListener::bind(&sock).unwrap();
+        let (intake, _log) = logging_intake(&sock, IO_TIMEOUT);
+        let router =
+            SystemMenuRouter::spawn_with(intake, Duration::from_millis(50), Box::new(|_| {}))
+                .unwrap();
+
+        let (mut menu, broker) = UnixStream::pair().unwrap();
+        let routed = router.clone();
+        let trusted_uid = unsafe { libc::geteuid() };
+        let server =
+            std::thread::spawn(move || serve_system_menu_provider(broker, &routed, trusted_uid));
+        pf_wire::write_frame(&mut menu, SYSTEM_MENU_RETURN_BODY).unwrap();
+        assert_eq!(
+            pf_wire::read_frame(&mut menu).unwrap(),
+            SYSTEM_MENU_RETURNED_BODY
+        );
+        server.join().unwrap().unwrap();
+
+        let (body, _) = accept_safe_return(&authority, Duration::from_secs(1));
+        assert_eq!(body, SAFE_RETURN_BODY);
+        let _ = std::fs::remove_file(sock);
+    }
+
+    #[test]
+    fn provider_endpoint_rejects_untrusted_uid_and_unsupported_major() {
+        let sock = scratch("menu-provider-rejections");
+        let _ = std::fs::remove_file(&sock);
+        let (intake, _log) = logging_intake(&sock, IO_TIMEOUT);
+        let router =
+            SystemMenuRouter::spawn_with(intake, Duration::from_millis(50), Box::new(|_| {}))
+                .unwrap();
+        let (client, server) = UnixStream::pair().unwrap();
+        let actual_uid = peer_uid(&client).unwrap();
+        let error =
+            serve_system_menu_provider(server, &router, actual_uid.wrapping_add(1)).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let routed = router.clone();
+        let worker =
+            std::thread::spawn(move || serve_system_menu_provider(server, &routed, actual_uid));
+        pf_wire::write_frame(&mut client, br#"{"version":2,"type":"register"}"#).unwrap();
+        let error = worker.join().unwrap().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
     #[test]
     fn body_is_the_authority_safe_return_serde_form() {
         let value: serde_json::Value = serde_json::from_slice(SAFE_RETURN_BODY).unwrap();
@@ -358,7 +800,10 @@ mod tests {
         let sock = scratch("gate-edges");
         let _ = std::fs::remove_file(&sock);
         let (intake, _log) = logging_intake(&sock, IO_TIMEOUT);
-        let mut gate = SafeReturnGate::new(intake);
+        let router =
+            SystemMenuRouter::spawn_with(intake, Duration::from_millis(50), Box::new(|_| {}))
+                .unwrap();
+        let mut gate = SystemMenuGate::new(router);
         assert!(!gate.consume_key(0x130, 1), "BTN_SOUTH passes through");
         assert!(gate.consume_key(GUIDE_CODE, 1));
         assert!(gate.down);

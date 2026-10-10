@@ -1,5 +1,5 @@
 {
-  "schema_version":1,"device_id":"a133","protected_actions":["SafeReturn"],
+  "schema_version":2,"device_id":"a133","protected_actions":["SystemMenu"],
   "physical_controls":[
     {"position":"east","printed_label":"A","fallback_glyph":{"source":"pocketforge","id":"pf-face-east"}},
     {"position":"south","printed_label":"B","fallback_glyph":{"source":"pocketforge","id":"pf-face-south"}},
@@ -14,7 +14,7 @@
   "effective_map":[
     {"context":"shell","action":"Activate","binding":{"shape":"single_press","controls":["east"]}},
     {"context":"shell","action":"Back","binding":{"shape":"single_press","controls":["south"]}},
-    {"context":"global","action":"SafeReturn","binding":{"shape":"single_press","controls":["guide"]}},
+    {"context":"global","action":"SystemMenu","binding":{"shape":"single_press","controls":["guide"]}},
     {"context":"global","action":"Start","binding":{"shape":"single_press","controls":["start"]}}
   ]
 }
