@@ -30,6 +30,27 @@ pub const KNOWN_CAPABILITIES: &[&str] = &[
     "leds",
 ];
 
+/// Minimum-spec graphics version vocabulary: OpenGL ES.
+pub const KNOWN_GLES_VERSIONS: &[&str] = &["2.0", "3.0", "3.1", "3.2"];
+
+/// Minimum-spec graphics version vocabulary: Vulkan.
+pub const KNOWN_VULKAN_VERSIONS: &[&str] = &["1.0", "1.1", "1.2", "1.3", "1.4"];
+
+/// Minimum-spec input token vocabulary.
+pub const KNOWN_INPUTS: &[&str] = &[
+    "buttons",
+    "dpad",
+    "stick",
+    "two_sticks",
+    "touch",
+    "keyboard",
+    "pointer",
+];
+
+/// Inputs the system input layer provides on every device, so declaring them
+/// in a minimum-spec table is redundant and only earns a warning.
+pub const SYSTEM_INPUTS: &[&str] = &["keyboard", "pointer"];
+
 /// One normalized `use = [...]` requirement.
 ///
 /// Parsing deliberately matches the capability-policy parser: trim the token, remove one
@@ -74,6 +95,45 @@ pub struct Manifest {
     pub health: Option<Health>,
     #[serde(default)]
     pub fetch: Option<Fetch>,
+    #[serde(default)]
+    pub requirements: Option<Requirements>,
+    #[serde(default)]
+    pub recommended: Option<Requirements>,
+}
+
+/// An app's declared minimum spec (`[requirements]`, enforced at launch) or
+/// its informational recommended tier (`[recommended]`, never refuses).
+/// Every field is optional; declared fields are validated strictly.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Requirements {
+    /// Measured peak on the reference device, GPU memory included, no zram credit.
+    #[serde(default)]
+    pub memory_mib: Option<u32>,
+    /// Minimum OpenGL ES version, one of [`KNOWN_GLES_VERSIONS`].
+    #[serde(default)]
+    pub gles: Option<String>,
+    /// Minimum Vulkan version, one of [`KNOWN_VULKAN_VERSIONS`].
+    #[serde(default)]
+    pub vulkan: Option<String>,
+    /// Controls the app cannot work without, from [`KNOWN_INPUTS`].
+    #[serde(default)]
+    pub inputs: Vec<String>,
+    /// Minimum display size in physical pixels, compared orientation-independently.
+    #[serde(default)]
+    pub display_min: Option<DisplaySize>,
+    /// Install size plus working space. Carried and validated, not checked at
+    /// launch; sizing installs is the store's job.
+    #[serde(default)]
+    pub storage_mib: Option<u32>,
+}
+
+/// A physical-pixel display size.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DisplaySize {
+    pub width: u32,
+    pub height: u32,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -199,6 +259,9 @@ pub fn parse_manifest(source: &str) -> Result<Manifest, ManifestError> {
         }
     })?;
     validate_manifest(&manifest)?;
+    for warning in manifest_warnings(&manifest) {
+        eprintln!("pf-app-manifest: warning: {warning}");
+    }
     Ok(manifest)
 }
 
@@ -239,6 +302,15 @@ fn validate_manifest(manifest: &Manifest) -> Result<(), ManifestError> {
         })?;
     }
 
+    for (table, requirements) in [
+        ("requirements", manifest.requirements.as_ref()),
+        ("recommended", manifest.recommended.as_ref()),
+    ] {
+        if let Some(requirements) = requirements {
+            validate_requirements(table, requirements)?;
+        }
+    }
+
     if let Some(fetch) = &manifest.fetch {
         if fetch.enabled && fetch.reason.as_deref().unwrap_or_default().is_empty() {
             return invalid_manifest("enabled fetch requires reason");
@@ -255,6 +327,56 @@ fn validate_manifest(manifest: &Manifest) -> Result<(), ManifestError> {
         }
     }
     Ok(())
+}
+
+fn validate_requirements(table: &str, requirements: &Requirements) -> Result<(), ManifestError> {
+    if requirements
+        .gles
+        .as_deref()
+        .is_some_and(|version| !KNOWN_GLES_VERSIONS.contains(&version))
+    {
+        return invalid_manifest(&format!("invalid {table}.gles"));
+    }
+    if requirements
+        .vulkan
+        .as_deref()
+        .is_some_and(|version| !KNOWN_VULKAN_VERSIONS.contains(&version))
+    {
+        return invalid_manifest(&format!("invalid {table}.vulkan"));
+    }
+    let mut seen = BTreeSet::new();
+    for input in &requirements.inputs {
+        if !KNOWN_INPUTS.contains(&input.as_str()) {
+            return invalid_manifest(&format!("invalid {table} input"));
+        }
+        if !seen.insert(input.as_str()) {
+            return invalid_manifest(&format!("duplicate {table} input"));
+        }
+    }
+    Ok(())
+}
+
+/// Non-fatal advisories for an already-parsed manifest. Today this is exactly
+/// the redundant [`SYSTEM_INPUTS`] declarations, which the system input layer
+/// satisfies on every device.
+pub fn manifest_warnings(manifest: &Manifest) -> Vec<String> {
+    let mut warnings = Vec::new();
+    for (table, requirements) in [
+        ("requirements", manifest.requirements.as_ref()),
+        ("recommended", manifest.recommended.as_ref()),
+    ] {
+        let Some(requirements) = requirements else {
+            continue;
+        };
+        for input in &requirements.inputs {
+            if SYSTEM_INPUTS.contains(&input.as_str()) {
+                warnings.push(format!(
+                    "{table} input {input} is provided by the system input layer on every device"
+                ));
+            }
+        }
+    }
+    warnings
 }
 
 fn invalid_manifest<T>(message: &str) -> Result<T, ManifestError> {
@@ -401,6 +523,24 @@ pub struct PlatformContract {
     pub runtime_abi: String,
     pub platform_version: String,
     pub supported_capabilities: Vec<String>,
+    /// Schema 2: total physical memory visible to the platform, in MiB.
+    #[serde(default)]
+    pub physical_memory_mib: Option<u32>,
+    /// Schema 2: the memory budget one app may rely on, in MiB.
+    #[serde(default)]
+    pub app_memory_budget_mib: Option<u32>,
+    /// Schema 2, optional: highest OpenGL ES version passing conformance.
+    #[serde(default)]
+    pub gles_max: Option<String>,
+    /// Schema 2, optional: highest Vulkan version passing conformance.
+    #[serde(default)]
+    pub vulkan_max: Option<String>,
+    /// Schema 2: input vocabulary the device provides.
+    #[serde(default)]
+    pub inputs: Option<Vec<String>>,
+    /// Schema 2: physical display size in pixels.
+    #[serde(default)]
+    pub display: Option<DisplaySize>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -460,11 +600,71 @@ pub fn parse_platform_contract(source: &str) -> Result<PlatformContract, Platfor
             message,
         }
     })?;
-    if contract.schema_version != 1 {
-        return invalid_contract(
-            PlatformContractErrorReason::Schema,
-            "schema_version must be 1",
-        );
+    match contract.schema_version {
+        1 => {
+            // Under schema 1 every numeric/graphics/input/display fact is absent.
+            if contract.physical_memory_mib.is_some()
+                || contract.app_memory_budget_mib.is_some()
+                || contract.gles_max.is_some()
+                || contract.vulkan_max.is_some()
+                || contract.inputs.is_some()
+                || contract.display.is_some()
+            {
+                return invalid_contract(
+                    PlatformContractErrorReason::Schema,
+                    "schema_version 1 must not declare schema 2 fields",
+                );
+            }
+        }
+        2 => {
+            for (present, field) in [
+                (
+                    contract.physical_memory_mib.is_some(),
+                    "physical_memory_mib",
+                ),
+                (
+                    contract.app_memory_budget_mib.is_some(),
+                    "app_memory_budget_mib",
+                ),
+                (contract.inputs.is_some(), "inputs"),
+                (contract.display.is_some(), "display"),
+            ] {
+                if !present {
+                    return invalid_contract(
+                        PlatformContractErrorReason::Schema,
+                        &format!("schema_version 2 requires {field}"),
+                    );
+                }
+            }
+            if contract
+                .gles_max
+                .as_deref()
+                .is_some_and(|version| !KNOWN_GLES_VERSIONS.contains(&version))
+            {
+                return invalid_contract(PlatformContractErrorReason::Schema, "invalid gles_max");
+            }
+            if contract
+                .vulkan_max
+                .as_deref()
+                .is_some_and(|version| !KNOWN_VULKAN_VERSIONS.contains(&version))
+            {
+                return invalid_contract(PlatformContractErrorReason::Schema, "invalid vulkan_max");
+            }
+            for input in contract.inputs.as_deref().unwrap_or_default() {
+                if !KNOWN_INPUTS.contains(&input.as_str()) {
+                    return invalid_contract(
+                        PlatformContractErrorReason::Schema,
+                        "unsupported input name",
+                    );
+                }
+            }
+        }
+        _ => {
+            return invalid_contract(
+                PlatformContractErrorReason::Schema,
+                "schema_version must be 1 or 2",
+            );
+        }
     }
     if !valid_runtime_family(&contract.runtime_family) {
         return invalid_contract(
@@ -550,6 +750,11 @@ pub enum ReasonCode {
     RuntimeAbiMismatch,
     PlatformVersionMismatch,
     UnsupportedCapability,
+    RequirementUnverifiable,
+    InsufficientMemory,
+    UnsupportedGraphics,
+    MissingInput,
+    DisplayTooSmall,
     PlatformContractMissing,
     PlatformContractInvalid,
     SystemdStartFailed,
@@ -588,6 +793,11 @@ impl ReasonCode {
             Self::RuntimeAbiMismatch => "runtime_abi_mismatch",
             Self::PlatformVersionMismatch => "platform_version_mismatch",
             Self::UnsupportedCapability => "unsupported_capability",
+            Self::RequirementUnverifiable => "requirement_unverifiable",
+            Self::InsufficientMemory => "insufficient_memory",
+            Self::UnsupportedGraphics => "unsupported_graphics",
+            Self::MissingInput => "missing_input",
+            Self::DisplayTooSmall => "display_too_small",
             Self::PlatformContractMissing => "platform_contract_missing",
             Self::PlatformContractInvalid => "platform_contract_invalid",
             Self::SystemdStartFailed => "systemd_start_failed",
@@ -883,7 +1093,142 @@ fn check_compatibility(
             ));
         }
     }
+    if let Some(requirements) = &manifest.requirements {
+        check_requirements(requirements, platform)?;
+    }
     Ok(())
+}
+
+/// Enforce the `[requirements]` minimum spec against the platform contract's
+/// device facts. A contract that lacks the fact for a declared requirement
+/// fails closed with [`ReasonCode::RequirementUnverifiable`]; under schema 1
+/// every fact is absent, so any requirement is unverifiable there. The
+/// `[recommended]` table is informational and is never consulted here.
+fn check_requirements(
+    requirements: &Requirements,
+    platform: &PlatformContract,
+) -> Result<(), ResolveError> {
+    if let Some(required) = requirements.memory_mib {
+        match platform.app_memory_budget_mib {
+            None => {
+                return Err(unverifiable(format!(
+                    "memory_mib {required} is unverifiable: platform contract declares no app_memory_budget_mib"
+                )))
+            }
+            Some(budget) if required > budget => {
+                return Err(resolve_error(
+                    ReasonCode::InsufficientMemory,
+                    65,
+                    format!("memory_mib {required} exceeds app_memory_budget_mib {budget}"),
+                ))
+            }
+            Some(_) => {}
+        }
+    }
+    if let Some(required) = requirements.gles.as_deref() {
+        check_graphics(
+            "gles",
+            required,
+            platform.gles_max.as_deref(),
+            KNOWN_GLES_VERSIONS,
+        )?;
+    }
+    if let Some(required) = requirements.vulkan.as_deref() {
+        check_graphics(
+            "vulkan",
+            required,
+            platform.vulkan_max.as_deref(),
+            KNOWN_VULKAN_VERSIONS,
+        )?;
+    }
+    for input in &requirements.inputs {
+        if SYSTEM_INPUTS.contains(&input.as_str()) {
+            continue;
+        }
+        let Some(device_inputs) = platform.inputs.as_deref() else {
+            return Err(unverifiable(format!(
+                "input {input} is unverifiable: platform contract declares no inputs"
+            )));
+        };
+        if !input_satisfied(input, device_inputs) {
+            return Err(resolve_error(
+                ReasonCode::MissingInput,
+                65,
+                format!(
+                    "required input {input} is not among platform inputs {}",
+                    device_inputs.join(", ")
+                ),
+            ));
+        }
+    }
+    if let Some(required) = requirements.display_min {
+        let Some(display) = platform.display else {
+            return Err(unverifiable(format!(
+                "display_min {}x{} is unverifiable: platform contract declares no display",
+                required.width, required.height
+            )));
+        };
+        let (required_small, required_large) = sorted_sides(required);
+        let (display_small, display_large) = sorted_sides(display);
+        if required_small > display_small || required_large > display_large {
+            return Err(resolve_error(
+                ReasonCode::DisplayTooSmall,
+                65,
+                format!(
+                    "display_min {}x{} exceeds display {}x{}",
+                    required.width, required.height, display.width, display.height
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Rank both versions in the fixed vocabulary and refuse when the required
+/// version outranks the platform maximum. An unrankable maximum (absent or
+/// outside the vocabulary) fails closed as unverifiable.
+fn check_graphics(
+    name: &str,
+    required: &str,
+    maximum: Option<&str>,
+    vocabulary: &[&str],
+) -> Result<(), ResolveError> {
+    let rank = |value: &str| vocabulary.iter().position(|known| *known == value);
+    match (rank(required), maximum, maximum.and_then(rank)) {
+        (Some(required_rank), Some(maximum), Some(maximum_rank)) => {
+            if required_rank > maximum_rank {
+                return Err(resolve_error(
+                    ReasonCode::UnsupportedGraphics,
+                    65,
+                    format!("{name} {required} exceeds {name}_max {maximum}"),
+                ));
+            }
+            Ok(())
+        }
+        _ => Err(unverifiable(format!(
+            "{name} {required} is unverifiable: platform contract declares no {name}_max"
+        ))),
+    }
+}
+
+/// `two_sticks` implies `stick`; every other token must be declared as-is.
+fn input_satisfied(required: &str, device_inputs: &[String]) -> bool {
+    device_inputs
+        .iter()
+        .any(|input| input == required || (required == "stick" && input == "two_sticks"))
+}
+
+/// The smaller side first, so display comparisons are orientation-independent.
+fn sorted_sides(display: DisplaySize) -> (u32, u32) {
+    if display.width <= display.height {
+        (display.width, display.height)
+    } else {
+        (display.height, display.width)
+    }
+}
+
+fn unverifiable(detail: String) -> ResolveError {
+    resolve_error(ReasonCode::RequirementUnverifiable, 65, detail)
 }
 
 fn symlink_metadata(
