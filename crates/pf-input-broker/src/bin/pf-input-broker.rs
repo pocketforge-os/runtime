@@ -16,7 +16,8 @@
 //! `--safe-return-sock` makes guide/`BTN_MODE` a protected System Menu action. A same-uid trusted
 //! provider can register at `--system-menu-sock`; it receives versioned `system_menu` actions and
 //! must acknowledge within 250 ms. Missing, invalid, disconnected, or hung providers fall back to
-//! the existing `safe_return` authority RPC. The input pump never waits on either process.
+//! the existing `safe_return` authority RPC. A provider's versioned `shown` message is logged but
+//! has no deadline policy in v1. The input pump never waits on either process.
 //!
 //! `--no-grab` is the R-C blessed-binary path (Steam Link): re-emit + hand the fd WITHOUT the
 //! exclusive grab (so a `uinput`-producing consumer is not broken).

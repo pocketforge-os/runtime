@@ -5,7 +5,9 @@
 //! `--safe-return-sock PATH` it drops every guide transition from the re-emit stream, so the app
 //! never observes it. A press is offered to the registered System Menu provider. Missing,
 //! disconnected, invalid, or unresponsive providers fall back to the existing SafeReturn intake
-//! after 250 ms. The menu's Return request enters that same intake.
+//! after 250 ms. After acknowledging, a provider may report `shown` when its frame is committed;
+//! v1 accepts and logs that message without enforcing a shown deadline or health policy. The
+//! menu's Return request enters the same SafeReturn intake.
 //!
 //! The authority is single-threaded, and while it runs `systemctl stop` it may block for 2 s or
 //! more. The input pump therefore never touches the socket:
@@ -18,11 +20,12 @@
 //! launcher contract crate.
 
 use std::io;
+use std::net::Shutdown;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{sync_channel, SyncSender, TrySendError};
+use std::sync::mpsc::{channel, sync_channel, Receiver, SyncSender, TrySendError};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -59,8 +62,20 @@ pub const SYSTEM_MENU_REGISTER_BODY: &[u8] = br#"{"version":1,"type":"register"}
 pub const SYSTEM_MENU_REGISTERED_BODY: &[u8] = br#"{"version":1,"type":"registered"}"#;
 pub const SYSTEM_MENU_ACTION_BODY: &[u8] = br#"{"version":1,"type":"system_menu"}"#;
 pub const SYSTEM_MENU_ACK_BODY: &[u8] = br#"{"version":1,"type":"ack","action":"system_menu"}"#;
+pub const SYSTEM_MENU_SHOWN_BODY: &[u8] = br#"{"version":1,"type":"shown"}"#;
 pub const SYSTEM_MENU_RETURN_BODY: &[u8] = br#"{"version":1,"type":"return"}"#;
 pub const SYSTEM_MENU_RETURNED_BODY: &[u8] = br#"{"version":1,"type":"ack","action":"return"}"#;
+
+struct RegisteredProvider {
+    writer: UnixStream,
+    replies: Receiver<io::Result<Vec<u8>>>,
+}
+
+impl RegisteredProvider {
+    fn shutdown(&self) {
+        let _ = self.writer.shutdown(Shutdown::Both);
+    }
+}
 
 enum SystemMenuCommand {
     Register {
@@ -90,33 +105,35 @@ impl SystemMenuRouter {
     pub fn spawn_with(
         safe_return: SafeReturnIntake,
         ack_timeout: Duration,
-        log: LogSink,
+        log: Box<dyn Fn(&str) + Send + Sync + 'static>,
     ) -> io::Result<Self> {
         let (tx, rx) = sync_channel(2);
         let busy = Arc::new(AtomicBool::new(false));
         let worker_busy = busy.clone();
         let fallback = safe_return.clone();
+        let log: Arc<dyn Fn(&str) + Send + Sync> = Arc::from(log);
         std::thread::Builder::new()
             .name("pf-system-menu".into())
             .spawn(move || {
-                let mut provider: Option<UnixStream> = None;
+                let mut provider: Option<RegisteredProvider> = None;
                 while let Ok(command) = rx.recv() {
                     match command {
                         SystemMenuCommand::Register {
-                            provider: mut candidate,
+                            provider: candidate,
                             ready,
                         } => {
-                            let result = (|| {
-                                candidate.set_read_timeout(Some(ack_timeout))?;
-                                candidate.set_write_timeout(Some(ack_timeout))?;
-                                pf_wire::write_frame(&mut candidate, SYSTEM_MENU_REGISTERED_BODY)
-                                    .map_err(wire_io)?;
-                                Ok(())
-                            })();
-                            if result.is_ok() {
-                                provider = Some(candidate);
+                            let result = prepare_provider(candidate, log.clone());
+                            match result {
+                                Ok(candidate) => {
+                                    if let Some(previous) = provider.replace(candidate) {
+                                        previous.shutdown();
+                                    }
+                                    let _ = ready.send(Ok(()));
+                                }
+                                Err(error) => {
+                                    let _ = ready.send(Err(error));
+                                }
                             }
-                            let _ = ready.send(result);
                         }
                         SystemMenuCommand::Press => {
                             let outcome = provider
@@ -127,11 +144,13 @@ impl SystemMenuRouter {
                                         "no system-menu provider registered",
                                     )
                                 })
-                                .and_then(send_system_menu);
+                                .and_then(|provider| send_system_menu(provider, ack_timeout));
                             match outcome {
                                 Ok(()) => log("pf-input-broker: system_menu acknowledged"),
                                 Err(error) => {
-                                    provider = None;
+                                    if let Some(failed) = provider.take() {
+                                        failed.shutdown();
+                                    }
                                     let dispatched = fallback.request();
                                     log(&format!(
                                         "pf-input-broker: system_menu fallback to safe_return ({:?}): {error}; dispatched={dispatched}",
@@ -201,9 +220,67 @@ impl SystemMenuRouter {
     }
 }
 
-fn send_system_menu(provider: &mut UnixStream) -> io::Result<()> {
-    pf_wire::write_frame(provider, SYSTEM_MENU_ACTION_BODY).map_err(wire_io)?;
-    let reply = pf_wire::read_frame(provider).map_err(wire_io)?;
+fn prepare_provider(
+    mut candidate: UnixStream,
+    log: Arc<dyn Fn(&str) + Send + Sync>,
+) -> io::Result<RegisteredProvider> {
+    candidate.set_write_timeout(Some(SYSTEM_MENU_ACK_TIMEOUT))?;
+    pf_wire::write_frame(&mut candidate, SYSTEM_MENU_REGISTERED_BODY).map_err(wire_io)?;
+    let mut reader = candidate.try_clone()?;
+    reader.set_read_timeout(None)?;
+    let (reply_tx, replies) = channel();
+    std::thread::Builder::new()
+        .name("pf-system-menu-provider".into())
+        .spawn(move || loop {
+            match pf_wire::read_frame(&mut reader).map_err(wire_io) {
+                Ok(body) => match is_shown(&body) {
+                    Ok(true) => log("pf-input-broker: system_menu shown"),
+                    Ok(false) => {
+                        if reply_tx.send(Ok(body)).is_err() {
+                            break;
+                        }
+                    }
+                    Err(error) => {
+                        let _ = reply_tx.send(Err(error));
+                        break;
+                    }
+                },
+                Err(error) => {
+                    let _ = reply_tx.send(Err(error));
+                    break;
+                }
+            }
+        })?;
+    Ok(RegisteredProvider {
+        writer: candidate,
+        replies,
+    })
+}
+
+fn is_shown(body: &[u8]) -> io::Result<bool> {
+    let value: serde_json::Value = serde_json::from_slice(body)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    Ok(
+        value.get("version").and_then(serde_json::Value::as_u64) == Some(1)
+            && value.get("type").and_then(serde_json::Value::as_str) == Some("shown"),
+    )
+}
+
+fn send_system_menu(provider: &mut RegisteredProvider, ack_timeout: Duration) -> io::Result<()> {
+    pf_wire::write_frame(&mut provider.writer, SYSTEM_MENU_ACTION_BODY).map_err(wire_io)?;
+    let reply = provider
+        .replies
+        .recv_timeout(ack_timeout)
+        .map_err(|error| match error {
+            std::sync::mpsc::RecvTimeoutError::Timeout => io::Error::new(
+                io::ErrorKind::TimedOut,
+                "system_menu acknowledgement timed out",
+            ),
+            std::sync::mpsc::RecvTimeoutError::Disconnected => io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "system-menu provider disconnected",
+            ),
+        })??;
     let value: serde_json::Value = serde_json::from_slice(&reply)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
     let valid = value.get("version").and_then(serde_json::Value::as_u64) == Some(1)
@@ -670,6 +747,76 @@ mod tests {
             authority.accept().unwrap_err().kind(),
             io::ErrorKind::WouldBlock,
             "an acknowledged provider must suppress fallback return"
+        );
+        let _ = std::fs::remove_file(sock);
+    }
+
+    #[test]
+    fn shown_after_ack_is_accepted_and_logged_without_poisoning_the_provider() {
+        let sock = scratch("menu-shown-provider");
+        let _ = std::fs::remove_file(&sock);
+        let authority = UnixListener::bind(&sock).unwrap();
+        authority.set_nonblocking(true).unwrap();
+        let (intake, _return_log) = logging_intake(&sock, IO_TIMEOUT);
+        let (menu_log_tx, menu_log_rx) = channel();
+        let router = SystemMenuRouter::spawn_with(
+            intake,
+            Duration::from_millis(50),
+            Box::new(move |line| {
+                let _ = menu_log_tx.send(line.to_owned());
+            }),
+        )
+        .unwrap();
+        let mut provider = register_test_provider(&router);
+        provider
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .unwrap();
+
+        assert!(router.press());
+        assert_eq!(
+            pf_wire::read_frame(&mut provider).unwrap(),
+            SYSTEM_MENU_ACTION_BODY
+        );
+        pf_wire::write_frame(&mut provider, SYSTEM_MENU_ACK_BODY).unwrap();
+        pf_wire::write_frame(&mut provider, SYSTEM_MENU_SHOWN_BODY).unwrap();
+        let shown_deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            let line = menu_log_rx
+                .recv_timeout(shown_deadline.saturating_duration_since(Instant::now()))
+                .unwrap();
+            if line.contains("shown") {
+                break;
+            }
+        }
+        assert_eq!(
+            authority.accept().unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        let first_deadline = Instant::now() + Duration::from_secs(1);
+        while router.in_flight() && Instant::now() < first_deadline {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(!router.in_flight());
+        while menu_log_rx.try_recv().is_ok() {}
+
+        assert!(router.press());
+        assert_eq!(
+            pf_wire::read_frame(&mut provider).unwrap(),
+            SYSTEM_MENU_ACTION_BODY
+        );
+        pf_wire::write_frame(&mut provider, SYSTEM_MENU_ACK_BODY).unwrap();
+        let acknowledged_deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            let line = menu_log_rx
+                .recv_timeout(acknowledged_deadline.saturating_duration_since(Instant::now()))
+                .unwrap();
+            if line.contains("acknowledged") {
+                break;
+            }
+        }
+        assert_eq!(
+            authority.accept().unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
         );
         let _ = std::fs::remove_file(sock);
     }

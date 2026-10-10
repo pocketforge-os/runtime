@@ -1237,6 +1237,23 @@ range = { min = 0, max = 255, fuzz = 0, flat = 0 }
                 frames.recv_timeout(Duration::from_secs(1)).unwrap(),
                 SAFE_RETURN_BODY
             );
+            let completed = Instant::now() + Duration::from_secs(1);
+            while p
+                .system_menu
+                .as_ref()
+                .unwrap()
+                .router()
+                .fallback_in_flight()
+                && Instant::now() < completed
+            {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            assert!(!p
+                .system_menu
+                .as_ref()
+                .unwrap()
+                .router()
+                .fallback_in_flight());
         }
         assert!(
             frames.recv_timeout(Duration::from_millis(300)).is_err(),
