@@ -4,7 +4,7 @@ use pf_ports::{
 };
 use pf_prefs::PrefsStore;
 use pf_prefs_port::{PrefsPreferencePort, USER_AUTHORITY};
-use pf_prefsd::{serve_until_with_timeout, Client};
+use pf_prefsd::{serve_until_with_timeout_and_resolver, Client, PreferenceWriter};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
@@ -24,12 +24,13 @@ fn daemon_mode_is_coherent_and_never_falls_back_when_down() {
     let thread_stop = stop.clone();
     let daemon_state = state.clone();
     let thread = std::thread::spawn(move || {
-        serve_until_with_timeout(
+        serve_until_with_timeout_and_resolver(
             listener,
             &PrefsStore::at(daemon_state),
             unsafe { libc::geteuid() },
             &thread_stop,
             Duration::from_millis(100),
+            |_| Ok(Some(PreferenceWriter::Settings)),
         )
         .unwrap();
     });

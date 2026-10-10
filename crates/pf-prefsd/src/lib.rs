@@ -4,8 +4,9 @@ use pf_prefs::{PrefKind, PrefValue, PrefsStore, SCHEMA};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
+use std::fs;
 use std::io;
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -50,6 +51,7 @@ pub enum RpcResponse {
 #[serde(rename_all = "snake_case")]
 pub enum ErrorKind {
     InvalidValue,
+    PermissionDenied,
     Store,
     Internal,
     #[serde(other)]
@@ -164,6 +166,100 @@ pub struct PeerCred {
     pub gid: u32,
 }
 
+/// Kernel-derived class of process permitted to change user preferences.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PreferenceWriter {
+    Settings,
+    Shell,
+}
+
+/// One explicit row in the default-deny write policy.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WritePolicyRow {
+    pub key: &'static str,
+    pub writers: &'static [PreferenceWriter],
+}
+
+const SETTINGS_AND_SHELL: &[PreferenceWriter] =
+    &[PreferenceWriter::Settings, PreferenceWriter::Shell];
+
+/// Every currently writable preference is named here. Schema additions do not inherit access.
+pub const WRITE_POLICY: &[WritePolicyRow] = &[
+    WritePolicyRow {
+        key: "appearance",
+        writers: SETTINGS_AND_SHELL,
+    },
+    WritePolicyRow {
+        key: "textScale",
+        writers: SETTINGS_AND_SHELL,
+    },
+    WritePolicyRow {
+        key: "highContrast",
+        writers: SETTINGS_AND_SHELL,
+    },
+    WritePolicyRow {
+        key: "reduceFlashing",
+        writers: SETTINGS_AND_SHELL,
+    },
+    WritePolicyRow {
+        key: "reduceMotion",
+        writers: SETTINGS_AND_SHELL,
+    },
+    WritePolicyRow {
+        key: "hapticsEnabled",
+        writers: SETTINGS_AND_SHELL,
+    },
+    WritePolicyRow {
+        key: "monoAudio",
+        writers: SETTINGS_AND_SHELL,
+    },
+    WritePolicyRow {
+        key: "brightness",
+        writers: SETTINGS_AND_SHELL,
+    },
+];
+
+/// Return whether a kernel-derived writer class may change `key`.
+pub fn write_allowed(writer: PreferenceWriter, key: &str) -> bool {
+    WRITE_POLICY
+        .iter()
+        .find(|row| row.key == key)
+        .is_some_and(|row| row.writers.contains(&writer))
+}
+
+fn writer_from_unit(unit: &str) -> Option<PreferenceWriter> {
+    match unit {
+        "pf-settings.service" => Some(PreferenceWriter::Settings),
+        "pf-shell-selected.service" => Some(PreferenceWriter::Shell),
+        unit if unit
+            .strip_prefix("pf-foreground@")
+            .and_then(|instance| instance.strip_suffix(".service"))
+            .is_some_and(|instance| !instance.is_empty()) =>
+        {
+            Some(PreferenceWriter::Shell)
+        }
+        _ => None,
+    }
+}
+
+/// Classify the systemd service in a `/proc/<pid>/cgroup` document.
+pub fn writer_from_cgroup(cgroup: &str) -> Option<PreferenceWriter> {
+    cgroup.lines().find_map(|line| {
+        let mut fields = line.splitn(3, ':');
+        let hierarchy = fields.next()?;
+        let controllers = fields.next()?;
+        let path = fields.next()?;
+        let is_systemd = (hierarchy == "0" && controllers.is_empty())
+            || controllers.split(',').any(|name| name == "name=systemd");
+        if !is_systemd {
+            return None;
+        }
+        path.rsplit('/')
+            .find(|component| component.ends_with(".service"))
+            .and_then(writer_from_unit)
+    })
+}
+
 /// Read `SO_PEERCRED` from an accepted Unix connection.
 pub fn peer_cred(stream: &UnixStream) -> io::Result<PeerCred> {
     let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
@@ -203,11 +299,89 @@ pub fn verify_peer_uid(cred: PeerCred, allowed_uid: u32) -> io::Result<()> {
     }
 }
 
+fn peer_pidfd(stream: &UnixStream) -> io::Result<OwnedFd> {
+    let mut fd: libc::c_int = -1;
+    let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    // SAFETY: the fd is a live Unix socket and `fd` is writable for exactly `len` bytes.
+    let rc = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERPIDFD,
+            (&mut fd as *mut libc::c_int).cast(),
+            &mut len,
+        )
+    };
+    if rc < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if fd < 0 || len as usize != std::mem::size_of::<libc::c_int>() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "SO_PEERPIDFD returned an invalid descriptor",
+        ));
+    }
+    // SAFETY: successful SO_PEERPIDFD returns a new descriptor owned by the caller.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+fn verify_live_pidfd(pidfd: &OwnedFd, expected_pid: i32) -> io::Result<()> {
+    let fdinfo = fs::read_to_string(format!("/proc/self/fdinfo/{}", pidfd.as_raw_fd()))?;
+    let pid = fdinfo
+        .lines()
+        .find_map(|line| line.strip_prefix("Pid:\t"))
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "pidfd has no Pid field"))?
+        .parse::<i32>()
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    if pid != expected_pid {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("pidfd names pid={pid}, expected peer pid={expected_pid}"),
+        ));
+    }
+    let mut pollfd = libc::pollfd {
+        fd: pidfd.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: `pollfd` points to one initialized descriptor and the zero timeout never blocks.
+    let rc = unsafe { libc::poll(&mut pollfd, 1, 0) };
+    if rc < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if rc != 0 || pollfd.revents != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "peer exited during identity lookup",
+        ));
+    }
+    Ok(())
+}
+
+/// Resolve the write class from the exact live socket peer's systemd cgroup.
+pub fn peer_writer(stream: &UnixStream) -> io::Result<Option<PreferenceWriter>> {
+    let cred = peer_cred(stream)?;
+    let pidfd = peer_pidfd(stream)?;
+    verify_live_pidfd(&pidfd, cred.pid)?;
+    let cgroup = fs::read_to_string(format!("/proc/{}/cgroup", cred.pid))?;
+    verify_live_pidfd(&pidfd, cred.pid)?;
+    Ok(writer_from_cgroup(&cgroup))
+}
+
 /// Serve exactly one request and response on a connection.
 pub fn serve_connection(store: &PrefsStore, stream: &mut UnixStream) -> io::Result<()> {
+    serve_connection_as(store, stream, None)
+}
+
+/// Serve one request using a writer identity established outside the request payload.
+pub fn serve_connection_as(
+    store: &PrefsStore,
+    stream: &mut UnixStream,
+    writer: Option<PreferenceWriter>,
+) -> io::Result<()> {
     let body = pf_wire::read_frame(stream).map_err(map_wire_error)?;
     let response = match serde_json::from_slice::<RpcRequest>(&body) {
-        Ok(request) => handle_rpc(store, request),
+        Ok(request) => handle_rpc(store, request, writer),
         Err(error) => RpcResponse::Error {
             message: format!("invalid request: {error}"),
             kind: Some(ErrorKind::Internal),
@@ -254,16 +428,53 @@ pub fn serve_until_with_timeout(
     stop: &AtomicBool,
     connection_timeout: Duration,
 ) -> io::Result<()> {
+    serve_until_with_timeout_and_resolver(
+        listener,
+        store,
+        allowed_uid,
+        stop,
+        connection_timeout,
+        peer_writer,
+    )
+}
+
+/// Serving loop with an injected kernel-identity resolver for hermetic policy tests.
+pub fn serve_until_with_timeout_and_resolver<F>(
+    listener: UnixListener,
+    store: &PrefsStore,
+    allowed_uid: u32,
+    stop: &AtomicBool,
+    connection_timeout: Duration,
+    resolve_writer: F,
+) -> io::Result<()>
+where
+    F: Fn(&UnixStream) -> io::Result<Option<PreferenceWriter>>,
+{
     listener.set_nonblocking(true)?;
     while !stop.load(Ordering::Acquire) {
         match listener.accept() {
             Ok((mut stream, _)) => {
-                let admitted =
-                    peer_cred(&stream).and_then(|cred| verify_peer_uid(cred, allowed_uid));
-                if let Err(error) = admitted {
+                let cred = match peer_cred(&stream) {
+                    Ok(cred) => cred,
+                    Err(error) => {
+                        eprintln!("pf-prefsd: peer refused: {error}");
+                        continue;
+                    }
+                };
+                if let Err(error) = verify_peer_uid(cred, allowed_uid) {
                     eprintln!("pf-prefsd: peer refused: {error}");
                     continue;
                 }
+                let writer = match resolve_writer(&stream) {
+                    Ok(writer) => writer,
+                    Err(error) => {
+                        eprintln!(
+                            "pf-prefsd: peer pid={} has no write identity: {error}",
+                            cred.pid
+                        );
+                        None
+                    }
+                };
                 if let Err(error) = stream
                     .set_nonblocking(false)
                     .and_then(|()| stream.set_read_timeout(Some(connection_timeout)))
@@ -272,7 +483,7 @@ pub fn serve_until_with_timeout(
                     eprintln!("pf-prefsd: connection setup error: {error}");
                     continue;
                 }
-                if let Err(error) = serve_connection(store, &mut stream) {
+                if let Err(error) = serve_connection_as(store, &mut stream, writer) {
                     eprintln!("pf-prefsd: connection error: {error}");
                 }
             }
@@ -285,7 +496,19 @@ pub fn serve_until_with_timeout(
     Ok(())
 }
 
-fn handle_rpc(store: &PrefsStore, request: RpcRequest) -> RpcResponse {
+fn handle_rpc(
+    store: &PrefsStore,
+    request: RpcRequest,
+    writer: Option<PreferenceWriter>,
+) -> RpcResponse {
+    if let RpcRequest::Set { key, .. } = &request {
+        if !writer.is_some_and(|writer| write_allowed(writer, key)) {
+            return RpcResponse::Error {
+                message: format!("writer is not authorized to change preference '{key}'"),
+                kind: Some(ErrorKind::PermissionDenied),
+            };
+        }
+    }
     let result: Result<RpcResponse, (ErrorKind, pf_prefs::PrefError)> = match request {
         RpcRequest::Get { key } => store
             .load()
@@ -402,5 +625,100 @@ mod tests {
             verify_peer_uid(cred, 41).unwrap_err().kind(),
             io::ErrorKind::PermissionDenied
         );
+    }
+
+    #[test]
+    fn app_cgroup_set_is_refused_while_settings_and_shell_are_accepted() {
+        let root =
+            std::env::temp_dir().join(format!("pf-prefsd-write-policy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let store = PrefsStore::at(&root);
+        let request = || RpcRequest::Set {
+            key: "reduceMotion".into(),
+            value: Value::Bool(true),
+        };
+
+        let app = writer_from_cgroup("0::/system.slice/pf-app@steamlink.service\n");
+        assert_eq!(app, None);
+        assert!(matches!(
+            handle_rpc(&store, request(), app),
+            RpcResponse::Error {
+                kind: Some(ErrorKind::PermissionDenied),
+                ..
+            }
+        ));
+        assert!(!root.join("prefs.json").exists(), "denial must not mutate");
+
+        for (cgroup, expected_writer) in [
+            (
+                "0::/system.slice/pf-settings.service\n",
+                PreferenceWriter::Settings,
+            ),
+            (
+                "0::/user.slice/user-1000.slice/pf-shell-selected.service\n",
+                PreferenceWriter::Shell,
+            ),
+            (
+                "0::/system.slice/pf-foreground@main.service\n",
+                PreferenceWriter::Shell,
+            ),
+        ] {
+            let writer = writer_from_cgroup(cgroup);
+            assert_eq!(writer, Some(expected_writer));
+            assert!(matches!(
+                handle_rpc(&store, request(), writer),
+                RpcResponse::Value {
+                    value: Value::Bool(true)
+                }
+            ));
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn write_policy_covers_schema_exactly_and_unknown_keys_default_deny() {
+        let policy_keys: std::collections::BTreeSet<_> =
+            WRITE_POLICY.iter().map(|row| row.key).collect();
+        let schema_keys: std::collections::BTreeSet<_> = SCHEMA.iter().map(|row| row.key).collect();
+        assert_eq!(policy_keys, schema_keys);
+        assert_eq!(
+            WRITE_POLICY.len(),
+            schema_keys.len(),
+            "duplicate policy row"
+        );
+
+        for spec in SCHEMA {
+            assert!(write_allowed(PreferenceWriter::Settings, spec.key));
+            assert!(write_allowed(PreferenceWriter::Shell, spec.key));
+        }
+        assert!(!write_allowed(PreferenceWriter::Settings, "futureKey"));
+    }
+
+    #[test]
+    fn cgroup_identity_ignores_app_broker_scopes_and_client_like_text() {
+        for cgroup in [
+            "0::/system.slice/pf-app@settings.service\n",
+            "0::/system.slice/pf-input-broker.service\n",
+            "0::/user.slice/user-1000.slice/session-3.scope\n",
+            "0::/system.slice/not-pf-settings.service\n",
+            "5:freezer:/pf-settings.service\n",
+        ] {
+            assert_eq!(writer_from_cgroup(cgroup), None, "{cgroup:?}");
+        }
+        assert_eq!(
+            writer_from_cgroup("1:name=systemd:/system.slice/pf-settings.service\n"),
+            Some(PreferenceWriter::Settings)
+        );
+    }
+
+    #[test]
+    fn socket_peer_pidfd_stabilizes_the_proc_cgroup_lookup() {
+        let (peer, _other) = UnixStream::pair().unwrap();
+        let cred = peer_cred(&peer).unwrap();
+        assert_eq!(cred.pid, std::process::id() as i32);
+        assert_eq!(cred.uid, unsafe { libc::geteuid() });
+
+        let expected = writer_from_cgroup(&std::fs::read_to_string("/proc/self/cgroup").unwrap());
+        assert_eq!(peer_writer(&peer).unwrap(), expected);
     }
 }
