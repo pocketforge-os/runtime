@@ -196,6 +196,28 @@ fn stale_apply_replies_cannot_overwrite_newer_writes_or_follow_an_item_index() {
     );
     assert_eq!(engine.value(moved), Some(MenuValue::Bool(false)));
     assert_eq!(engine.apply_state(moved), ApplyState::Committed);
+
+    let invalidated = request(engine.input(MenuInput::Activate, MonotonicTime::from_nanos(4)));
+    engine
+        .edit(&PrefsSchemas, |menu| {
+            let ItemKind::Toggle { bind } = &mut menu.pages[0].sections[0].items[1].kind else {
+                unreachable!()
+            };
+            *bind = Bind::Host("replacement-toggle".into());
+        })
+        .unwrap();
+    assert_eq!(engine.value(moved), Some(MenuValue::Bool(false)));
+    assert_eq!(engine.apply_state(moved), ApplyState::Idle);
+    assert!(engine
+        .input(
+            MenuInput::Applied {
+                request: invalidated,
+                result: ApplyResult::Committed(MenuValue::Bool(true)),
+            },
+            MonotonicTime::from_nanos(5),
+        )
+        .is_empty());
+    assert_eq!(engine.value(moved), Some(MenuValue::Bool(false)));
 }
 
 #[test]

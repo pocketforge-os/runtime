@@ -594,8 +594,13 @@ impl MenuEngine {
         self.leave_page();
 
         let item_id = |engine: &Self, i: u32| engine.item(ItemIndex(i)).id.clone();
-        let slots: BTreeMap<ItemId, Slot> = (0..self.slots.len() as u32)
-            .map(|i| (item_id(self, i), self.slots[i as usize]))
+        let slots: BTreeMap<ItemId, (Slot, ItemKind)> = (0..self.slots.len() as u32)
+            .map(|i| {
+                (
+                    item_id(self, i),
+                    (self.slots[i as usize], self.item_at(i).kind.clone()),
+                )
+            })
             .collect();
         let memory: BTreeMap<PageId, (Option<ItemId>, u32)> = self
             .memory
@@ -626,7 +631,22 @@ impl MenuEngine {
         self.reindex();
         let find = |engine: &Self, id: &ItemId| engine.item_index(id).map(|i| i.0);
         self.slots = (0..self.index.loc.len() as u32)
-            .map(|i| slots.get(&item_id(self, i)).copied().unwrap_or_default())
+            .map(|i| {
+                let Some((slot, old_kind)) = slots.get(&item_id(self, i)) else {
+                    return Slot::default();
+                };
+                if matches!(slot.state, ApplyState::Pending { .. })
+                    && old_kind != &self.item_at(i).kind
+                {
+                    Slot {
+                        value: slot.previous,
+                        previous: None,
+                        state: ApplyState::Idle,
+                    }
+                } else {
+                    *slot
+                }
+            })
             .collect();
         for i in 0..self.slots.len() {
             let item = self.item(ItemIndex(i as u32));
