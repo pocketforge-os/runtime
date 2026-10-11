@@ -10,6 +10,7 @@ members = [
     "crates/pf-hw-exerciser",
     "crates/pf-prefs",
     "crates/pf-prefsd",
+    "crates/pf-peer-identity",
     "crates/pf-prefs-port",
     "crates/pf-settings",
     "crates/pf-input-collect",
@@ -46,6 +47,8 @@ pocketforge = { path = "crates/pocketforge", version = "0.0.1" }
 # E4 preference data layer (tsp-xubv.1) — a NEW leaf crate + its CLI.
 pf-prefs = { path = "crates/pf-prefs", version = "0.0.1" }
 pf-prefsd = { path = "crates/pf-prefsd", version = "0.0.1" }
+# Shared kernel-attested peer identity (tsp-ght0z): pf-prefsd and the session authority use it.
+pf-peer-identity = { path = "crates/pf-peer-identity", version = "0.0.1" }
 pf-ports = { path = "crates/pf-ports", version = "0.0.1" }
 pf-scene = { path = "crates/pf-scene", version = "0.0.1" }
 pf-input-map = { path = "crates/pf-input-map", version = "0.0.1" }

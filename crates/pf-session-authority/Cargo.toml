@@ -8,7 +8,9 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
+libc.workspace = true
 pf-app-manifest.workspace = true
+pf-peer-identity.workspace = true
 pf-ports.workspace = true
 pf-wire.workspace = true
 serde.workspace = true

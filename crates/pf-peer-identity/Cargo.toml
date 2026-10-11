@@ -1,0 +1,12 @@
+[package]
+name = "pf-peer-identity"
+description = "Kernel-attested Unix peer identity shared by every PocketForge service that identifies apps"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+libc.workspace = true
