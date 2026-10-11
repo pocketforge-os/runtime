@@ -156,65 +156,88 @@ fn refused(reason: RefusalReason, at: impl Into<String>) -> Refused {
     Refused::new(reason, at)
 }
 
-fn head(major: u8, argument: u64, output: &mut Vec<u8>) {
-    match argument {
-        0..=23 => output.push((major << 5) | argument as u8),
-        24..=0xff => {
-            output.push((major << 5) | 24);
-            output.push(argument as u8);
-        }
-        0x100..=0xffff => {
-            output.push((major << 5) | 25);
-            output.extend_from_slice(&(argument as u16).to_be_bytes());
-        }
-        0x1_0000..=0xffff_ffff => {
-            output.push((major << 5) | 26);
-            output.extend_from_slice(&(argument as u32).to_be_bytes());
-        }
-        _ => {
-            output.push((major << 5) | 27);
-            output.extend_from_slice(&argument.to_be_bytes());
-        }
+fn push_byte(byte: u8, output: &mut Vec<u8>) -> Result<()> {
+    if output.len() >= MAX_BYTES {
+        return Err(refused(RefusalReason::TooLarge, ""));
     }
+    output.push(byte);
+    Ok(())
 }
 
-fn encode_value(value: &CborValue, output: &mut Vec<u8>) {
+fn push_bytes(bytes: &[u8], output: &mut Vec<u8>) -> Result<()> {
+    if output
+        .len()
+        .checked_add(bytes.len())
+        .is_none_or(|length| length > MAX_BYTES)
+    {
+        return Err(refused(RefusalReason::TooLarge, ""));
+    }
+    output.extend_from_slice(bytes);
+    Ok(())
+}
+
+fn head(major: u8, argument: u64, output: &mut Vec<u8>) -> Result<()> {
+    match argument {
+        0..=23 => push_byte((major << 5) | argument as u8, output)?,
+        24..=0xff => {
+            push_byte((major << 5) | 24, output)?;
+            push_byte(argument as u8, output)?;
+        }
+        0x100..=0xffff => {
+            push_byte((major << 5) | 25, output)?;
+            push_bytes(&(argument as u16).to_be_bytes(), output)?;
+        }
+        0x1_0000..=0xffff_ffff => {
+            push_byte((major << 5) | 26, output)?;
+            push_bytes(&(argument as u32).to_be_bytes(), output)?;
+        }
+        _ => {
+            push_byte((major << 5) | 27, output)?;
+            push_bytes(&argument.to_be_bytes(), output)?;
+        }
+    }
+    Ok(())
+}
+
+fn encode_value(value: &CborValue, output: &mut Vec<u8>) -> Result<()> {
     match value {
-        CborValue::Null => output.push(0xf6),
-        CborValue::Bool(false) => output.push(0xf4),
-        CborValue::Bool(true) => output.push(0xf5),
-        CborValue::Uint(value) => head(0, *value, output),
+        CborValue::Null => push_byte(0xf6, output)?,
+        CborValue::Bool(false) => push_byte(0xf4, output)?,
+        CborValue::Bool(true) => push_byte(0xf5, output)?,
+        CborValue::Uint(value) => head(0, *value, output)?,
         CborValue::Bytes(value) => {
-            head(2, value.len() as u64, output);
-            output.extend_from_slice(value);
+            head(2, value.len() as u64, output)?;
+            push_bytes(value, output)?;
         }
         CborValue::Text(value) => {
-            head(3, value.len() as u64, output);
-            output.extend_from_slice(value.as_bytes());
+            head(3, value.len() as u64, output)?;
+            push_bytes(value.as_bytes(), output)?;
         }
         CborValue::Array(values) => {
-            head(4, values.len() as u64, output);
+            head(4, values.len() as u64, output)?;
             for value in values {
-                encode_value(value, output);
+                encode_value(value, output)?;
             }
         }
         CborValue::Map(entries) => {
-            let mut pairs: Vec<_> = entries
+            let mut pairs = entries
                 .iter()
-                .map(|(key, value)| {
+                .map(|(key, value)| -> Result<_> {
                     let mut encoded_key = Vec::new();
-                    encode_value(&CborValue::Text(key.clone()), &mut encoded_key);
-                    (encoded_key, value)
+                    head(3, key.len() as u64, &mut encoded_key)?;
+                    push_bytes(key.as_bytes(), &mut encoded_key)?;
+                    Ok((encoded_key, value))
                 })
-                .collect();
+                .collect::<Result<Vec<_>>>()?;
             pairs.sort_by(|left, right| left.0.cmp(&right.0));
-            head(5, pairs.len() as u64, output);
+            head(5, pairs.len() as u64, output)?;
             for (key, value) in pairs {
-                output.extend_from_slice(&key);
-                encode_value(value, output);
+                push_bytes(&key, output)?;
+                encode_value(value, output)?;
             }
         }
     }
+    Ok(())
 }
 
 struct Parser<'a> {
@@ -829,6 +852,46 @@ fn decode_hex(value: &str) -> Option<Vec<u8>> {
     )
 }
 
+fn charge_json_budget(budget: &mut usize, amount: usize) -> Result<()> {
+    *budget = budget
+        .checked_add(amount)
+        .ok_or_else(|| refused(RefusalReason::TooLarge, ""))?;
+    if *budget > MAX_BYTES {
+        return Err(refused(RefusalReason::TooLarge, ""));
+    }
+    Ok(())
+}
+
+fn preflight_json(value: &JsonValue, depth: usize, budget: &mut usize) -> Result<()> {
+    // One byte is the minimum encoded representation of every JSON value. It
+    // also bounds traversal of containers containing zero-length strings.
+    charge_json_budget(budget, 1)?;
+    match value {
+        JsonValue::String(value) => charge_json_budget(budget, value.len()),
+        JsonValue::Array(values) => {
+            if depth >= MAX_DEPTH {
+                return Err(refused(RefusalReason::Unsupported, "nesting"));
+            }
+            for value in values {
+                preflight_json(value, depth + 1, budget)?;
+            }
+            Ok(())
+        }
+        JsonValue::Object(entries) => {
+            if depth >= MAX_DEPTH {
+                return Err(refused(RefusalReason::Unsupported, "nesting"));
+            }
+            for (key, value) in entries {
+                charge_json_budget(budget, key.len())?;
+                charge_json_budget(budget, 1)?;
+                preflight_json(value, depth + 1, budget)?;
+            }
+            Ok(())
+        }
+        JsonValue::Null | JsonValue::Bool(_) | JsonValue::Number(_) => Ok(()),
+    }
+}
+
 fn json_to_cbor(value: &JsonValue) -> Result<CborValue> {
     match value {
         JsonValue::Null => Ok(CborValue::Null),
@@ -914,9 +977,11 @@ pub fn decode(data: &[u8]) -> Result<JsonValue> {
 
 /// Validate the JSON mapping and encode its deterministic CBOR representation.
 pub fn encode(report: &JsonValue) -> Result<Vec<u8>> {
+    let mut budget = 0;
+    preflight_json(report, 0, &mut budget)?;
     let value = report_json_to_cbor(report)?;
     let mut data = Vec::new();
-    encode_value(&value, &mut data);
+    encode_value(&value, &mut data)?;
     let decoded = decode(&data)?;
     if decoded != *report {
         return Err(refused(

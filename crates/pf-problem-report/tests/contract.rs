@@ -305,3 +305,37 @@ fn unknown_vocabulary_and_free_text_mutations_are_refused() {
         );
     }
 }
+
+#[test]
+fn oversized_json_is_refused_before_semantic_conversion() {
+    let report = fixtures("valid")
+        .into_iter()
+        .next()
+        .expect("positive fixture")
+        .1["report"]
+        .clone();
+    encode(&report).expect("bounded positive control");
+
+    let oversized = json!({
+        "oversized": "x".repeat(MAX_BYTES),
+        "v": -1,
+    });
+    assert_eq!(
+        encode(&oversized)
+            .expect_err("size bound must run before numeric conversion")
+            .reason(),
+        RefusalReason::TooLarge
+    );
+
+    let mut nested = Value::Null;
+    for _ in 0..16 {
+        nested = Value::Array(vec![nested]);
+    }
+    let too_deep = json!({"nested": nested});
+    assert_eq!(
+        encode(&too_deep)
+            .expect_err("depth must be bounded before recursive conversion")
+            .reason(),
+        RefusalReason::Unsupported
+    );
+}
