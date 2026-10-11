@@ -247,7 +247,8 @@ fn broker_safe_return(authority: &mut TestAuthority) {
                 unit: "pf-input-broker.service".into(),
             })
         },
-    );
+    )
+    .unwrap();
     spawn_rpc_acceptor(listener, requests, DEFAULT_CONNECTION_LIMITS, policy);
     let (log_tx, log) = channel();
     let intake = SafeReturnIntake::spawn_with(

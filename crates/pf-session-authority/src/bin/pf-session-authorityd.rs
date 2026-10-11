@@ -62,7 +62,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let shell_uid = resolve_uid(&args.shell_user)?;
     let shell_policy =
-        ShellPolicy::kernel(shell_uid, args.shell_unit.clone(), args.broker_unit.clone());
+        ShellPolicy::kernel(shell_uid, args.shell_unit.clone(), args.broker_unit.clone())?;
     let mut authority = Authority::open(
         FileStore::new(args.state_dir.join("authority.json")),
         CommandSystem::new(args.templates),

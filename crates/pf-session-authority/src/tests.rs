@@ -1633,6 +1633,7 @@ fn shell_policy_for(uid: u32, unit: &str) -> ShellPolicy {
             })
         },
     )
+    .unwrap()
 }
 
 fn trusted_shell_policy() -> ShellPolicy {
@@ -1789,6 +1790,25 @@ fn broker_identity_is_limited_to_safe_return() {
     assert!(log.iter().any(|line| line.contains("method=launch")));
     assert!(log.iter().any(|line| line.contains("method=open_url")));
     fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn overlapping_shell_and_broker_identity_never_gets_shell_authority() {
+    let overlapping =
+        ShellPolicy::custom(0, TEST_BROKER_UNIT.into(), TEST_BROKER_UNIT.into(), |_| {
+            unreachable!("overlapping policy must be refused before identity resolution")
+        });
+    let error = overlapping.err().expect("overlap was accepted");
+    assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    assert!(error.to_string().contains("overlaps the root broker"));
+
+    assert!(ShellPolicy::custom(
+        TEST_GAMER_UID,
+        TEST_SHELL_UNIT.into(),
+        TEST_BROKER_UNIT.into(),
+        |_| unreachable!("construction does not resolve a peer"),
+    )
+    .is_ok());
 }
 
 #[test]

@@ -1158,7 +1158,7 @@ enum ShellPeerRole {
 }
 
 impl ShellPolicy {
-    pub fn kernel(shell_uid: u32, shell_unit: String, broker_unit: String) -> Self {
+    pub fn kernel(shell_uid: u32, shell_unit: String, broker_unit: String) -> io::Result<Self> {
         Self::custom(
             shell_uid,
             shell_unit,
@@ -1175,13 +1175,19 @@ impl ShellPolicy {
             + Send
             + Sync
             + 'static,
-    ) -> Self {
-        Self {
+    ) -> io::Result<Self> {
+        if shell_uid == 0 && shell_unit == broker_unit {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("shell uid=0 unit={shell_unit} overlaps the root broker identity"),
+            ));
+        }
+        Ok(Self {
             shell_uid,
             shell_unit,
             broker_unit,
             resolve_peer: Arc::new(resolve_peer),
-        }
+        })
     }
 
     fn authenticate_peer(&self, stream: &UnixStream) -> io::Result<ShellPeerRole> {
