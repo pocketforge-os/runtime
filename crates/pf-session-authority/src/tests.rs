@@ -1612,6 +1612,185 @@ fn raw_rpc(socket: &Path, request: &RpcRequest) -> RpcResponse {
     serde_json::from_slice(&pf_wire::read_frame(&mut stream).unwrap()).unwrap()
 }
 
+const TEST_GAMER_UID: u32 = 1000;
+const TEST_SHELL_UNIT: &str = "pf-shell-selected.service";
+const TEST_BROKER_UNIT: &str = "pf-input-broker.service";
+
+fn shell_policy_for(uid: u32, unit: &str) -> ShellPolicy {
+    let unit = unit.to_owned();
+    ShellPolicy::custom(
+        TEST_GAMER_UID,
+        TEST_SHELL_UNIT.into(),
+        TEST_BROKER_UNIT.into(),
+        move |_| {
+            Ok(pf_peer_identity::PeerServiceIdentity {
+                cred: pf_peer_identity::PeerCred {
+                    pid: 4242,
+                    uid,
+                    gid: uid,
+                },
+                unit: unit.clone(),
+            })
+        },
+    )
+}
+
+fn trusted_shell_policy() -> ShellPolicy {
+    shell_policy_for(TEST_GAMER_UID, TEST_SHELL_UNIT)
+}
+
+fn assert_shell_socket_peer_refused(name: &str, uid: u32, unit: &str) {
+    use std::io::Read as _;
+    let dir = short_socket_dir(name);
+    let socket = dir.join("a.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    let (requests, incoming) = std::sync::mpsc::channel();
+    spawn_rpc_acceptor(
+        listener,
+        requests,
+        DEFAULT_CONNECTION_LIMITS,
+        shell_policy_for(uid, unit),
+    );
+
+    let mut stream = std::os::unix::net::UnixStream::connect(&socket).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let mut byte = [0; 1];
+    assert_eq!(stream.read(&mut byte).unwrap(), 0, "{name} was not closed");
+    assert!(
+        incoming.recv_timeout(Duration::from_millis(100)).is_err(),
+        "{name} reached the authority loop"
+    );
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn shell_socket_refuses_apps_and_wrong_uid_services_at_accept() {
+    assert_shell_socket_peer_refused(
+        "shell-app-refused",
+        TEST_GAMER_UID,
+        "pf-app@org.example.game.service",
+    );
+    assert_shell_socket_peer_refused("shell-wrong-uid", TEST_GAMER_UID + 1, TEST_SHELL_UNIT);
+    assert_shell_socket_peer_refused("broker-nonroot", TEST_GAMER_UID, TEST_BROKER_UNIT);
+}
+
+#[test]
+fn shell_identity_can_send_the_full_shell_request_set() {
+    let dir = short_socket_dir("shell-full-set");
+    let socket = dir.join("a.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    let (requests, incoming) = std::sync::mpsc::channel();
+    spawn_rpc_acceptor(
+        listener,
+        requests,
+        DEFAULT_CONNECTION_LIMITS,
+        trusted_shell_policy(),
+    );
+    let requests = [
+        RpcRequest::Launch {
+            item_id: APP_ID.into(),
+        },
+        RpcRequest::SafeReturn,
+        RpcRequest::Events {
+            client_id: "shell".into(),
+            contract: SESSION_RPC_CONTRACT_V1,
+        },
+        RpcRequest::Acknowledge {
+            client_id: "shell".into(),
+            sequence: 1,
+        },
+        RpcRequest::History,
+        RpcRequest::Observe {
+            observation: RpcObservation::SessionRunning,
+        },
+        RpcRequest::Tick,
+        RpcRequest::OpenUrl {
+            app_id: None,
+            url: "https://example.test/".into(),
+            flags: 0,
+        },
+        RpcRequest::ReturnToCaller {
+            app_id: APP_ID.into(),
+            url: None,
+        },
+    ];
+
+    for request in requests {
+        let client_socket = socket.clone();
+        let sent = request.clone();
+        let client = std::thread::spawn(move || raw_rpc(&client_socket, &sent));
+        let pending = incoming
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        assert_eq!(pending.origin(), &RpcOrigin::Shell);
+        pending.respond(RpcResponse::Ok);
+        assert!(matches!(client.join().unwrap(), RpcResponse::Ok));
+    }
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn broker_identity_is_limited_to_safe_return() {
+    let dir = short_socket_dir("broker-scope");
+    let socket = dir.join("a.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    let (requests, incoming) = std::sync::mpsc::channel();
+    spawn_rpc_acceptor(
+        listener,
+        requests,
+        DEFAULT_CONNECTION_LIMITS,
+        shell_policy_for(0, TEST_BROKER_UNIT),
+    );
+    let (mut authority, log) = logged_authority(None);
+    launch_running(&mut authority);
+
+    for (request, accepted) in [
+        (
+            RpcRequest::Launch {
+                item_id: APP_ID.into(),
+            },
+            false,
+        ),
+        (
+            RpcRequest::OpenUrl {
+                app_id: None,
+                url: "https://example.test/".into(),
+                flags: 0,
+            },
+            false,
+        ),
+        (RpcRequest::SafeReturn, true),
+    ] {
+        let client_socket = socket.clone();
+        let sent = request.clone();
+        let client = std::thread::spawn(move || raw_rpc(&client_socket, &sent));
+        let pending = incoming
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        assert_eq!(pending.origin(), &RpcOrigin::Broker);
+        pending.dispatch(&mut authority);
+        let response = client.join().unwrap();
+        assert_eq!(matches!(&response, RpcResponse::Ok), accepted);
+        if !accepted {
+            assert!(matches!(&response, RpcResponse::Denied));
+        }
+    }
+
+    assert!(
+        matches!(authority.state().phase, Phase::StoppingGracefully { .. }),
+        "broker SafeReturn did not enter the close path: {:?}",
+        authority.state().phase
+    );
+    let log = log.lock().unwrap();
+    assert!(log.iter().any(|line| line.contains("method=launch")));
+    assert!(log.iter().any(|line| line.contains("method=open_url")));
+    fs::remove_dir_all(dir).unwrap();
+}
+
 #[test]
 fn stalled_clients_never_block_the_service_loop_tick() {
     use std::io::Write as _;
@@ -1624,7 +1803,7 @@ fn stalled_clients_never_block_the_service_loop_tick() {
         ..DEFAULT_CONNECTION_LIMITS
     };
     let (requests, incoming) = std::sync::mpsc::channel();
-    spawn_rpc_acceptor(listener, requests, limits);
+    spawn_rpc_acceptor(listener, requests, limits, trusted_shell_policy());
     let silent = std::os::unix::net::UnixStream::connect(&socket).unwrap();
     let mut partial = std::os::unix::net::UnixStream::connect(&socket).unwrap();
     partial.write_all(&[0, 0]).unwrap();
@@ -1682,7 +1861,7 @@ fn acceptor_closes_connections_beyond_its_bound() {
         max_connections: 1,
     };
     let (requests, _incoming) = std::sync::mpsc::channel();
-    spawn_rpc_acceptor(listener, requests, limits);
+    spawn_rpc_acceptor(listener, requests, limits, trusted_shell_policy());
     let _occupying = std::os::unix::net::UnixStream::connect(&socket).unwrap();
     std::thread::sleep(Duration::from_millis(100));
     let mut refused = std::os::unix::net::UnixStream::connect(&socket).unwrap();

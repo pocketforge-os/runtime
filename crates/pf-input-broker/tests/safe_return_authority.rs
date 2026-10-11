@@ -1,7 +1,8 @@
 //! Authority-side proof for the broker's protected SafeReturn intake (`tsp-f3fm.202.1`).
 //!
 //! The broker's real SafeReturn worker sends its frame over a real Unix socket to the REAL
-//! `pf_session_authority::serve_connection`. That authority runs the production `CommandSystem`
+//! shell-socket acceptor as the authenticated root `pf-input-broker.service`. That authority runs
+//! the production `CommandSystem`
 //! with default systemd templates over a fake `CommandExecutor`, which models `systemctl`. The
 //! authority itself is unchanged: this crate is not launcher-vendored, and
 //! `crates/pf-session-authority` is.
@@ -30,9 +31,9 @@ use pf_input_broker::safe_return::{CONNECT_TIMEOUT, IO_TIMEOUT};
 use pf_input_broker::SafeReturnIntake;
 use pf_ports::TestClock;
 use pf_session_authority::{
-    serve_connection, Authority, CommandExecutor, CommandOutput, CommandSystem, CommandTemplates,
-    MemoryStore, Phase, Receipt, RpcEvent, RpcObservation, RpcRequest, RpcResponse,
-    SESSION_RPC_CONTRACT_V1,
+    serve_connection, spawn_rpc_acceptor, Authority, CommandExecutor, CommandOutput, CommandSystem,
+    CommandTemplates, MemoryStore, Phase, Receipt, RpcEvent, RpcObservation, RpcRequest,
+    RpcResponse, ShellPolicy, DEFAULT_CONNECTION_LIMITS, SESSION_RPC_CONTRACT_V1,
 };
 
 const APP_ID: &str = "org.example.game";
@@ -226,10 +227,28 @@ fn launch_running(authority: &mut TestAuthority) -> String {
 }
 
 /// Press guide once: the broker's real worker sends its frame to a real socket, and this thread
-/// serves that one connection exactly as `pf-session-authorityd` does.
+/// serves that one connection through the authenticated acceptor used by
+/// `pf-session-authorityd`.
 fn broker_safe_return(authority: &mut TestAuthority) {
     let sock = scratch("authority.sock");
     let listener = UnixListener::bind(&sock).unwrap();
+    let (requests, incoming) = channel();
+    let policy = ShellPolicy::custom(
+        1000,
+        "pf-shell-selected.service".into(),
+        "pf-input-broker.service".into(),
+        |_| {
+            Ok(pf_peer_identity::PeerServiceIdentity {
+                cred: pf_peer_identity::PeerCred {
+                    pid: 4242,
+                    uid: 0,
+                    gid: 0,
+                },
+                unit: "pf-input-broker.service".into(),
+            })
+        },
+    );
+    spawn_rpc_acceptor(listener, requests, DEFAULT_CONNECTION_LIMITS, policy);
     let (log_tx, log) = channel();
     let intake = SafeReturnIntake::spawn_with(
         &sock,
@@ -241,9 +260,11 @@ fn broker_safe_return(authority: &mut TestAuthority) {
     )
     .unwrap();
     assert!(intake.request(), "the press dispatches a request");
-    let (mut stream, _) = listener.accept().unwrap();
-    let mut writer = stream.try_clone().unwrap();
-    serve_connection(authority, &mut stream, &mut writer).unwrap();
+    let pending = incoming
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap()
+        .unwrap();
+    pending.dispatch(authority);
     // Event-driven wait: the round trip is already complete, so the outcome line is in the
     // channel; the 5 s bound is a safety net, not a timing window.
     let line = log.recv_timeout(Duration::from_secs(5)).unwrap();

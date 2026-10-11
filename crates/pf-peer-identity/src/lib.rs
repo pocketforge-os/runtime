@@ -30,6 +30,17 @@ pub struct PeerCred {
     pub gid: u32,
 }
 
+/// One accepted socket peer's kernel-attested credentials and systemd service unit.
+///
+/// Both values are derived once from the same socket peer. The cgroup read is pinned by the
+/// peer process handle, so callers can authorize more than one exact service identity without
+/// reimplementing or repeating the identity lookup.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PeerServiceIdentity {
+    pub cred: PeerCred,
+    pub unit: String,
+}
+
 /// Read `SO_PEERCRED` from an accepted Unix connection.
 pub fn peer_cred(stream: &UnixStream) -> io::Result<PeerCred> {
     let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
@@ -419,21 +430,33 @@ pub fn verify_peer_service(
     expected_uid: u32,
     expected_unit: &str,
 ) -> io::Result<()> {
-    let cred = peer_cred(stream)?;
-    verify_peer_uid(cred, expected_uid)?;
-    let cgroup = peer_cgroup_with_source(stream, cred.pid, &KernelPeerProcessSource)?;
-    if unit_matches(&cgroup, expected_unit) {
+    let identity = peer_service_identity(stream)?;
+    verify_peer_uid(identity.cred, expected_uid)?;
+    if identity.unit == expected_unit {
         Ok(())
     } else {
         Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             format!(
                 "peer pid={} is {} (expected {expected_unit})",
-                cred.pid,
-                service_unit_from_cgroup(&cgroup).unwrap_or_else(|| "no service unit".into())
+                identity.cred.pid, identity.unit
             ),
         ))
     }
+}
+
+/// Derive one accepted socket peer's uid and exact leaf service unit through the shared stable
+/// process-handle path. No request field participates in this identity.
+pub fn peer_service_identity(stream: &UnixStream) -> io::Result<PeerServiceIdentity> {
+    let cred = peer_cred(stream)?;
+    let cgroup = peer_cgroup_with_source(stream, cred.pid, &KernelPeerProcessSource)?;
+    let unit = service_unit_from_cgroup(&cgroup).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("peer pid={} has no service unit", cred.pid),
+        )
+    })?;
+    Ok(PeerServiceIdentity { cred, unit })
 }
 
 /// A process handle that arrived over `SCM_RIGHTS`, classified from the kernel's description of

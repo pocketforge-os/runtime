@@ -900,6 +900,8 @@ pub struct FrontEnvelope {
 pub enum RpcOrigin {
     /// The shell's own socket (hidden from apps by the image).
     Shell,
+    /// The root input broker on the shell socket. Its role is restricted to `SafeReturn`.
+    Broker,
     /// The SDK front's private socket, with the app id re-derived from the forwarded process
     /// handle, or the reason no app id could be derived.
     Front { caller: Result<String, String> },
@@ -1136,6 +1138,75 @@ pub type PeerAuthenticator = dyn Fn(&UnixStream) -> io::Result<()> + Send + Sync
 /// Derives the caller's app id from the forwarded process handle, or the refusal reason.
 pub type CallerDeriver = dyn Fn(OwnedFd) -> Result<String, String> + Send + Sync;
 
+/// How the shell socket authenticates and classifies its two legitimate peers. The resolver is
+/// injectable for hermetic tests; production uses the shared `pf-peer-identity` implementation.
+#[derive(Clone)]
+pub struct ShellPolicy {
+    shell_uid: u32,
+    shell_unit: String,
+    broker_unit: String,
+    resolve_peer: Arc<ShellPeerResolver>,
+}
+
+type ShellPeerResolver =
+    dyn Fn(&UnixStream) -> io::Result<pf_peer_identity::PeerServiceIdentity> + Send + Sync;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ShellPeerRole {
+    Shell,
+    Broker,
+}
+
+impl ShellPolicy {
+    pub fn kernel(shell_uid: u32, shell_unit: String, broker_unit: String) -> Self {
+        Self::custom(
+            shell_uid,
+            shell_unit,
+            broker_unit,
+            pf_peer_identity::peer_service_identity,
+        )
+    }
+
+    pub fn custom(
+        shell_uid: u32,
+        shell_unit: String,
+        broker_unit: String,
+        resolve_peer: impl Fn(&UnixStream) -> io::Result<pf_peer_identity::PeerServiceIdentity>
+            + Send
+            + Sync
+            + 'static,
+    ) -> Self {
+        Self {
+            shell_uid,
+            shell_unit,
+            broker_unit,
+            resolve_peer: Arc::new(resolve_peer),
+        }
+    }
+
+    fn authenticate_peer(&self, stream: &UnixStream) -> io::Result<ShellPeerRole> {
+        let identity = (self.resolve_peer)(stream)?;
+        if identity.cred.uid == self.shell_uid && identity.unit == self.shell_unit {
+            return Ok(ShellPeerRole::Shell);
+        }
+        if identity.cred.uid == 0 && identity.unit == self.broker_unit {
+            return Ok(ShellPeerRole::Broker);
+        }
+        Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "refused peer pid={} uid={} unit={} (expected uid={} unit={} or uid=0 unit={})",
+                identity.cred.pid,
+                identity.cred.uid,
+                identity.unit,
+                self.shell_uid,
+                self.shell_unit,
+                self.broker_unit
+            ),
+        ))
+    }
+}
+
 impl FrontPolicy {
     /// The SDK front is exactly `front_unit` running as `front_uid`; callers are the
     /// `pf-app@<id>.service` unit of the forwarded process handle.
@@ -1321,6 +1392,7 @@ pub fn spawn_rpc_acceptor(
     listener: UnixListener,
     requests: mpsc::Sender<io::Result<PendingRpc>>,
     limits: ConnectionLimits,
+    policy: ShellPolicy,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let active = Arc::new(AtomicUsize::new(0));
@@ -1340,9 +1412,9 @@ pub fn spawn_rpc_acceptor(
                 );
                 continue;
             }
-            let (requests, active) = (requests.clone(), active.clone());
+            let (requests, active, policy) = (requests.clone(), active.clone(), policy.clone());
             thread::spawn(move || {
-                if let Err(error) = serve_rpc_connection(stream, &requests, limits) {
+                if let Err(error) = serve_rpc_connection(stream, &requests, limits, &policy) {
                     eprintln!("pf-session-authorityd: connection error: {error:?}");
                 }
                 active.fetch_sub(1, Ordering::AcqRel);
@@ -1355,8 +1427,20 @@ fn serve_rpc_connection(
     mut stream: UnixStream,
     requests: &mpsc::Sender<io::Result<PendingRpc>>,
     limits: ConnectionLimits,
+    policy: &ShellPolicy,
 ) -> Result<(), AuthorityError> {
     let backend = |error: &dyn std::fmt::Display| AuthorityError::Backend(error.to_string());
+    let origin = match policy.authenticate_peer(&stream) {
+        Ok(ShellPeerRole::Shell) => RpcOrigin::Shell,
+        Ok(ShellPeerRole::Broker) => RpcOrigin::Broker,
+        Err(error) => {
+            eprintln!(
+                "pf-session-authorityd: shell_refused reason=peer_identity detail={}",
+                json_string(&error.to_string())
+            );
+            return Ok(());
+        }
+    };
     stream
         .set_read_timeout(Some(limits.io_timeout))
         .and_then(|()| stream.set_write_timeout(Some(limits.io_timeout)))
@@ -1368,7 +1452,7 @@ fn serve_rpc_connection(
             let pending = PendingRpc {
                 request,
                 reply,
-                origin: RpcOrigin::Shell,
+                origin,
             };
             if requests.send(Ok(pending)).is_err() {
                 return Err(AuthorityError::Backend("authority loop stopped".into()));
@@ -1397,6 +1481,13 @@ fn handle_rpc_from<S: StateStore, B: SessionSystem, C: Clock>(
     origin: RpcOrigin,
     request: RpcRequest,
 ) -> Result<RpcResponse, AuthorityError> {
+    if origin == RpcOrigin::Broker && !matches!(&request, RpcRequest::SafeReturn) {
+        authority.log(&format!(
+            "pf-session-authorityd: shell_refused reason=peer_scope role=broker method={}",
+            rpc_method(&request)
+        ));
+        return Ok(RpcResponse::Denied);
+    }
     Ok(match request {
         RpcRequest::OpenUrl { app_id, url, flags } => {
             let caller = match (origin, app_id) {
@@ -1416,6 +1507,7 @@ fn handle_rpc_from<S: StateStore, B: SessionSystem, C: Clock>(
                         None => return Ok(RpcResponse::Denied),
                     }
                 }
+                (RpcOrigin::Broker, _) => unreachable!("broker requests are filtered above"),
             };
             authority.open_url(caller, &url, flags)?
         }
@@ -1435,6 +1527,7 @@ fn handle_rpc_from<S: StateStore, B: SessionSystem, C: Clock>(
                     None => RpcResponse::Denied,
                 }
             }
+            RpcOrigin::Broker => unreachable!("broker requests are filtered above"),
         },
         RpcRequest::Launch { item_id } => match authority.launch(LaunchRequest { item_id })? {
             LaunchResult::Accepted { session_id } => RpcResponse::Accepted { session_id },
@@ -1485,6 +1578,20 @@ fn handle_rpc_from<S: StateStore, B: SessionSystem, C: Clock>(
             RpcResponse::Ok
         }
     })
+}
+
+fn rpc_method(request: &RpcRequest) -> &'static str {
+    match request {
+        RpcRequest::Launch { .. } => "launch",
+        RpcRequest::SafeReturn => "safe_return",
+        RpcRequest::Events { .. } => "events",
+        RpcRequest::Acknowledge { .. } => "acknowledge",
+        RpcRequest::History => "history",
+        RpcRequest::Observe { .. } => "observe",
+        RpcRequest::Tick => "tick",
+        RpcRequest::OpenUrl { .. } => "open_url",
+        RpcRequest::ReturnToCaller { .. } => "return_to_caller",
+    }
 }
 
 /// Receives one complete diagnostic line (no trailing newline).

@@ -454,6 +454,7 @@ dependencies = [
  "libc",
  "pf-app-manifest",
  "pf-input-decode",
+ "pf-peer-identity",
  "pf-ports",
  "pf-prefs",
  "pf-prefsd",

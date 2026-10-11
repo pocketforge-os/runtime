@@ -1,7 +1,7 @@
 use pf_ports::{Clock, MonotonicTime};
 use pf_session_authority::{
     run_service_loop, spawn_front_acceptor, spawn_rpc_acceptor, Authority, CommandSystem,
-    CommandTemplates, FileStore, FixedUrlHandler, FrontPolicy, PendingRpc,
+    CommandTemplates, FileStore, FixedUrlHandler, FrontPolicy, PendingRpc, ShellPolicy,
     DEFAULT_CONNECTION_LIMITS, DEFAULT_GRACE_PERIOD, DEFAULT_PRESENTATION_TIMEOUT,
     DEFAULT_TICK_INTERVAL,
 };
@@ -25,6 +25,9 @@ impl Clock for SystemClock {
 struct Args {
     state_dir: PathBuf,
     socket: PathBuf,
+    shell_user: String,
+    shell_unit: String,
+    broker_unit: String,
     templates: CommandTemplates,
     /// The private SDK-front socket (tsp-ght0z); absent until the front's unit exists.
     front: Option<FrontArgs>,
@@ -57,6 +60,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         None => None,
     };
+    let shell_uid = resolve_uid(&args.shell_user)?;
+    let shell_policy =
+        ShellPolicy::kernel(shell_uid, args.shell_unit.clone(), args.broker_unit.clone());
     let mut authority = Authority::open(
         FileStore::new(args.state_dir.join("authority.json")),
         CommandSystem::new(args.templates),
@@ -77,7 +83,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // only complete requests, so the single-threaded authority blocks only in the loop's channel
     // wait and its self-driven tick keeps firing during a slow or silent client.
     let (requests, incoming) = mpsc::channel();
-    spawn_rpc_acceptor(listener, requests.clone(), DEFAULT_CONNECTION_LIMITS);
+    spawn_rpc_acceptor(
+        listener,
+        requests.clone(),
+        DEFAULT_CONNECTION_LIMITS,
+        shell_policy,
+    );
     let _front_guard = match (&args.front, front_policy) {
         (Some(front), Some(policy)) => {
             let listener = UnixListener::bind(&front.socket)?;
@@ -103,7 +114,7 @@ fn resolve_uid(name: &str) -> io::Result<u32> {
     user_uid(&passwd, name).ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::NotFound,
-            format!("front user '{name}' does not exist"),
+            format!("configured user '{name}' does not exist"),
         )
     })
 }
@@ -161,6 +172,9 @@ Options:
   --graceful-stop-command COMMAND  Override the preset's graceful-stop command
   --terminate-command COMMAND      Override the preset's forced-termination command
   --activate-owner-command COMMAND Override the preset's selected-owner command
+  --shell-user NAME                Shell socket user (default gamer)
+  --shell-unit UNIT                Full-access shell unit (default pf-shell-selected.service)
+  --broker-unit UNIT               Root SafeReturn-only unit (default pf-input-broker.service)
   --front-socket PATH              Private socket for the SDK front (OpenUrl/ReturnToCaller);
                                    requires --front-user and --front-unit
   --front-user NAME                The SDK front's user (socket-bound peer uid)
@@ -171,6 +185,9 @@ Options:
 fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
     let mut state_dir: Option<PathBuf> = None;
     let mut socket: Option<PathBuf> = None;
+    let mut shell_user = "gamer".to_owned();
+    let mut shell_unit = "pf-shell-selected.service".to_owned();
+    let mut broker_unit = "pf-input-broker.service".to_owned();
     let mut preset = "device".to_owned();
     let mut grace = DEFAULT_GRACE_PERIOD;
     let mut start = None;
@@ -188,6 +205,9 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
         match flag.as_str() {
             "--state-dir" => state_dir = Some(value.into()),
             "--socket" => socket = Some(value.into()),
+            "--shell-user" => shell_user = value,
+            "--shell-unit" => shell_unit = value,
+            "--broker-unit" => broker_unit = value,
             "--command-preset" => preset = value,
             "--grace-period-ms" => {
                 grace =
@@ -236,6 +256,9 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
     Ok(Args {
         state_dir,
         socket: socket.ok_or("--socket is required")?,
+        shell_user,
+        shell_unit,
+        broker_unit,
         templates,
         front,
         url_handler,
@@ -270,6 +293,9 @@ mod tests {
         assert_eq!(args.templates.request_graceful_stop[4], "/tmp/pf state");
         assert!(args.front.is_none());
         assert!(args.url_handler.is_none());
+        assert_eq!(args.shell_user, "gamer");
+        assert_eq!(args.shell_unit, "pf-shell-selected.service");
+        assert_eq!(args.broker_unit, "pf-input-broker.service");
     }
 
     #[test]
@@ -277,6 +303,12 @@ mod tests {
         let base = ["--state-dir", "/tmp/pf", "--socket", "/tmp/pf.sock"];
         let parse = |extra: &[&str]| parse_args(base.iter().chain(extra).map(|s| (*s).to_owned()));
         let args = parse(&[
+            "--shell-user",
+            "player",
+            "--shell-unit",
+            "custom-shell.service",
+            "--broker-unit",
+            "custom-broker.service",
             "--front-socket",
             "/run/pocketforge/session-authority-front.sock",
             "--front-user",
@@ -295,6 +327,9 @@ mod tests {
         assert_eq!(front.user, "pf-front");
         assert_eq!(front.unit, "pf-sdk-front.service");
         assert_eq!(args.url_handler.as_deref(), Some("org.pocketforge.browser"));
+        assert_eq!(args.shell_user, "player");
+        assert_eq!(args.shell_unit, "custom-shell.service");
+        assert_eq!(args.broker_unit, "custom-broker.service");
         assert!(parse(&["--front-socket", "/tmp/f.sock"]).is_err());
         assert!(parse(&["--url-handler", "not an id"]).is_err());
         assert_eq!(
