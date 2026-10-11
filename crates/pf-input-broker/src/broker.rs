@@ -1492,38 +1492,12 @@ range = { min = 0, max = 255, fuzz = 0, flat = 0 }
         listener.set_nonblocking(true).unwrap();
         let (intake, _log) = intake(&sock);
         let mut p = pump(Some(intake));
-        let mut events = Vec::new();
-        for _ in 0..50 {
-            events.extend(guide_press_release());
-            events.extend([key(SOUTH, 1), syn(), key(SOUTH, 0), syn()]);
-        }
+        let mut first_events = guide_press_release();
+        first_events.extend([key(SOUTH, 1), syn(), key(SOUTH, 0), syn()]);
         let started = Instant::now();
-        let out = run(&mut p, &events);
-        let elapsed = started.elapsed();
-        assert!(elapsed < Duration::from_secs(1), "pump took {elapsed:?}");
-        let south: Vec<_> = out.iter().filter(|e| e.1 == SOUTH).collect();
-        assert_eq!(south.len(), 100, "every non-guide event still flows");
-        assert!(!out.iter().any(|&(_, code, _)| code == GUIDE_CODE));
-        let fallback_deadline = Instant::now() + Duration::from_secs(1);
-        while !p
-            .system_menu
-            .as_ref()
-            .unwrap()
-            .router()
-            .fallback_in_flight()
-            && Instant::now() < fallback_deadline
-        {
-            std::thread::sleep(Duration::from_millis(2));
-        }
-        assert!(
-            p.system_menu
-                .as_ref()
-                .unwrap()
-                .router()
-                .fallback_in_flight(),
-            "the first press is still waiting on fallback return"
-        );
-        // 50 presses while that request is in flight coalesce into exactly one connection.
+        let mut out = run(&mut p, &first_events);
+        // Accept and hold the first request so the remaining presses have a
+        // deterministic in-flight fallback to coalesce behind.
         let deadline = Instant::now() + Duration::from_secs(1);
         let first = loop {
             match listener.accept() {
@@ -1534,13 +1508,31 @@ range = { min = 0, max = 255, fuzz = 0, flat = 0 }
                 Err(e) => panic!("no SafeReturn connection: {e}"),
             }
         };
-        drop(first);
-        std::thread::sleep(Duration::from_millis(50));
+        let mut remaining_events = Vec::new();
+        for _ in 1..50 {
+            remaining_events.extend(guide_press_release());
+            remaining_events.extend([key(SOUTH, 1), syn(), key(SOUTH, 0), syn()]);
+        }
+        out.extend(run(&mut p, &remaining_events));
+        let elapsed = started.elapsed();
+        assert!(elapsed < Duration::from_secs(1), "pump took {elapsed:?}");
+        let south: Vec<_> = out.iter().filter(|e| e.1 == SOUTH).collect();
+        assert_eq!(south.len(), 100, "every non-guide event still flows");
+        assert!(!out.iter().any(|&(_, code, _)| code == GUIDE_CODE));
+        assert!(
+            p.system_menu
+                .as_ref()
+                .unwrap()
+                .router()
+                .fallback_in_flight(),
+            "the first press is still waiting on fallback return"
+        );
         assert_eq!(
             listener.accept().unwrap_err().kind(),
             io::ErrorKind::WouldBlock,
             "coalesced presses must not open more connections"
         );
+        drop(first);
         let _ = std::fs::remove_file(sock);
     }
 
