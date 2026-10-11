@@ -5,7 +5,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::io;
-use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -26,6 +26,57 @@ use crate::uinput::Uinput;
 
 const MAX_REPORT_EVENTS: usize = 256;
 const ACQUIRE_CLIENT_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// How the broker authenticates its source device.
+///
+/// Production callers use [`SourceIdentity::system`], which requires the decoder's virtual path,
+/// `phys` value and trusted runtime record. Simulation and test callers must opt out by spelling
+/// [`SourceIdentity::allow_unidentified`]; there is no implicit `None` policy.
+#[derive(Debug, Clone)]
+pub struct SourceIdentity {
+    trust: Option<Trust>,
+}
+
+impl SourceIdentity {
+    /// Require the decoder identity record in the production `/sys` and `/run` trees.
+    pub fn system() -> SourceIdentity {
+        SourceIdentity::require_builtin(Trust::system())
+    }
+
+    /// Require built-in identity according to an explicit trust source (for hermetic tests).
+    pub fn require_builtin(trust: Trust) -> SourceIdentity {
+        SourceIdentity { trust: Some(trust) }
+    }
+
+    /// Explicitly accept a descriptor-matching source without decoder identity.
+    ///
+    /// This is only for desktop simulation and tests. The daemon logs a warning when its CLI flag
+    /// selects this policy.
+    pub fn allow_unidentified() -> SourceIdentity {
+        SourceIdentity { trust: None }
+    }
+
+    /// Whether decoder identity is enforced.
+    pub fn is_enforcing(&self) -> bool {
+        self.trust.is_some()
+    }
+
+    fn verify_fd(&self, fd: BorrowedFd<'_>) -> io::Result<()> {
+        match self.trust.as_ref() {
+            Some(trust) => require_builtin(trust.identify_fd(fd)),
+            None => Ok(()),
+        }
+    }
+
+    #[cfg(test)]
+    fn verify_verdict(&self, verdict: io::Result<Verdict>) -> io::Result<()> {
+        if self.is_enforcing() {
+            require_builtin(verdict)
+        } else {
+            Ok(())
+        }
+    }
+}
 
 /// A source that can answer the `EVIOCGBIT` question the broker's capability check asks: does it
 /// advertise every one of `codes` for `event_type`? [`Evdev`] answers from the opened fd; a
@@ -239,17 +290,18 @@ impl InputBroker {
         descriptor: &Descriptor,
         grab: bool,
     ) -> io::Result<InputBroker> {
-        InputBroker::start_checked(source_path, descriptor, grab, None)
+        InputBroker::start_checked(source_path, descriptor, grab, &SourceIdentity::system())
     }
 
-    /// As [`start_with`](Self::start_with); with `builtin` set, the opened source must also be the
-    /// built-in controller by [`pf_input_decode::builtin`] (`--require-builtin`, `tsp-ihne1.8`).
-    /// The check runs on the opened fd, before the grab, so a lookalike is never grabbed.
+    /// As [`start_with`](Self::start_with), with an explicit source-identity policy. The production
+    /// default requires the built-in controller by [`pf_input_decode::builtin`]; simulation/tests
+    /// can explicitly allow an unidentified source. The check runs on the opened fd, before the
+    /// grab, so a lookalike is never grabbed.
     pub fn start_checked(
         source_path: impl AsRef<Path>,
         descriptor: &Descriptor,
         grab: bool,
-        builtin: Option<&Trust>,
+        identity: &SourceIdentity,
     ) -> io::Result<InputBroker> {
         let remap = Remap::from_descriptor(descriptor)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
@@ -257,9 +309,7 @@ impl InputBroker {
             || {
                 let mut source = Evdev::open(source_path)?;
                 Self::validate_source(&source, descriptor, &remap)?;
-                if let Some(trust) = builtin {
-                    require_builtin(trust.identify_fd(source.as_fd()))?;
-                }
+                identity.verify_fd(source.as_fd())?;
                 if grab {
                     source.grab()?;
                 }
@@ -305,14 +355,15 @@ impl InputBroker {
     /// Discover exactly one descriptor-matching event node. Every candidate is identified from
     /// its opened fd; `start` opens and validates the winner again before grabbing it.
     pub fn discover(descriptor: &Descriptor) -> io::Result<PathBuf> {
-        InputBroker::discover_checked(descriptor, None)
+        InputBroker::discover_checked(descriptor, &SourceIdentity::system())
     }
 
-    /// As [`discover`](Self::discover); with `builtin` set, only the built-in controller is a
-    /// candidate, so a lookalike cannot make discovery ambiguous or win it.
+    /// As [`discover`](Self::discover), with an explicit source-identity policy. Under the
+    /// production default only the built-in controller is a candidate, so a lookalike cannot make
+    /// discovery ambiguous or win it.
     pub fn discover_checked(
         descriptor: &Descriptor,
-        builtin: Option<&Trust>,
+        identity: &SourceIdentity,
     ) -> io::Result<PathBuf> {
         let expected = ExpectedIdentity::from_descriptor(descriptor)?;
         let remap = Remap::from_descriptor(descriptor)
@@ -329,28 +380,33 @@ impl InputBroker {
             }
             candidates.push(path);
         }
-        discover_candidates(candidates, |path| {
+        let mut identity_rejection = None;
+        let result = discover_candidates(candidates, |path| {
             let dev = Evdev::open(path)?;
             if !(expected.matches(&dev.name()?, dev.id()?)
                 && missing_source_capabilities(&dev, &remap)?.is_empty())
             {
                 return Ok(false);
             }
-            match builtin {
+            match identity.trust.as_ref() {
                 Some(trust) => match trust.identify_fd(dev.as_fd()) {
                     Ok(Verdict::BuiltIn { .. }) => Ok(true),
-                    Ok(Verdict::NotBuiltIn(_)) => Ok(false),
+                    Ok(Verdict::NotBuiltIn(reason)) => {
+                        identity_rejection
+                            .get_or_insert_with(|| format!("{}: {reason:?}", path.display()));
+                        Ok(false)
+                    }
                     Err(error) => {
-                        eprintln!(
-                            "pf-input-broker: cannot identify candidate {} as the built-in controller: {error}",
-                            path.display()
-                        );
+                        identity_rejection.get_or_insert_with(|| {
+                            format!("{}: identification error: {error}", path.display())
+                        });
                         Ok(false)
                     }
                 },
                 None => Ok(true),
             }
-        })
+        });
+        finish_discovery(result, identity_rejection)
     }
 
     fn resolve_matches(mut matches: Vec<PathBuf>) -> io::Result<PathBuf> {
@@ -430,6 +486,21 @@ impl InputBroker {
             .node_path()
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "re-emit node not resolved"))?;
         open_read_fd(&node)
+    }
+}
+
+fn finish_discovery(
+    result: io::Result<PathBuf>,
+    identity_rejection: Option<String>,
+) -> io::Result<PathBuf> {
+    match (result, identity_rejection) {
+        (Err(error), Some(reason)) if error.kind() == io::ErrorKind::NotFound => {
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("descriptor-matching source failed built-in controller identity: {reason}"),
+            ))
+        }
+        (result, _) => result,
     }
 }
 
@@ -897,6 +968,10 @@ mod readiness_tests {
         }));
         assert!(unit.lines().any(|line| line == "Restart=on-failure"));
         assert!(
+            !unit.contains("--allow-unidentified-pad"),
+            "the production service must keep built-in controller identity enforcement"
+        );
+        assert!(
             !unit.lines().any(|line| {
                 line.starts_with("BindsTo=")
                     || (line.starts_with("Requires=")
@@ -951,6 +1026,57 @@ mod readiness_tests {
             err.kind(),
             io::ErrorKind::NotFound,
             "an I/O error is never a pass"
+        );
+    }
+
+    #[test]
+    fn source_identity_policy_refuses_lookalikes_and_missing_records_by_default() {
+        use pf_input_decode::builtin::Reason;
+
+        let default = SourceIdentity::system();
+        assert!(default
+            .verify_verdict(Ok(Verdict::BuiltIn {
+                sysname: "input5".into(),
+            }))
+            .is_ok());
+        for reason in [
+            Reason::SysnameMismatch {
+                device: "input9".into(),
+                record: "input5".into(),
+            },
+            Reason::RecordAbsent,
+        ] {
+            assert!(
+                default
+                    .verify_verdict(Ok(Verdict::NotBuiltIn(reason.clone())))
+                    .is_err(),
+                "default must fail closed for {reason:?}"
+            );
+        }
+
+        let simulation = SourceIdentity::allow_unidentified();
+        assert!(simulation
+            .verify_verdict(Ok(Verdict::NotBuiltIn(Reason::SysnameMismatch {
+                device: "input9".into(),
+                record: "input5".into(),
+            })))
+            .is_ok());
+        assert!(simulation
+            .verify_verdict(Ok(Verdict::NotBuiltIn(Reason::RecordAbsent)))
+            .is_ok());
+
+        let missing_record = finish_discovery(
+            Err(io::Error::new(io::ErrorKind::NotFound, "no match")),
+            Some("/dev/input/event9: RecordAbsent".into()),
+        )
+        .unwrap_err();
+        assert_eq!(missing_record.kind(), io::ErrorKind::PermissionDenied);
+        assert!(missing_record.to_string().contains("RecordAbsent"));
+        let decoder = PathBuf::from("/dev/input/event5");
+        assert_eq!(
+            finish_discovery(Ok(decoder.clone()), Some("ignored lookalike".into())).unwrap(),
+            decoder,
+            "a valid decoder device remains the positive control"
         );
     }
 

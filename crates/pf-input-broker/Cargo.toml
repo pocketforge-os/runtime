@@ -26,8 +26,9 @@ pf-wire = { workspace = true }
 libc = { workspace = true }
 # Reads the session authority's JSON reply to the SafeReturn frame (--safe-return-sock).
 serde_json = { workspace = true }
-# The built-in controller identity (--require-builtin, tsp-ihne1.8): pf_input_decode::builtin is
-# the one place that decides which device is the built-in pad. libc-only, static-musl clean.
+# The built-in controller identity (enforced by default, tsp-ihne1.8/.52):
+# pf_input_decode::builtin is the one place that decides which device is the built-in pad.
+# libc-only, static-musl clean.
 pf-input-decode = { path = "../pf-input-decode", version = "0.0.1" }
 
 [dev-dependencies]
