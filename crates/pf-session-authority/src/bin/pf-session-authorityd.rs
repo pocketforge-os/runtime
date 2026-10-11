@@ -2,7 +2,8 @@ use pf_ports::{Clock, MonotonicTime};
 use pf_session_authority::{
     run_service_loop, spawn_front_acceptor, spawn_rpc_acceptor, Authority, CommandSystem,
     CommandTemplates, FileStore, FixedUrlHandler, FrontPolicy, PendingRpc,
-    DEFAULT_CONNECTION_LIMITS, DEFAULT_PRESENTATION_TIMEOUT, DEFAULT_TICK_INTERVAL,
+    DEFAULT_CONNECTION_LIMITS, DEFAULT_GRACE_PERIOD, DEFAULT_PRESENTATION_TIMEOUT,
+    DEFAULT_TICK_INTERVAL,
 };
 use std::env;
 use std::fs;
@@ -20,6 +21,7 @@ impl Clock for SystemClock {
     }
 }
 
+#[derive(Debug)]
 struct Args {
     state_dir: PathBuf,
     socket: PathBuf,
@@ -28,8 +30,10 @@ struct Args {
     front: Option<FrontArgs>,
     /// The URL handler item id until pf-prefsd's default-handler key lands (tsp-mv7zn).
     url_handler: Option<String>,
+    grace: Duration,
 }
 
+#[derive(Debug)]
 struct FrontArgs {
     socket: PathBuf,
     user: String,
@@ -58,7 +62,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         CommandSystem::new(args.templates),
         SystemClock(Instant::now()),
         32,
-        Duration::from_secs(10),
+        args.grace,
     )?
     .with_presentation_timeout(DEFAULT_PRESENTATION_TIMEOUT);
     if let Some(handler) = args.url_handler {
@@ -150,6 +154,9 @@ Options:
   --command-preset PRESET          Command templates to use: device (default), desktop-sim
                                    desktop-sim maintains sessions/{session_id}.running and
                                    shell-selected markers below --state-dir
+  --grace-period-ms MS             Graceful-stop window before self-escalation (default 1500;
+                                   keep it plus the hang sampler's budget inside the app
+                                   unit's TimeoutStopSec)
   --start-command COMMAND          Override the preset's launch command
   --graceful-stop-command COMMAND  Override the preset's graceful-stop command
   --terminate-command COMMAND      Override the preset's forced-termination command
@@ -165,6 +172,7 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
     let mut state_dir: Option<PathBuf> = None;
     let mut socket: Option<PathBuf> = None;
     let mut preset = "device".to_owned();
+    let mut grace = DEFAULT_GRACE_PERIOD;
     let mut start = None;
     let mut graceful = None;
     let mut terminate = None;
@@ -181,6 +189,12 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
             "--state-dir" => state_dir = Some(value.into()),
             "--socket" => socket = Some(value.into()),
             "--command-preset" => preset = value,
+            "--grace-period-ms" => {
+                grace =
+                    Duration::from_millis(value.parse::<u64>().map_err(|error| {
+                        format!("--grace-period-ms expects milliseconds: {error}")
+                    })?)
+            }
             "--start-command" => start = Some(value),
             "--graceful-stop-command" => graceful = Some(value),
             "--terminate-command" => terminate = Some(value),
@@ -225,6 +239,7 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
         templates,
         front,
         url_handler,
+        grace,
     })
 }
 
@@ -290,5 +305,49 @@ mod tests {
             Some(991)
         );
         assert_eq!(user_uid("pf-front-x:x:1:1::/:/bin/sh\n", "pf-front"), None);
+    }
+
+    #[test]
+    fn grace_period_defaults_to_the_backstop_budget_and_a_flag_overrides_it() {
+        let args = parse_args(
+            ["--state-dir", "/tmp/pf", "--socket", "/tmp/pf.sock"]
+                .into_iter()
+                .map(str::to_owned),
+        )
+        .unwrap();
+        assert_eq!(args.grace, DEFAULT_GRACE_PERIOD);
+        // Budget: grace (1500 ms) + root sampler (≤300 ms) stays inside the app unit's own
+        // TimeoutStopSec=2 s, so the authority escalates before the systemd backstop fires.
+        assert_eq!(DEFAULT_GRACE_PERIOD, Duration::from_millis(1500));
+
+        let args = parse_args(
+            [
+                "--state-dir",
+                "/tmp/pf",
+                "--socket",
+                "/tmp/pf.sock",
+                "--grace-period-ms",
+                "2500",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        )
+        .unwrap();
+        assert_eq!(args.grace, Duration::from_millis(2500));
+
+        let error = parse_args(
+            [
+                "--state-dir",
+                "/tmp/pf",
+                "--socket",
+                "/tmp/pf.sock",
+                "--grace-period-ms",
+                "soon",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        )
+        .unwrap_err();
+        assert!(error.contains("--grace-period-ms"), "{error}");
     }
 }
