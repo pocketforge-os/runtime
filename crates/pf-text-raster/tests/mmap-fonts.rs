@@ -199,3 +199,42 @@ fn default_fonts_are_disk_backed_and_measure_without_copies() {
     );
     assert_file_backed(&paths);
 }
+
+#[cfg(feature = "default-fonts")]
+#[test]
+fn default_fonts_partial_override_dir_fails_closed() {
+    let _guard = lock();
+    // End-to-end complement to the resolver unit test: a partial $PF_FONTS_DIR
+    // override (one canonical face missing) must fail closed at the public entry
+    // point, never silently substitute another face and shift metrics.
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!(
+        "pf-default-fonts-partial-{}-{}",
+        std::process::id(),
+        nanos
+    ));
+    std::fs::create_dir_all(&dir).expect("create partial font dir");
+    std::fs::write(dir.join("Manrope[wght].ttf"), b"").expect("write Manrope stub");
+    // Fraunces is deliberately absent.
+
+    std::env::set_var("PF_FONTS_DIR", &dir);
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = pf_text_raster::pocketforge_default_fonts();
+    }));
+    std::panic::set_hook(prev);
+    std::env::remove_var("PF_FONTS_DIR");
+
+    // Cleanup: remove the stub then the dir (no recursive delete, no rm -rf).
+    let _ = std::fs::remove_file(dir.join("Manrope[wght].ttf"));
+    let _ = std::fs::remove_dir(&dir);
+
+    assert!(
+        outcome.is_err(),
+        "a partial PF_FONTS_DIR override must fail closed, not substitute another face"
+    );
+}

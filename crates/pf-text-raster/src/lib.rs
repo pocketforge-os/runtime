@@ -155,8 +155,10 @@ const CANONICAL_FONT_ORDER: [&str; 2] = ["Manrope[wght].ttf", "Fraunces[SOFT,WON
 /// 2. `/usr/share/fonts/pocketforge` (device image; v1 ships the Latin faces there),
 /// 3. this crate's `fonts/` directory (repository checkout: development and CI).
 ///
-/// Font bytes are never embedded in binaries; a missing or empty font directory is a fatal
-/// configuration error and panics with the offending path.
+/// Font bytes are never embedded in binaries. The selected directory must contain both canonical
+/// faces; a missing, unreadable, or partial directory (one missing either canonical face, even if
+/// it holds other fonts) is a fatal configuration error and panics naming the path and the missing
+/// faces, rather than letting cosmic-text silently substitute a different face and change metrics.
 #[cfg(feature = "default-fonts")]
 pub fn pocketforge_default_fonts() -> FontSet {
     let dir = default_fonts_dir();
@@ -188,22 +190,31 @@ fn default_font_files(dir: &Path) -> Vec<PathBuf> {
         Err(error) => panic!("font directory {} is unreadable: {error}", dir.display()),
     };
     present.sort();
+    // Fail closed unless BOTH canonical faces are present in the selected directory: a partial
+    // or stale directory that keeps only some other font must not load, or cosmic-text silently
+    // substitutes the remaining faces and changes layout metrics and raster output. Validate
+    // before loading extras and name every missing face.
+    let missing: Vec<&str> = CANONICAL_FONT_ORDER
+        .iter()
+        .filter(|name| !present.contains(&dir.join(*name)))
+        .copied()
+        .collect();
+    if !missing.is_empty() {
+        panic!(
+            "font directory {} is missing canonical font(s) {}; refusing to substitute other faces",
+            dir.display(),
+            missing.join(", ")
+        );
+    }
     let mut ordered: Vec<PathBuf> = CANONICAL_FONT_ORDER
         .iter()
         .map(|name| dir.join(name))
-        .filter(|path| present.contains(path))
         .collect();
     let extra: Vec<PathBuf> = present
         .into_iter()
         .filter(|path| !ordered.contains(path))
         .collect();
     ordered.extend(extra);
-    if ordered.is_empty() {
-        panic!(
-            "font directory {} holds no font files (.ttf/.otf/.ttc/.otc)",
-            dir.display()
-        );
-    }
     ordered
 }
 
@@ -346,4 +357,160 @@ fn blend_text_pixel_rgba(pixmap: &mut Pixmap, draw: &TextDraw<'_>, gx: i32, gy: 
         255,
     )
     .expect("opaque text blend is valid");
+}
+
+#[cfg(all(test, feature = "default-fonts"))]
+mod default_font_tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    type PanicHook = Box<dyn Fn(&std::panic::PanicHookInfo<'_>) + Send + Sync>;
+
+    struct HookGuard(Option<PanicHook>);
+    impl Drop for HookGuard {
+        fn drop(&mut self) {
+            if let Some(hook) = self.0.take() {
+                std::panic::set_hook(hook);
+            }
+        }
+    }
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "pf-text-raster-{}-{}-{}",
+            tag,
+            std::process::id(),
+            nanos
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp font dir");
+        dir
+    }
+
+    fn write_names(dir: &Path, names: &[&str]) {
+        for name in names {
+            std::fs::write(dir.join(name), b"").expect("write font placeholder");
+        }
+    }
+
+    // Removes each created file then the directory: no recursive delete, no rm -rf.
+    fn cleanup(dir: &Path) {
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+        let _ = std::fs::remove_dir(dir);
+    }
+
+    // Resolve `dir`, returning Ok(files) or Err(panic message). The expected-panic
+    // message is captured (and the default hook silenced) so a fail-closed case is
+    // proven to reject for the RIGHT reason, not panic incidentally.
+    fn resolve_capturing_panic(
+        dir: &Path,
+        captured: &Arc<Mutex<String>>,
+    ) -> Result<Vec<PathBuf>, ()> {
+        captured.lock().expect("capture lock").clear();
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| default_font_files(dir)))
+            .map_err(|_| ())
+    }
+
+    #[test]
+    fn default_font_files_requires_both_canonical_faces() {
+        let captured = Arc::new(Mutex::new(String::new()));
+        let captured_hook = captured.clone();
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let text = info
+                .payload()
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| {
+                    info.payload()
+                        .downcast_ref::<&str>()
+                        .map(|s| (*s).to_owned())
+                })
+                .unwrap_or_default();
+            *captured_hook.lock().expect("capture lock") = text;
+        }));
+        let _guard = HookGuard(Some(prev));
+
+        // Positive control: both canonical faces present (plus a CJK extra and a
+        // non-font license file) resolve canonical-first, extras sorted, non-fonts ignored.
+        let ok = temp_dir("ok");
+        write_names(
+            &ok,
+            &[
+                "Manrope[wght].ttf",
+                "Fraunces[SOFT,WONK,opsz,wght].ttf",
+                "NotoSansCJK-Regular.ttc",
+                "Manrope-OFL.txt",
+            ],
+        );
+        let resolved = resolve_capturing_panic(&ok, &captured)
+            .expect("both canonical faces present must resolve, not panic");
+        assert_eq!(
+            resolved,
+            vec![
+                ok.join("Manrope[wght].ttf"),
+                ok.join("Fraunces[SOFT,WONK,opsz,wght].ttf"),
+                ok.join("NotoSansCJK-Regular.ttc"),
+            ],
+            "canonical faces must lead in order, extras follow sorted, non-fonts ignored"
+        );
+        cleanup(&ok);
+
+        // Negative controls: each partial/stale/empty directory must fail closed AND
+        // name the missing canonical face(s), so cosmic-text never silently substitutes.
+        for (tag, names, expected_missing) in [
+            (
+                "empty",
+                &[][..],
+                &["Manrope[wght].ttf", "Fraunces[SOFT,WONK,opsz,wght].ttf"][..],
+            ),
+            (
+                "only-other",
+                &["DejaVuSans.ttf"][..],
+                &["Manrope[wght].ttf", "Fraunces[SOFT,WONK,opsz,wght].ttf"][..],
+            ),
+            (
+                "missing-fraunces",
+                &["Manrope[wght].ttf"][..],
+                &["Fraunces[SOFT,WONK,opsz,wght].ttf"][..],
+            ),
+            (
+                "missing-manrope",
+                &["Fraunces[SOFT,WONK,opsz,wght].ttf"][..],
+                &["Manrope[wght].ttf"][..],
+            ),
+            (
+                "cjk-rescues-neither",
+                &["NotoSansCJK-Regular.ttc", "Manrope[wght].ttf"][..],
+                &["Fraunces[SOFT,WONK,opsz,wght].ttf"][..],
+            ),
+        ] {
+            let dir = temp_dir(tag);
+            write_names(&dir, names);
+            let outcome = resolve_capturing_panic(&dir, &captured);
+            assert!(
+                outcome.is_err(),
+                "case {tag}: a partial font directory must fail closed, not substitute another face"
+            );
+            let message = captured.lock().expect("capture lock").clone();
+            assert!(
+                message.contains("missing canonical font"),
+                "case {tag}: rejection must state the missing-canonical reason; got: {message}"
+            );
+            for name in expected_missing {
+                assert!(
+                    message.contains(name),
+                    "case {tag}: rejection must name the missing face {name}; got: {message}"
+                );
+            }
+            cleanup(&dir);
+        }
+    }
 }
