@@ -1432,16 +1432,17 @@ range = { min = 0, max = 255, fuzz = 0, flat = 0 }
         );
         assert!(!out.iter().any(|&(_, code, _)| code == GUIDE_CODE));
         let deadline = Instant::now() + Duration::from_secs(1);
-        while p
-            .system_menu
-            .as_ref()
-            .unwrap()
-            .router()
-            .fallback_in_flight()
-            && Instant::now() < deadline
-        {
+        while {
+            let router = p.system_menu.as_ref().unwrap().router();
+            (router.in_flight() || router.fallback_in_flight()) && Instant::now() < deadline
+        } {
             std::thread::sleep(Duration::from_millis(5));
         }
+        let router = p.system_menu.as_ref().unwrap().router();
+        assert!(
+            !router.in_flight() && !router.fallback_in_flight(),
+            "first failed return did not become idle"
+        );
         let out = run(&mut p, &[key(SOUTH, 1), syn()]);
         assert_eq!(
             out,
