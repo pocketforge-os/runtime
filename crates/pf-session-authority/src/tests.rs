@@ -1,5 +1,5 @@
 use super::*;
-use pf_ports::{SessionEvent, TestClock};
+use pf_ports::{Clock, MonotonicTime, SessionEvent, TestClock};
 use std::cell::Cell;
 use std::io;
 use std::os::unix::fs::PermissionsExt;
@@ -433,10 +433,11 @@ fn events_reconcile_systemd_ladder_but_return_waits_for_presentation_ack() {
             &mut a,
             RpcRequest::Events {
                 client_id: "restored-shell".into(),
+                contract: SESSION_RPC_CONTRACT_V1,
             },
         )
         .unwrap();
-        let RpcResponse::Events { events } = response else {
+        let RpcResponse::Events { events, .. } = response else {
             panic!()
         };
         assert!(matches!(
@@ -715,6 +716,8 @@ fn every_failure_rung_is_durable_recovery_required() {
             .iter()
             .any(|(_, e)| matches!(e, SessionEvent::Terminal(_))));
     }
+    // tsp-ihne1.10: a failed kill on a close path is no longer a terminal recovery: the menu
+    // spec (§9.6 "Stop failed") keeps the row retryable, so the phase is the durable StopFailed.
     let mut a = authority();
     launch_running(&mut a);
     a.intake_safe_return().unwrap();
@@ -722,7 +725,10 @@ fn every_failure_rung_is_durable_recovery_required() {
     a.system.fail_force = true;
     a.clock.advance(Duration::from_millis(10));
     a.tick().unwrap();
-    assert!(matches!(a.state.phase, Phase::RecoveryRequired { .. }));
+    assert!(matches!(
+        a.store.snapshot().unwrap().phase,
+        Phase::StopFailed { .. }
+    ));
 
     let mut a = authority();
     launch_running(&mut a);
@@ -730,7 +736,10 @@ fn every_failure_rung_is_durable_recovery_required() {
     a.system.fail_force = true;
     a.intake_safe_return().unwrap();
     a.tick().unwrap();
-    assert!(matches!(a.state.phase, Phase::RecoveryRequired { .. }));
+    assert!(matches!(
+        a.store.snapshot().unwrap().phase,
+        Phase::StopFailed { .. }
+    ));
 }
 
 #[test]
@@ -1198,10 +1207,11 @@ fn ended_session_starting_and_running_are_never_delivered_to_a_cursor_zero_clien
 
     // Through the RPC the restarted shell uses, with reconcile advancing the ladder (P3 shape).
     a.system.lifecycle = crashed_unit_restored_owner();
-    let RpcResponse::Events { events } = handle_rpc(
+    let RpcResponse::Events { events, .. } = handle_rpc(
         &mut a,
         RpcRequest::Events {
             client_id: "pf-shell".into(),
+            contract: SESSION_RPC_CONTRACT_V1,
         },
     )
     .unwrap() else {
@@ -1596,4 +1606,1091 @@ fn acceptor_closes_connections_beyond_its_bound() {
         "closed without service"
     );
     fs::remove_dir_all(dir).unwrap();
+}
+
+// ---- tsp-ihne1.10: close-progress events (contract v2) for the system menu ----
+//
+// The menu never decides anything during a close; it renders the authority's progress. These
+// tests pin the exact §9.6 event vocabulary on the router-facing v2 RPC stream, the retryable
+// StopFailed phase, the negotiated contract, and the escalation hook the hang sampler attaches
+// to (cr-collect samples just before enforce_termination; the close is never delayed).
+
+/// Drains the router-facing v2 stream for `client` and acknowledges it, exactly as the
+/// system-menu router polls: one cursor, every event once, in publication order.
+fn drain_v2<S: StateStore, B: SessionSystem, C: Clock>(
+    a: &mut Authority<S, B, C>,
+    client: &str,
+) -> Vec<RpcEvent> {
+    let RpcResponse::Events { events, contract } = handle_rpc(
+        a,
+        RpcRequest::Events {
+            client_id: client.into(),
+            contract: SESSION_RPC_CONTRACT_V2,
+        },
+    )
+    .unwrap() else {
+        panic!("expected an events response")
+    };
+    assert_eq!(contract, SESSION_RPC_CONTRACT_V2);
+    if let Some((last, _)) = events.last() {
+        a.acknowledge(client, *last).unwrap();
+    }
+    events.into_iter().map(|(_, event)| event).collect()
+}
+
+#[test]
+fn close_progress_stream_matches_menu_spec_9_6_when_the_app_stops_in_time() {
+    let mut a = authority();
+    let id = launch_running(&mut a);
+    assert_eq!(
+        drain_v2(&mut a, "menu"),
+        [RpcEvent::Starting, RpcEvent::Running]
+    );
+
+    // A starts the graceful stop; the row becomes "Closing…" and the menu stays open.
+    a.intake_safe_return().unwrap();
+    a.tick().unwrap();
+    assert!(matches!(a.state.phase, Phase::StoppingGracefully { .. }));
+    assert_eq!(
+        drain_v2(&mut a, "menu"),
+        [RpcEvent::StoppingGracefully {
+            session_id: id.clone()
+        }]
+    );
+
+    // The app stops inside the grace window: no escalation ever happens.
+    a.observe(Observation::UnitInactive).unwrap();
+    restore(&mut a);
+    assert_eq!(
+        drain_v2(&mut a, "menu"),
+        [
+            RpcEvent::ObservationComplete,
+            RpcEvent::Returned { session_id: id },
+        ]
+    );
+    assert_eq!(
+        a.system.calls.iter().filter(|c| *c == "force").count(),
+        0,
+        "a stop in time must never reach enforce_termination"
+    );
+}
+
+#[test]
+fn close_progress_stream_matches_menu_spec_9_6_when_the_stop_escalates() {
+    let mut a = authority();
+    let id = launch_running(&mut a);
+    assert_eq!(
+        drain_v2(&mut a, "menu"),
+        [RpcEvent::Starting, RpcEvent::Running]
+    );
+
+    a.intake_safe_return().unwrap();
+    a.tick().unwrap();
+    // The app "didn't stop in time": the authority escalates by itself.
+    a.clock.advance(Duration::from_millis(10));
+    a.tick().unwrap();
+    assert!(matches!(a.state.phase, Phase::ForceStopping { .. }));
+    assert_eq!(
+        drain_v2(&mut a, "menu"),
+        [
+            RpcEvent::StoppingGracefully {
+                session_id: id.clone()
+            },
+            RpcEvent::ForceStopping {
+                session_id: id.clone(),
+                reason: ForceStopReason::StopTimeout,
+            },
+        ]
+    );
+
+    a.observe(Observation::UnitInactive).unwrap();
+    restore(&mut a);
+    // Returned with the escalated flag: the ForcedClose receipt is the flag (§9.6 toast
+    // "‹App› was force-closed").
+    assert_eq!(
+        drain_v2(&mut a, "menu"),
+        [
+            RpcEvent::ObservationComplete,
+            RpcEvent::ForcedClose { session_id: id },
+        ]
+    );
+}
+
+#[test]
+fn close_progress_stream_matches_menu_spec_9_6_when_stop_fails_and_the_user_retries() {
+    let mut a = authority();
+    let id = launch_running(&mut a);
+    assert_eq!(
+        drain_v2(&mut a, "menu"),
+        [RpcEvent::Starting, RpcEvent::Running]
+    );
+
+    a.intake_safe_return().unwrap();
+    a.tick().unwrap();
+    a.system.fail_force = true;
+    a.clock.advance(Duration::from_millis(10));
+    a.tick().unwrap();
+
+    // §9.6 "Stop failed": the row keeps offering the retry, and no terminal receipt exists.
+    assert!(matches!(
+        a.store.snapshot().unwrap().phase,
+        Phase::StopFailed {
+            ref session_id,
+            ref reason,
+            ..
+        } if session_id == &id && reason == "app_exit_failed: refused"
+    ));
+    assert_eq!(
+        drain_v2(&mut a, "menu"),
+        [
+            RpcEvent::StoppingGracefully {
+                session_id: id.clone()
+            },
+            RpcEvent::StopFailed {
+                session_id: id.clone(),
+                reason: "app_exit_failed: refused".into(),
+            },
+        ]
+    );
+    assert!(
+        !a.events_for("test")
+            .iter()
+            .any(|(_, e)| matches!(e, SessionEvent::Terminal(_))),
+        "a failed stop leaves the session open and retryable"
+    );
+
+    // The retry survives a daemon restart: StopFailed is durable, not a memory-only limbo.
+    a.system.fail_force = false;
+    let (store, system, clock) = a.into_parts();
+    let mut a = Authority::open(store, system, clock, 3, Duration::from_millis(10)).unwrap();
+    assert!(matches!(a.state.phase, Phase::StopFailed { .. }));
+
+    // A retries: the full close sequence runs again from the top.
+    assert!(matches!(
+        handle_rpc(&mut a, RpcRequest::SafeReturn).unwrap(),
+        RpcResponse::Ok
+    ));
+    assert!(matches!(a.state.phase, Phase::StoppingGracefully { .. }));
+    a.clock.advance(Duration::from_millis(10));
+    a.tick().unwrap();
+    assert!(matches!(a.state.phase, Phase::ForceStopping { .. }));
+    a.observe(Observation::UnitInactive).unwrap();
+    restore(&mut a);
+    assert_eq!(
+        drain_v2(&mut a, "menu"),
+        [
+            RpcEvent::StoppingGracefully {
+                session_id: id.clone()
+            },
+            RpcEvent::ForceStopping {
+                session_id: id.clone(),
+                reason: ForceStopReason::StopTimeout,
+            },
+            RpcEvent::ObservationComplete,
+            RpcEvent::ForcedClose { session_id: id },
+        ]
+    );
+}
+
+#[derive(Clone, Default)]
+struct SharedLogSystem {
+    log: Log,
+    fail_graceful: bool,
+    fail_force: bool,
+    lifecycle: Option<SystemLifecycle>,
+}
+impl SessionSystem for SharedLogSystem {
+    fn start_foreground(&mut self, _: &LaunchRequest, _: &str) -> Result<(), String> {
+        self.log.lock().unwrap().push("start".into());
+        Ok(())
+    }
+    fn request_graceful_stop(&mut self, _: &str, _: &str) -> Result<(), String> {
+        self.log.lock().unwrap().push("graceful".into());
+        if self.fail_graceful {
+            Err("unavailable".into())
+        } else {
+            Ok(())
+        }
+    }
+    fn enforce_termination(&mut self, _: &str, _: &str) -> Result<(), String> {
+        self.log.lock().unwrap().push("force".into());
+        if self.fail_force {
+            Err("refused".into())
+        } else {
+            Ok(())
+        }
+    }
+    fn activate_selected_owner(&mut self) -> Result<(), String> {
+        self.log.lock().unwrap().push("owner".into());
+        Ok(())
+    }
+    fn lifecycle(&mut self, _: &str) -> Result<Option<SystemLifecycle>, String> {
+        Ok(self.lifecycle.clone())
+    }
+}
+
+fn sampler_line(context: &EscalationContext) -> String {
+    format!(
+        "hook:{}:{}:{}",
+        context.reason.as_str(),
+        context.session_id,
+        context.item_id
+    )
+}
+
+/// An authority whose escalation hook writes into the same log the system writes into, so the
+/// tests can prove the hook fires immediately before the kill and never after it.
+fn hooked_authority(
+    system: SharedLogSystem,
+    log: Log,
+) -> Authority<MemoryStore, SharedLogSystem, TestClock> {
+    Authority::open_with_resolver(
+        MemoryStore::default(),
+        system,
+        TestClock::new(),
+        3,
+        Duration::from_millis(10),
+        test_resolver(),
+    )
+    .unwrap()
+    .with_escalation_hook(move |context| log.lock().unwrap().push(sampler_line(context)))
+}
+
+fn launch_hooked(a: &mut Authority<MemoryStore, SharedLogSystem, TestClock>) -> String {
+    let LaunchResult::Accepted { session_id } = a
+        .launch(LaunchRequest {
+            item_id: APP_ID.into(),
+        })
+        .unwrap()
+    else {
+        panic!()
+    };
+    session_id
+}
+
+#[test]
+fn escalation_hook_fires_just_before_every_close_path_kill() {
+    // Path 1: the graceful window expired (the §9.6 escalation).
+    let log: Log = Log::default();
+    let mut a = hooked_authority(
+        SharedLogSystem {
+            log: log.clone(),
+            ..SharedLogSystem::default()
+        },
+        log.clone(),
+    );
+    let id = launch_hooked(&mut a);
+    a.intake_safe_return().unwrap();
+    a.tick().unwrap();
+    a.clock.advance(Duration::from_millis(10));
+    a.tick().unwrap();
+    assert!(matches!(a.state.phase, Phase::ForceStopping { .. }));
+    assert_eq!(
+        *log.lock().unwrap(),
+        vec![
+            "start".to_owned(),
+            "graceful".to_owned(),
+            format!("hook:stop_timeout:{id}:{APP_ID}"),
+            "force".to_owned(),
+        ],
+        "the sampler runs synchronously immediately before enforce_termination"
+    );
+
+    // Path 2: a daemon restart lost the monotonic deadline; reconcile escalates at once.
+    let log2: Log = Log::default();
+    let mut armed = hooked_authority(
+        SharedLogSystem {
+            log: log2.clone(),
+            ..SharedLogSystem::default()
+        },
+        log2.clone(),
+    );
+    let id2 = launch_hooked(&mut armed);
+    armed.intake_safe_return().unwrap();
+    armed.tick().unwrap();
+    assert!(matches!(
+        armed.state.phase,
+        Phase::StoppingGracefully { .. }
+    ));
+    let (store, system, _) = armed.into_parts();
+    let log3: Log = Log::default();
+    let hook3 = log3.clone();
+    let mut reopened = Authority::open(
+        store,
+        system,
+        TestClock::new(),
+        3,
+        Duration::from_millis(10),
+    )
+    .unwrap()
+    .with_escalation_hook(move |context| hook3.lock().unwrap().push(sampler_line(context)));
+    reopened.reconcile().unwrap();
+    assert!(matches!(reopened.state.phase, Phase::ForceStopping { .. }));
+    // The reopened hook fires before the kill; the moved system still logs into log2, so the
+    // pairing across the two logs proves the restart path escalates through the hook exactly once.
+    assert_eq!(
+        *log3.lock().unwrap(),
+        vec![format!("hook:stop_timeout:{id2}:{APP_ID}")]
+    );
+    assert_eq!(
+        *log2.lock().unwrap(),
+        vec![
+            "start".to_owned(),
+            "graceful".to_owned(),
+            "force".to_owned()
+        ]
+    );
+    // The escalation event is durable for the router even across the restart.
+    assert!(reopened.state.pending.iter().any(|e| matches!(
+        e.event,
+        WireEvent::ForceStopping {
+            reason: ForceStopReason::StopTimeout,
+            ..
+        }
+    )));
+
+    // Path 3: the graceful-stop request itself failed, so the kill is immediate.
+    let log4: Log = Log::default();
+    let mut failed_request = hooked_authority(
+        SharedLogSystem {
+            log: log4.clone(),
+            fail_graceful: true,
+            ..SharedLogSystem::default()
+        },
+        log4.clone(),
+    );
+    let id4 = launch_hooked(&mut failed_request);
+    failed_request.intake_safe_return().unwrap();
+    failed_request.tick().unwrap();
+    assert!(matches!(
+        failed_request.state.phase,
+        Phase::ForceStopping { .. }
+    ));
+    assert_eq!(
+        *log4.lock().unwrap(),
+        vec![
+            "start".to_owned(),
+            "graceful".to_owned(),
+            format!("hook:stop_request_failed:{id4}:{APP_ID}"),
+            "force".to_owned(),
+        ]
+    );
+    assert!(failed_request.state.pending.iter().any(|e| matches!(
+        e.event,
+        WireEvent::ForceStopping {
+            reason: ForceStopReason::StopRequestFailed,
+            ..
+        }
+    )));
+}
+
+#[test]
+fn escalation_hook_never_fires_when_systemd_beats_the_deadline() {
+    // Negative: the app died to systemd's own TimeoutStopSec backstop during the graceful
+    // window (Result=timeout). The pinned tsp-f3fm.202.1 contract completes that as Returned
+    // with no second kill, so no escalation happens and the sampler must not run either.
+    let log: Log = Log::default();
+    let mut raced = hooked_authority(
+        SharedLogSystem {
+            log: log.clone(),
+            ..SharedLogSystem::default()
+        },
+        log.clone(),
+    );
+    launch_hooked(&mut raced);
+    raced.intake_safe_return().unwrap();
+    raced.tick().unwrap();
+    raced.system.lifecycle = Some(SystemLifecycle {
+        app: AppUnitState::InactiveFailure {
+            summary: "systemd result: timeout".into(),
+        },
+        foreground_target_active: false,
+        selected_owner_active: true,
+    });
+    raced.tick().unwrap();
+    assert!(matches!(
+        raced.state.phase,
+        Phase::Restoring {
+            receipt: Receipt::Returned,
+            ..
+        }
+    ));
+    assert!(
+        !log.lock()
+            .unwrap()
+            .iter()
+            .any(|line| line.starts_with("hook:") || line == "force"),
+        "the backstop race must not sample or kill again: {:?}",
+        log.lock().unwrap()
+    );
+
+    // Positive control in the same invocation: when the app does not die by itself, the very
+    // same setup escalates and the hook fires.
+    let log2: Log = Log::default();
+    let mut escalated = hooked_authority(
+        SharedLogSystem {
+            log: log2.clone(),
+            ..SharedLogSystem::default()
+        },
+        log2.clone(),
+    );
+    launch_hooked(&mut escalated);
+    escalated.intake_safe_return().unwrap();
+    escalated.tick().unwrap();
+    escalated.clock.advance(Duration::from_millis(10));
+    escalated.tick().unwrap();
+    assert!(matches!(escalated.state.phase, Phase::ForceStopping { .. }));
+    assert!(log2
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|line| line.starts_with("hook:stop_timeout:")));
+}
+
+#[test]
+fn restart_over_an_already_stopped_unit_completes_as_returned_without_escalating() {
+    // The daemon went down mid-graceful-stop and lost its monotonic deadline. While it was
+    // down the app stopped — by itself or by systemd's own backstop. On restart, reconcile
+    // must read the unit before it acts: no sampler, no second kill, and the close completes
+    // as Returned — never a bogus ForceStopping/ForcedClose or a transient StopFailed.
+    for app in [
+        AppUnitState::InactiveSuccess,
+        AppUnitState::InactiveFailure {
+            summary: "systemd result: timeout".into(),
+        },
+    ] {
+        let log: Log = Log::default();
+        let mut armed = hooked_authority(
+            SharedLogSystem {
+                log: log.clone(),
+                ..SharedLogSystem::default()
+            },
+            log.clone(),
+        );
+        let id = launch_hooked(&mut armed);
+        armed.intake_safe_return().unwrap();
+        armed.tick().unwrap();
+        assert!(matches!(
+            armed.state.phase,
+            Phase::StoppingGracefully { .. }
+        ));
+
+        let (store, mut system, _) = armed.into_parts();
+        system.lifecycle = Some(SystemLifecycle {
+            app: app.clone(),
+            foreground_target_active: false,
+            selected_owner_active: true,
+        });
+        let hook_log: Log = Log::default();
+        let hook_sink = hook_log.clone();
+        let mut reopened = Authority::open(
+            store,
+            system,
+            TestClock::new(),
+            3,
+            Duration::from_millis(10),
+        )
+        .unwrap()
+        .with_escalation_hook(move |context| hook_sink.lock().unwrap().push(sampler_line(context)));
+
+        reopened.reconcile().unwrap();
+
+        assert!(
+            hook_log.lock().unwrap().is_empty(),
+            "no hang sample for a unit that already stopped: {:?}",
+            hook_log.lock().unwrap()
+        );
+        assert!(
+            !log.lock().unwrap().iter().any(|line| line == "force"),
+            "a stopped unit must not be killed again: {:?}",
+            log.lock().unwrap()
+        );
+        assert!(matches!(
+            reopened.state.phase,
+            Phase::Restoring {
+                receipt: Receipt::Returned,
+                ..
+            }
+        ));
+        // The menu-facing stream shows the durable StoppingGracefully but no bogus escalation.
+        let events = drain_v2(&mut reopened, "menu");
+        assert!(events.iter().any(|event| matches!(
+            event,
+            RpcEvent::StoppingGracefully { session_id } if session_id == &id
+        )));
+        assert!(
+            !events.iter().any(|event| matches!(
+                event,
+                RpcEvent::ForceStopping { .. }
+                    | RpcEvent::StopFailed { .. }
+                    | RpcEvent::ForcedClose { .. }
+            )),
+            "{events:?}"
+        );
+    }
+
+    // Positive control in the same invocation: a restart over a unit that is STILL active
+    // escalates through the hook exactly as before.
+    let log3: Log = Log::default();
+    let mut armed3 = hooked_authority(
+        SharedLogSystem {
+            log: log3.clone(),
+            ..SharedLogSystem::default()
+        },
+        log3.clone(),
+    );
+    let id3 = launch_hooked(&mut armed3);
+    armed3.intake_safe_return().unwrap();
+    armed3.tick().unwrap();
+    let (store3, mut system3, _) = armed3.into_parts();
+    system3.lifecycle = Some(SystemLifecycle {
+        app: AppUnitState::Active,
+        foreground_target_active: true,
+        selected_owner_active: false,
+    });
+    let hook_log3: Log = Log::default();
+    let hook_sink3 = hook_log3.clone();
+    let mut reopened3 = Authority::open(
+        store3,
+        system3,
+        TestClock::new(),
+        3,
+        Duration::from_millis(10),
+    )
+    .unwrap()
+    .with_escalation_hook(move |context| hook_sink3.lock().unwrap().push(sampler_line(context)));
+    reopened3.reconcile().unwrap();
+    assert!(matches!(reopened3.state.phase, Phase::ForceStopping { .. }));
+    assert_eq!(
+        *hook_log3.lock().unwrap(),
+        vec![format!("hook:stop_timeout:{id3}:{APP_ID}")]
+    );
+    assert!(log3.lock().unwrap().iter().any(|line| line == "force"));
+}
+
+#[test]
+fn a_failed_kill_is_a_durable_retryable_stop_failed_not_a_terminal_recovery() {
+    let log: Log = Log::default();
+    let hook_log = log.clone();
+    let sink_log: Log = Log::default();
+    let sink = sink_log.clone();
+    let mut a = Authority::open_with_resolver(
+        MemoryStore::default(),
+        SharedLogSystem {
+            log: log.clone(),
+            fail_force: true,
+            ..SharedLogSystem::default()
+        },
+        TestClock::new(),
+        3,
+        Duration::from_millis(10),
+        test_resolver(),
+    )
+    .unwrap()
+    .with_escalation_hook(move |context| hook_log.lock().unwrap().push(sampler_line(context)))
+    .with_log_sink(move |line| sink.lock().unwrap().push(line.to_owned()));
+
+    let id = launch_hooked(&mut a);
+    a.intake_safe_return().unwrap();
+    a.tick().unwrap();
+    a.clock.advance(Duration::from_millis(10));
+    a.tick().unwrap();
+
+    assert!(
+        matches!(
+            a.store.snapshot().unwrap().phase,
+            Phase::StopFailed {
+                ref session_id,
+                ref reason,
+                ..
+            } if session_id == &id && reason == "app_exit_failed: refused"
+        ),
+        "{:?}",
+        a.state.phase
+    );
+    assert!(
+        log.lock()
+            .unwrap()
+            .iter()
+            .any(|line| *line == "hook:stop_timeout:session-1:org.example.game"),
+        "the sampler ran even though the kill it precedes failed: {:?}",
+        log.lock().unwrap()
+    );
+    // An error is never silent.
+    assert_eq!(
+        *sink_log.lock().unwrap(),
+        [
+            "pf-session-authorityd: lifecycle_failure reason=app_exit_failed \
+             item_id=\"org.example.game\" detail=\"refused\""
+        ]
+    );
+    assert!(!a
+        .events_for("test")
+        .iter()
+        .any(|(_, e)| matches!(e, SessionEvent::Terminal(_))));
+
+    // The unit dies anyway (systemd's backstop or the app on its own): the close completes
+    // as a forced close rather than staying wedged.
+    a.observe(Observation::UnitInactive).unwrap();
+    assert!(matches!(
+        a.state.phase,
+        Phase::Restoring {
+            receipt: Receipt::ForcedClose,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn escalation_without_a_sampler_adds_no_delay_and_a_sleeping_sampler_proves_the_clock() {
+    let prepare = |with_sampler: bool| {
+        let log: Log = Log::default();
+        let mut a = Authority::open_with_resolver(
+            MemoryStore::default(),
+            SharedLogSystem {
+                log: log.clone(),
+                ..SharedLogSystem::default()
+            },
+            TestClock::new(),
+            3,
+            Duration::from_millis(10),
+            test_resolver(),
+        )
+        .unwrap();
+        if with_sampler {
+            a = a.with_escalation_hook(|_| std::thread::sleep(Duration::from_millis(150)));
+        }
+        let LaunchResult::Accepted { .. } = a
+            .launch(LaunchRequest {
+                item_id: APP_ID.into(),
+            })
+            .unwrap()
+        else {
+            panic!()
+        };
+        a.intake_safe_return().unwrap();
+        a.tick().unwrap();
+        a.clock.advance(Duration::from_millis(10));
+        a
+    };
+
+    // Negative control: a sleeping sampler is measured as a delay by this same stopwatch, so
+    // the fast unhooked run below cannot be a broken measurement.
+    let mut sampler = prepare(true);
+    let started = Instant::now();
+    sampler.tick().unwrap();
+    let with_sampler = started.elapsed();
+    assert!(matches!(sampler.state.phase, Phase::ForceStopping { .. }));
+    assert!(
+        with_sampler >= Duration::from_millis(150),
+        "the sampler's own cost must be visible to this measurement: {with_sampler:?}"
+    );
+
+    // The AC: with no sampler attached the identical escalation costs no measurable delay.
+    let mut plain = prepare(false);
+    let started = Instant::now();
+    plain.tick().unwrap();
+    let without_sampler = started.elapsed();
+    assert!(matches!(plain.state.phase, Phase::ForceStopping { .. }));
+    assert!(
+        without_sampler < Duration::from_millis(50),
+        "an unobserved escalation must not delay the close: {without_sampler:?}"
+    );
+}
+
+#[test]
+fn events_request_without_a_contract_field_decodes_as_v1() {
+    let request: RpcRequest =
+        serde_json::from_str(r#"{"method":"events","client_id":"menu"}"#).unwrap();
+    assert!(matches!(
+        request,
+        RpcRequest::Events {
+            ref client_id,
+            contract: SESSION_RPC_CONTRACT_V1,
+        } if client_id == "menu"
+    ));
+    // A v1 client's request stays byte-identical to the pre-negotiation shape.
+    assert_eq!(
+        serde_json::to_vec(&RpcRequest::Events {
+            client_id: "menu".into(),
+            contract: SESSION_RPC_CONTRACT_V1,
+        })
+        .unwrap(),
+        br#"{"method":"events","client_id":"menu"}"#.to_vec()
+    );
+}
+
+#[test]
+fn v1_clients_never_see_close_progress_events_and_their_acks_still_compact() {
+    let mut a = authority();
+    let id = launch_running(&mut a);
+
+    // An old shell polling while the session runs: its v1 stream holds only the v1 vocabulary,
+    // and the response keeps the pre-v2 byte shape (no contract key).
+    let RpcResponse::Events { events, contract } = handle_rpc(
+        &mut a,
+        RpcRequest::Events {
+            client_id: "old-shell".into(),
+            contract: SESSION_RPC_CONTRACT_V1,
+        },
+    )
+    .unwrap() else {
+        panic!()
+    };
+    assert_eq!(contract, SESSION_RPC_CONTRACT_V1);
+    assert_eq!(
+        events,
+        vec![(1, RpcEvent::Starting), (2, RpcEvent::Running)]
+    );
+    assert_eq!(
+        serde_json::to_vec(&RpcResponse::Events {
+            events: Vec::new(),
+            contract: SESSION_RPC_CONTRACT_V1,
+        })
+        .unwrap(),
+        br#"{"result":"events","events":[]}"#.to_vec()
+    );
+    assert!(matches!(
+        handle_rpc(
+            &mut a,
+            RpcRequest::Acknowledge {
+                client_id: "old-shell".into(),
+                sequence: 2,
+            },
+        )
+        .unwrap(),
+        RpcResponse::Ok
+    ));
+
+    // The close escalates while the v1 client is away: sequences 3 and 4 are the v2-only
+    // StoppingGracefully/ForceStopping events, which the v1 stream must never carry.
+    a.intake_safe_return().unwrap();
+    a.tick().unwrap();
+    a.clock.advance(Duration::from_millis(10));
+    a.tick().unwrap();
+    let RpcResponse::Events { events, .. } = handle_rpc(
+        &mut a,
+        RpcRequest::Events {
+            client_id: "old-shell".into(),
+            contract: SESSION_RPC_CONTRACT_V1,
+        },
+    )
+    .unwrap() else {
+        panic!()
+    };
+    assert_eq!(events, vec![], "no v2 event may reach a v1 client");
+
+    a.observe(Observation::UnitInactive).unwrap();
+    restore(&mut a);
+    let RpcResponse::Events { events, .. } = handle_rpc(
+        &mut a,
+        RpcRequest::Events {
+            client_id: "old-shell".into(),
+            contract: SESSION_RPC_CONTRACT_V1,
+        },
+    )
+    .unwrap() else {
+        panic!()
+    };
+    assert_eq!(
+        events,
+        vec![
+            (5, RpcEvent::ObservationComplete),
+            (6, RpcEvent::ForcedClose { session_id: id }),
+        ]
+    );
+    // Acking the last delivered sequence compacts past the filtered v2 events: the v1 cursor
+    // is blind to them, never blocked by them.
+    assert!(matches!(
+        handle_rpc(
+            &mut a,
+            RpcRequest::Acknowledge {
+                client_id: "old-shell".into(),
+                sequence: 6,
+            },
+        )
+        .unwrap(),
+        RpcResponse::Ok
+    ));
+    assert!(a.state.pending.is_empty());
+}
+
+#[test]
+fn an_unsupported_contract_is_refused_explicitly() {
+    let mut a = authority();
+    // Positive control: the newest contract this authority knows is served.
+    assert!(matches!(
+        handle_rpc(
+            &mut a,
+            RpcRequest::Events {
+                client_id: "router".into(),
+                contract: SESSION_RPC_CONTRACT_CURRENT,
+            },
+        )
+        .unwrap(),
+        RpcResponse::Events {
+            contract: SESSION_RPC_CONTRACT_CURRENT,
+            ..
+        }
+    ));
+    // A client from the future gets a typed refusal, never a silently downgraded stream.
+    let response = handle_rpc(
+        &mut a,
+        RpcRequest::Events {
+            client_id: "router".into(),
+            contract: SESSION_RPC_CONTRACT_CURRENT + 1,
+        },
+    )
+    .unwrap();
+    assert!(
+        matches!(&response, RpcResponse::Error { message } if message.contains("contract")),
+        "{response:?}"
+    );
+}
+
+#[test]
+fn close_progress_wire_shapes_are_pinned() {
+    // Router-facing events (snake_case, internally tagged by "event").
+    assert_eq!(
+        serde_json::to_string(&RpcEvent::StoppingGracefully {
+            session_id: "session-1".into(),
+        })
+        .unwrap(),
+        r#"{"event":"stopping_gracefully","session_id":"session-1"}"#
+    );
+    assert_eq!(
+        serde_json::to_string(&RpcEvent::ForceStopping {
+            session_id: "session-1".into(),
+            reason: ForceStopReason::StopTimeout,
+        })
+        .unwrap(),
+        r#"{"event":"force_stopping","session_id":"session-1","reason":"stop_timeout"}"#
+    );
+    assert_eq!(
+        serde_json::to_string(&RpcEvent::ForceStopping {
+            session_id: "session-1".into(),
+            reason: ForceStopReason::StopRequestFailed,
+        })
+        .unwrap(),
+        r#"{"event":"force_stopping","session_id":"session-1","reason":"stop_request_failed"}"#
+    );
+    assert_eq!(
+        serde_json::to_string(&RpcEvent::StopFailed {
+            session_id: "session-1".into(),
+            reason: "app_exit_failed: refused".into(),
+        })
+        .unwrap(),
+        r#"{"event":"stop_failed","session_id":"session-1","reason":"app_exit_failed: refused"}"#
+    );
+
+    // Persisted wire events (external tagging, like every WireEvent before them).
+    for (event, json) in [
+        (
+            WireEvent::StoppingGracefully {
+                session_id: "session-1".into(),
+            },
+            r#"{"StoppingGracefully":{"session_id":"session-1"}}"#,
+        ),
+        (
+            WireEvent::ForceStopping {
+                session_id: "session-1".into(),
+                reason: ForceStopReason::StopTimeout,
+            },
+            r#"{"ForceStopping":{"session_id":"session-1","reason":"stop_timeout"}}"#,
+        ),
+        (
+            WireEvent::StopFailed {
+                session_id: "session-1".into(),
+                reason: "app_exit_failed: refused".into(),
+            },
+            r#"{"StopFailed":{"session_id":"session-1","reason":"app_exit_failed: refused"}}"#,
+        ),
+    ] {
+        assert_eq!(serde_json::to_string(&event).unwrap(), json);
+        assert_eq!(serde_json::from_str::<WireEvent>(json).unwrap(), event);
+    }
+
+    // The durable StopFailed phase.
+    let phase = Phase::StopFailed {
+        session_id: "session-1".into(),
+        item_id: APP_ID.into(),
+        reason: "app_exit_failed: refused".into(),
+    };
+    let json = serde_json::to_string(&phase).unwrap();
+    assert_eq!(
+        json,
+        r#"{"StopFailed":{"session_id":"session-1","item_id":"org.example.game","reason":"app_exit_failed: refused"}}"#
+    );
+    assert_eq!(serde_json::from_str::<Phase>(&json).unwrap(), phase);
+    assert_eq!(phase.name(), "stop_failed");
+
+    // A v2 request names its contract; a v2 response echoes it.
+    assert_eq!(
+        serde_json::to_vec(&RpcRequest::Events {
+            client_id: "menu".into(),
+            contract: SESSION_RPC_CONTRACT_V2,
+        })
+        .unwrap(),
+        br#"{"method":"events","client_id":"menu","contract":2}"#.to_vec()
+    );
+    assert_eq!(
+        serde_json::to_vec(&RpcResponse::Events {
+            events: Vec::new(),
+            contract: SESSION_RPC_CONTRACT_V2,
+        })
+        .unwrap(),
+        br#"{"result":"events","events":[],"contract":2}"#.to_vec()
+    );
+}
+
+#[test]
+fn v1_persisted_state_with_a_close_phase_still_decodes_and_escalates() {
+    // A state file written by the pre-v2 daemon: no close-progress events in pending, no
+    // contract field anywhere. It must load unchanged.
+    let json = r#"{
+        "phase": {"StoppingGracefully": {
+            "session_id": "session-3",
+            "item_id": "org.example.game",
+            "boot_marker": "boot-1"
+        }},
+        "history": [],
+        "pending": [
+            {"sequence": 1, "event": "ObservedStarting"},
+            {"sequence": 2, "event": {"Terminal": {"session_id": "session-2", "receipt": "Returned"}}}
+        ],
+        "next_sequence": 3,
+        "next_session": 4,
+        "safe_return_queue": 0,
+        "safe_return_binding_revision": 0,
+        "acknowledged": {"menu": 1}
+    }"#;
+    let state: PersistedState = serde_json::from_str(json).unwrap();
+    assert!(matches!(
+        state.phase,
+        Phase::StoppingGracefully {
+            ref session_id,
+            ref boot_marker,
+            ..
+        } if session_id == "session-3" && boot_marker == "boot-1"
+    ));
+    assert_eq!(state.pending.len(), 2);
+    assert!(matches!(
+        state.pending[1].event,
+        WireEvent::Terminal {
+            receipt: Receipt::Returned,
+            ..
+        }
+    ));
+
+    // And the reopened authority drives it exactly like its own state: the lost deadline
+    // escalates on the first reconcile.
+    let mut store = MemoryStore::default();
+    store.save(&state).unwrap();
+    let mut a = Authority::open(
+        store,
+        FakeSystem::available(),
+        TestClock::new(),
+        3,
+        Duration::from_millis(10),
+    )
+    .unwrap();
+    a.reconcile().unwrap();
+    assert!(matches!(a.state.phase, Phase::ForceStopping { .. }));
+    assert_eq!(a.system.calls.iter().filter(|c| *c == "force").count(), 1);
+}
+
+/// A real-time clock for the deadline-wake test: monotonic nanoseconds like the daemon's.
+struct RealClock(Instant);
+impl Clock for RealClock {
+    fn now(&self) -> MonotonicTime {
+        MonotonicTime::from_nanos(self.0.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64)
+    }
+}
+
+#[test]
+fn service_loop_escalates_at_the_grace_deadline_without_waiting_for_a_tick() {
+    let mut a = Authority::open_with_resolver(
+        MemoryStore::default(),
+        FakeSystem::available(),
+        RealClock(Instant::now()),
+        3,
+        Duration::from_millis(150),
+        test_resolver(),
+    )
+    .unwrap();
+    let LaunchResult::Accepted { .. } = a
+        .launch(LaunchRequest {
+            item_id: APP_ID.into(),
+        })
+        .unwrap()
+    else {
+        panic!()
+    };
+    a.intake_safe_return().unwrap();
+    a.reconcile().unwrap();
+    assert!(matches!(a.state.phase, Phase::StoppingGracefully { .. }));
+
+    // The periodic tick is 10 s away; the 150 ms deadline must wake the loop by itself, or the
+    // device escalation would land up to a full tick late (inside systemd's 2 s backstop).
+    let (connections, incoming) = std::sync::mpsc::channel::<io::Result<u32>>();
+    let closer = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(1200));
+        drop(connections);
+    });
+    let started = Instant::now();
+    run_service_loop(&mut a, &incoming, Duration::from_secs(10), |_, _| Ok(())).unwrap();
+    closer.join().unwrap();
+    assert!(
+        matches!(a.state.phase, Phase::ForceStopping { .. }),
+        "the deadline must wake the loop before the 10 s tick: {:?}",
+        a.state.phase
+    );
+    assert_eq!(a.system.calls.iter().filter(|c| *c == "force").count(), 1);
+    assert!(started.elapsed() < Duration::from_secs(5));
+
+    // Control: a session nobody asked to close is left alone by the same deadline-aware loop.
+    let mut idle = Authority::open_with_resolver(
+        MemoryStore::default(),
+        FakeSystem::available(),
+        RealClock(Instant::now()),
+        3,
+        Duration::from_millis(150),
+        test_resolver(),
+    )
+    .unwrap();
+    let LaunchResult::Accepted { .. } = idle
+        .launch(LaunchRequest {
+            item_id: APP_ID.into(),
+        })
+        .unwrap()
+    else {
+        panic!()
+    };
+    let (connections, incoming) = std::sync::mpsc::channel::<io::Result<u32>>();
+    let closer = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(300));
+        drop(connections);
+    });
+    run_service_loop(&mut idle, &incoming, Duration::from_secs(10), |_, _| Ok(())).unwrap();
+    closer.join().unwrap();
+    assert!(matches!(idle.state.phase, Phase::Running { .. }));
+    assert_eq!(
+        idle.system.calls.iter().filter(|c| *c == "force").count(),
+        0
+    );
+}
+
+#[test]
+fn default_graceful_stop_is_non_blocking_so_the_app_window_stays_the_units_own() {
+    // The device escalation was unreachable while the graceful stop blocked for the unit's
+    // whole TimeoutStopSec: `systemctl stop` only returned after systemd had already SIGKILLed
+    // the app. --no-block hands the window back to the authority's own deadline.
+    let templates = CommandTemplates::default();
+    assert_eq!(
+        templates.request_graceful_stop,
+        words("systemctl stop --no-block pf-app@{item_id}.service")
+    );
+    // Budget: grace (1500 ms) + root sampler (≤300 ms, cr-collect) must stay inside the app
+    // unit's own TimeoutStopSec=2 s so the authority escalates before the systemd backstop.
+    assert_eq!(DEFAULT_GRACE_PERIOD, Duration::from_millis(1500));
 }

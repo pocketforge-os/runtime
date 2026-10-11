@@ -5,6 +5,7 @@ use pf_ports::{
 };
 use pf_session_authority::{
     AuthorityApi, AuthorityError, HistoryEntry, RpcEvent, RpcRequest, RpcResponse,
+    SESSION_RPC_CONTRACT_V1,
 };
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -126,10 +127,12 @@ impl AuthorityApi for SocketTransport {
     fn try_events_for(&self, client_id: &str) -> Result<Vec<(u64, SessionEvent)>, AuthorityError> {
         match self.call(&RpcRequest::Events {
             client_id: client_id.to_owned(),
+            contract: SESSION_RPC_CONTRACT_V1,
         })? {
-            RpcResponse::Events { events } => {
-                Ok(events.into_iter().map(|(s, e)| (s, rpc_event(e))).collect())
-            }
+            RpcResponse::Events { events, .. } => Ok(events
+                .into_iter()
+                .filter_map(|(sequence, event)| rpc_event(event).map(|event| (sequence, event)))
+                .collect()),
             _ => Err(AuthorityError::Backend("unexpected events response".into())),
         }
     }
@@ -177,29 +180,41 @@ fn receipt_event(session_id: String, receipt: pf_session_authority::Receipt) -> 
     }
 }
 
-fn rpc_event(event: RpcEvent) -> SessionEvent {
+/// The launcher speaks contract v1: close-progress events (contract v2, the system menu's
+/// vocabulary) have no port shape and are skipped instead of failing the stream.
+fn rpc_event(event: RpcEvent) -> Option<SessionEvent> {
     match event {
-        RpcEvent::Starting => SessionEvent::Observed(pf_ports::ObservedSessionState::Starting),
-        RpcEvent::Running => SessionEvent::Observed(pf_ports::ObservedSessionState::Running),
-        RpcEvent::ObservationComplete => {
-            SessionEvent::Observed(pf_ports::ObservedSessionState::ObservationComplete)
-        }
-        RpcEvent::Returned { session_id } => {
-            SessionEvent::Terminal(pf_ports::TerminalReceipt::Returned { session_id })
-        }
-        RpcEvent::ForcedClose { session_id } => {
-            SessionEvent::Terminal(pf_ports::TerminalReceipt::ForcedClose { session_id })
-        }
+        RpcEvent::Starting => Some(SessionEvent::Observed(
+            pf_ports::ObservedSessionState::Starting,
+        )),
+        RpcEvent::Running => Some(SessionEvent::Observed(
+            pf_ports::ObservedSessionState::Running,
+        )),
+        RpcEvent::ObservationComplete => Some(SessionEvent::Observed(
+            pf_ports::ObservedSessionState::ObservationComplete,
+        )),
+        RpcEvent::Returned { session_id } => Some(SessionEvent::Terminal(
+            pf_ports::TerminalReceipt::Returned { session_id },
+        )),
+        RpcEvent::ForcedClose { session_id } => Some(SessionEvent::Terminal(
+            pf_ports::TerminalReceipt::ForcedClose { session_id },
+        )),
         RpcEvent::Crash {
             session_id,
             summary,
-        } => SessionEvent::Terminal(pf_ports::TerminalReceipt::Crash {
+        } => Some(SessionEvent::Terminal(pf_ports::TerminalReceipt::Crash {
             session_id,
             summary,
-        }),
+        })),
         RpcEvent::RecoveryRequired { session_id, reason } => {
-            SessionEvent::RecoveryRequired(pf_ports::RecoveryRequired { session_id, reason })
+            Some(SessionEvent::RecoveryRequired(pf_ports::RecoveryRequired {
+                session_id,
+                reason,
+            }))
         }
+        RpcEvent::StoppingGracefully { .. }
+        | RpcEvent::ForceStopping { .. }
+        | RpcEvent::StopFailed { .. } => None,
     }
 }
 impl<T: AuthorityApi> SessionPort for SessionClient<T> {
