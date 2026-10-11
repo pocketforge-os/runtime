@@ -29,6 +29,10 @@ pub struct ItemIndex(pub u32);
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct PageIndex(pub u32);
 
+/// Stable identity for one host write. Replies carrying an older or unknown request are ignored.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ApplyRequest(pub u64);
+
 /// Engine input. There is deliberately no hold input in v1 (X11 is superseded by the Capture
 /// sub-panel; review adjudication round 7, item 8).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -57,9 +61,10 @@ pub enum MenuInput {
     ScanStep,
     /// One-switch scanning: act.
     ScanSelect,
-    /// The host's answer to a [`MenuEffect::SetValue`], or a value change from elsewhere.
+    /// The host's answer to a [`MenuEffect::SetValue`]. Backend changes not initiated by the
+    /// engine use [`MenuEngine::set_value`].
     Applied {
-        item: ItemIndex,
+        request: ApplyRequest,
         result: ApplyResult,
     },
     /// Time passed; expires pending values.
@@ -108,6 +113,7 @@ pub enum ApplyState {
     Idle,
     Pending {
         deadline: MonotonicTime,
+        request: ApplyRequest,
     },
     Committed,
     Reverted(RevertReason),
@@ -138,6 +144,7 @@ pub enum AnnounceWhat {
 pub enum MenuEffect {
     /// Write `value` to the item's binding, then answer with [`MenuInput::Applied`].
     SetValue {
+        request: ApplyRequest,
         item: ItemIndex,
         value: MenuValue,
     },
@@ -340,6 +347,7 @@ pub struct MenuEngine {
     legend: [LegendEntry; MAX_LEGEND],
     legend_len: usize,
     revision: u64,
+    next_request: u64,
 }
 
 impl MenuEngine {
@@ -365,6 +373,7 @@ impl MenuEngine {
             legend: [NO_LEGEND; MAX_LEGEND],
             legend_len: 0,
             revision: 0,
+            next_request: 0,
         };
         engine.reindex();
         engine.slots = vec![Slot::default(); engine.index.loc.len()];
@@ -660,13 +669,24 @@ impl MenuEngine {
         }
         self.overlay = overlay.and_then(|(id, confirm, cursor)| {
             let item = ItemIndex(find(self, &id)?);
-            Some(match confirm {
-                Some(confirm_focused) => Overlay::Confirm {
+            match (confirm, &self.item(item).kind) {
+                (
+                    Some(confirm_focused),
+                    ItemKind::Action {
+                        confirm: Some(_), ..
+                    },
+                ) => Some(Overlay::Confirm {
                     item,
                     confirm_focused,
-                },
-                None => Overlay::Picker { item, cursor },
-            })
+                }),
+                (None, ItemKind::Choice { options, .. }) if !options.is_empty() => {
+                    Some(Overlay::Picker {
+                        item,
+                        cursor: cursor.min((options.len() - 1) as u16),
+                    })
+                }
+                _ => None,
+            }
         });
         self.settle();
         self.refresh_legend();
@@ -700,7 +720,7 @@ impl MenuEngine {
                     self.activate(now);
                 }
             }
-            MenuInput::Applied { item, result } => self.applied(item, result),
+            MenuInput::Applied { request, result } => self.applied(request, result),
             MenuInput::Tick => {}
         }
         self.settle();
@@ -981,15 +1001,21 @@ impl MenuEngine {
     /// Show `value` at once and ask the host to write it.
     fn write(&mut self, i: u32, value: MenuValue, now: MonotonicTime) {
         let deadline = now.saturating_add(self.options.echo_timeout);
+        let request = ApplyRequest(self.next_request);
+        self.next_request = self.next_request.wrapping_add(1);
         let slot = &mut self.slots[i as usize];
         if !matches!(slot.state, ApplyState::Pending { .. }) {
             slot.previous = slot.value;
             self.pending += 1;
         }
         slot.value = Some(value);
-        slot.state = ApplyState::Pending { deadline };
+        slot.state = ApplyState::Pending { deadline, request };
         let item = ItemIndex(i);
-        self.emit(MenuEffect::SetValue { item, value });
+        self.emit(MenuEffect::SetValue {
+            request,
+            item,
+            value,
+        });
         self.emit(MenuEffect::Announce {
             item: Some(item),
             what: AnnounceWhat::Value,
@@ -1017,7 +1043,7 @@ impl MenuEngine {
             return;
         }
         for i in 0..self.slots.len() {
-            if let ApplyState::Pending { deadline } = self.slots[i].state {
+            if let ApplyState::Pending { deadline, .. } = self.slots[i].state {
                 if deadline <= now {
                     self.revert(i as u32, RevertReason::Timeout);
                 }
@@ -1025,22 +1051,22 @@ impl MenuEngine {
         }
     }
 
-    fn applied(&mut self, item: ItemIndex, result: ApplyResult) {
-        let i = item.0;
-        if i as usize >= self.slots.len() {
+    fn applied(&mut self, request: ApplyRequest, result: ApplyResult) {
+        let Some(i) = self.slots.iter().position(|slot| {
+            matches!(slot.state, ApplyState::Pending { request: pending, .. } if pending == request)
+        }) else {
             return;
-        }
-        let pending = matches!(self.slots[i as usize].state, ApplyState::Pending { .. });
+        };
+        let i = i as u32;
+        let item = ItemIndex(i);
         match result {
             ApplyResult::Committed(value) if self.item_at(i).accepts(value) => {
                 let slot = &mut self.slots[i as usize];
                 let changed = slot.value != Some(value);
                 slot.value = Some(value);
-                if pending {
-                    slot.state = ApplyState::Committed;
-                    self.pending -= 1;
-                    self.emit(MenuEffect::Committed { item });
-                }
+                slot.state = ApplyState::Committed;
+                self.pending -= 1;
+                self.emit(MenuEffect::Committed { item });
                 if changed {
                     self.emit(MenuEffect::Announce {
                         item: Some(item),
@@ -1049,8 +1075,7 @@ impl MenuEngine {
                 }
             }
             ApplyResult::Committed(_) => self.revert(i, RevertReason::InvalidValue),
-            ApplyResult::Rejected if pending => self.revert(i, RevertReason::Rejected),
-            ApplyResult::Rejected => {}
+            ApplyResult::Rejected => self.revert(i, RevertReason::Rejected),
         }
     }
 

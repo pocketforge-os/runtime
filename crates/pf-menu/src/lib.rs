@@ -17,9 +17,9 @@ pub mod schema;
 pub mod value;
 
 pub use engine::{
-    AnnounceWhat, ApplyResult, ApplyState, EngineOptions, Feedback, ItemIndex, LegendAction,
-    LegendEntry, LegendGlyph, LegendLabel, MenuEffect, MenuEngine, MenuInput, Overlay, PageIndex,
-    RevertReason,
+    AnnounceWhat, ApplyRequest, ApplyResult, ApplyState, EngineOptions, Feedback, ItemIndex,
+    LegendAction, LegendEntry, LegendGlyph, LegendLabel, MenuEffect, MenuEngine, MenuInput,
+    Overlay, PageIndex, RevertReason,
 };
 pub use kind::{ItemKindId, KIND_TABLE};
 pub use model::{
