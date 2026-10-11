@@ -30,6 +30,7 @@ members = [
     "crates/pf-session-client",
     "crates/pf-session-contract",
     "crates/pf-problem-report",
+    "crates/pf-menu",
 ]
 
 # Shared metadata for every crate in the runtime workspace (tsp-e1b.2 / E2).

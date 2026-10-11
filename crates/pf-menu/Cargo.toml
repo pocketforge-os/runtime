@@ -1,0 +1,22 @@
+[package]
+name = "pf-menu"
+description = "Menu model, frozen item-kind numbering and the controller focus engine shared by Settings, the system menu, pf-osk panels and app menus"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lib]
+name = "pf_menu"
+
+[dependencies]
+# pf-ports: MonotonicTime for the apply deadline, ShellAction input and GlyphResolver legend.
+pf-ports = { workspace = true }
+# pf-prefs: Bind::Pref keys are validated against the real PrefSpec table (design note §3
+# listed serde + pf-ports only; pf-prefs is a leaf crate that adds nothing beyond serde_json).
+pf-prefs = { workspace = true }
+pf-scene = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }

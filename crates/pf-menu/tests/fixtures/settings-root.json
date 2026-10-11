@@ -1,0 +1,33 @@
+{
+  "format": "pocketforge.menu/1",
+  "id": "settings",
+  "root": "settings",
+  "pages": [
+    {
+      "id": "settings",
+      "title": { "id": "settings-title" },
+      "sections": [
+        {
+          "items": [
+            { "id": "display-link", "kind": "link", "label": { "text": "Display" }, "page": "display" },
+            { "id": "controls-link", "kind": "link", "label": { "text": "Controls" }, "page": "controls" }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "display",
+      "title": { "text": "Display" },
+      "sections": [
+        { "items": [{ "id": "display-back", "kind": "info", "label": { "text": "Display settings" }, "value": { "text": "Available" } }] }
+      ]
+    },
+    {
+      "id": "controls",
+      "title": { "text": "Controls" },
+      "sections": [
+        { "items": [{ "id": "controls-info", "kind": "info", "label": { "text": "Controller" }, "value": { "text": "Connected" } }] }
+      ]
+    }
+  ]
+}
