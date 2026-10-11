@@ -99,7 +99,11 @@ decision (every-menu-spec Q3). One close sequence:
 3. If the grace period (`--grace-period-ms`, default `DEFAULT_GRACE_PERIOD` = 1500 ms)
    expires first, the authority escalates: `force_stopping {reason: stop_timeout}` after
    `systemctl kill --kill-who=all`. Budget: 1500 ms grace + ≤300 ms hang-sampler + kill spawn
-   must stay inside the unit's 2 s backstop.
+   must stay inside the unit's 2 s backstop. A daemon restart loses the monotonic deadline; a
+   reopened `stopping_gracefully` session re-reads the unit before acting: still active →
+   immediate escalation (`stop_timeout`), already inactive → the close completes as `returned`
+   with no second kill and no sampler run, unknown state → typed `systemd_state_unknown`
+   recovery.
 4. If the stop request itself failed in step 1, escalation is immediate with
    `force_stopping {reason: stop_request_failed}`.
 5. If the kill fails, the close is `stop_failed` (durable, logged, retryable) — never a
@@ -117,5 +121,6 @@ interval late.
 `enforce_termination`, with `EscalationContext { session_id, item_id, reason }`. The hook must
 self-bound (the design budget is 300 ms); the authority adds no timeout of its own. With no
 hook attached, escalation is a single branch — pinned by a timing test with a sleeping-hook
-negative control. The hook does not fire when systemd beats the deadline (step 2: no kill is
-sent) or outside close paths.
+negative control. The hook does not fire when systemd beats the deadline or when the unit is
+already inactive across a daemon restart (no kill is sent in either case) or outside close
+paths.

@@ -1617,7 +1617,10 @@ fn acceptor_closes_connections_beyond_its_bound() {
 
 /// Drains the router-facing v2 stream for `client` and acknowledges it, exactly as the
 /// system-menu router polls: one cursor, every event once, in publication order.
-fn drain_v2(a: &mut Authority<MemoryStore, FakeSystem, TestClock>, client: &str) -> Vec<RpcEvent> {
+fn drain_v2<S: StateStore, B: SessionSystem, C: Clock>(
+    a: &mut Authority<S, B, C>,
+    client: &str,
+) -> Vec<RpcEvent> {
     let RpcResponse::Events { events, contract } = handle_rpc(
         a,
         RpcRequest::Events {
@@ -2042,6 +2045,127 @@ fn escalation_hook_never_fires_when_systemd_beats_the_deadline() {
         .unwrap()
         .iter()
         .any(|line| line.starts_with("hook:stop_timeout:")));
+}
+
+#[test]
+fn restart_over_an_already_stopped_unit_completes_as_returned_without_escalating() {
+    // The daemon went down mid-graceful-stop and lost its monotonic deadline. While it was
+    // down the app stopped — by itself or by systemd's own backstop. On restart, reconcile
+    // must read the unit before it acts: no sampler, no second kill, and the close completes
+    // as Returned — never a bogus ForceStopping/ForcedClose or a transient StopFailed.
+    for app in [
+        AppUnitState::InactiveSuccess,
+        AppUnitState::InactiveFailure {
+            summary: "systemd result: timeout".into(),
+        },
+    ] {
+        let log: Log = Log::default();
+        let mut armed = hooked_authority(
+            SharedLogSystem {
+                log: log.clone(),
+                ..SharedLogSystem::default()
+            },
+            log.clone(),
+        );
+        let id = launch_hooked(&mut armed);
+        armed.intake_safe_return().unwrap();
+        armed.tick().unwrap();
+        assert!(matches!(
+            armed.state.phase,
+            Phase::StoppingGracefully { .. }
+        ));
+
+        let (store, mut system, _) = armed.into_parts();
+        system.lifecycle = Some(SystemLifecycle {
+            app: app.clone(),
+            foreground_target_active: false,
+            selected_owner_active: true,
+        });
+        let hook_log: Log = Log::default();
+        let hook_sink = hook_log.clone();
+        let mut reopened = Authority::open(
+            store,
+            system,
+            TestClock::new(),
+            3,
+            Duration::from_millis(10),
+        )
+        .unwrap()
+        .with_escalation_hook(move |context| hook_sink.lock().unwrap().push(sampler_line(context)));
+
+        reopened.reconcile().unwrap();
+
+        assert!(
+            hook_log.lock().unwrap().is_empty(),
+            "no hang sample for a unit that already stopped: {:?}",
+            hook_log.lock().unwrap()
+        );
+        assert!(
+            !log.lock().unwrap().iter().any(|line| line == "force"),
+            "a stopped unit must not be killed again: {:?}",
+            log.lock().unwrap()
+        );
+        assert!(matches!(
+            reopened.state.phase,
+            Phase::Restoring {
+                receipt: Receipt::Returned,
+                ..
+            }
+        ));
+        // The menu-facing stream shows the durable StoppingGracefully but no bogus escalation.
+        let events = drain_v2(&mut reopened, "menu");
+        assert!(events.iter().any(|event| matches!(
+            event,
+            RpcEvent::StoppingGracefully { session_id } if session_id == &id
+        )));
+        assert!(
+            !events.iter().any(|event| matches!(
+                event,
+                RpcEvent::ForceStopping { .. }
+                    | RpcEvent::StopFailed { .. }
+                    | RpcEvent::ForcedClose { .. }
+            )),
+            "{events:?}"
+        );
+    }
+
+    // Positive control in the same invocation: a restart over a unit that is STILL active
+    // escalates through the hook exactly as before.
+    let log3: Log = Log::default();
+    let mut armed3 = hooked_authority(
+        SharedLogSystem {
+            log: log3.clone(),
+            ..SharedLogSystem::default()
+        },
+        log3.clone(),
+    );
+    let id3 = launch_hooked(&mut armed3);
+    armed3.intake_safe_return().unwrap();
+    armed3.tick().unwrap();
+    let (store3, mut system3, _) = armed3.into_parts();
+    system3.lifecycle = Some(SystemLifecycle {
+        app: AppUnitState::Active,
+        foreground_target_active: true,
+        selected_owner_active: false,
+    });
+    let hook_log3: Log = Log::default();
+    let hook_sink3 = hook_log3.clone();
+    let mut reopened3 = Authority::open(
+        store3,
+        system3,
+        TestClock::new(),
+        3,
+        Duration::from_millis(10),
+    )
+    .unwrap()
+    .with_escalation_hook(move |context| hook_sink3.lock().unwrap().push(sampler_line(context)));
+    reopened3.reconcile().unwrap();
+    assert!(matches!(reopened3.state.phase, Phase::ForceStopping { .. }));
+    assert_eq!(
+        *hook_log3.lock().unwrap(),
+        vec![format!("hook:stop_timeout:{id3}:{APP_ID}")]
+    );
+    assert!(log3.lock().unwrap().iter().any(|line| line == "force"));
 }
 
 #[test]

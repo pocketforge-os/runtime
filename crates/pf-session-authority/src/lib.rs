@@ -1389,20 +1389,36 @@ impl<S: StateStore, B: SessionSystem, C: Clock> Authority<S, B, C> {
         } = self.state.phase.clone()
         {
             if self.graceful_deadline.is_none() {
-                if let Err(reason) =
-                    self.escalate(&item_id, &session_id, ForceStopReason::StopTimeout)
-                {
-                    return self.stop_failed(reason);
-                }
-                self.publish(WireEvent::ForceStopping {
-                    session_id: session_id.clone(),
-                    reason: ForceStopReason::StopTimeout,
-                });
-                self.state.phase = Phase::ForceStopping {
-                    session_id,
-                    item_id,
+                // The monotonic deadline was lost to a daemon restart. Read the unit before
+                // acting: if the app already stopped while the daemon was down (by itself or
+                // by the unit's own TimeoutStopSec backstop), the close completes as Returned
+                // through reconcile_systemd() below. Killing a dead unit would publish a
+                // wrong ForcedClose — and sample a hang that is already gone.
+                let still_running = match self.system.lifecycle(&item_id) {
+                    Ok(Some(snapshot)) => matches!(snapshot.app, AppUnitState::Active),
+                    // No lifecycle source (fakes, the desktop-sim preset): a lost deadline
+                    // stays immediately due, as before.
+                    Ok(None) => true,
+                    // Unknown unit state: never kill blind; reconcile_systemd() below records
+                    // the typed systemd_state_unknown recovery.
+                    Err(_) => false,
                 };
-                self.persist()?;
+                if still_running {
+                    if let Err(reason) =
+                        self.escalate(&item_id, &session_id, ForceStopReason::StopTimeout)
+                    {
+                        return self.stop_failed(reason);
+                    }
+                    self.publish(WireEvent::ForceStopping {
+                        session_id: session_id.clone(),
+                        reason: ForceStopReason::StopTimeout,
+                    });
+                    self.state.phase = Phase::ForceStopping {
+                        session_id,
+                        item_id,
+                    };
+                    self.persist()?;
+                }
             }
         }
         if self.state.safe_return_queue > 0
