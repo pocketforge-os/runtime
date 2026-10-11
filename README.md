@@ -119,6 +119,18 @@ cooperative v0 contract — real default-deny-vs-hostile + server-side quotas ar
 pf-input-broker --source /dev/input/eventN --descriptor <caps.toml> --acquire-sock <sock>
 ```
 
+### Built-in controller trust
+
+The broker fails closed on source identity by default, for both automatic discovery and an
+explicit `--source`. Descriptor name, IDs and capabilities are not identity: a USB device or a
+second uinput creator can copy them. The source must be the virtual device recorded by
+`pf-input-decode`, with its decoder-set `phys` value and root-owned runtime record. A missing,
+untrusted or mismatched record refuses startup before the source is grabbed.
+
+Desktop simulation and root-only test harnesses that intentionally create their own uinput pad
+must pass `--allow-unidentified-pad`. The broker prints a warning whenever that explicit opt-out
+is active; production service units must never use it.
+
 **Proof** (`crates/pf-input-broker/itest/run.sh`, run as root): against the E5 sim's
 descriptor-synthesized source it shows grab + remap (`BTN_X`→`BTN_WEST`) + the `SCM_RIGHTS`
 handoff + a **silent grabbed source** (the app cannot bypass), on **both** x86 (native, via the
