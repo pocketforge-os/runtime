@@ -268,6 +268,69 @@ fn socket_transport_reports_daemon_down_instead_of_idle() {
 }
 
 #[test]
+fn socket_transport_skips_close_progress_events_the_v1_port_surface_cannot_express() {
+    let dir = std::env::temp_dir().join(format!("pf-session-socket-v2skip-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let socket = dir.join("authority.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let thread = std::thread::spawn(move || {
+        use pf_session_authority::{ForceStopReason, RpcEvent, SESSION_RPC_CONTRACT_V1};
+        let (mut stream, _) = listener.accept().unwrap();
+        let request = pf_wire::read_frame(&mut stream).unwrap();
+        // The v1 client's request stays byte-identical to the pre-negotiation shape.
+        assert_eq!(
+            request,
+            br#"{"method":"events","client_id":"launcher"}"#.to_vec()
+        );
+        let response = pf_session_authority::RpcResponse::Events {
+            contract: SESSION_RPC_CONTRACT_V1,
+            events: vec![
+                (1, RpcEvent::Running),
+                (
+                    2,
+                    RpcEvent::StoppingGracefully {
+                        session_id: "s1".into(),
+                    },
+                ),
+                (
+                    3,
+                    RpcEvent::ForceStopping {
+                        session_id: "s1".into(),
+                        reason: ForceStopReason::StopTimeout,
+                    },
+                ),
+                (
+                    4,
+                    RpcEvent::ForcedClose {
+                        session_id: "s1".into(),
+                    },
+                ),
+            ],
+        };
+        pf_wire::write_frame(&mut stream, &serde_json::to_vec(&response).unwrap()).unwrap();
+    });
+
+    let mut client = SessionClient::new("launcher", SocketTransport::connect(&socket));
+    let events = client.transport_mut().try_events_for("launcher").unwrap();
+    // The close-progress events have no v1 port shape: they are skipped, never an error, and
+    // the surrounding v1 events keep their sequences.
+    assert_eq!(events.len(), 2, "{events:?}");
+    assert!(matches!(
+        events[0],
+        (1, SessionEvent::Observed(ObservedSessionState::Running))
+    ));
+    assert!(matches!(
+        events[1],
+        (4, SessionEvent::Terminal(TerminalReceipt::ForcedClose { ref session_id }))
+            if session_id == "s1"
+    ));
+
+    thread.join().unwrap();
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
 fn socket_transport_reports_mid_stream_drop_on_next_call() {
     let dir = std::env::temp_dir().join(format!("pf-session-socket-drop-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -278,9 +341,11 @@ fn socket_transport_reports_mid_stream_drop_on_next_call() {
         let (mut first, _) = listener.accept().unwrap();
         let request = pf_wire::read_frame(&mut first).unwrap();
         let _: pf_session_authority::RpcRequest = serde_json::from_slice(&request).unwrap();
-        let response =
-            serde_json::to_vec(&pf_session_authority::RpcResponse::Events { events: vec![] })
-                .unwrap();
+        let response = serde_json::to_vec(&pf_session_authority::RpcResponse::Events {
+            events: vec![],
+            contract: pf_session_authority::SESSION_RPC_CONTRACT_V1,
+        })
+        .unwrap();
         pf_wire::write_frame(&mut first, &response).unwrap();
 
         let (_dropped, _) = listener.accept().unwrap();
