@@ -677,6 +677,8 @@ pub enum MenuStep {
     FallbackReturn,
     /// Send `dismiss{reason}` and take the pad back.
     Dismiss(menu::DismissReason),
+    /// Send `dismiss{reason}`, take the pad back, and run the one safe return path.
+    DismissAndReturn(menu::DismissReason),
 }
 
 /// Deterministic model of ordering rules (d) and (e): `press → ack ≤ 250 ms → shown ≤ 500 ms →
@@ -686,6 +688,7 @@ pub struct MenuSession {
     phase: MenuPhase,
     acked_at: Option<Duration>,
     last_pong_at: Duration,
+    outstanding_ping: Option<(u64, Duration)>,
 }
 
 impl Default for MenuSession {
@@ -701,6 +704,7 @@ impl MenuSession {
             phase: MenuPhase::AwaitingAck,
             acked_at: None,
             last_pong_at: Duration::ZERO,
+            outstanding_ping: None,
         }
     }
 
@@ -730,15 +734,37 @@ impl MenuSession {
         }
         if elapsed.saturating_sub(acked_at) > timeouts::MENU_SHOWN_TIMEOUT {
             self.phase = MenuPhase::Closed { fallback: true };
-            return MenuStep::Dismiss(menu::DismissReason::ShownTimeout);
+            return MenuStep::DismissAndReturn(menu::DismissReason::ShownTimeout);
         }
         self.phase = MenuPhase::Open;
         self.last_pong_at = elapsed;
+        self.outstanding_ping = None;
         MenuStep::RoutePadToMenu
     }
 
-    pub fn pong(&mut self, elapsed: Duration) -> MenuStep {
+    /// Record a health probe sent by the router. Only the newest outstanding sequence is valid.
+    pub fn ping(&mut self, seq: u64, elapsed: Duration) -> MenuStep {
         if self.phase == MenuPhase::Open {
+            self.outstanding_ping = Some((seq, elapsed));
+        }
+        MenuStep::None
+    }
+
+    /// Accept a health reply only when it matches the outstanding probe and is fresh. A pong is
+    /// one-shot: unsolicited, wrong-sequence, duplicate, stale and time-inverted replies cannot
+    /// move the health deadline.
+    pub fn pong(&mut self, seq: u64, elapsed: Duration) -> MenuStep {
+        if self.phase != MenuPhase::Open {
+            return MenuStep::None;
+        }
+        let Some((expected, sent_at)) = self.outstanding_ping else {
+            return MenuStep::None;
+        };
+        if seq == expected
+            && elapsed >= sent_at
+            && elapsed.saturating_sub(sent_at) <= timeouts::PONG_MAX_AGE
+        {
+            self.outstanding_ping = None;
             self.last_pong_at = elapsed;
         }
         MenuStep::None
@@ -761,7 +787,7 @@ impl MenuSession {
             return MenuStep::None;
         }
         self.phase = MenuPhase::Closed { fallback: true };
-        MenuStep::Dismiss(menu::DismissReason::HoldReturn)
+        MenuStep::DismissAndReturn(menu::DismissReason::HoldReturn)
     }
 
     /// Advance the clock. Returns the first step the deadlines demand.
@@ -776,7 +802,7 @@ impl MenuSession {
                     > timeouts::MENU_SHOWN_TIMEOUT =>
             {
                 self.phase = MenuPhase::Closed { fallback: true };
-                MenuStep::Dismiss(menu::DismissReason::ShownTimeout)
+                MenuStep::DismissAndReturn(menu::DismissReason::ShownTimeout)
             }
             MenuPhase::Open
                 if elapsed.saturating_sub(self.last_pong_at) > timeouts::MENU_HEALTH_TIMEOUT =>

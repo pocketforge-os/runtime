@@ -81,8 +81,11 @@ and Menu before it serves any endpoint, and Menu with no provider is a direct re
 | `PONG_MAX_AGE` | 1 s | a `pong` echoing a `seq` older than this is ignored. |
 
 `MenuSession` in the crate is the deterministic model of the first five: feed it `ack`,
-`shown`, `pong`, `held` and `tick` with the elapsed time since the press and it returns the
-step the router must take. The router bead (`tsp-ihne1.7`) drives the real worker from it.
+`shown`, each emitted `ping{seq}`, each received `pong{seq}`, `held` and `tick` with the elapsed
+time since the press and it returns the step the router must take. A pong refreshes health only
+once, when its sequence matches the newest outstanding ping and its age is at most
+`PONG_MAX_AGE`. Fallback steps explicitly require the caller to run the one safe return path;
+the router bead (`tsp-ihne1.7`) drives the real worker from it.
 
 ## 3. Menu channel (`menu.sock`)
 

@@ -380,7 +380,8 @@ fn menu_session_honours_the_timeout_constants() {
         MenuStep::None,
         "no pong yet, inside the window"
     );
-    assert_eq!(good.pong(t_open + ms(400)), MenuStep::None);
+    assert_eq!(good.ping(7, t_open + ms(100)), MenuStep::None);
+    assert_eq!(good.pong(7, t_open + ms(400)), MenuStep::None);
     assert_eq!(
         good.tick(t_open + ms(400) + health),
         MenuStep::None,
@@ -410,7 +411,7 @@ fn menu_session_honours_the_timeout_constants() {
     assert_eq!(late_shown.tick(ms(100) + shown), MenuStep::None);
     assert_eq!(
         late_shown.tick(ms(100) + shown + ms(1)),
-        MenuStep::Dismiss(DismissReason::ShownTimeout)
+        MenuStep::DismissAndReturn(DismissReason::ShownTimeout)
     );
     assert_eq!(late_shown.shown(ms(100) + shown + ms(2)), MenuStep::None);
     assert_eq!(late_shown.phase(), MenuPhase::Closed { fallback: true });
@@ -425,7 +426,7 @@ fn menu_session_honours_the_timeout_constants() {
         MenuStep::Dismiss(DismissReason::Unhealthy)
     );
     assert_eq!(
-        quiet.pong(ms(2_000)),
+        quiet.pong(99, ms(2_000)),
         MenuStep::None,
         "a late pong cannot revive it"
     );
@@ -441,7 +442,7 @@ fn menu_session_honours_the_timeout_constants() {
     );
     assert_eq!(
         held.held(timeouts::MENU_HOLD_RETURN),
-        MenuStep::Dismiss(DismissReason::HoldReturn)
+        MenuStep::DismissAndReturn(DismissReason::HoldReturn)
     );
     assert_eq!(held.phase(), MenuPhase::Closed { fallback: true });
     assert_eq!(held.held(ms(5_000)), MenuStep::None, "already closed");
@@ -453,4 +454,95 @@ fn menu_session_honours_the_timeout_constants() {
     assert_eq!(timeouts::MENU_HEARTBEAT_INTERVAL * 2, health);
     assert_eq!(timeouts::MENU_HOLD_RETURN, ms(2_000));
     assert_eq!(timeouts::USER_PRESS_WINDOW, ms(1_000));
+}
+
+/// Heartbeats refresh health only for one fresh reply to an outstanding ping. Unsolicited,
+/// wrong-sequence, duplicate and stale replies are negative controls in the same invocation.
+#[test]
+fn menu_session_rejects_invalid_pongs() {
+    let ms = Duration::from_millis;
+
+    let opened = || {
+        let mut session = MenuSession::new();
+        assert_eq!(session.ack(ms(10)), MenuStep::None);
+        assert_eq!(session.shown(ms(20)), MenuStep::RoutePadToMenu);
+        session
+    };
+
+    // Positive control: a fresh reply with the matching sequence refreshes health.
+    let mut fresh = opened();
+    assert_eq!(fresh.ping(10, ms(100)), MenuStep::None);
+    assert_eq!(fresh.pong(10, ms(150)), MenuStep::None);
+    assert_eq!(fresh.tick(ms(1_150)), MenuStep::None);
+
+    // An unsolicited reply cannot move the health window.
+    let mut unsolicited = opened();
+    assert_eq!(unsolicited.pong(10, ms(900)), MenuStep::None);
+    assert_eq!(
+        unsolicited.tick(ms(1_021)),
+        MenuStep::Dismiss(DismissReason::Unhealthy)
+    );
+
+    // A wrong sequence cannot consume the outstanding ping or refresh health.
+    let mut wrong = opened();
+    assert_eq!(wrong.ping(10, ms(100)), MenuStep::None);
+    assert_eq!(wrong.pong(11, ms(900)), MenuStep::None);
+    assert_eq!(
+        wrong.tick(ms(1_021)),
+        MenuStep::Dismiss(DismissReason::Unhealthy)
+    );
+
+    // A matching reply is one-shot; replaying it cannot keep the provider healthy.
+    let mut duplicate = opened();
+    assert_eq!(duplicate.ping(10, ms(100)), MenuStep::None);
+    assert_eq!(duplicate.pong(10, ms(150)), MenuStep::None);
+    assert_eq!(duplicate.pong(10, ms(1_100)), MenuStep::None);
+    assert_eq!(
+        duplicate.tick(ms(1_151)),
+        MenuStep::Dismiss(DismissReason::Unhealthy)
+    );
+
+    // A matching echo older than PONG_MAX_AGE is ignored.
+    let mut stale = opened();
+    assert_eq!(stale.ping(10, ms(100)), MenuStep::None);
+    assert_eq!(stale.pong(10, ms(1_101)), MenuStep::None);
+    assert_eq!(
+        stale.tick(ms(1_101)),
+        MenuStep::Dismiss(DismissReason::Unhealthy)
+    );
+}
+
+/// Every fallback branch tells the caller to run safe_return, including a directly delivered
+/// late `shown` and holds in all three live phases.
+#[test]
+fn menu_session_fallback_steps_always_request_safe_return() {
+    let ms = Duration::from_millis;
+
+    let mut late_shown = MenuSession::new();
+    assert_eq!(late_shown.ack(ms(10)), MenuStep::None);
+    assert_eq!(
+        late_shown.shown(ms(10) + timeouts::MENU_SHOWN_TIMEOUT + ms(1)),
+        MenuStep::DismissAndReturn(DismissReason::ShownTimeout)
+    );
+
+    let mut awaiting_ack = MenuSession::new();
+    assert_eq!(
+        awaiting_ack.held(timeouts::MENU_HOLD_RETURN),
+        MenuStep::DismissAndReturn(DismissReason::HoldReturn)
+    );
+
+    let mut awaiting_shown = MenuSession::new();
+    assert_eq!(awaiting_shown.ack(ms(10)), MenuStep::None);
+    assert_eq!(
+        awaiting_shown.held(timeouts::MENU_HOLD_RETURN),
+        MenuStep::DismissAndReturn(DismissReason::HoldReturn)
+    );
+
+    let mut open = MenuSession::new();
+    assert_eq!(open.ack(ms(10)), MenuStep::None);
+    assert_eq!(open.shown(ms(20)), MenuStep::RoutePadToMenu);
+    assert_eq!(
+        open.held(timeouts::MENU_HOLD_RETURN),
+        MenuStep::DismissAndReturn(DismissReason::HoldReturn)
+    );
 }
