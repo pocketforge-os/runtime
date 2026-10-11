@@ -60,13 +60,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("--system-menu-sock requires --safe-return-sock".into());
     }
     let grab = !args.iter().any(|a| a == "--no-grab");
+    // --require-builtin (tsp-ihne1.8): the source must be the built-in controller by
+    // pf_input_decode::builtin (virtual path + decoder phys + decoder record), not just by name.
+    let builtin = require_builtin(&args).then(pf_input_decode::builtin::Trust::system);
 
     let descriptor = Descriptor::load(&desc_path)?;
     let source = match arg(&args, "--source") {
         Some(path) => std::path::PathBuf::from(path),
-        None => discover_with_timeout(&descriptor)?,
+        None => discover_with_timeout(&descriptor, builtin.as_ref())?,
     };
-    let mut broker = InputBroker::start_with(&source, &descriptor, grab)?;
+    let mut broker = InputBroker::start_checked(&source, &descriptor, grab, builtin.as_ref())?;
     let system_menu_router = safe_return_sock
         .as_deref()
         .map(SafeReturnIntake::spawn)
@@ -203,10 +206,17 @@ fn supervise(
     }
 }
 
-fn discover_with_timeout(descriptor: &Descriptor) -> std::io::Result<std::path::PathBuf> {
+fn require_builtin(args: &[String]) -> bool {
+    args.iter().any(|a| a == "--require-builtin")
+}
+
+fn discover_with_timeout(
+    descriptor: &Descriptor,
+    builtin: Option<&pf_input_decode::builtin::Trust>,
+) -> std::io::Result<std::path::PathBuf> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     loop {
-        match InputBroker::discover(descriptor) {
+        match InputBroker::discover_checked(descriptor, builtin) {
             Ok(path) => return Ok(path),
             Err(e)
                 if e.kind() == std::io::ErrorKind::NotFound
