@@ -14,4 +14,5 @@ default-fonts = []
 
 [dependencies]
 cosmic-text-tracking = { package = "cosmic-text", version = "0.15", default-features = false, features = ["std", "swash"] }
+memmap2 = "0.9"
 tiny-skia = "0.12"
