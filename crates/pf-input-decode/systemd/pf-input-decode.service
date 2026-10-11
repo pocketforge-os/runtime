@@ -23,6 +23,12 @@ ExecStart=/usr/bin/pf-input-decode --right /dev/ttyS3 --left /dev/ttyS4
 # service user is ever introduced it needs read on the ttys and rw on /dev/uinput.
 Restart=on-failure
 RestartSec=2
+# The built-in identity record (tsp-ihne1.8): pf-input-decode writes its device's inputN to
+# /run/pocketforge-input/builtin-pad, and pf_input_decode::builtin trusts it only in a root-owned
+# directory nobody else can write. systemd removes the directory when the decoder stops, so a
+# record never outlives its device. Not /run/pocketforge: that one belongs to the session user.
+RuntimeDirectory=pocketforge-input
+RuntimeDirectoryMode=0755
 # The virtual device is destroyed on process exit (fd close), so a restart is clean.
 KillSignal=SIGTERM
 TimeoutStopSec=5

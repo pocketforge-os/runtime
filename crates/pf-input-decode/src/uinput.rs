@@ -26,6 +26,9 @@ pub struct UinputSpec {
     pub vendor: u16,
     pub product: u16,
     pub version: u16,
+    /// The `phys` string set with `UI_SET_PHYS`, if any. The built-in pad's is
+    /// [`crate::builtin::PHYS`], one of the checks that identify it.
+    pub phys: Option<String>,
     /// Button codes to advertise.
     pub keys: Vec<u16>,
     /// Absolute axes to advertise, with calibration.
@@ -63,6 +66,7 @@ pub fn setup_bits(spec: &UinputSpec) -> Vec<SetBit> {
 /// A live uinput virtual device. `Drop` destroys it.
 pub struct Uinput {
     fd: OwnedFd,
+    sysname: Option<String>,
     node: Option<String>,
 }
 
@@ -82,7 +86,11 @@ impl Uinput {
         }
         // SAFETY: fresh owned fd from a successful open.
         let fd = unsafe { OwnedFd::from_raw_fd(raw) };
-        let dev = Uinput { fd, node: None };
+        let dev = Uinput {
+            fd,
+            sysname: None,
+            node: None,
+        };
         let f = dev.fd.as_raw_fd();
 
         for bit in setup_bits(spec) {
@@ -92,6 +100,14 @@ impl Uinput {
                 SetBit::Abs(c) => (ioc::UI_SET_ABSBIT, c),
             };
             dev.set_bit(req, code as libc::c_int)?;
+        }
+        if let Some(phys) = &spec.phys {
+            let phys = std::ffi::CString::new(phys.as_str())
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "phys has NUL"))?;
+            // SAFETY: UI_SET_PHYS takes a NUL-terminated string the kernel copies before returning.
+            if unsafe { libc::ioctl(f, ioc::UI_SET_PHYS, phys.as_ptr()) } < 0 {
+                return Err(io::Error::last_os_error());
+            }
         }
 
         // Legacy setup: write a uinput_user_dev, then UI_DEV_CREATE.
@@ -126,6 +142,7 @@ impl Uinput {
         }
 
         let mut dev = dev;
+        dev.sysname = dev.read_sysname();
         dev.node = dev.resolve_node();
         Ok(dev)
     }
@@ -138,9 +155,8 @@ impl Uinput {
         Ok(())
     }
 
-    /// Resolve the created device's `/dev/input/eventN` path via `UI_GET_SYSNAME` (`inputN`),
-    /// matching the sysfs `device` symlink — the same scheme as `uinput_synth.py::_resolve_node`.
-    fn resolve_node(&self) -> Option<String> {
+    /// The created device's `inputN` sysname, via `UI_GET_SYSNAME`.
+    fn read_sysname(&self) -> Option<String> {
         let mut buf = [0u8; 64];
         // SAFETY: buf is a valid writable buffer of the length passed in the ioctl.
         let n = unsafe {
@@ -159,6 +175,13 @@ impl Uinput {
         if sysname.is_empty() {
             return None;
         }
+        Some(sysname)
+    }
+
+    /// Resolve the created device's `/dev/input/eventN` path from its `inputN` sysname, matching
+    /// the sysfs `device` symlink — the same scheme as `uinput_synth.py::_resolve_node`.
+    fn resolve_node(&self) -> Option<String> {
+        let sysname = self.sysname.as_deref()?;
         // The eventN child appears just after UI_DEV_CREATE; poll briefly.
         for _ in 0..50 {
             if let Ok(rd) = std::fs::read_dir("/sys/class/input") {
@@ -183,6 +206,11 @@ impl Uinput {
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
         None
+    }
+
+    /// The device's `inputN` sysname (if `UI_GET_SYSNAME` answered).
+    pub fn sysname(&self) -> Option<&str> {
+        self.sysname.as_deref()
     }
 
     /// The `/dev/input/eventN` node of the device (if it could be resolved).
