@@ -1206,6 +1206,10 @@ mod readiness_tests {
 
     #[test]
     fn stalled_acquire_client_is_deadline_bounded() {
+        // The ceiling is the SUBJECT of the test, not a synchronisation window: a silent
+        // client must be cut off by the production ACQUIRE_CLIENT_TIMEOUT (250 ms), so a
+        // healthy run finishes at the deadline; only a regression to unbounded blocking can
+        // reach the 1 s assert bound.
         let (server, _silent_client) = UnixStream::pair().unwrap();
         let started = std::time::Instant::now();
         handle_acquire(server, "/unused").unwrap();
@@ -1419,13 +1423,21 @@ range = { min = 0, max = 255, fuzz = 0, flat = 0 }
         let stop = Arc::new(AtomicBool::new(false));
         let server_stop = stop.clone();
         let server = std::thread::spawn(move || {
+            // Bounded polling wait, not an assertion window: the thread exits on the stop
+            // flag, and a connection that never arrives fails the test through the bounded
+            // channel receives in the test body.
             while !server_stop.load(Ordering::Acquire) {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
                         stream.set_nonblocking(false).unwrap();
                         let body = pf_wire::read_frame(&mut stream).unwrap();
-                        pf_wire::write_frame(&mut stream, br#"{"result":"ok"}"#).unwrap();
+                        // Publish the frame BEFORE answering: the intake worker can observe
+                        // "ok" only after this send, so once the test has seen the outcome
+                        // line and both gates are idle, every completed round trip's frame
+                        // is already in the channel — the final drain is exhaustive with a
+                        // zero window.
                         frames_tx.send(body).unwrap();
+                        pf_wire::write_frame(&mut stream, br#"{"result":"ok"}"#).unwrap();
                     }
                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                         std::thread::sleep(Duration::from_millis(5))
@@ -1449,34 +1461,26 @@ range = { min = 0, max = 255, fuzz = 0, flat = 0 }
                     syn(),
                 ],
             );
-            let line = log.recv_timeout(Duration::from_secs(5)).unwrap();
+            // Event-driven receives with generous bounds: the "ok" line is emitted after the
+            // intake worker re-armed its gate, and the router barrier drains its command
+            // queue, so the flag asserts below are direct — no polling window.
+            let line = log.recv_timeout(Duration::from_secs(10)).unwrap();
             assert!(line.ends_with(": ok"), "press {press}: {line}");
             assert_eq!(
-                frames.recv_timeout(Duration::from_secs(1)).unwrap(),
+                frames.recv_timeout(Duration::from_secs(10)).unwrap(),
                 SAFE_RETURN_BODY
             );
-            let completed = Instant::now() + Duration::from_secs(1);
-            while p
-                .system_menu
-                .as_ref()
-                .unwrap()
-                .router()
-                .fallback_in_flight()
-                && Instant::now() < completed
-            {
-                std::thread::sleep(Duration::from_millis(2));
-            }
-            assert!(!p
-                .system_menu
-                .as_ref()
-                .unwrap()
-                .router()
-                .fallback_in_flight());
+            let router = p.system_menu.as_ref().unwrap().router();
+            router.sync().unwrap();
+            assert!(
+                !router.in_flight() && !router.fallback_in_flight(),
+                "press {press} left a request in flight"
+            );
         }
-        assert!(
-            frames.recv_timeout(Duration::from_millis(300)).is_err(),
-            "no frame beyond one per press"
-        );
+        // Zero-window negative control: idle gates mean no dispatch can still be in flight,
+        // and the fake authority publishes every frame before answering, so a duplicate frame
+        // from a regressed coalescing path would already sit in the channel.
+        assert!(frames.try_recv().is_err(), "no frame beyond one per press");
         stop.store(true, Ordering::Release);
         server.join().unwrap();
         let _ = std::fs::remove_file(sock);
@@ -1489,8 +1493,7 @@ range = { min = 0, max = 255, fuzz = 0, flat = 0 }
         let sock = scratch("stalled.sock");
         let _ = std::fs::remove_file(&sock);
         let listener = UnixListener::bind(&sock).unwrap();
-        listener.set_nonblocking(true).unwrap();
-        let (intake, _log) = intake(&sock);
+        let (intake, log) = intake(&sock);
         let mut p = pump(Some(intake));
         let mut events = Vec::new();
         for _ in 0..50 {
@@ -1499,43 +1502,61 @@ range = { min = 0, max = 255, fuzz = 0, flat = 0 }
         }
         let started = Instant::now();
         let out = run(&mut p, &events);
+        // Generous liveness bound, not a synchronisation window: the pump path performs no
+        // I/O, so a healthy run finishes in milliseconds; only a regression that blocks the
+        // pump on the authority (which would stall on the 5 s socket read) can reach 1 s.
         let elapsed = started.elapsed();
         assert!(elapsed < Duration::from_secs(1), "pump took {elapsed:?}");
         let south: Vec<_> = out.iter().filter(|e| e.1 == SOUTH).collect();
         assert_eq!(south.len(), 100, "every non-guide event still flows");
         assert!(!out.iter().any(|&(_, code, _)| code == GUIDE_CODE));
-        let fallback_deadline = Instant::now() + Duration::from_secs(1);
-        while !p
-            .system_menu
-            .as_ref()
-            .unwrap()
-            .router()
-            .fallback_in_flight()
-            && Instant::now() < fallback_deadline
-        {
-            std::thread::sleep(Duration::from_millis(2));
-        }
+
+        let router = p.system_menu.as_ref().unwrap().router().clone();
+        // FIFO barrier: once sync() returns, all 50 presses have been coalesced or processed.
+        // Exactly one of them dispatched a SafeReturn request, which is stalled on the socket
+        // read (the authority never answers; the production IO_TIMEOUT of 5 s has not
+        // elapsed), so the fallback gate must still be armed — a direct assert, no polling
+        // window.
+        router.sync().unwrap();
         assert!(
-            p.system_menu
-                .as_ref()
-                .unwrap()
-                .router()
-                .fallback_in_flight(),
+            router.fallback_in_flight(),
             "the first press is still waiting on fallback return"
         );
-        // 50 presses while that request is in flight coalesce into exactly one connection.
-        let deadline = Instant::now() + Duration::from_secs(1);
-        let first = loop {
-            match listener.accept() {
-                Ok(conn) => break conn,
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock && Instant::now() < deadline => {
-                    std::thread::sleep(Duration::from_millis(5))
-                }
-                Err(e) => panic!("no SafeReturn connection: {e}"),
-            }
-        };
+
+        // The dispatched request surfaces as exactly one connection in the listener's
+        // backlog. Accept it on a blocking helper thread bounded by a channel timeout
+        // instead of racing a non-blocking accept against a sleep.
+        let blocking = listener.try_clone().unwrap();
+        let (conn_tx, conn_rx) = channel();
+        std::thread::spawn(move || {
+            let _ = conn_tx.send(blocking.accept());
+        });
+        let (first, _) = conn_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("no SafeReturn connection within 10 s")
+            .expect("accept failed");
         drop(first);
-        std::thread::sleep(Duration::from_millis(50));
+        // Dropping the connection ends the worker's stalled round trip with an error. The
+        // intake worker re-arms its gate BEFORE emitting the outcome line, so receiving that
+        // line proves the request completed and nothing can still be pending: the router
+        // barrier above drained its command queue, and its busy gate coalesced all 50
+        // presses into the single dispatch.
+        let line = log
+            .recv_timeout(Duration::from_secs(10))
+            .expect("no safe_return outcome line within 10 s");
+        assert!(
+            line.contains("safe_return") && line.contains("failed"),
+            "{line}"
+        );
+        assert!(
+            !router.in_flight() && !router.fallback_in_flight(),
+            "the completed round trip must re-arm both gates"
+        );
+        // Zero-window negative control: with the command queue drained and both gates
+        // re-armed, no further dispatch can exist, so a second connection could only come
+        // from a regression that re-dispatched a coalesced press — which would have opened
+        // it before the outcome line above was ever logged.
+        listener.set_nonblocking(true).unwrap();
         assert_eq!(
             listener.accept().unwrap_err().kind(),
             io::ErrorKind::WouldBlock,
@@ -1551,20 +1572,21 @@ range = { min = 0, max = 255, fuzz = 0, flat = 0 }
         let (intake, log) = intake(&sock);
         let mut p = pump(Some(intake));
         let out = run(&mut p, &guide_press_release());
-        let line = log.recv_timeout(Duration::from_secs(2)).unwrap();
+        // The absent socket fails the round trip immediately (NotFound), and the intake worker
+        // re-arms its gate BEFORE emitting the outcome line, so receiving the line is the
+        // completion event itself — a generous bound that only a regression can reach, not a
+        // timing window.
+        let line = log.recv_timeout(Duration::from_secs(10)).unwrap();
         assert!(
             line.contains("safe_return") && line.contains("failed") && line.contains("NotFound"),
             "{line}"
         );
         assert!(!out.iter().any(|&(_, code, _)| code == GUIDE_CODE));
-        let deadline = Instant::now() + Duration::from_secs(1);
-        while {
-            let router = p.system_menu.as_ref().unwrap().router();
-            (router.in_flight() || router.fallback_in_flight()) && Instant::now() < deadline
-        } {
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        let router = p.system_menu.as_ref().unwrap().router();
+        // The router barrier proves the Press command was fully processed (its busy gate
+        // re-armed), so the flag asserts are direct and the next press cannot be silently
+        // coalesced into a completed request.
+        let router = p.system_menu.as_ref().unwrap().router().clone();
+        router.sync().unwrap();
         assert!(
             !router.in_flight() && !router.fallback_in_flight(),
             "first failed return did not become idle"
@@ -1575,7 +1597,7 @@ range = { min = 0, max = 255, fuzz = 0, flat = 0 }
             vec![(ioc::EV_KEY, SOUTH, 1), (ioc::EV_SYN, ioc::SYN_REPORT, 0)]
         );
         run(&mut p, &guide_press_release());
-        let again = log.recv_timeout(Duration::from_secs(2)).unwrap();
+        let again = log.recv_timeout(Duration::from_secs(10)).unwrap();
         assert!(again.contains("failed"), "the next press retries: {again}");
     }
 
@@ -1602,8 +1624,11 @@ range = { min = 0, max = 255, fuzz = 0, flat = 0 }
             vec![(ioc::EV_KEY, SOUTH, 1), (ioc::EV_SYN, ioc::SYN_REPORT, 0)]
         );
         assert!(!p.pressed.contains(&GUIDE_CODE));
+        // Event-driven completion: the press edge's fallback attempt fails immediately on
+        // the absent socket and the outcome line arrives through the channel; the bound is
+        // generous and only a regression can reach it.
         assert!(
-            log.recv_timeout(Duration::from_secs(2)).is_ok(),
+            log.recv_timeout(Duration::from_secs(10)).is_ok(),
             "press edge requested"
         );
     }
@@ -1727,6 +1752,10 @@ range = { min = 0, max = 255, fuzz = 0, flat = 0 }
 
     #[test]
     fn client_stalled_mid_frame_is_deadline_bounded() {
+        // The ceiling is the SUBJECT of the test, not a synchronisation window: serve_client
+        // must cut a mid-frame stall at the acquisition I/O deadline (250 ms), so a healthy
+        // run finishes at the deadline; only a regression to unbounded blocking can reach
+        // the 1 s assert bound.
         let node = node_file("stalled-frame.node");
         let (mut client, server) = serve_pair(&node);
         client.write_all(&[0, 0]).unwrap(); // half a length prefix, then silence
