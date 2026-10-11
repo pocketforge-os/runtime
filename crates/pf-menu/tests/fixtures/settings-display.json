@@ -1,0 +1,44 @@
+{
+  "format": "pocketforge.menu/1",
+  "id": "settings-display",
+  "root": "display",
+  "pages": [
+    {
+      "id": "display",
+      "title": { "text": "Display" },
+      "sections": [
+        {
+          "header": { "text": "Appearance" },
+          "items": [
+            {
+              "id": "appearance",
+              "kind": "choice",
+              "label": { "text": "Appearance" },
+              "bind": { "pref": "appearance" },
+              "options": [
+                { "value": "light", "label": { "text": "Light" } },
+                { "value": "dark", "label": { "text": "Dark" } }
+              ]
+            },
+            {
+              "id": "brightness",
+              "kind": "slider",
+              "label": { "text": "Brightness" },
+              "visible": { "when": "has_backlight_apply" },
+              "bind": { "pref": "brightness" },
+              "min": 0,
+              "max": 100,
+              "step": 5
+            },
+            {
+              "id": "high-contrast",
+              "kind": "toggle",
+              "label": { "text": "High contrast" },
+              "bind": { "pref": "highContrast" }
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

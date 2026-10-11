@@ -26,6 +26,10 @@ pf-wire = { workspace = true }
 libc = { workspace = true }
 # Reads the session authority's JSON reply to the SafeReturn frame (--safe-return-sock).
 serde_json = { workspace = true }
+# The built-in controller identity (enforced by default, tsp-ihne1.8/.52):
+# pf_input_decode::builtin is the one place that decides which device is the built-in pad.
+# libc-only, static-musl clean.
+pf-input-decode = { path = "../pf-input-decode", version = "0.0.1" }
 
 [dev-dependencies]
 # Hermetic proof that the broker's SafeReturn frame drives the REAL authority RPC path
@@ -38,6 +42,6 @@ pf-prefs = { workspace = true }
 pf-prefsd = { workspace = true }
 # The decoder↔descriptor capability contract (tests/decoder_descriptor_contract.rs, tsp-f3fm.217):
 # the broker's own capability check is run against pf-input-decode's REAL uinput setup bits, and
-# the sha256 of the real a133 descriptor it scored is printed. Test-only; the daemon links neither.
-pf-input-decode = { path = "../pf-input-decode", version = "0.0.1" }
+# the sha256 of the real a133 descriptor it scored is printed (pf-input-decode is also a normal
+# dependency above). sha2 is test-only.
 sha2 = "0.10"

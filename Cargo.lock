@@ -477,6 +477,7 @@ name = "pf-input-decode"
 version = "0.0.1"
 dependencies = [
  "libc",
+ "tempfile",
 ]
 
 [[package]]
@@ -484,6 +485,17 @@ name = "pf-input-map"
 version = "0.0.1"
 dependencies = [
  "pf-ports",
+ "pf-scene",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "pf-menu"
+version = "0.0.1"
+dependencies = [
+ "pf-ports",
+ "pf-prefs",
  "pf-scene",
  "serde",
  "serde_json",
@@ -595,6 +607,7 @@ name = "pf-text-raster"
 version = "0.0.1"
 dependencies = [
  "cosmic-text",
+ "memmap2",
  "tiny-skia",
 ]
 

@@ -67,11 +67,14 @@ SRC="$(cat "$WORK/src.node" 2>/dev/null || true)"
 echo "   source = $SRC"
 
 echo "== start the broker (grab $SRC, re-emit, serve Acquire(input)) =="
-"$BROKER" --source "$SRC" --descriptor "$FIXTURE" --acquire-sock "$WORK/in.sock" \
+"$BROKER" --allow-unidentified-pad --source "$SRC" --descriptor "$FIXTURE" \
+  --acquire-sock "$WORK/in.sock" \
   >"$WORK/broker.out" 2>"$WORK/broker.err" &
 BROKER_PID=$!
 for _ in $(seq 1 100); do grep -q '^ready' "$WORK/broker.out" 2>/dev/null && break; sleep 0.05; done
 grep -q '^ready' "$WORK/broker.out" || { echo "FAIL: broker not ready"; cat "$WORK/broker.err"; exit 1; }
+grep -q -- '--allow-unidentified-pad disables built-in controller identity checks' \
+  "$WORK/broker.err" || { echo "FAIL: missing unidentified-pad warning"; cat "$WORK/broker.err"; exit 1; }
 REEMIT="$(sed -n 's/^node=//p' "$WORK/broker.out" | head -1)"
 echo "   re-emit = $REEMIT"
 
