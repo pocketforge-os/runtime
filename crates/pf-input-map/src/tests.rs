@@ -1070,3 +1070,170 @@ fn system_store_reads_the_system_path_first_and_migrates_the_legacy_shell_docume
     ));
     let _ = fs::remove_dir_all(dir);
 }
+
+// --- review round 1 (runtime#119): version-gated vocabulary + persisted fail-closed ---
+
+#[test]
+fn v2_contracts_reject_every_v3_only_construct() {
+    // Positive control: the frozen v2 document parses.
+    assert_eq!(contract(A133).schema_version, 2);
+
+    // A v3-only position is unknown at v2.
+    let dpad = mutated(A133, |document| {
+        document["physical_controls"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "position": "dpad_up",
+                "fallback_glyph": {"source": "pocketforge", "id": "pf-dpad-up"}
+            }));
+    });
+    assert!(matches!(
+        DeviceContract::parse_json(&dpad),
+        Err(MapError::InvalidContract(_))
+    ));
+
+    // A v3-only context/action row is rejected at v2.
+    let osk_row = mutated(A133, |document| {
+        document["effective_map"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "context": "osk",
+                "action": "Type",
+                "binding": {"shape": "single_press", "controls": ["east"]}
+            }));
+    });
+    assert!(matches!(
+        DeviceContract::parse_json(&osk_row),
+        Err(MapError::InvalidContract(_))
+    ));
+
+    // v3-only binding shapes are rejected at v2, before any absent-control reasoning.
+    let on_screen_doc = mutated(A133, |document| {
+        mapping_mut(document, "shell", "Activate")["binding"] =
+            serde_json::json!({"shape": "on_screen"});
+    });
+    assert!(matches!(
+        DeviceContract::parse_json(&on_screen_doc),
+        Err(MapError::InvalidBinding(_))
+    ));
+    let stick = mutated(A133, |document| {
+        mapping_mut(document, "shell", "Activate")["binding"] = serde_json::json!({
+            "shape": "stick_axis",
+            "controls": ["lstick"],
+            "axis": "horizontal"
+        });
+    });
+    assert!(matches!(
+        DeviceContract::parse_json(&stick),
+        Err(MapError::InvalidBinding(_))
+    ));
+
+    // The same gate applies to interactive remap candidates on a v2 map ...
+    let mut engine = RemapEngine::new(map(A133), MemoryStore::default());
+    assert!(matches!(
+        engine.begin("shell", "Activate", on_screen()),
+        Err(MapError::InvalidBinding(_))
+    ));
+    // ... while the v3 map accepts the identical candidate shape (positive control:
+    // required_physical_keyboard_actions_refuse_on_screen_candidates passes Shift).
+    assert_eq!(map(A133_V3).contract_version(), 3);
+}
+
+#[test]
+fn persisted_policy_violations_discard_the_whole_document() {
+    let shipped = contract(A133_V3).effective_map.clone();
+    let case = |name: &str, mutate: &dyn Fn(&mut Vec<Mapping>)| {
+        let mut persisted = shipped.clone();
+        mutate(&mut persisted);
+        let mut store = MemoryStore::default();
+        store.save("a133", &persisted).unwrap();
+        // The violation must never abort startup (fail-open) nor become effective:
+        // the whole document is discarded and re-resolved to shipped, with honest events.
+        let mut effective = EffectiveMap::load(contract(A133_V3), &store)
+            .unwrap_or_else(|error| panic!("{name}: load must not fail, got {error:?}"));
+        assert_eq!(effective.mappings(), shipped.as_slice(), "{name}");
+        assert!(
+            matches!(
+                effective.next_event(),
+                Some(MapEvent::BindingReResolved { .. })
+            ),
+            "{name}: discard must be reported"
+        );
+    };
+
+    case("p2-on-screen", &|persisted| {
+        persisted
+            .iter_mut()
+            .find(|m| m.context == "osk" && m.action == "Type")
+            .unwrap()
+            .binding = on_screen();
+    });
+    case("on-screen-outside-keyboard", &|persisted| {
+        persisted
+            .iter_mut()
+            .find(|m| m.context == "shell" && m.action == "Quick")
+            .unwrap()
+            .binding = on_screen();
+    });
+    case("menu-reserved-control", &|persisted| {
+        persisted
+            .iter_mut()
+            .find(|m| m.context == "osk" && m.action == "Commit")
+            .unwrap()
+            .binding = Binding::single("guide");
+    });
+    case("ruled-menu-binding", &|persisted| {
+        persisted
+            .iter_mut()
+            .find(|m| m.context == "shell" && m.action == "Quick")
+            .unwrap()
+            .binding = double_press(&["guide"], 500);
+    });
+    case("duplicate-pair", &|persisted| {
+        let mut duplicate = persisted
+            .iter()
+            .find(|m| m.context == "shell" && m.action == "Quick")
+            .unwrap()
+            .clone();
+        duplicate.binding = Binding::single("west");
+        persisted.push(duplicate);
+    });
+    case("malformed-binding", &|persisted| {
+        persisted
+            .iter_mut()
+            .find(|m| m.context == "osk" && m.action == "Symbols")
+            .unwrap()
+            .binding = Binding {
+            shape: BindingShape::Hold,
+            controls: vec!["r2".into()],
+            max_interval_ms: None,
+            min_duration_ms: None,
+            axis: None,
+            direction: None,
+        };
+    });
+
+    // Positive control: legal persisted remaps survive the same load path.
+    let mut persisted = shipped.clone();
+    persisted
+        .iter_mut()
+        .find(|m| m.context == "shell" && m.action == "Quick")
+        .unwrap()
+        .binding = Binding::single("l1");
+    persisted
+        .iter_mut()
+        .find(|m| m.context == "osk" && m.action == "Shift")
+        .unwrap()
+        .binding = on_screen();
+    let mut store = MemoryStore::default();
+    store.save("a133", &persisted).unwrap();
+    let mut effective = EffectiveMap::load(contract(A133_V3), &store).unwrap();
+    assert_eq!(
+        effective.binding("shell", "Quick"),
+        Some(&Binding::single("l1"))
+    );
+    assert_eq!(effective.binding("osk", "Shift"), Some(&on_screen()));
+    assert_eq!(effective.next_event(), None);
+}

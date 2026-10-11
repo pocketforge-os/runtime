@@ -13,6 +13,10 @@ The crate accepts contract schema versions 2 and 3.
 - v3 adds `device_class` (`two_stick`, `no_stick`, `minimal`), the keyboard and pointer
   contexts, the stick/D-pad positions (`l3`, `r3`, `dpad_*`, `lstick`, `rstick`) and the
   `stick_axis`, `stick_direction` and `on_screen` binding shapes.
+- v2 contracts reject every v3-only construct: the new positions, the keyboard/pointer
+  contexts and actions and the `stick_axis`, `stick_direction` and `on_screen` shapes are
+  unknown vocabulary at version 2, and the remap engine refuses to begin such a candidate
+  against a v2 map.
 - The device-class defaults table (`shell-input-contract/fixtures/device-class-defaults.json`
   in the platform repo) is the shipped per-class binding table and the source the
   Settings "Reset to default" action restores.

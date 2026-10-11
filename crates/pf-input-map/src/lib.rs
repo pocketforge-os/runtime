@@ -108,6 +108,26 @@ const POSITIONS: [&str; 20] = [
     "rstick",
 ];
 const STICK_POSITIONS: [&str; 2] = ["lstick", "rstick"];
+/// The frozen v2 vocabulary. A v2 contract must reject every v3-only construct: a document
+/// is interpreted with exactly the semantics its version negotiated.
+const V2_POSITIONS: [&str; 12] = [
+    "east", "south", "west", "north", "start", "select", "guide", "home", "l1", "r1", "l2", "r2",
+];
+const V2_CONTEXTS: [&str; 3] = ["shell", "search", "global"];
+const V2_ACTIONS: [&str; 12] = [
+    "Activate",
+    "Back",
+    "Move.up",
+    "Move.down",
+    "Move.left",
+    "Move.right",
+    "Quick",
+    "Search.open",
+    "Search.submit",
+    "Search.cancel",
+    "SystemMenu",
+    "Start",
+];
 const DEVICE_CLASSES: [&str; 3] = ["two_stick", "no_stick", "minimal"];
 /// Every context the contract knows (X15). `osk.num` inherits from `osk` and never maps.
 const CONTEXTS: [&str; 7] = [
@@ -598,11 +618,13 @@ impl DeviceContract {
                 "physical control positions must be unique and non-empty".into(),
             ));
         }
+        let v3 = self.schema_version == 3;
         for control in &self.physical_controls {
-            if !POSITIONS.contains(&control.position.as_str()) {
+            let known: &[&str] = if v3 { &POSITIONS } else { &V2_POSITIONS };
+            if !known.contains(&control.position.as_str()) {
                 return Err(MapError::InvalidContract(format!(
-                    "unknown physical position {}",
-                    control.position
+                    "unknown physical position {} at schema version {}",
+                    control.position, self.schema_version
                 )));
             }
             if control.fallback_glyph.source != "pocketforge"
@@ -613,65 +635,12 @@ impl DeviceContract {
                 ));
             }
         }
-        let menu_controls = system_menu_controls(&self.effective_map);
-        let mut seen_pairs = BTreeSet::new();
-        for mapping in &self.effective_map {
-            if !seen_pairs.insert((mapping.context.as_str(), mapping.action.as_str())) {
-                return Err(MapError::InvalidContract(format!(
-                    "duplicate mapping for {}/{}",
-                    mapping.context, mapping.action
-                )));
-            }
-            if !ACTIONS.contains(&mapping.action.as_str())
-                || !allowed_contexts(&mapping.action)
-                    .is_some_and(|contexts| contexts.contains(&mapping.context.as_str()))
-            {
-                return Err(MapError::InvalidContract(format!(
-                    "unknown semantic action {} in context {}",
-                    mapping.action, mapping.context
-                )));
-            }
-            mapping.binding.validate()?;
-            if mapping
-                .binding
-                .controls
-                .iter()
-                .any(|c| !controls.contains(c.as_str()))
-            {
-                return Err(MapError::AbsentControl {
-                    action: mapping.action.clone(),
-                });
-            }
-            let is_menu = mapping.action == "SystemMenu";
-            if is_menu && mapping.context != "global" {
-                return Err(MapError::InvalidContract(
-                    "SystemMenu must use the global context".into(),
-                ));
-            }
-            if !is_menu {
-                if mapping.binding.is_ruled_system_menu() {
-                    return Err(MapError::MenuReserved(mapping.binding.id()));
-                }
-                if menu_controls
-                    .iter()
-                    .any(|reserved| mapping.binding.controls.iter().any(|c| c == reserved))
-                {
-                    return Err(MapError::MenuReserved(mapping.binding.id()));
-                }
-            }
-            if mapping.binding.shape == BindingShape::OnScreen {
-                if !KEYBOARD_CONTEXTS.contains(&mapping.context.as_str()) {
-                    return Err(MapError::InvalidBinding(
-                        "on_screen is only valid in the keyboard contexts".into(),
-                    ));
-                }
-                if REQUIRED_PHYSICAL_KEYBOARD
-                    .contains(&(mapping.context.as_str(), mapping.action.as_str()))
-                {
-                    return Err(MapError::RequiredPhysicalBinding(mapping.action.clone()));
-                }
-            }
-        }
+        validate_map_policies(
+            &self.effective_map,
+            &controls,
+            &system_menu_controls(&self.effective_map),
+            v3,
+        )?;
         validate_candidate(&self.effective_map, &controls)
     }
 
@@ -910,6 +879,7 @@ pub enum MapEvent {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EffectiveMap {
     device_id: String,
+    version: u32,
     controls: BTreeMap<String, PhysicalControl>,
     shipped: Vec<Mapping>,
     mappings: Vec<Mapping>,
@@ -941,7 +911,9 @@ impl EffectiveMap {
     ) -> Result<Self, MapError> {
         contract.validate()?;
         let controls = contract.controls();
+        let v3 = contract.schema_version == 3;
         let shipped = contract.effective_map.clone();
+        let menu_controls = system_menu_controls(&shipped);
         let mut events = VecDeque::new();
         let stored_device = persisted
             .as_ref()
@@ -1011,34 +983,44 @@ impl EffectiveMap {
                         mappings.push(shipped_mapping.clone());
                     }
                 }
-                for mapping in &mut mappings {
-                    mapping.binding.validate()?;
-                    if mapping
-                        .binding
-                        .controls
-                        .iter()
-                        .any(|c| !controls.contains(c.as_str()))
-                    {
-                        let fallback = shipped
+                // Every persisted row must satisfy the same policies a shipped contract
+                // and an interactive remap satisfy. ANY violation — a malformed binding,
+                // a duplicate pair, an on-screen/P2/Menu breach or a complete-map
+                // invariant failure — discards the whole document and re-resolves to the
+                // shipped map, so a corrupt remap can neither become effective nor strand
+                // input at boot.
+                let prepared = (|| -> Result<(), MapError> {
+                    for mapping in &mut mappings {
+                        mapping.binding.validate()?;
+                        if mapping
+                            .binding
+                            .controls
                             .iter()
-                            .find(|m| m.context == mapping.context && m.action == mapping.action)
-                            .ok_or_else(|| MapError::AbsentControl {
+                            .any(|c| !controls.contains(c.as_str()))
+                        {
+                            let fallback = shipped
+                                .iter()
+                                .find(|m| {
+                                    m.context == mapping.context && m.action == mapping.action
+                                })
+                                .ok_or_else(|| MapError::AbsentControl {
+                                    action: mapping.action.clone(),
+                                })?;
+                            let old =
+                                std::mem::replace(&mut mapping.binding, fallback.binding.clone());
+                            events.push_back(MapEvent::BindingReResolved {
                                 action: mapping.action.clone(),
-                            })?;
-                        let old = std::mem::replace(&mut mapping.binding, fallback.binding.clone());
-                        events.push_back(MapEvent::BindingReResolved {
-                            action: mapping.action.clone(),
-                            stored_device_id: stored_device.into(),
-                            current_device_id: contract.device_id.clone(),
-                            old_binding: old,
-                            effective_binding: fallback.binding.clone(),
-                        });
+                                stored_device_id: stored_device.into(),
+                                current_device_id: contract.device_id.clone(),
+                                old_binding: old,
+                                effective_binding: fallback.binding.clone(),
+                            });
+                        }
                     }
-                }
-                if validate_candidate(&mappings, &controls).is_err() {
-                    // The persisted document violates the complete-map invariants; discard it
-                    // and re-resolve every changed binding to the shipped map so a corrupt
-                    // remap cannot strand input at boot.
+                    validate_map_policies(&mappings, &controls, &menu_controls, v3)?;
+                    validate_candidate(&mappings, &controls)
+                })();
+                if prepared.is_err() {
                     emit_re_resolved(
                         &mappings,
                         &shipped,
@@ -1051,6 +1033,7 @@ impl EffectiveMap {
             }
         }
         Ok(Self {
+            version: contract.schema_version,
             device_id: contract.device_id,
             controls: contract
                 .physical_controls
@@ -1065,6 +1048,11 @@ impl EffectiveMap {
 
     pub fn device_id(&self) -> &str {
         &self.device_id
+    }
+    /// The contract schema version this map was loaded from; v3-only binding shapes are
+    /// refused as remap candidates on a v2 map.
+    pub fn contract_version(&self) -> u32 {
+        self.version
     }
     pub fn mappings(&self) -> &[Mapping] {
         &self.mappings
@@ -1147,6 +1135,17 @@ impl<S: RemapStore> RemapEngine<S> {
             return Err(MapError::ProtectedActionImmutable(action.into()));
         }
         candidate.validate()?;
+        if self.map.version < 3
+            && matches!(
+                candidate.shape,
+                BindingShape::StickAxis | BindingShape::StickDirection | BindingShape::OnScreen
+            )
+        {
+            return Err(MapError::InvalidBinding(format!(
+                "binding {} requires contract schema version 3",
+                candidate.id()
+            )));
+        }
         if candidate.shape == BindingShape::OnScreen {
             if !KEYBOARD_CONTEXTS.contains(&context) {
                 return Err(MapError::InvalidBinding(
@@ -1295,6 +1294,95 @@ fn validate_remap_collision(mappings: &[Mapping], preview: &RemapPreview) -> Res
                 first: preview.action.clone(),
                 second: existing.action.clone(),
             });
+        }
+    }
+    Ok(())
+}
+
+/// The per-mapping policy every effective map must satisfy, shared by contract validation
+/// and the persisted-document path so a stored remap can never smuggle in what an
+/// interactive remap or a shipped contract would refuse: uniqueness, the version-gated
+/// vocabularies, binding shape rules, absent controls, the Menu reservation and the
+/// on-screen placement/P2 rules.
+fn validate_map_policies(
+    mappings: &[Mapping],
+    controls: &BTreeSet<&str>,
+    menu_controls: &[&str],
+    v3: bool,
+) -> Result<(), MapError> {
+    let mut seen_pairs = BTreeSet::new();
+    for mapping in mappings {
+        if !seen_pairs.insert((mapping.context.as_str(), mapping.action.as_str())) {
+            return Err(MapError::InvalidContract(format!(
+                "duplicate mapping for {}/{}",
+                mapping.context, mapping.action
+            )));
+        }
+        if !v3
+            && (!V2_CONTEXTS.contains(&mapping.context.as_str())
+                || !V2_ACTIONS.contains(&mapping.action.as_str()))
+        {
+            return Err(MapError::InvalidContract(format!(
+                "context {} or action {} requires contract schema version 3",
+                mapping.context, mapping.action
+            )));
+        }
+        if !ACTIONS.contains(&mapping.action.as_str())
+            || !allowed_contexts(&mapping.action)
+                .is_some_and(|contexts| contexts.contains(&mapping.context.as_str()))
+        {
+            return Err(MapError::InvalidContract(format!(
+                "unknown semantic action {} in context {}",
+                mapping.action, mapping.context
+            )));
+        }
+        mapping.binding.validate()?;
+        if !v3
+            && matches!(
+                mapping.binding.shape,
+                BindingShape::StickAxis | BindingShape::StickDirection | BindingShape::OnScreen
+            )
+        {
+            return Err(MapError::InvalidBinding(format!(
+                "binding {} requires contract schema version 3",
+                mapping.binding.id()
+            )));
+        }
+        if mapping
+            .binding
+            .controls
+            .iter()
+            .any(|c| !controls.contains(c.as_str()))
+        {
+            return Err(MapError::AbsentControl {
+                action: mapping.action.clone(),
+            });
+        }
+        let is_menu = mapping.action == "SystemMenu";
+        if is_menu && mapping.context != "global" {
+            return Err(MapError::InvalidContract(
+                "SystemMenu must use the global context".into(),
+            ));
+        }
+        if !is_menu
+            && (mapping.binding.is_ruled_system_menu()
+                || menu_controls
+                    .iter()
+                    .any(|reserved| mapping.binding.controls.iter().any(|c| c == reserved)))
+        {
+            return Err(MapError::MenuReserved(mapping.binding.id()));
+        }
+        if mapping.binding.shape == BindingShape::OnScreen {
+            if !KEYBOARD_CONTEXTS.contains(&mapping.context.as_str()) {
+                return Err(MapError::InvalidBinding(
+                    "on_screen is only valid in the keyboard contexts".into(),
+                ));
+            }
+            if REQUIRED_PHYSICAL_KEYBOARD
+                .contains(&(mapping.context.as_str(), mapping.action.as_str()))
+            {
+                return Err(MapError::RequiredPhysicalBinding(mapping.action.clone()));
+            }
         }
     }
     Ok(())
