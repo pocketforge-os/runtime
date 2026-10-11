@@ -165,8 +165,7 @@ fn input_action_map_is_pure_descriptor_data() {
     let m133 = a133.acquire::<Input>().unwrap();
     let m523 = a523.acquire::<Input>().unwrap();
 
-    // accept_default = "east" on both: confirm follows the printed A button and cancel is its
-    // opposite positional face button. Exercise both descriptors through the same code path.
+    // X18: accept_default = "east" on both; exercise both descriptors through the same path.
     for input in [&m133, &m523] {
         assert_eq!(input.map().resolve("confirm"), Some("east"));
         assert_eq!(input.map().resolve("cancel"), Some("south"));

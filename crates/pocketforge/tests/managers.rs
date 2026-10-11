@@ -192,6 +192,7 @@ fn input_manager_is_pure_descriptor_data() {
     let m133 = a133.input_manager();
     let m523 = a523.input_manager();
 
+    // X18: both descriptors ship accept_default = "east" (printed A on Nintendo chassis).
     for manager in [&m133, &m523] {
         assert_eq!(manager.resolve("confirm"), Some("east"));
         assert_eq!(manager.resolve("cancel"), Some("south"));
