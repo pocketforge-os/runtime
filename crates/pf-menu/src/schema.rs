@@ -231,12 +231,9 @@ fn check_item(item: &Item) -> Result<(), MenuError> {
                 return Err(item_err(item, "option values must be unique"));
             }
         }
-        ItemKind::Stepper {
-            min, max, step, ..
+        ItemKind::Stepper { min, max, step, .. } | ItemKind::Slider { min, max, step, .. } => {
+            check_range(item, *min, *max, *step)?
         }
-        | ItemKind::Slider {
-            min, max, step, ..
-        } => check_range(item, *min, *max, *step)?,
         ItemKind::Text { max_chars, .. } if *max_chars == 0 => {
             return Err(item_err(item, "max_chars must be positive"))
         }
@@ -296,7 +293,10 @@ fn check_bind(item: &Item, schemas: &dyn BindSchemas) -> Result<(), MenuError> {
                     _ => {
                         return Err(mismatch(
                             item,
-                            format!("option {:?} is not an integer in {min}..={max}", option.value),
+                            format!(
+                                "option {:?} is not an integer in {min}..={max}",
+                                option.value
+                            ),
                         ))
                     }
                 }
@@ -356,7 +356,10 @@ impl Item {
             bind: Bind::Pref(key.clone()),
         })?;
         if !self.accepts(value) {
-            return Err(item_err(self, format!("{value:?} is not a value of this item")));
+            return Err(item_err(
+                self,
+                format!("{value:?} is not a value of this item"),
+            ));
         }
         let candidate = match (value, spec.kind) {
             (MenuValue::Bool(b), _) => PrefValue::Bool(b),

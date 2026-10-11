@@ -1,0 +1,33 @@
+{
+  "format": "pocketforge.menu/1",
+  "id": "system-menu",
+  "root": "system",
+  "pages": [
+    {
+      "id": "system",
+      "title": { "id": "system-menu-title" },
+      "primary": "resume",
+      "sections": [
+        {
+          "items": [
+            { "id": "resume", "kind": "action", "label": { "text": "Resume" }, "stay_open": true },
+            { "id": "keyboard", "kind": "action", "label": { "text": "Keyboard" }, "stay_open": true },
+            { "id": "pointer", "kind": "toggle", "label": { "text": "Pointer" }, "bind": { "host": "pointer" } },
+            { "id": "capture", "kind": "link", "label": { "text": "Capture" }, "page": "capture" }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "capture",
+      "title": { "text": "Capture" },
+      "sections": [
+        {
+          "items": [
+            { "id": "screenshot", "kind": "action", "label": { "text": "Screenshot" }, "stay_open": true }
+          ]
+        }
+      ]
+    }
+  ]
+}

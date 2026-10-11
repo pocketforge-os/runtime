@@ -726,9 +726,7 @@ impl MenuEngine {
             }
         }
         if after.1 != before.1 {
-            self.emit(MenuEffect::FocusChanged {
-                item: self.focus(),
-            });
+            self.emit(MenuEffect::FocusChanged { item: self.focus() });
             if self.focus.is_some() {
                 self.emit(MenuEffect::Announce {
                     item: self.focus(),
@@ -960,12 +958,7 @@ impl MenuEngine {
                     )),
                 }
             }
-            ItemKind::Stepper {
-                min, max, step, ..
-            }
-            | ItemKind::Slider {
-                min, max, step, ..
-            } => {
+            ItemKind::Stepper { min, max, step, .. } | ItemKind::Slider { min, max, step, .. } => {
                 let at = match current {
                     Some(MenuValue::Int(n)) => n,
                     _ => *min,
@@ -1096,7 +1089,13 @@ impl MenuEngine {
         }
         let item = ItemIndex(f);
         let kind = &self.item_at(f).kind;
-        let confirm = matches!(kind, ItemKind::Action { confirm: Some(_), .. });
+        let confirm = matches!(
+            kind,
+            ItemKind::Action {
+                confirm: Some(_),
+                ..
+            }
+        );
         match kind.id() {
             ItemKindId::Action if confirm => {
                 self.overlay = Some(Overlay::Confirm {

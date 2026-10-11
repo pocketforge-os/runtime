@@ -490,6 +490,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "pf-menu"
+version = "0.0.1"
+dependencies = [
+ "pf-ports",
+ "pf-prefs",
+ "pf-scene",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "pf-ports"
 version = "0.0.1"
 dependencies = [
