@@ -14,7 +14,7 @@ use std::os::raw::c_int;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use pf_input_decode::{a133_spec, FrameScanner, Side, SideDecoder, Uinput};
+use pf_input_decode::{a133_spec, builtin, FrameScanner, Side, SideDecoder, Uinput};
 
 static STOP: AtomicBool = AtomicBool::new(false);
 
@@ -80,6 +80,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let uinput = Uinput::create(&a133_spec())?;
     let node = uinput.node().unwrap_or("<unresolved>").to_string();
+    // Publish which kernel device is the built-in pad (tsp-ihne1.8). Without the record the pad
+    // still works for the shell, but nothing that needs the built-in identity (the router, system
+    // confirmations) trusts it: fail closed for trust, never strand basic input.
+    match uinput.sysname() {
+        Some(sysname) => {
+            if let Err(e) = builtin::write_record(std::path::Path::new(builtin::RECORD_DIR), sysname)
+            {
+                eprintln!(
+                    "pf-input-decode: ERROR: cannot write {}/{}: {e}; the pad will not be trusted as built-in",
+                    builtin::RECORD_DIR,
+                    builtin::RECORD_NAME
+                );
+            }
+        }
+        None => eprintln!(
+            "pf-input-decode: ERROR: UI_GET_SYSNAME failed; the pad will not be trusted as built-in"
+        ),
+    }
 
     // SAFETY: installing a simple handler that only sets an atomic flag. Cast via a fn pointer
     // (not a fn item) so the conversion to sighandler_t is explicit, not a numeric cast.

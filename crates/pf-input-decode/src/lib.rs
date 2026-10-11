@@ -49,6 +49,7 @@
 //! dependency, exhaustively unit-tested against synthetic frames, plus a `tests/` integration
 //! stream that exercises EVERY control (the parity baseline `tsp-ozbp.10` is measured against).
 
+pub mod builtin;
 pub mod codes;
 pub mod decode;
 pub mod frame;
@@ -105,6 +106,7 @@ pub fn a133_spec() -> UinputSpec {
         vendor: identity::VENDOR,
         product: identity::PRODUCT,
         version: identity::VERSION,
+        phys: Some(builtin::PHYS.to_string()),
         keys,
         abs,
     }
@@ -119,6 +121,8 @@ mod tests {
         let s = a133_spec();
         // Identity is the X360 compatibility identity.
         assert_eq!((s.bus, s.vendor, s.product), (0x03, 0x045e, 0x028e));
+        // The decoder-set property the built-in identity checks (tsp-ihne1.8).
+        assert_eq!(s.phys.as_deref(), Some(builtin::PHYS));
         // 9 buttons: the four face positions, L1 R1, Select Start Menu. L2/R2 are NOT buttons.
         let expect_keys = [
             codes::BTN_SOUTH,

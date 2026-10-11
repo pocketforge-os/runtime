@@ -5,11 +5,12 @@
 
 use std::collections::{HashMap, HashSet};
 use std::io;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use pf_input_decode::builtin::{Trust, Verdict};
 use pf_wire::{recv_request, send_response, Op, Request, Response, Status};
 use pocketforge::descriptor::Descriptor;
 use pocketforge::server::handle_request;
@@ -238,12 +239,27 @@ impl InputBroker {
         descriptor: &Descriptor,
         grab: bool,
     ) -> io::Result<InputBroker> {
+        InputBroker::start_checked(source_path, descriptor, grab, None)
+    }
+
+    /// As [`start_with`](Self::start_with); with `builtin` set, the opened source must also be the
+    /// built-in controller by [`pf_input_decode::builtin`] (`--require-builtin`, `tsp-ihne1.8`).
+    /// The check runs on the opened fd, before the grab, so a lookalike is never grabbed.
+    pub fn start_checked(
+        source_path: impl AsRef<Path>,
+        descriptor: &Descriptor,
+        grab: bool,
+        builtin: Option<&Trust>,
+    ) -> io::Result<InputBroker> {
         let remap = Remap::from_descriptor(descriptor)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
         let (source, sink) = acquire_then_create(
             || {
                 let mut source = Evdev::open(source_path)?;
                 Self::validate_source(&source, descriptor, &remap)?;
+                if let Some(trust) = builtin {
+                    require_builtin(trust.identify_fd(source.as_fd()))?;
+                }
                 if grab {
                     source.grab()?;
                 }
@@ -289,6 +305,12 @@ impl InputBroker {
     /// Discover exactly one descriptor-matching event node. Every candidate is identified from
     /// its opened fd; `start` opens and validates the winner again before grabbing it.
     pub fn discover(descriptor: &Descriptor) -> io::Result<PathBuf> {
+        InputBroker::discover_checked(descriptor, None)
+    }
+
+    /// As [`discover`](Self::discover); with `builtin` set, only the built-in controller is a
+    /// candidate, so a lookalike cannot make discovery ambiguous or win it.
+    pub fn discover_checked(descriptor: &Descriptor, builtin: Option<&Trust>) -> io::Result<PathBuf> {
         let expected = ExpectedIdentity::from_descriptor(descriptor)?;
         let remap = Remap::from_descriptor(descriptor)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
@@ -306,8 +328,15 @@ impl InputBroker {
         }
         discover_candidates(candidates, |path| {
             let dev = Evdev::open(path)?;
-            Ok(expected.matches(&dev.name()?, dev.id()?)
+            if !(expected.matches(&dev.name()?, dev.id()?)
                 && missing_source_capabilities(&dev, &remap)?.is_empty())
+            {
+                return Ok(false);
+            }
+            match builtin {
+                Some(trust) => Ok(require_builtin(trust.identify_fd(dev.as_fd())).is_ok()),
+                None => Ok(true),
+            }
         })
     }
 
@@ -540,6 +569,22 @@ impl ReportPump {
             actual_abs,
             actual_binary,
         ))
+    }
+}
+
+/// The broker's built-in gate: only [`Verdict::BuiltIn`] passes. A lookalike and an identification
+/// failure both refuse the source (fail closed); the error says which.
+fn require_builtin(verdict: io::Result<Verdict>) -> io::Result<()> {
+    match verdict {
+        Ok(Verdict::BuiltIn { .. }) => Ok(()),
+        Ok(Verdict::NotBuiltIn(reason)) => Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("opened source is not the built-in controller: {reason:?}"),
+        )),
+        Err(e) => Err(io::Error::new(
+            e.kind(),
+            format!("cannot identify the opened source as the built-in controller: {e}"),
+        )),
     }
 }
 
@@ -861,6 +906,34 @@ mod readiness_tests {
         assert!(!e.matches("event-gamepad", (3, 0x045e, 0x028e, 0x0110)));
         assert!(!e.matches("TRIMUI Player1", (3, 0x1234, 0x028e, 0x0110)));
         assert!(!e.matches("TRIMUI Player1", (5, 0x045e, 0x028e, 0x0110)));
+    }
+
+    #[test]
+    fn builtin_gate_passes_only_the_built_in_verdict() {
+        use pf_input_decode::builtin::Reason;
+        assert!(require_builtin(Ok(Verdict::BuiltIn {
+            sysname: "input5".into()
+        }))
+        .is_ok());
+        for reason in [
+            Reason::NotInputCharDevice,
+            Reason::NotVirtual {
+                devpath: "devices/platform/usb1/1-1/input/input9/event4".into(),
+            },
+            Reason::PhysMismatch,
+            Reason::RecordAbsent,
+            Reason::RecordUntrusted("mode 666".into()),
+            Reason::SysnameMismatch {
+                device: "input9".into(),
+                record: "input5".into(),
+            },
+        ] {
+            let err = require_builtin(Ok(Verdict::NotBuiltIn(reason.clone()))).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::PermissionDenied, "{reason:?}");
+            assert!(err.to_string().contains("not the built-in controller"));
+        }
+        let err = require_builtin(Err(io::Error::new(io::ErrorKind::NotFound, "gone"))).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound, "an I/O error is never a pass");
     }
 
     #[test]
