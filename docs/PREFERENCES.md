@@ -94,6 +94,8 @@ units; app units do not receive it. This socket-bound prerequisite closes the ol
 gap before any numeric-PID lookup, while the cgroup check prevents a trusted socket from being
 reclassified as an app after process exit.
 
+The identity implementation is the shared `pf-peer-identity` crate (tsp-ght0z), which the session
+authority also uses for the SDK front and app handles (docs/URL-HANDOFF.md); it is never forked.
 On kernels with `SO_PEERPIDFD`, the socket supplies the pidfd directly. The shipping A523/5.15
 kernel falls back to `pidfd_open`; the A133/4.9 kernel holds an opened `/proc/<pid>` directory and
 reads `stat` and `cgroup` relative to that descriptor. These compatibility handles narrow an
