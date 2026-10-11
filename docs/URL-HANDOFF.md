@@ -14,12 +14,13 @@ and the authority uses it for both of the following; nothing forks it.
 - **The front itself** is authenticated at accept: peer uid equals `--front-user` and the peer's
   systemd unit equals `--front-unit`. Any other peer is closed without a frame and logged
   `front_refused reason=peer_identity`.
-- **No transitive trust.** Every front request carries the caller's process handle over
+- **No transitive trust.** Every front request carries exactly one caller process handle over
   `SCM_RIGHTS`: a pidfd, or on the A133/4.9 kernel (no pidfds) the front's opened `/proc/<pid>`
   directory. The authority classifies the handle from the kernel's own description of the
   descriptor, reads its cgroup, and requires `pf-app@<id>.service`. The derived id must equal the
-  front's `app_id` claim; a mismatch, a missing handle or a non-app handle answers `denied` and
-  logs `url_refused reason=identity_mismatch|identity_unverified|missing_claim`.
+  front's `app_id` claim; multiple handles fail the frame as ambiguous, while a mismatch, a
+  missing handle or a non-app handle answers `denied` and logs
+  `url_refused reason=identity_mismatch|identity_unverified|missing_claim`.
 
 ## Wire (versioned, minimal)
 
@@ -71,7 +72,8 @@ persisted state. It never stacks: a second `OpenUrl` while a slot exists is `bus
   normal outcome, and the browser's own exit runs the usual shell-restoration ladder. No Terminal
   event is published for the caller, because a Terminal means the shell is back in front.
 - **Shell caller** (captive portal, tsp-7s0ti): the handler is a normal foreground session.
-  `ReturnToCaller` means Home and goes through the protected return path.
+  The backend's `launched`/`delivered` outcome is preserved; a failed switch creates no return
+  slot. `ReturnToCaller` means Home and goes through the protected return path.
 - A protected `SafeReturn` with a slot stops the handler first, then runs the ladder on the phase
   session.
 

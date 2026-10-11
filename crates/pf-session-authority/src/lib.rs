@@ -2225,15 +2225,21 @@ impl<S: StateStore, B: SessionSystem, C: Clock> Authority<S, B, C> {
         match slot_caller {
             SlotCaller::Shell => {
                 // The handler is a real foreground session launched by the shell's request.
-                let (session_id, _) = self.start_session(&handler, |system, session_id| {
-                    system.open_url(&UrlHandoff {
-                        caller: SlotCaller::Shell,
-                        handler_item_id: handler.clone(),
-                        handler_session_id: session_id.to_owned(),
-                        url,
-                        flags,
-                    })
-                })?;
+                let (session_id, outcome) =
+                    self.start_session(&handler, |system, session_id| {
+                        system.open_url(&UrlHandoff {
+                            caller: SlotCaller::Shell,
+                            handler_item_id: handler.clone(),
+                            handler_session_id: session_id.to_owned(),
+                            url,
+                            flags,
+                        })
+                    })?;
+                let Some(outcome) = outcome else {
+                    return Ok(RpcResponse::Error {
+                        message: "URL handoff failed".into(),
+                    });
+                };
                 self.state.return_slot = Some(ReturnSlot {
                     caller: SlotCaller::Shell,
                     handler_session_id: session_id.clone(),
@@ -2243,7 +2249,10 @@ impl<S: StateStore, B: SessionSystem, C: Clock> Authority<S, B, C> {
                 let line = url_handoff_line("opened", self.state.return_slot.as_ref().unwrap());
                 self.log(&line);
                 self.persist()?;
-                Ok(RpcResponse::Launched { session_id })
+                Ok(match outcome {
+                    UrlHandoffOutcome::Launched => RpcResponse::Launched { session_id },
+                    UrlHandoffOutcome::Delivered => RpcResponse::Delivered,
+                })
             }
             SlotCaller::App { .. } if handler == caller_key => {
                 // The handler itself is in front: the URL is delivered to it, no handoff.

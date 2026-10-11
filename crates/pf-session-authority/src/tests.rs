@@ -2442,6 +2442,29 @@ fn shell_open_url_launches_the_handler_as_a_session_and_return_goes_home() {
 }
 
 #[test]
+fn shell_open_url_preserves_the_backend_outcome_and_refuses_a_failed_handoff() {
+    // Positive control: a running handler reports delivered and still owns the return slot.
+    let (a, _log) = logged_authority(None);
+    let mut a = a.with_url_handler(FixedUrlHandler(BROWSER_ID.into()));
+    a.system.delivered = true;
+    let response = dispatch_rpc(&mut a, open_url_request(None, URL, 0));
+    assert!(matches!(response, RpcResponse::Delivered), "{response:?}");
+    assert!(a.state.return_slot.is_some());
+
+    // Negative control: a failed foreground switch is never reported as launched and leaves no
+    // depth-1 return slot for a handler that did not take the URL.
+    let (a, _log) = logged_authority(None);
+    let mut a = a.with_url_handler(FixedUrlHandler(BROWSER_ID.into()));
+    a.system.fail_open_url = true;
+    let response = dispatch_rpc(&mut a, open_url_request(None, URL, 0));
+    assert!(
+        matches!(&response, RpcResponse::Error { message } if message.contains("handoff failed")),
+        "{response:?}"
+    );
+    assert!(a.state.return_slot.is_none());
+}
+
+#[test]
 fn shell_open_url_is_busy_while_an_app_is_in_front_and_without_a_handler_is_no_handler() {
     let (a, log) = logged_authority(None);
     let mut a = a.with_url_handler(FixedUrlHandler(BROWSER_ID.into()));

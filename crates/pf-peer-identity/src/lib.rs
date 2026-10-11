@@ -549,8 +549,8 @@ pub mod scm {
         Ok(())
     }
 
-    /// Receive up to `data.len()` payload bytes plus at most one fd. Surplus fds a hostile peer
-    /// attaches are closed, never kept.
+    /// Receive up to `data.len()` payload bytes plus at most one fd. A request with multiple fds
+    /// is ambiguous and fails closed; every received descriptor is still closed on that path.
     pub fn recv_with_fd(sock: RawFd, data: &mut [u8]) -> io::Result<(usize, Option<OwnedFd>)> {
         let mut iov = libc::iovec {
             iov_base: data.as_mut_ptr() as *mut libc::c_void,
@@ -570,15 +570,24 @@ pub mod scm {
             return Err(io::Error::last_os_error());
         }
         let mut first: Option<OwnedFd> = None;
+        let mut fd_count = 0usize;
         unsafe {
             let mut cmsg = libc::CMSG_FIRSTHDR(&msg);
             while !cmsg.is_null() {
                 if (*cmsg).cmsg_level == libc::SOL_SOCKET && (*cmsg).cmsg_type == libc::SCM_RIGHTS {
                     let data_ptr = libc::CMSG_DATA(cmsg) as *const RawFd;
-                    let payload = (*cmsg).cmsg_len as usize - libc::CMSG_LEN(0) as usize;
+                    let header_len = libc::CMSG_LEN(0) as usize;
+                    if ((*cmsg).cmsg_len as usize) < header_len {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "SCM_RIGHTS header has an invalid length",
+                        ));
+                    }
+                    let payload = (*cmsg).cmsg_len as usize - header_len;
                     for index in 0..payload / std::mem::size_of::<RawFd>() {
                         let raw = std::ptr::read_unaligned(data_ptr.add(index));
                         let owned = OwnedFd::from_raw_fd(raw);
+                        fd_count += 1;
                         if first.is_none() {
                             first = Some(owned);
                         }
@@ -591,6 +600,12 @@ pub mod scm {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "ancillary data truncated",
+            ));
+        }
+        if fd_count > 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "multiple SCM_RIGHTS descriptors",
             ));
         }
         Ok((received as usize, first))
@@ -711,6 +726,59 @@ mod tests {
         assert_eq!(&buffer[..len], b"bare");
         assert!(fd.is_none());
         assert!(scm::send_with_fd(client.as_raw_fd(), b"", None).is_err());
+    }
+
+    #[test]
+    fn scm_rights_refuses_ambiguous_multiple_process_handles() {
+        fn send_with_fds(sock: i32, data: &[u8], fds: &[i32]) -> io::Result<()> {
+            let mut iov = libc::iovec {
+                iov_base: data.as_ptr() as *mut libc::c_void,
+                iov_len: data.len(),
+            };
+            let fd_bytes = std::mem::size_of_val(fds) as u32;
+            let space = unsafe { libc::CMSG_SPACE(fd_bytes) } as usize;
+            let mut control = vec![0u8; space];
+            let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
+            message.msg_iov = &mut iov;
+            message.msg_iovlen = 1;
+            message.msg_control = control.as_mut_ptr().cast();
+            message.msg_controllen = control.len();
+            unsafe {
+                let header = libc::CMSG_FIRSTHDR(&message);
+                (*header).cmsg_level = libc::SOL_SOCKET;
+                (*header).cmsg_type = libc::SCM_RIGHTS;
+                (*header).cmsg_len = libc::CMSG_LEN(fd_bytes) as usize;
+                std::ptr::copy_nonoverlapping(
+                    fds.as_ptr(),
+                    libc::CMSG_DATA(header).cast::<i32>(),
+                    fds.len(),
+                );
+                if libc::sendmsg(sock, &message, libc::MSG_NOSIGNAL) < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+            }
+            Ok(())
+        }
+
+        // Positive control: exactly one process handle is accepted.
+        let (client, server) = UnixStream::pair().unwrap();
+        let first = pidfd_open(std::process::id() as i32).unwrap();
+        send_with_fds(client.as_raw_fd(), b"one", &[first.as_raw_fd()]).unwrap();
+        let mut buffer = [0u8; 16];
+        let (_, received) = scm::recv_with_fd(server.as_raw_fd(), &mut buffer).unwrap();
+        assert!(received.is_some());
+
+        // Negative control: the wire admits one handle, so an ambiguous pair fails closed.
+        let (client, server) = UnixStream::pair().unwrap();
+        let second = pidfd_open(std::process::id() as i32).unwrap();
+        send_with_fds(
+            client.as_raw_fd(),
+            b"two",
+            &[first.as_raw_fd(), second.as_raw_fd()],
+        )
+        .unwrap();
+        let error = scm::recv_with_fd(server.as_raw_fd(), &mut buffer).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{error}");
     }
 
     #[test]
