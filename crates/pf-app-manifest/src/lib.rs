@@ -28,6 +28,9 @@ pub const KNOWN_CAPABILITIES: &[&str] = &[
     "audio",
     "settings",
     "leds",
+    // Open URLs in the default browser through the session authority (tsp-ght0z, owner
+    // decision B: only apps declaring it may open URLs).
+    "open_url",
 ];
 
 /// Minimum-spec graphics version vocabulary: OpenGL ES.

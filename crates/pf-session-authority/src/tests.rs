@@ -8,6 +8,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 
 const APP_ID: &str = "org.example.game";
+/// An app that declares the `open_url` capability.
+const LINKER_ID: &str = "org.example.linker";
+/// The URL handler (default browser).
+const BROWSER_ID: &str = "org.example.browser";
 static RESOLVER_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 thread_local! {
@@ -30,6 +34,13 @@ struct FakeSystem {
     fail_owner: bool,
     fail_start: bool,
     lifecycle: Option<SystemLifecycle>,
+    /// Per-item lifecycle, consulted before `lifecycle` (the slot's handler unit).
+    lifecycles: BTreeMap<String, SystemLifecycle>,
+    handoffs: Vec<UrlHandoff>,
+    restores: Vec<ReturnSlot>,
+    fail_open_url: bool,
+    fail_restore: bool,
+    delivered: bool,
 }
 
 #[derive(Default)]
@@ -70,13 +81,20 @@ fn test_resolver_fixture() -> (Resolver, PathBuf) {
     fs::create_dir_all(&root).unwrap();
     let mut ids = vec![APP_ID.to_owned(), "org.example.never-running".to_owned()];
     ids.extend((0..5).map(|n| format!("org.example.g{n}")));
+    ids.extend([LINKER_ID.to_owned(), BROWSER_ID.to_owned()]);
     for id in &ids {
         let app = root.join(id);
         fs::create_dir_all(app.join("bin")).unwrap();
+        // Only the linker declares the open_url capability (owner decision B).
+        let capabilities = if id == LINKER_ID {
+            "[\"input\", \"open_url\"]"
+        } else {
+            "[\"input\"]"
+        };
         fs::write(
             app.join("app.toml"),
             format!(
-                "[app]\nid = \"{id}\"\nuse = [\"input\"]\n\
+                "[app]\nid = \"{id}\"\nuse = {capabilities}\n\
                  [runtime]\nfamily = \"pocketforge/a133-powervr\"\nabi = \"1\"\nplatform-version = \"20\"\n\
                  [launch]\nexec = \"bin/app\"\n"
             ),
@@ -95,7 +113,7 @@ fn test_resolver_fixture() -> (Resolver, PathBuf) {
          runtime_family = \"pocketforge/a133-powervr\"\n\
          runtime_abi = \"1\"\n\
          platform_version = \"20\"\n\
-         supported_capabilities = [\"input\"]\n",
+         supported_capabilities = [\"input\", \"open_url\"]\n",
     )
     .unwrap();
     let executable = root.join(APP_ID).join("bin/app");
@@ -338,8 +356,35 @@ impl SessionSystem for FakeSystem {
             Ok(())
         }
     }
-    fn lifecycle(&mut self, _: &str) -> Result<Option<SystemLifecycle>, String> {
-        Ok(self.lifecycle.clone())
+    fn lifecycle(&mut self, item_id: &str) -> Result<Option<SystemLifecycle>, String> {
+        Ok(self
+            .lifecycles
+            .get(item_id)
+            .cloned()
+            .or_else(|| self.lifecycle.clone()))
+    }
+    fn open_url(&mut self, handoff: &UrlHandoff) -> Result<UrlHandoffOutcome, String> {
+        // The URL is data on the handoff. A real system passes it in the launch request; the
+        // fake records exactly what it was given and never builds a command from it.
+        self.calls
+            .push(format!("open_url {}", handoff.handler_item_id));
+        self.handoffs.push(handoff.clone());
+        if self.fail_open_url {
+            Err("handoff refused".into())
+        } else if self.delivered {
+            Ok(UrlHandoffOutcome::Delivered)
+        } else {
+            Ok(UrlHandoffOutcome::Launched)
+        }
+    }
+    fn restore_caller(&mut self, slot: &ReturnSlot) -> Result<(), String> {
+        self.calls.push(format!("restore {}", slot.handler_item_id));
+        self.restores.push(slot.clone());
+        if self.fail_restore {
+            Err("restore refused".into())
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -1595,5 +1640,1129 @@ fn acceptor_closes_connections_beyond_its_bound() {
         0,
         "closed without service"
     );
+    fs::remove_dir_all(dir).unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// URL handoff (tsp-ght0z): OpenUrl / ReturnToCaller, the depth-1 return slot, typed results.
+// ---------------------------------------------------------------------------
+
+const URL: &str = "https://example.org/listen?track=7";
+
+fn front(app_id: &str) -> RpcOrigin {
+    RpcOrigin::Front {
+        caller: Ok(app_id.to_owned()),
+    }
+}
+
+fn open_url_request(app_id: Option<&str>, url: &str, flags: u32) -> RpcRequest {
+    RpcRequest::OpenUrl {
+        app_id: app_id.map(str::to_owned),
+        url: url.to_owned(),
+        flags,
+    }
+}
+
+fn return_request(app_id: &str, url: Option<&str>) -> RpcRequest {
+    RpcRequest::ReturnToCaller {
+        app_id: app_id.to_owned(),
+        url: url.map(str::to_owned),
+    }
+}
+
+/// An authority with the linker app running in front and the browser installed as handler.
+fn linker_in_front() -> (Authority<MemoryStore, FakeSystem, TestClock>, Log, String) {
+    let (a, log) = logged_authority(None);
+    let mut a = a.with_url_handler(FixedUrlHandler(BROWSER_ID.into()));
+    let LaunchResult::Accepted { session_id } = a
+        .launch(LaunchRequest {
+            item_id: LINKER_ID.into(),
+        })
+        .unwrap()
+    else {
+        panic!()
+    };
+    assert!(matches!(a.state.phase, Phase::Running { .. }));
+    (a, log, session_id)
+}
+
+fn refusals(log: &Log) -> Vec<String> {
+    log.lock()
+        .unwrap()
+        .iter()
+        .filter(|line| line.contains("url_refused"))
+        .cloned()
+        .collect()
+}
+
+#[test]
+fn url_policy_accepts_http_and_https_and_refuses_everything_else() {
+    assert_eq!(validate_url("http://example.org"), Ok("http"));
+    assert_eq!(validate_url("HTTPS://Example.org/a?b=c#d"), Ok("https"));
+    let longest = format!("https://example.org/{}", "a".repeat(MAX_URL_BYTES - 20));
+    assert_eq!(longest.len(), MAX_URL_BYTES);
+    assert_eq!(validate_url(&longest), Ok("https"));
+    for (url, rejection) in [
+        (format!("{longest}a"), UrlRejection::TooLong),
+        ("file:///etc/passwd".into(), UrlRejection::SchemeNotAllowed),
+        ("data:text/html,hi".into(), UrlRejection::SchemeNotAllowed),
+        ("javascript:alert(1)".into(), UrlRejection::SchemeNotAllowed),
+        ("ftp://example.org".into(), UrlRejection::SchemeNotAllowed),
+        ("example.org/path".into(), UrlRejection::NoScheme),
+        ("http:example.org".into(), UrlRejection::NoAuthority),
+        ("http:///path".into(), UrlRejection::EmptyHost),
+        ("http://".into(), UrlRejection::EmptyHost),
+        (
+            "http://exa mple.org".into(),
+            UrlRejection::ControlOrNonAscii,
+        ),
+        (
+            "http://example.org/\n".into(),
+            UrlRejection::ControlOrNonAscii,
+        ),
+        ("http://exämple.org".into(), UrlRejection::ControlOrNonAscii),
+        ("".into(), UrlRejection::NoScheme),
+    ] {
+        assert_eq!(validate_url(&url), Err(rejection), "{url:?}");
+    }
+}
+
+#[test]
+fn front_open_url_launches_the_handler_with_the_url_as_data_and_opens_the_slot() {
+    let (mut a, log, caller_session) = linker_in_front();
+    let response = dispatch_rpc_from(
+        &mut a,
+        front(LINKER_ID),
+        open_url_request(Some(LINKER_ID), URL, 0),
+    );
+    assert!(
+        matches!(&response, RpcResponse::Launched { session_id } if session_id == "session-2"),
+        "{response:?}"
+    );
+    // The caller keeps running in front of the authority's phase; the slot records the handoff.
+    assert!(
+        matches!(&a.state.phase, Phase::Running { session_id, item_id } if session_id == &caller_session && item_id == LINKER_ID)
+    );
+    assert_eq!(
+        a.state.return_slot,
+        Some(ReturnSlot {
+            caller: SlotCaller::App {
+                session_id: caller_session.clone(),
+                item_id: LINKER_ID.into(),
+            },
+            handler_session_id: "session-2".into(),
+            handler_item_id: BROWSER_ID.into(),
+            caller_gone: false,
+        })
+    );
+    // The URL reached the system as data on the handoff, never as a command token.
+    let handoff = &a.system.handoffs[0];
+    assert_eq!(handoff.url, URL);
+    assert_eq!(handoff.handler_item_id, BROWSER_ID);
+    assert_eq!(handoff.handler_session_id, "session-2");
+    assert!(
+        a.system
+            .calls
+            .iter()
+            .all(|call| !call.contains("example.org")),
+        "{:?}",
+        a.system.calls
+    );
+    // The handler session is in history with a start stamp; the caller's entry stays open.
+    let browser = a
+        .state
+        .history
+        .iter()
+        .find(|e| e.session_id == "session-2")
+        .unwrap();
+    assert_eq!(browser.item_id, BROWSER_ID);
+    assert!(browser.started_at.is_some() && browser.ended_at.is_none());
+    assert_eq!(a.state.next_session, 3);
+    assert!(log.lock().unwrap().iter().any(|line| line
+        == "pf-session-authorityd: url_handoff event=opened caller=\"org.example.linker\" handler=\"org.example.browser\" session=\"session-2\""));
+    // A second OpenUrl never stacks: the slot is occupied.
+    let response = dispatch_rpc_from(
+        &mut a,
+        front(LINKER_ID),
+        open_url_request(Some(LINKER_ID), URL, 0),
+    );
+    assert!(matches!(response, RpcResponse::Busy), "{response:?}");
+    assert!(refusals(&log)
+        .last()
+        .unwrap()
+        .contains("reason=slot_occupied"));
+    assert_eq!(a.system.handoffs.len(), 1);
+}
+
+#[test]
+fn front_open_url_delivered_when_a_running_handler_takes_the_url() {
+    let (mut a, _log, _) = linker_in_front();
+    a.system.delivered = true;
+    let response = dispatch_rpc_from(
+        &mut a,
+        front(LINKER_ID),
+        open_url_request(Some(LINKER_ID), URL, 0),
+    );
+    assert!(matches!(response, RpcResponse::Delivered), "{response:?}");
+    assert!(a.state.return_slot.is_some());
+    assert_eq!(a.system.handoffs[0].url, URL);
+}
+
+#[test]
+fn front_open_url_without_an_installed_handler_is_no_handler() {
+    let (a, log) = logged_authority(None);
+    let mut a = a.with_url_handler(NoUrlHandler);
+    launch_item(&mut a, LINKER_ID);
+    let response = dispatch_rpc_from(
+        &mut a,
+        front(LINKER_ID),
+        open_url_request(Some(LINKER_ID), URL, 0),
+    );
+    assert!(matches!(response, RpcResponse::NoHandler), "{response:?}");
+    assert!(a.state.return_slot.is_none());
+    assert!(a.system.handoffs.is_empty());
+    assert!(refusals(&log)[0].contains("reason=no_handler"));
+
+    // A configured handler that is not installed is also no_handler (never a start attempt).
+    let (a, log) = logged_authority(None);
+    let mut a = a.with_url_handler(FixedUrlHandler("org.example.missing-browser".into()));
+    launch_item(&mut a, LINKER_ID);
+    let response = dispatch_rpc_from(
+        &mut a,
+        front(LINKER_ID),
+        open_url_request(Some(LINKER_ID), URL, 0),
+    );
+    assert!(matches!(response, RpcResponse::NoHandler), "{response:?}");
+    assert!(a.system.handoffs.is_empty());
+    assert!(refusals(&log)[0].contains("reason=no_handler"));
+}
+
+fn launch_item(a: &mut Authority<MemoryStore, FakeSystem, TestClock>, item_id: &str) {
+    assert!(matches!(
+        a.launch(LaunchRequest {
+            item_id: item_id.into()
+        })
+        .unwrap(),
+        LaunchResult::Accepted { .. }
+    ));
+}
+
+#[test]
+fn front_open_url_refuses_non_http_and_over_length_urls_before_any_handoff() {
+    let (mut a, log, _) = linker_in_front();
+    let too_long = format!("https://example.org/{}", "a".repeat(MAX_URL_BYTES));
+    for (url, detail) in [
+        ("file:///etc/passwd", "scheme_not_allowed"),
+        ("data:text/html,<script>", "scheme_not_allowed"),
+        ("javascript:alert(1)", "scheme_not_allowed"),
+        (too_long.as_str(), "too_long"),
+    ] {
+        // Each caller gets its own window, so the policy, not the limiter, answers.
+        a.url_rate.clear();
+        let response = dispatch_rpc_from(
+            &mut a,
+            front(LINKER_ID),
+            open_url_request(Some(LINKER_ID), url, 0),
+        );
+        assert!(
+            matches!(response, RpcResponse::InvalidUrl),
+            "{url:?}: {response:?}"
+        );
+        assert!(refusals(&log).last().unwrap().contains(&format!(
+            "reason=invalid_url caller=\"org.example.linker\" detail=\"{detail}\""
+        )));
+    }
+    assert!(a.system.handoffs.is_empty() && a.state.return_slot.is_none());
+    // Positive control in the same authority: the same caller with an http URL is launched.
+    a.url_rate.clear();
+    let response = dispatch_rpc_from(
+        &mut a,
+        front(LINKER_ID),
+        open_url_request(Some(LINKER_ID), "http://example.org", 0),
+    );
+    assert!(
+        matches!(response, RpcResponse::Launched { .. }),
+        "{response:?}"
+    );
+}
+
+#[test]
+fn front_open_url_pidfd_claim_mismatch_is_refused_and_logged() {
+    let (mut a, log, _) = linker_in_front();
+    // The front claims the foreground linker, but the forwarded process handle is another app.
+    let response = dispatch_rpc_from(
+        &mut a,
+        front("org.example.g1"),
+        open_url_request(Some(LINKER_ID), URL, 0),
+    );
+    assert!(matches!(response, RpcResponse::Denied), "{response:?}");
+    assert_eq!(
+        refusals(&log),
+        ["pf-session-authorityd: url_refused verb=open_url reason=identity_mismatch caller=\"org.example.linker\" detail=\"derived=org.example.g1\""]
+    );
+    // No handle at all, a handle that is not an app, and a missing claim are refused too.
+    for (origin, reason) in [
+        (
+            RpcOrigin::Front {
+                caller: Err("missing_process_handle".into()),
+            },
+            "identity_unverified",
+        ),
+        (
+            RpcOrigin::Front {
+                caller: Err("pid=42 is not in a pf-app@ unit".into()),
+            },
+            "identity_unverified",
+        ),
+        (front(LINKER_ID), "missing_claim"),
+    ] {
+        let claim = if reason == "missing_claim" {
+            None
+        } else {
+            Some(LINKER_ID)
+        };
+        let response = dispatch_rpc_from(&mut a, origin, open_url_request(claim, URL, 0));
+        assert!(matches!(response, RpcResponse::Denied), "{response:?}");
+        assert!(refusals(&log)
+            .last()
+            .unwrap()
+            .contains(&format!("reason={reason}")));
+    }
+    assert!(a.system.handoffs.is_empty() && a.state.return_slot.is_none());
+    // Positive control: claim and derived id agree.
+    let response = dispatch_rpc_from(
+        &mut a,
+        front(LINKER_ID),
+        open_url_request(Some(LINKER_ID), URL, 0),
+    );
+    assert!(
+        matches!(response, RpcResponse::Launched { .. }),
+        "{response:?}"
+    );
+}
+
+#[test]
+fn front_open_url_is_denied_without_the_capability_or_the_foreground() {
+    // APP_ID is in front but does not declare open_url.
+    let (a, log) = logged_authority(None);
+    let mut a = a.with_url_handler(FixedUrlHandler(BROWSER_ID.into()));
+    launch_running(&mut a);
+    let response = dispatch_rpc_from(
+        &mut a,
+        front(APP_ID),
+        open_url_request(Some(APP_ID), URL, 0),
+    );
+    assert!(matches!(response, RpcResponse::Denied), "{response:?}");
+    assert!(refusals(&log)[0]
+        .contains("reason=capability caller=\"org.example.game\" detail=\"open_url\""));
+    // The linker declares it but is not the foreground app.
+    let response = dispatch_rpc_from(
+        &mut a,
+        front(LINKER_ID),
+        open_url_request(Some(LINKER_ID), URL, 0),
+    );
+    assert!(matches!(response, RpcResponse::Denied), "{response:?}");
+    assert!(refusals(&log)[1].contains("reason=not_foreground"));
+    // An unknown app id is denied with the resolver's reason.
+    let response = dispatch_rpc_from(
+        &mut a,
+        front("org.example.nowhere"),
+        open_url_request(Some("org.example.nowhere"), URL, 0),
+    );
+    assert!(matches!(response, RpcResponse::Denied), "{response:?}");
+    assert!(refusals(&log)[2].contains("reason=app_not_found"));
+    assert!(a.system.handoffs.is_empty());
+}
+
+#[test]
+fn front_open_url_is_busy_while_the_phase_cannot_hand_off() {
+    let (mut a, log, _) = linker_in_front();
+    a.intake_safe_return().unwrap();
+    a.tick().unwrap();
+    assert!(matches!(a.state.phase, Phase::StoppingGracefully { .. }));
+    let response = dispatch_rpc_from(
+        &mut a,
+        front(LINKER_ID),
+        open_url_request(Some(LINKER_ID), URL, 0),
+    );
+    assert!(matches!(response, RpcResponse::Busy), "{response:?}");
+    assert!(refusals(&log)[0]
+        .contains("reason=phase caller=\"org.example.linker\" detail=\"stopping_gracefully\""));
+    assert!(a.system.handoffs.is_empty());
+}
+
+#[test]
+fn front_open_url_is_rate_limited_after_three_in_ten_seconds() {
+    let (a, log) = logged_authority(None);
+    let mut a = a.with_url_handler(NoUrlHandler);
+    launch_item(&mut a, LINKER_ID);
+    for _ in 0..URL_RATE_LIMIT {
+        let response = dispatch_rpc_from(
+            &mut a,
+            front(LINKER_ID),
+            open_url_request(Some(LINKER_ID), URL, 0),
+        );
+        assert!(matches!(response, RpcResponse::NoHandler), "{response:?}");
+        a.clock.advance(Duration::from_secs(1));
+    }
+    let response = dispatch_rpc_from(
+        &mut a,
+        front(LINKER_ID),
+        open_url_request(Some(LINKER_ID), URL, 0),
+    );
+    assert!(matches!(response, RpcResponse::RateLimited), "{response:?}");
+    assert!(refusals(&log)
+        .last()
+        .unwrap()
+        .contains("reason=rate_limited caller=\"org.example.linker\""));
+    // Another caller's budget is separate (per app).
+    let response = dispatch_rpc_from(&mut a, RpcOrigin::Shell, open_url_request(None, URL, 0));
+    assert!(matches!(response, RpcResponse::Busy), "{response:?}");
+    // The window slides: the first request was 3 s ago plus 7 s makes 10 s.
+    a.clock.advance(Duration::from_secs(7));
+    let response = dispatch_rpc_from(
+        &mut a,
+        front(LINKER_ID),
+        open_url_request(Some(LINKER_ID), URL, 0),
+    );
+    assert!(matches!(response, RpcResponse::NoHandler), "{response:?}");
+}
+
+#[test]
+fn reserved_flags_auth_session_everywhere_and_captive_portal_from_apps_are_refused() {
+    let (mut a, log, _) = linker_in_front();
+    for (flags, detail) in [
+        (
+            OPEN_URL_FLAG_AUTH_SESSION,
+            "reason=flag_reserved caller=\"org.example.linker\" detail=\"auth_session\"",
+        ),
+        (
+            OPEN_URL_FLAG_CAPTIVE_PORTAL,
+            "reason=flag_shell_only caller=\"org.example.linker\" detail=\"captive_portal\"",
+        ),
+        (
+            OPEN_URL_FLAG_AUTH_SESSION | OPEN_URL_FLAG_CAPTIVE_PORTAL,
+            "reason=flag_reserved",
+        ),
+        (
+            1 << 7,
+            "reason=flag_unknown caller=\"org.example.linker\" detail=\"0x80\"",
+        ),
+    ] {
+        a.url_rate.clear();
+        let response = dispatch_rpc_from(
+            &mut a,
+            front(LINKER_ID),
+            open_url_request(Some(LINKER_ID), URL, flags),
+        );
+        assert!(
+            matches!(response, RpcResponse::Denied),
+            "{flags:#x}: {response:?}"
+        );
+        assert!(
+            refusals(&log).last().unwrap().contains(detail),
+            "{flags:#x}: {:?}",
+            refusals(&log)
+        );
+    }
+    assert!(a.system.handoffs.is_empty() && a.state.return_slot.is_none());
+    // Positive control: no flags from the same caller is launched.
+    a.url_rate.clear();
+    let response = dispatch_rpc_from(
+        &mut a,
+        front(LINKER_ID),
+        open_url_request(Some(LINKER_ID), URL, 0),
+    );
+    assert!(
+        matches!(response, RpcResponse::Launched { .. }),
+        "{response:?}"
+    );
+
+    // The shell: AUTH_SESSION is still reserved, CAPTIVE_PORTAL is accepted and carried through.
+    let (a, log) = logged_authority(None);
+    let mut a = a.with_url_handler(FixedUrlHandler(BROWSER_ID.into()));
+    let response = dispatch_rpc_from(
+        &mut a,
+        RpcOrigin::Shell,
+        open_url_request(None, URL, OPEN_URL_FLAG_AUTH_SESSION),
+    );
+    assert!(matches!(response, RpcResponse::Denied), "{response:?}");
+    assert!(refusals(&log)[0].contains("reason=flag_reserved caller=\"shell\""));
+    let response = dispatch_rpc_from(
+        &mut a,
+        RpcOrigin::Shell,
+        open_url_request(
+            None,
+            "http://network-test.debian.org/nm",
+            OPEN_URL_FLAG_CAPTIVE_PORTAL,
+        ),
+    );
+    assert!(
+        matches!(response, RpcResponse::Launched { .. }),
+        "{response:?}"
+    );
+    assert_eq!(a.system.handoffs[0].flags, OPEN_URL_FLAG_CAPTIVE_PORTAL);
+    assert_eq!(a.system.handoffs[0].caller, SlotCaller::Shell);
+}
+
+#[test]
+fn return_to_caller_restores_a_running_caller_and_clears_the_slot() {
+    let (mut a, log, caller_session) = linker_in_front();
+    assert!(matches!(
+        dispatch_rpc_from(
+            &mut a,
+            front(LINKER_ID),
+            open_url_request(Some(LINKER_ID), URL, 0)
+        ),
+        RpcResponse::Launched { .. }
+    ));
+    // Only the handler may return, and only through the front with its own identity.
+    let response = dispatch_rpc_from(&mut a, front(LINKER_ID), return_request(LINKER_ID, None));
+    assert!(matches!(response, RpcResponse::Denied), "{response:?}");
+    assert!(refusals(&log)
+        .last()
+        .unwrap()
+        .contains("reason=not_handler"));
+    let response = dispatch_rpc_from(&mut a, front(BROWSER_ID), return_request(LINKER_ID, None));
+    assert!(matches!(response, RpcResponse::Denied), "{response:?}");
+    assert!(refusals(&log)
+        .last()
+        .unwrap()
+        .contains("reason=identity_mismatch"));
+    let response = dispatch_rpc_from(&mut a, RpcOrigin::Shell, return_request(BROWSER_ID, None));
+    assert!(matches!(response, RpcResponse::Denied), "{response:?}");
+    assert!(refusals(&log).last().unwrap().contains("reason=front_only"));
+    assert!(a.system.restores.is_empty());
+
+    let response = dispatch_rpc_from(&mut a, front(BROWSER_ID), return_request(BROWSER_ID, None));
+    assert!(matches!(response, RpcResponse::Restored), "{response:?}");
+    assert_eq!(a.system.restores.len(), 1);
+    assert_eq!(a.system.restores[0].handler_item_id, BROWSER_ID);
+    assert!(a.state.return_slot.is_none());
+    assert!(
+        matches!(&a.state.phase, Phase::Running { session_id, .. } if session_id == &caller_session)
+    );
+    // Nothing was published: the shell is not back in front.
+    assert!(!a
+        .events_for("test")
+        .iter()
+        .any(|(_, e)| matches!(e, SessionEvent::Terminal(_))));
+    // Without a slot, a return is denied.
+    let response = dispatch_rpc_from(&mut a, front(BROWSER_ID), return_request(BROWSER_ID, None));
+    assert!(matches!(response, RpcResponse::Denied), "{response:?}");
+    assert!(refusals(&log)
+        .last()
+        .unwrap()
+        .contains("reason=no_return_slot"));
+    // And the caller can open again (depth 1, sequentially).
+    let response = dispatch_rpc_from(
+        &mut a,
+        front(LINKER_ID),
+        open_url_request(Some(LINKER_ID), URL, 0),
+    );
+    assert!(
+        matches!(response, RpcResponse::Launched { .. }),
+        "{response:?}"
+    );
+}
+
+#[test]
+fn return_to_caller_answers_caller_gone_after_the_memory_policy_killed_the_caller() {
+    let (mut a, log, caller_session) = linker_in_front();
+    assert!(matches!(
+        dispatch_rpc_from(
+            &mut a,
+            front(LINKER_ID),
+            open_url_request(Some(LINKER_ID), URL, 0)
+        ),
+        RpcResponse::Launched { .. }
+    ));
+    // systemd: the backgrounded caller's unit was killed (SIGKILL by the memory policy), the
+    // handler is still active.
+    a.system.lifecycles.insert(
+        LINKER_ID.into(),
+        SystemLifecycle {
+            app: AppUnitState::InactiveFailure {
+                summary: "systemd result: signal".into(),
+            },
+            foreground_target_active: true,
+            selected_owner_active: false,
+        },
+    );
+    a.system.lifecycles.insert(
+        BROWSER_ID.into(),
+        SystemLifecycle {
+            app: AppUnitState::Active,
+            foreground_target_active: true,
+            selected_owner_active: false,
+        },
+    );
+    a.tick().unwrap();
+    // The handler was promoted to the foreground session; the caller's history closed.
+    assert!(
+        matches!(&a.state.phase, Phase::Running { session_id, item_id } if session_id == "session-2" && item_id == BROWSER_ID),
+        "{:?}",
+        a.state.phase
+    );
+    let slot = a.state.return_slot.clone().unwrap();
+    assert!(slot.caller_gone);
+    let caller = a
+        .state
+        .history
+        .iter()
+        .find(|e| e.session_id == caller_session)
+        .unwrap();
+    assert!(matches!(caller.receipt, Some(Receipt::Crash { .. })));
+    assert!(caller.ended_at.is_some());
+    assert!(
+        a.system.calls.iter().all(|call| call != "owner"),
+        "{:?}",
+        a.system.calls
+    );
+    assert!(!a
+        .events_for("test")
+        .iter()
+        .any(|(_, e)| matches!(e, SessionEvent::Terminal(_))));
+    assert!(log
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|line| line.contains("url_handoff event=caller_gone")));
+
+    let response = dispatch_rpc_from(&mut a, front(BROWSER_ID), return_request(BROWSER_ID, None));
+    assert!(matches!(response, RpcResponse::CallerGone), "{response:?}");
+    assert!(a.state.return_slot.is_none());
+    assert!(a.system.restores.is_empty(), "nothing to restore");
+    // The browser is now an ordinary foreground session: its exit runs the normal ladder.
+    a.system.lifecycles.insert(
+        BROWSER_ID.into(),
+        SystemLifecycle {
+            app: AppUnitState::InactiveSuccess,
+            foreground_target_active: false,
+            selected_owner_active: true,
+        },
+    );
+    a.tick().unwrap();
+    a.observe(Observation::PresentationAcknowledged).unwrap();
+    assert!(matches!(a.state.phase, Phase::Idle));
+    assert!(a.events_for("test").iter().any(|(_, e)| matches!(
+        e,
+        SessionEvent::Terminal(TerminalReceipt::Returned { session_id }) if session_id == "session-2"
+    )));
+}
+
+#[test]
+fn handler_exit_restores_the_caller_and_a_failed_restore_is_recovery() {
+    let (mut a, log, caller_session) = linker_in_front();
+    assert!(matches!(
+        dispatch_rpc_from(
+            &mut a,
+            front(LINKER_ID),
+            open_url_request(Some(LINKER_ID), URL, 0)
+        ),
+        RpcResponse::Launched { .. }
+    ));
+    a.system.lifecycles.insert(
+        LINKER_ID.into(),
+        SystemLifecycle {
+            app: AppUnitState::Active,
+            foreground_target_active: true,
+            selected_owner_active: false,
+        },
+    );
+    a.system.lifecycles.insert(
+        BROWSER_ID.into(),
+        SystemLifecycle {
+            app: AppUnitState::InactiveSuccess,
+            foreground_target_active: true,
+            selected_owner_active: false,
+        },
+    );
+    a.tick().unwrap();
+    assert!(a.state.return_slot.is_none());
+    assert_eq!(a.system.restores.len(), 1);
+    assert!(
+        matches!(&a.state.phase, Phase::Running { session_id, .. } if session_id == &caller_session)
+    );
+    let browser = a
+        .state
+        .history
+        .iter()
+        .find(|e| e.session_id == "session-2")
+        .unwrap();
+    assert_eq!(browser.receipt, Some(Receipt::Returned));
+    assert!(log
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|line| line.contains("url_handoff event=handler_exited")));
+
+    // Negative control: the restore itself fails, which is durable recovery.
+    let (mut a, _log, _) = linker_in_front();
+    assert!(matches!(
+        dispatch_rpc_from(
+            &mut a,
+            front(LINKER_ID),
+            open_url_request(Some(LINKER_ID), URL, 0)
+        ),
+        RpcResponse::Launched { .. }
+    ));
+    a.system.fail_restore = true;
+    a.system.lifecycles.insert(
+        BROWSER_ID.into(),
+        SystemLifecycle {
+            app: AppUnitState::InactiveFailure {
+                summary: "systemd result: exit-code".into(),
+            },
+            foreground_target_active: true,
+            selected_owner_active: false,
+        },
+    );
+    a.tick().unwrap();
+    assert!(
+        matches!(
+            &a.state.phase,
+            Phase::RecoveryRequired { reason, .. } if reason.starts_with("owner_not_active: caller restore failed")
+        ),
+        "{:?}",
+        a.state.phase
+    );
+}
+
+#[test]
+fn safe_return_with_a_slot_stops_the_handler_then_runs_the_caller_ladder() {
+    let (mut a, log, caller_session) = linker_in_front();
+    assert!(matches!(
+        dispatch_rpc_from(
+            &mut a,
+            front(LINKER_ID),
+            open_url_request(Some(LINKER_ID), URL, 0)
+        ),
+        RpcResponse::Launched { .. }
+    ));
+    assert!(matches!(
+        dispatch_rpc(&mut a, RpcRequest::SafeReturn),
+        RpcResponse::Ok
+    ));
+    assert!(a.state.return_slot.is_none());
+    assert!(
+        matches!(&a.state.phase, Phase::StoppingGracefully { session_id, .. } if session_id == &caller_session)
+    );
+    // Handler first, then the caller: two graceful stops, no restore.
+    assert_eq!(
+        a.system.calls.iter().filter(|c| *c == "graceful").count(),
+        2
+    );
+    assert!(a.system.restores.is_empty());
+    assert!(log
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|line| line.contains("url_handoff event=safe_return")));
+    a.observe(Observation::UnitInactive).unwrap();
+    restore(&mut a);
+    assert!(matches!(a.state.phase, Phase::Idle));
+}
+
+#[test]
+fn shell_open_url_launches_the_handler_as_a_session_and_return_goes_home() {
+    let (a, log) = logged_authority(None);
+    let mut a = a.with_url_handler(FixedUrlHandler(BROWSER_ID.into()));
+    let response = dispatch_rpc(
+        &mut a,
+        open_url_request(
+            None,
+            "http://network-test.debian.org/nm",
+            OPEN_URL_FLAG_CAPTIVE_PORTAL,
+        ),
+    );
+    assert!(
+        matches!(&response, RpcResponse::Launched { session_id } if session_id == "session-1"),
+        "{response:?}"
+    );
+    assert!(matches!(&a.state.phase, Phase::Running { item_id, .. } if item_id == BROWSER_ID));
+    assert_eq!(
+        a.state.return_slot,
+        Some(ReturnSlot {
+            caller: SlotCaller::Shell,
+            handler_session_id: "session-1".into(),
+            handler_item_id: BROWSER_ID.into(),
+            caller_gone: false,
+        })
+    );
+    assert_eq!(
+        a.system.handoffs[0].url,
+        "http://network-test.debian.org/nm"
+    );
+    assert!(a
+        .system
+        .calls
+        .iter()
+        .all(|call| !call.contains("debian.org")));
+    // The shell socket never accepts an app claim.
+    let response = dispatch_rpc(&mut a, open_url_request(Some(LINKER_ID), URL, 0));
+    assert!(matches!(response, RpcResponse::Denied), "{response:?}");
+    assert!(refusals(&log)
+        .last()
+        .unwrap()
+        .contains("reason=claim_without_identity"));
+    // A launch while the handler is in front is the usual busy refusal.
+    assert!(matches!(
+        dispatch_rpc(
+            &mut a,
+            RpcRequest::Launch {
+                item_id: APP_ID.into()
+            }
+        ),
+        RpcResponse::RejectedBusy
+    ));
+
+    // Back at the arrival chip: the browser returns to the caller, which is Home.
+    let response = dispatch_rpc_from(&mut a, front(BROWSER_ID), return_request(BROWSER_ID, None));
+    assert!(matches!(response, RpcResponse::Restored), "{response:?}");
+    assert!(a.state.return_slot.is_none());
+    assert!(
+        a.system.restores.is_empty(),
+        "Home is reached through the protected return, not a restore"
+    );
+    assert!(matches!(a.state.phase, Phase::StoppingGracefully { .. }));
+    a.observe(Observation::UnitInactive).unwrap();
+    restore(&mut a);
+    assert!(matches!(a.state.phase, Phase::Idle));
+    assert!(a.events_for("test").iter().any(|(_, e)| matches!(
+        e,
+        SessionEvent::Terminal(TerminalReceipt::Returned { session_id }) if session_id == "session-1"
+    )));
+    // Idle again: the shell can open the next URL; while an app is in front it is busy.
+    let response = dispatch_rpc(&mut a, open_url_request(None, URL, 0));
+    assert!(
+        matches!(response, RpcResponse::Launched { .. }),
+        "{response:?}"
+    );
+}
+
+#[test]
+fn shell_open_url_is_busy_while_an_app_is_in_front_and_without_a_handler_is_no_handler() {
+    let (a, log) = logged_authority(None);
+    let mut a = a.with_url_handler(FixedUrlHandler(BROWSER_ID.into()));
+    launch_running(&mut a);
+    let response = dispatch_rpc(&mut a, open_url_request(None, URL, 0));
+    assert!(matches!(response, RpcResponse::Busy), "{response:?}");
+    assert!(refusals(&log)[0].contains("reason=phase caller=\"shell\" detail=\"running\""));
+    let (a, _log) = logged_authority(None);
+    let mut a = a.with_url_handler(NoUrlHandler);
+    let response = dispatch_rpc(&mut a, open_url_request(None, URL, 0));
+    assert!(matches!(response, RpcResponse::NoHandler), "{response:?}");
+    assert!(matches!(a.state.phase, Phase::Idle));
+}
+
+#[test]
+fn return_to_caller_url_is_reserved_for_auth_sessions() {
+    let (mut a, log, _) = linker_in_front();
+    assert!(matches!(
+        dispatch_rpc_from(
+            &mut a,
+            front(LINKER_ID),
+            open_url_request(Some(LINKER_ID), URL, 0)
+        ),
+        RpcResponse::Launched { .. }
+    ));
+    let response = dispatch_rpc_from(
+        &mut a,
+        front(BROWSER_ID),
+        return_request(BROWSER_ID, Some("javascript:x")),
+    );
+    assert!(matches!(response, RpcResponse::InvalidUrl), "{response:?}");
+    let response = dispatch_rpc_from(
+        &mut a,
+        front(BROWSER_ID),
+        return_request(BROWSER_ID, Some("https://app.example/callback?code=1")),
+    );
+    assert!(matches!(response, RpcResponse::Denied), "{response:?}");
+    assert!(refusals(&log)
+        .last()
+        .unwrap()
+        .contains("reason=return_url_reserved"));
+    assert!(
+        a.state.return_slot.is_some(),
+        "a refused return leaves the slot"
+    );
+    assert!(a.system.restores.is_empty());
+    // Positive control: the optional url absent.
+    let response = dispatch_rpc_from(&mut a, front(BROWSER_ID), return_request(BROWSER_ID, None));
+    assert!(matches!(response, RpcResponse::Restored), "{response:?}");
+}
+
+#[test]
+fn a_failed_handoff_is_a_logged_error_and_leaves_no_slot() {
+    let (mut a, log, _) = linker_in_front();
+    a.system.fail_open_url = true;
+    let response = dispatch_rpc_from(
+        &mut a,
+        front(LINKER_ID),
+        open_url_request(Some(LINKER_ID), URL, 0),
+    );
+    assert!(
+        matches!(&response, RpcResponse::Error { message } if message.contains("handoff refused")),
+        "{response:?}"
+    );
+    assert!(a.state.return_slot.is_none());
+    assert_eq!(a.state.next_session, 2, "no session was consumed");
+    assert!(log.lock().unwrap().iter().any(|line| line.contains(
+        "lifecycle_failure reason=systemd_start_failed item_id=\"org.example.browser\""
+    )));
+}
+
+#[test]
+fn command_system_refuses_the_handoff_and_never_execs_a_url_argv() {
+    let mut system =
+        CommandSystem::with_executor(CommandTemplates::default(), FakeExecutor::default());
+    let handoff = UrlHandoff {
+        caller: SlotCaller::App {
+            session_id: "session-1".into(),
+            item_id: LINKER_ID.into(),
+        },
+        handler_item_id: BROWSER_ID.into(),
+        handler_session_id: "session-2".into(),
+        url: "https://example.org/$(reboot);rm".into(),
+        flags: 0,
+    };
+    assert!(system
+        .open_url(&handoff)
+        .unwrap_err()
+        .contains("trusted session path"));
+    let slot = ReturnSlot {
+        caller: handoff.caller.clone(),
+        handler_session_id: "session-2".into(),
+        handler_item_id: BROWSER_ID.into(),
+        caller_gone: false,
+    };
+    assert!(system.restore_caller(&slot).is_err());
+    // Positive control: the same system still runs its templates for a plain start.
+    system
+        .start_foreground(
+            &LaunchRequest {
+                item_id: BROWSER_ID.into(),
+            },
+            "session-2",
+        )
+        .unwrap();
+    let calls = system.into_executor().calls;
+    assert_eq!(calls.len(), 1);
+    assert!(calls.iter().all(|(program, args)| {
+        !program.contains("example.org") && args.iter().all(|arg| !arg.contains("example.org"))
+    }));
+}
+
+#[test]
+fn return_slot_persists_and_older_state_without_one_still_loads() {
+    let state = PersistedState::default();
+    let json = serde_json::to_string(&state).unwrap();
+    assert!(!json.contains("return_slot"), "{json}");
+    let legacy: PersistedState = serde_json::from_str(
+        r#"{"phase":"Idle","history":[],"pending":[],"next_sequence":1,"next_session":1,"safe_return_queue":0,"safe_return_binding_revision":0,"acknowledged":{}}"#,
+    )
+    .unwrap();
+    assert_eq!(legacy.return_slot, None);
+    let slot = ReturnSlot {
+        caller: SlotCaller::App {
+            session_id: "session-1".into(),
+            item_id: LINKER_ID.into(),
+        },
+        handler_session_id: "session-2".into(),
+        handler_item_id: BROWSER_ID.into(),
+        caller_gone: true,
+    };
+    let json = serde_json::to_string(&slot).unwrap();
+    assert_eq!(
+        json,
+        r#"{"caller":{"app":{"session_id":"session-1","item_id":"org.example.linker"}},"handler_session_id":"session-2","handler_item_id":"org.example.browser","caller_gone":true}"#
+    );
+    assert_eq!(serde_json::from_str::<ReturnSlot>(&json).unwrap(), slot);
+    assert_eq!(
+        serde_json::to_string(&SlotCaller::Shell).unwrap(),
+        "\"shell\""
+    );
+    // The wire: a front envelope flattens the request beside its version.
+    let envelope: FrontEnvelope = serde_json::from_str(
+        r#"{"version":1,"method":"open_url","app_id":"org.example.linker","url":"https://x.y","flags":0}"#,
+    )
+    .unwrap();
+    assert_eq!(envelope.version, FRONT_WIRE_VERSION);
+    assert!(matches!(envelope.request, RpcRequest::OpenUrl { .. }));
+    assert_eq!(
+        serde_json::to_string(&RpcResponse::Launched {
+            session_id: "session-2".into()
+        })
+        .unwrap(),
+        r#"{"result":"launched","session_id":"session-2"}"#
+    );
+    for (response, expected) in [
+        (RpcResponse::Delivered, "delivered"),
+        (RpcResponse::NoHandler, "no_handler"),
+        (RpcResponse::InvalidUrl, "invalid_url"),
+        (RpcResponse::Denied, "denied"),
+        (RpcResponse::Busy, "busy"),
+        (RpcResponse::RateLimited, "rate_limited"),
+        (RpcResponse::Restored, "restored"),
+        (RpcResponse::CallerGone, "caller_gone"),
+    ] {
+        assert_eq!(
+            serde_json::to_string(&response).unwrap(),
+            format!(r#"{{"result":"{expected}"}}"#)
+        );
+    }
+}
+
+/// A fake SDK front for the socket-level test: the forwarded handle is this process's own
+/// pidfd (a real `SCM_RIGHTS` transfer); the caller mapping stands in for the pf-app@ cgroup.
+fn front_policy(front_ok: bool) -> FrontPolicy {
+    let self_pid = std::process::id() as i32;
+    FrontPolicy::custom(
+        move |_stream| {
+            if front_ok {
+                Ok(())
+            } else {
+                Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "peer pid=1 is session-1.scope (expected pf-sdk-front.service)",
+                ))
+            }
+        },
+        move |fd| {
+            let process = pf_peer_identity::ReceivedProcess::from_fd(fd)
+                .map_err(|error| error.to_string())?;
+            if process.pid() == self_pid {
+                Ok(LINKER_ID.to_owned())
+            } else {
+                Err(format!("pid={} is not in a pf-app@ unit", process.pid()))
+            }
+        },
+    )
+}
+
+fn front_call(socket: &Path, envelope: &FrontEnvelope, with_handle: bool) -> RpcResponse {
+    let stream = std::os::unix::net::UnixStream::connect(socket).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let pidfd = pf_peer_identity::pidfd_open(std::process::id() as i32).unwrap();
+    let handle = with_handle.then(|| std::os::fd::AsFd::as_fd(&pidfd));
+    send_front_request(&stream, envelope, handle).unwrap();
+    let mut stream = stream;
+    serde_json::from_slice(&pf_wire::read_frame(&mut stream).unwrap()).unwrap()
+}
+
+#[test]
+fn front_socket_refuses_a_non_front_peer_and_re_derives_the_caller_from_the_handle() {
+    use std::io::Read as _;
+    let dir = short_socket_dir("front");
+    let socket = dir.join("front.sock");
+    let envelope = |request: RpcRequest| FrontEnvelope {
+        version: FRONT_WIRE_VERSION,
+        request,
+    };
+
+    // A peer that is not the SDK front is closed without a single frame.
+    let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    let (requests, _incoming) = std::sync::mpsc::channel();
+    spawn_front_acceptor(
+        listener,
+        requests,
+        DEFAULT_CONNECTION_LIMITS,
+        front_policy(false),
+    );
+    let mut refused = std::os::unix::net::UnixStream::connect(&socket).unwrap();
+    refused
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let mut byte = [0; 1];
+    assert_eq!(
+        refused.read(&mut byte).unwrap(),
+        0,
+        "closed without service"
+    );
+    drop(refused);
+    fs::remove_file(&socket).unwrap();
+
+    // The SDK front: each request is served with the caller re-derived from the handle.
+    let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    let (requests, incoming) = std::sync::mpsc::channel();
+    spawn_front_acceptor(
+        listener,
+        requests,
+        DEFAULT_CONNECTION_LIMITS,
+        front_policy(true),
+    );
+    let (a, log) = logged_authority(None);
+    let mut a = a.with_url_handler(FixedUrlHandler(BROWSER_ID.into()));
+    launch_item(&mut a, LINKER_ID);
+    let client_socket = socket.clone();
+    let client = std::thread::spawn(move || {
+        let matching = front_call(
+            &client_socket,
+            &envelope(open_url_request(Some(LINKER_ID), URL, 0)),
+            true,
+        );
+        let mismatch = front_call(
+            &client_socket,
+            &envelope(open_url_request(Some(APP_ID), URL, 0)),
+            true,
+        );
+        let no_handle = front_call(
+            &client_socket,
+            &envelope(open_url_request(Some(LINKER_ID), URL, 0)),
+            false,
+        );
+        let wrong_version = front_call(
+            &client_socket,
+            &FrontEnvelope {
+                version: 2,
+                request: open_url_request(Some(LINKER_ID), URL, 0),
+            },
+            true,
+        );
+        let shell_verb = front_call(&client_socket, &envelope(RpcRequest::History), true);
+        (matching, mismatch, no_handle, wrong_version, shell_verb)
+    });
+    let mut served = 0;
+    let stopped = run_service_loop(
+        &mut a,
+        &incoming,
+        Duration::from_millis(5),
+        |authority, pending: PendingRpc| {
+            assert!(matches!(pending.origin(), RpcOrigin::Front { .. }));
+            pending.dispatch(authority);
+            served += 1;
+            if served == 3 {
+                Err(io::Error::other("served every front request"))
+            } else {
+                Ok(())
+            }
+        },
+    );
+    assert_eq!(
+        stopped.unwrap_err().to_string(),
+        "served every front request"
+    );
+    let (matching, mismatch, no_handle, wrong_version, shell_verb) = client.join().unwrap();
+    assert!(
+        matches!(matching, RpcResponse::Launched { .. }),
+        "{matching:?}"
+    );
+    assert!(matches!(mismatch, RpcResponse::Denied), "{mismatch:?}");
+    assert!(matches!(no_handle, RpcResponse::Denied), "{no_handle:?}");
+    assert!(
+        matches!(&wrong_version, RpcResponse::Error { message } if message.contains("version 2")),
+        "{wrong_version:?}"
+    );
+    assert!(
+        matches!(&shell_verb, RpcResponse::Error { message } if message.contains("not accepted on the front socket")),
+        "{shell_verb:?}"
+    );
+    let refused = refusals(&log);
+    assert!(refused[0].contains("reason=identity_mismatch caller=\"org.example.game\" detail=\"derived=org.example.linker\""), "{refused:?}");
+    assert!(refused[1].contains("reason=identity_unverified caller=\"org.example.linker\" detail=\"missing_process_handle\""), "{refused:?}");
+    assert_eq!(a.system.handoffs.len(), 1);
     fs::remove_dir_all(dir).unwrap();
 }

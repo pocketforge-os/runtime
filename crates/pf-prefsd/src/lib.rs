@@ -1,8 +1,7 @@
 //! System preference service protocol and serving loop.
 
 use pf_peer_identity::{
-    peer_cgroup_with_source, service_unit_from_cgroup, KernelPeerProcessSource,
-    PeerProcessSource,
+    peer_cgroup_with_source, service_unit_from_cgroup, KernelPeerProcessSource, PeerProcessSource,
 };
 // Peer identity is the shared `pf-peer-identity` crate (one implementation for every service
 // that identifies apps); these re-exports keep the daemon's public surface stable.

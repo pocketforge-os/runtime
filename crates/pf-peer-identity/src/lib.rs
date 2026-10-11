@@ -573,8 +573,7 @@ pub mod scm {
         unsafe {
             let mut cmsg = libc::CMSG_FIRSTHDR(&msg);
             while !cmsg.is_null() {
-                if (*cmsg).cmsg_level == libc::SOL_SOCKET && (*cmsg).cmsg_type == libc::SCM_RIGHTS
-                {
+                if (*cmsg).cmsg_level == libc::SOL_SOCKET && (*cmsg).cmsg_type == libc::SCM_RIGHTS {
                     let data_ptr = libc::CMSG_DATA(cmsg) as *const RawFd;
                     let payload = (*cmsg).cmsg_len as usize - libc::CMSG_LEN(0) as usize;
                     for index in 0..payload / std::mem::size_of::<RawFd>() {
