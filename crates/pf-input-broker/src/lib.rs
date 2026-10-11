@@ -48,7 +48,9 @@ pub use broker::{
 };
 pub use policy::TokenBucket;
 pub use remap::{Remap, RemapError};
-pub use safe_return::{SafeReturnGate, SafeReturnIntake};
+pub use safe_return::{
+    serve_system_menu_provider, SafeReturnIntake, SystemMenuGate, SystemMenuRouter,
+};
 pub use uinput::{AbsInfo, Uinput, UinputSpec};
 
 /// How the broker vends the input device to a consumer (R-C).

@@ -7,25 +7,30 @@
 //! Usage:
 //!   pf-input-broker --descriptor <caps.toml> [--source <event-node>] [--acquire-sock <path>]
 //!                   [--safe-return-sock <authority.sock>]
+//!                   [--system-menu-sock <provider.sock>]
 //!
 //! Each `--acquire-sock` connection is a persistent PFW1 session: repeated `Acquire("input")`
 //! (each answered with a fresh re-emit fd), `GetAppearance` (prefsd via `$PF_PREFSD_SOCK`), and a
 //! typed `Unsupported` for everything else.
 //!
-//! `--safe-return-sock` makes the broker the protected SafeReturn intake: guide/`BTN_MODE` never
-//! reaches the app, and each guide press sends one `{"method":"safe_return"}` to the session
-//! authority from a worker thread. The pump never waits on the authority. Without the flag the
-//! re-emit stream is unchanged.
+//! `--safe-return-sock` makes guide/`BTN_MODE` a protected System Menu action. A same-uid trusted
+//! provider can register at `--system-menu-sock`; it receives versioned `system_menu` actions and
+//! must acknowledge within 250 ms. Missing, invalid, disconnected, or hung providers fall back to
+//! the existing `safe_return` authority RPC. A provider's versioned `shown` message is logged but
+//! has no deadline policy in v1. The input pump never waits on either process.
 //!
 //! `--no-grab` is the R-C blessed-binary path (Steam Link): re-emit + hand the fd WITHOUT the
 //! exclusive grab (so a `uinput`-producing consumer is not broken).
 
 use std::os::raw::c_int;
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixListener;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use pf_input_broker::{serve_client, InputBroker, SafeReturnIntake};
+use pf_input_broker::{
+    serve_client, serve_system_menu_provider, InputBroker, SafeReturnIntake, SystemMenuRouter,
+};
 use pocketforge::backends::InProcessBackend;
 use pocketforge::{Backend, Descriptor};
 
@@ -49,6 +54,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .ok_or("need --descriptor <caps.toml> (or PF_DESCRIPTOR)")?;
     let acquire_sock = arg(&args, "--acquire-sock");
     let safe_return_sock = arg(&args, "--safe-return-sock");
+    let system_menu_sock = arg(&args, "--system-menu-sock");
+    if system_menu_sock.is_some() && safe_return_sock.is_none() {
+        return Err("--system-menu-sock requires --safe-return-sock".into());
+    }
     let grab = !args.iter().any(|a| a == "--no-grab");
 
     let descriptor = Descriptor::load(&desc_path)?;
@@ -57,8 +66,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         None => discover_with_timeout(&descriptor)?,
     };
     let mut broker = InputBroker::start_with(&source, &descriptor, grab)?;
-    if let Some(sock) = safe_return_sock.as_deref() {
-        broker = broker.with_safe_return(SafeReturnIntake::spawn(sock)?);
+    let system_menu_router = safe_return_sock
+        .as_deref()
+        .map(SafeReturnIntake::spawn)
+        .transpose()?
+        .map(SystemMenuRouter::spawn)
+        .transpose()?;
+    if let Some(router) = system_menu_router.as_ref() {
+        broker = broker.with_system_menu(router.clone());
     }
     // GetAppearance fallback when $PF_PREFSD_SOCK is unset: the store-less in-process default.
     let backend: Arc<dyn Backend> = Arc::new(InProcessBackend::new(Arc::new(descriptor)));
@@ -89,13 +104,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("acquire-sock={sock}");
     }
     if let Some(sock) = safe_return_sock.as_deref() {
-        eprintln!("pf-input-broker: safe-return intake -> {sock} (guide withheld from the app)");
+        eprintln!("pf-input-broker: System Menu fallback -> {sock} (guide withheld from apps)");
     }
-    // Bind before readiness: READY means both the event node and acquisition endpoint exist.
+    // Bind before readiness: READY means the event node and configured endpoints all exist.
     let listener = if let Some(sock) = acquire_sock.as_deref() {
         let _ = std::fs::remove_file(sock);
         let listener = UnixListener::bind(sock)?;
         listener.set_nonblocking(true)?;
+        Some(listener)
+    } else {
+        None
+    };
+    let system_menu_listener = if let Some(sock) = system_menu_sock.as_deref() {
+        let _ = std::fs::remove_file(sock);
+        let listener = UnixListener::bind(sock)?;
+        std::fs::set_permissions(sock, std::fs::Permissions::from_mode(0o600))?;
+        listener.set_nonblocking(true)?;
+        println!("system-menu-sock={sock}");
         Some(listener)
     } else {
         None
@@ -111,7 +136,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let _ = pump_tx.send(broker.run(&STOP));
     });
 
-    let result = supervise(listener.as_ref(), &node, &backend, &pump_rx, &STOP);
+    let result = supervise(
+        listener.as_ref(),
+        system_menu_listener.as_ref(),
+        system_menu_router.as_ref(),
+        &node,
+        &backend,
+        &pump_rx,
+        &STOP,
+    );
     STOP.store(true, Ordering::Release);
     let _ = pump.join();
     result.map_err(Into::into)
@@ -119,6 +152,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 fn supervise(
     listener: Option<&UnixListener>,
+    system_menu_listener: Option<&UnixListener>,
+    system_menu_router: Option<&SystemMenuRouter>,
     node: &str,
     backend: &Arc<dyn Backend>,
     pump_rx: &std::sync::mpsc::Receiver<std::io::Result<()>>,
@@ -141,6 +176,22 @@ fn supervise(
                     // carries a finite I/O deadline once it starts.
                     std::thread::spawn(move || {
                         let _ = serve_client(stream, &node, &*backend);
+                    });
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(e) => return Err(e),
+            }
+        }
+        if let (Some(listener), Some(router)) = (system_menu_listener, system_menu_router) {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    let router = router.clone();
+                    let trusted_uid = unsafe { libc::geteuid() };
+                    std::thread::spawn(move || {
+                        if let Err(error) = serve_system_menu_provider(stream, &router, trusted_uid)
+                        {
+                            eprintln!("pf-input-broker: rejected system-menu provider: {error}");
+                        }
                     });
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
@@ -269,9 +320,17 @@ mod tests {
         let stop = AtomicBool::new(false);
         let started = std::time::Instant::now();
         assert_eq!(
-            supervise(Some(&listener), "/unused", &test_backend(), &rx, &stop)
-                .unwrap_err()
-                .kind(),
+            supervise(
+                Some(&listener),
+                None,
+                None,
+                "/unused",
+                &test_backend(),
+                &rx,
+                &stop,
+            )
+            .unwrap_err()
+            .kind(),
             std::io::ErrorKind::BrokenPipe
         );
         assert!(started.elapsed() < std::time::Duration::from_secs(1));
@@ -291,7 +350,16 @@ mod tests {
         let (_tx, rx) = std::sync::mpsc::channel();
         let stop = AtomicBool::new(true);
         let started = std::time::Instant::now();
-        supervise(Some(&listener), "/unused", &test_backend(), &rx, &stop).unwrap();
+        supervise(
+            Some(&listener),
+            None,
+            None,
+            "/unused",
+            &test_backend(),
+            &rx,
+            &stop,
+        )
+        .unwrap();
         assert!(started.elapsed() < std::time::Duration::from_secs(1));
         std::fs::remove_file(path).unwrap();
     }

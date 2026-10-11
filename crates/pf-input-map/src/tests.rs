@@ -22,15 +22,15 @@ fn chord(a: &str, b: &str) -> Binding {
 #[test]
 fn per_device_shipped_defaults_cover_all_device_classes() {
     assert_eq!(
-        map(A523).binding("global", "SafeReturn"),
+        map(A523).binding("global", "SystemMenu"),
         Some(&Binding::single("home"))
     );
     assert_eq!(
-        map(A133).binding("global", "SafeReturn"),
+        map(A133).binding("global", "SystemMenu"),
         Some(&Binding::single("guide"))
     );
     assert_eq!(
-        map(BUTTONLESS).binding("global", "SafeReturn"),
+        map(BUTTONLESS).binding("global", "SystemMenu"),
         Some(&chord("select", "start"))
     );
     for fixture in [A523, A133, BUTTONLESS] {
@@ -47,11 +47,11 @@ fn a523_home_re_resolves_on_a133_once() {
     let mut current =
         EffectiveMap::from_persisted(contract(A133), Some(("a523".into(), old))).unwrap();
     assert_eq!(
-        current.binding("global", "SafeReturn"),
+        current.binding("global", "SystemMenu"),
         Some(&Binding::single("guide"))
     );
     assert!(
-        matches!(current.next_event(), Some(MapEvent::BindingReResolved { action, stored_device_id, current_device_id, .. }) if action == "SafeReturn" && stored_device_id == "a523" && current_device_id == "a133")
+        matches!(current.next_event(), Some(MapEvent::BindingReResolved { action, stored_device_id, current_device_id, .. }) if action == "SystemMenu" && stored_device_id == "a523" && current_device_id == "a133")
     );
     assert_eq!(current.next_event(), None);
 }
@@ -62,11 +62,11 @@ fn guide_re_resolves_to_buttonless_chord() {
     let mut current =
         EffectiveMap::from_persisted(contract(BUTTONLESS), Some(("a133".into(), old))).unwrap();
     assert_eq!(
-        current.binding("global", "SafeReturn"),
+        current.binding("global", "SystemMenu"),
         Some(&chord("select", "start"))
     );
     assert!(
-        matches!(current.next_event(), Some(MapEvent::BindingReResolved { action, .. }) if action == "SafeReturn")
+        matches!(current.next_event(), Some(MapEvent::BindingReResolved { action, .. }) if action == "SystemMenu")
     );
 }
 
@@ -76,7 +76,7 @@ fn carried_identity_is_loaded_from_the_keyed_store_then_re_resolved() {
     store.save("a523", map(A523).mappings()).unwrap();
     let mut current = EffectiveMap::load_carried(contract(A133), "a523", &store).unwrap();
     assert_eq!(
-        current.binding("global", "SafeReturn"),
+        current.binding("global", "SystemMenu"),
         Some(&Binding::single("guide"))
     );
     assert!(matches!(
@@ -241,14 +241,11 @@ fn reset_to_shipped_cancels_an_in_flight_preview() {
 }
 
 #[test]
-fn rejects_safe_return_collision_across_contexts() {
+fn system_menu_cannot_be_rebound_even_to_a_noncolliding_control() {
     let mut engine = RemapEngine::new(map(A133), MemoryStore::default());
     assert_eq!(
-        engine.begin("global", "SafeReturn", Binding::single("east")),
-        Err(MapError::Collision {
-            first: "SafeReturn".into(),
-            second: "Activate".into()
-        })
+        engine.begin("global", "SystemMenu", Binding::single("l1")),
+        Err(MapError::ProtectedActionImmutable("SystemMenu".into()))
     );
 }
 
@@ -344,6 +341,40 @@ fn legacy_persisted_map_keeps_user_remaps_and_adds_new_shipped_protected_actions
 }
 
 #[test]
+fn persisted_map_cannot_override_the_shipped_system_menu_binding() {
+    let device = contract(A133);
+    let shipped_menu = device
+        .effective_map
+        .iter()
+        .find(|mapping| mapping.action == "SystemMenu")
+        .unwrap()
+        .binding
+        .clone();
+    let mut persisted = device.effective_map.clone();
+    persisted
+        .iter_mut()
+        .find(|mapping| mapping.action == "SystemMenu")
+        .unwrap()
+        .binding = Binding::single("l1");
+    persisted
+        .iter_mut()
+        .find(|mapping| mapping.action == "Activate")
+        .unwrap()
+        .binding = Binding::single("west");
+
+    let effective = EffectiveMap::from_persisted(device, Some(("a133".into(), persisted))).unwrap();
+
+    assert_eq!(
+        effective.binding("global", "SystemMenu"),
+        Some(&shipped_menu)
+    );
+    assert_eq!(
+        effective.binding("shell", "Activate"),
+        Some(&Binding::single("west"))
+    );
+}
+
+#[test]
 fn rejects_any_candidate_that_strands_a_protected_action() {
     let mut broken = contract(A133);
     broken.effective_map.retain(|m| m.action != "Back");
@@ -396,7 +427,7 @@ fn glyphs_resolve_every_binding_shape_and_printed_or_source_truth() {
     };
     assert_eq!(face.printed_label, "A");
     let GlyphResult::Resolved(guide) = effective
-        .resolve(&ShellAction::Custom("SafeReturn".into()))
+        .resolve(&ShellAction::Custom("SystemMenu".into()))
         .unwrap()
     else {
         panic!()
@@ -420,6 +451,44 @@ fn json_store_is_identity_keyed_and_round_trips() {
 }
 
 #[test]
+fn json_store_migrates_v1_safe_return_on_load_and_next_save() {
+    let dir =
+        std::env::temp_dir().join(format!("pf-input-map-v1-migration-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("remaps.json");
+    let mut legacy = map(A133).mappings().to_vec();
+    legacy
+        .iter_mut()
+        .find(|mapping| mapping.action == "SystemMenu")
+        .unwrap()
+        .action = "SafeReturn".into();
+    let document = serde_json::json!({
+        "schema_version": 1,
+        "devices": {
+            "a133": legacy,
+            "other-device": [{
+                "context": "global",
+                "action": "SafeReturn",
+                "binding": {"shape": "single_press", "controls": ["home"]}
+            }]
+        }
+    });
+    fs::write(&path, serde_json::to_vec(&document).unwrap()).unwrap();
+    let mut store = JsonRemapStore::at(&path);
+
+    let loaded = store.load("a133").unwrap().unwrap();
+    assert!(loaded.iter().any(|mapping| mapping.action == "SystemMenu"));
+    assert!(!loaded.iter().any(|mapping| mapping.action == "SafeReturn"));
+
+    store.save("a133", &loaded).unwrap();
+    let saved: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    assert_eq!(saved["schema_version"], SCHEMA_VERSION);
+    assert_eq!(saved["devices"]["other-device"][0]["action"], "SystemMenu");
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
 fn json_store_save_rejects_future_version_without_touching_file() {
     let dir = std::env::temp_dir().join(format!(
         "pf-input-map-future-version-{}",
@@ -428,14 +497,14 @@ fn json_store_save_rejects_future_version_without_touching_file() {
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).unwrap();
     let path = dir.join("remaps.json");
-    let original = br#"{"schema_version":2,"devices":{"future-device":[]}}"#;
+    let original = br#"{"schema_version":3,"devices":{"future-device":[]}}"#;
     fs::write(&path, original).unwrap();
     let mut store = JsonRemapStore::at(&path);
 
     assert_eq!(
         store.save("a133", map(A133).mappings()),
         Err(MapError::UnsupportedVersion {
-            found: 2,
+            found: 3,
             supported: SCHEMA_VERSION,
         })
     );
