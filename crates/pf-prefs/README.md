@@ -6,23 +6,19 @@ on. Sibling `.2` wires it into the capability backends (so the facade honors it 
 and attaches the `PrefsDidChange` observer; `.3` adds the on-panel settings UI. The v1 writer
 surface is the `pf-settings` CLI (crate `pf-settings`).
 
-> `docs/PREFERENCES.md` — the epic's cross-linked contract doc — is authored by `.2` (this bead
-> is new-files-only and does not touch `docs/`). Until then, this README + the crate rustdoc are
-> the contract of record.
+> `docs/PREFERENCES.md` is the cross-linked contract, including the daemon's enforced write policy.
 
 ## The contract: read-only to apps, cooperatively honored
 
-Preferences are **READ-ONLY TO APPS by contract** (owner ruling Q4 / R-A). An app may *read* a
-preference and — once `.2` lands the observer — *subscribe* to changes; it may **never write
-one**. Authority to change a preference lives with the user: the `pf-settings` CLI today, the
+Preferences are **READ-ONLY TO APPS** (owner ruling Q4 / R-A). An app may *read* and subscribe to a
+preference, but it may **never write one**. App units cannot reach the prefs daemon, whose write
+path also authenticates the socket peer's systemd unit. Authority to change a preference lives
+with the user: the `pf-settings` CLI today, the
 on-panel settings UI (`.3`) and supervisor later, all through the single write path here.
 
-This contract is **cooperative, permanently** — *"contract, cooperatively honored"*, never an
-enforcement claim against a hostile app. The v0 facade is an in-process library; it proves the
-contract + ergonomics + graceful missing-hardware degradation, not confinement. The one path
-where a preference is enforceable against a *non-cooperative* app is the FF/rumble route through
-E2's `uinput`+`EVIOCGRAB` input broker — that R-B nuance is documented where it applies (`.2`'s
-integration docs), not here.
+Preference *effects* remain cooperative: except for brokered rumble, a hostile app can reproduce a
+disabled behavior through some other ambient primitive. That is distinct from write authority,
+which is enforced.
 
 ## Not a fork of the capabilities descriptor
 

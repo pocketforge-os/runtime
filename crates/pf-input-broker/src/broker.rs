@@ -722,8 +722,9 @@ pub fn handle_acquire(mut stream: UnixStream, app_fd_path: &str) -> io::Result<(
 /// * `Acquire("input")` replies `Ok` plus a fresh re-emit read fd over `SCM_RIGHTS`, as many
 ///   times as the client asks, so a client that dropped its fd can re-acquire on the same session
 ///   connection.
-/// * `GetAppearance` goes through [`pocketforge::server::handle_request`]: prefsd at
-///   `$PF_PREFSD_SOCK` when set, otherwise `backend`.
+/// * Preference reads (`GetAppearance`, `GetAppearanceSource`, and `GetPreference`) go through
+///   [`pocketforge::server::handle_request`]: prefsd at `$PF_PREFSD_SOCK` when set, otherwise the
+///   backend/default response.
 /// * Every other op gets a typed `Unsupported`.
 ///
 /// The client (the app's `BrokerClientBackend`) holds this connection for its whole session, so
@@ -793,10 +794,10 @@ fn respond(
             send_response(&mut framed, &Response::ok()).map_err(wire_err)?;
             scm::send_fd(stream.as_raw_fd(), &framed, fd.as_raw_fd())
         }
-        Op::GetAppearance => {
+        Op::GetAppearance | Op::GetAppearanceSource | Op::GetPreference => {
             send_response(&mut writer, &handle_request(backend, req)).map_err(wire_err)
         }
-        // This socket vends the input fd and the appearance read; nothing else.
+        // This socket vends the input fd and read-only preferences; nothing mutating.
         _ => send_response(&mut writer, &Response::err(Status::Unsupported)).map_err(wire_err),
     }
 }
@@ -1443,7 +1444,7 @@ range = { min = 0, max = 255, fuzz = 0, flat = 0 }
     }
 
     #[test]
-    fn get_appearance_is_served_and_other_ops_stay_unsupported() {
+    fn preference_reads_are_served_and_mutating_ops_stay_unsupported() {
         let node = node_file("appearance.node");
         let (client, server) = serve_pair(&node);
         let appearance = call(&client, Op::GetAppearance, "");
@@ -1455,9 +1456,8 @@ range = { min = 0, max = 255, fuzz = 0, flat = 0 }
         );
         for (op, name) in [
             (Op::IsPresent, "input"),
-            (Op::GetAppearanceSource, ""),
-            (Op::GetPreference, ""),
             (Op::Acquire, "imu"),
+            (Op::SetCapability, "settings"),
         ] {
             assert_eq!(
                 call(&client, op, name).status,
@@ -1465,6 +1465,11 @@ range = { min = 0, max = 255, fuzz = 0, flat = 0 }
                 "{op:?}"
             );
         }
+        assert_eq!(
+            call(&client, Op::GetAppearanceSource, "").status,
+            Status::Ok
+        );
+        assert_eq!(call(&client, Op::GetPreference, "").status, Status::Ok);
         // The session survives all of that: input can still be acquired.
         assert!(acquire_on(&client).1.is_some());
         drop(client);

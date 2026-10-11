@@ -7,18 +7,16 @@
 //!
 //! ## The contract: read-only to apps, cooperatively honored
 //!
-//! Preferences are **READ-ONLY TO APPS by contract** (owner ruling Q4 / R-A): an app may read a
-//! preference (to, say, skip a flashy animation under `reduceMotion`) and — once `.2` lands the
-//! observer — subscribe to changes, but it may **never write one**. Authority to change a
+//! Preferences are **READ-ONLY TO APPS** (owner ruling Q4 / R-A): an app may read a preference (to,
+//! say, skip a flashy animation under `reduceMotion`) and subscribe to changes, but it may **never
+//! write one**. The image hides the prefs daemon socket from app units, and `pf-prefsd` independently
+//! authorizes writes from kernel peer credentials plus the peer's systemd cgroup. Authority to change a
 //! preference lives with the *user* (the `pf-settings` CLI today; the on-panel settings UI and
 //! supervisor later), all going through the single write path here.
 //!
-//! This contract is **cooperative, permanently** — "contract, cooperatively honored", never an
-//! enforcement claim against a hostile app. The v0 facade is an in-process library, so it proves
-//! the contract + ergonomics, not confinement. (The *one* path where a preference is enforceable
-//! against a non-cooperative app is the FF/rumble route through E2's `uinput`+`EVIOCGRAB` input
-//! broker — that R-B nuance is documented where it applies, in `.2`'s integration docs, not
-//! here.)
+//! Preference *effects* remain cooperatively honored: except for brokered rumble, disabling a
+//! behavior does not confine a hostile app from reproducing that behavior through another ambient
+//! primitive. That limitation is separate from write authority, which is now enforced.
 //!
 //! ## Not a fork of the capabilities descriptor
 //!

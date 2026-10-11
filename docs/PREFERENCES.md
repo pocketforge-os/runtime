@@ -82,6 +82,39 @@ The epic acceptance is explicit: `PrefsDidChange` fires on **any** write path. T
    (`tests/prefs_change_event.rs::external_cli_write_becomes_observable_via_reload`) and `.4`'s sim
    E2E exercise the CLI-write → reload → observer-fires leg explicitly.
 
+### 3.2 Enforced daemon write policy
+
+On the image, read-only-to-apps is also an enforced process boundary. App units cannot reach
+`/run/pocketforge/prefsd.sock`; their preference reads use the input broker's read-only
+`GetAppearance`, `GetAppearanceSource`, and `GetPreference` operations. `pf-prefsd` independently
+default-denies every `Set` unless socket-bound `SO_PEERCRED` and `SO_PEERGROUPS` include the daemon
+uid and the dedicated `pf-pref-writer` group, and the peer's systemd cgroup identifies a trusted
+Settings or PocketForge shell service. The writer group is assigned only to those control-plane
+units; app units do not receive it. This socket-bound prerequisite closes the old-kernel PID-reuse
+gap before any numeric-PID lookup, while the cgroup check prevents a trusted socket from being
+reclassified as an app after process exit.
+
+On kernels with `SO_PEERPIDFD`, the socket supplies the pidfd directly. The shipping A523/5.15
+kernel falls back to `pidfd_open`; the A133/4.9 kernel holds an opened `/proc/<pid>` directory and
+reads `stat` and `cgroup` relative to that descriptor. These compatibility handles narrow an
+already socket-authorized writer; they never grant authority by themselves. Unsupported-kernel
+fallback is narrow, and every other identity error denies the write. A request never declares its
+own role.
+
+The executable policy is `pf_prefsd::WRITE_POLICY`; its schema-exhaustiveness test makes a newly
+added preference deny-by-default until an explicit row is reviewed.
+
+| key | Settings (`pf-settings.service`) | shell (`pf-shell-selected.service`, `pf-foreground@*.service`) | app/broker/unknown |
+|-----|:--:|:--:|:--:|
+| `appearance` | allow | allow | deny |
+| `textScale` | allow | allow | deny |
+| `highContrast` | allow | allow | deny |
+| `reduceFlashing` | allow | allow | deny |
+| `reduceMotion` | allow | allow | deny |
+| `hapticsEnabled` | allow | allow | deny |
+| `monoAudio` | allow | allow | deny |
+| `brightness` | allow | allow | deny |
+
 ## 4. `reduceMotion` and `monoAudio` — documented seams, honest v0 semantics
 
 - **`reduceMotion` is a readable + observable flag with NO v0 machinery.** There is no cosmetic-motion
@@ -129,28 +162,23 @@ not "fix" the enum. The unification is proven under IDENTICAL calling code by
 (a523-with-haptics-off ⇒ `NoopSuppressed`, a133-no-motor ⇒ `NoopAbsent`), and `.4`'s two CI matrix
 rows build on it.
 
-## 7. Additive-only on the frozen v1 wire/ABI — and the post-Phase-2 path
+## 7. Additive-only on the frozen v1 wire/ABI
 
-This bead adds **NO** PFW1 wire op and **NO** C-ABI symbol — the frozen surfaces
+This integration adds **NO new** PFW1 wire op and **NO** C-ABI symbol — the frozen surfaces
 ([`STABILITY.md`](STABILITY.md): the `pf-wire` `Op` enum, `abi/libpocketforge.v1.abi`) are **untouched**
-(`crates/pf-wire/tests/frozen_contract.rs` and `abi/check-abi.sh` stay green unchanged). The store
-integration, the `PrefsDidChange` observer, and the scalar getter are **Rust-level** additions
-(`InProcessBackend` methods + two **defaulted** `Backend` trait methods `preference_scalar` /
-`subscribe_preference`) — not part of the frozen contract. The v0 in-process backend is the facade
-that proves the contract + observer + at-the-primitive honoring device-free; the out-of-process broker
-client cannot yet read/observe preferences over the wire and says so honestly (`preference_scalar`
-returns the caller's default; `subscribe_preference` returns `None`).
+(`crates/pf-wire/tests/frozen_contract.rs` and `abi/check-abi.sh` stay green unchanged). Existing
+`GetPreference`, `GetAppearance`, and `GetAppearanceSource` operations give the out-of-process broker
+client read access through `pf-prefsd`. Subscription remains a later additive operation; until then,
+`subscribe_preference` returns `None` out of process.
 
-**Post-Phase-2 path (so the deferral is documented, not accidental):**
+The preference **WRITE** operation stays absent from the app wire. Writes are control-plane-scoped
+to the trusted units in §3.2 and go directly to `pf-prefsd`; an app with a broker socket therefore
+cannot acquire a write surface.
 
-- When the broker goes **out-of-process**, preference **read/subscribe** ops are added to the PFW1 wire
-  **ADDITIVELY** then (a new `Op` value + `frozen_contract.rs` golden in the same change, per
-  `STABILITY.md §2`). The broker will own the store and fire `PrefsDidChange` natively over the socket,
-  retiring the `reload_prefs()` stand-in (§3.1).
-- The preference **WRITE** op stays **control-plane-scoped** — it is exposed to the authority side
-  (CLI / supervisor / settings UI), **never to app sockets**. That is precisely how **read-only-to-apps
-  survives the backend swap**: an app that gains a broker socket still cannot write a preference,
-  because the wire never offers it a write.
+**Remaining additive path:**
+
+- A future broker-native `PrefsDidChange` subscription adds a new operation and frozen-contract
+  golden in the same change, then retires the `reload_prefs()` stand-in (§3.1).
 - **`reduceMotion`'s C-ABI story:** no C symbol is added in v1 because there is no C consumer that reads
   preferences yet. When a real C consumer exists, a `pf_preference_*` read/subscribe symbol is added
   **additively** (appended to `abi/libpocketforge.v1.abi` in the same change, per `STABILITY.md §2`).

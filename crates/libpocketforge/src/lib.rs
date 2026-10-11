@@ -467,11 +467,17 @@ sdl_guid = "00000000000000000000000000000000"
         let state = std::path::PathBuf::from(std::env::var_os("PF_TEST_STATE").unwrap());
         let listener = UnixListener::bind(socket).unwrap();
         let stop = std::sync::atomic::AtomicBool::new(false);
-        pf_prefsd::serve_until(
+        // This subprocess stands in for the trusted control plane. Keep its
+        // authority explicit: CI processes are not launched in a PocketForge
+        // systemd unit, while production `serve_until` still derives the
+        // writer solely from the live socket peer.
+        pf_prefsd::serve_until_with_timeout_and_resolver(
             listener,
             &pf_prefs::PrefsStore::at(state),
             unsafe { libc::geteuid() },
             &stop,
+            Duration::from_secs(2),
+            |_| Ok(Some(pf_prefsd::PreferenceWriter::Shell)),
         )
         .unwrap();
     }

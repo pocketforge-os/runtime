@@ -10,7 +10,8 @@
 //!                   [--system-menu-sock <provider.sock>]
 //!
 //! Each `--acquire-sock` connection is a persistent PFW1 session: repeated `Acquire("input")`
-//! (each answered with a fresh re-emit fd), `GetAppearance` (prefsd via `$PF_PREFSD_SOCK`), and a
+//! (each answered with a fresh re-emit fd), read-only preference operations (prefsd via
+//! `$PF_PREFSD_SOCK`), and a
 //! typed `Unsupported` for everything else.
 //!
 //! `--safe-return-sock` makes guide/`BTN_MODE` a protected System Menu action. A same-uid trusted

@@ -1,4 +1,4 @@
-use pf_prefsd::{serve_until_with_timeout, ErrorKind, RpcResponse};
+use pf_prefsd::{serve_until_with_timeout_and_resolver, ErrorKind, PreferenceWriter, RpcResponse};
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -39,22 +39,31 @@ struct Server {
 
 impl Server {
     fn start(root: &Path) -> Self {
-        Self::start_with_timeout(root, Duration::from_millis(100))
+        Self::start_as(root, Some(PreferenceWriter::Shell))
     }
 
-    fn start_with_timeout(root: &Path, connection_timeout: Duration) -> Self {
+    fn start_as(root: &Path, writer: Option<PreferenceWriter>) -> Self {
+        Self::start_with_timeout_as(root, Duration::from_millis(100), writer)
+    }
+
+    fn start_with_timeout_as(
+        root: &Path,
+        connection_timeout: Duration,
+        writer: Option<PreferenceWriter>,
+    ) -> Self {
         let socket = root.join("prefsd.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let state = root.join("state");
         let stop = Arc::new(AtomicBool::new(false));
         let thread_stop = stop.clone();
         let thread = std::thread::spawn(move || {
-            serve_until_with_timeout(
+            serve_until_with_timeout_and_resolver(
                 listener,
                 &pf_prefs::PrefsStore::at(state),
                 unsafe { libc::geteuid() },
                 &thread_stop,
                 connection_timeout,
+                move |_| Ok(writer),
             )
             .unwrap();
         });
@@ -63,6 +72,46 @@ impl Server {
             stop,
             thread: Some(thread),
         }
+    }
+}
+
+#[test]
+fn same_uid_app_peer_cannot_set_but_trusted_units_can() {
+    let app_root = Scratch::new("app-writer");
+    let app = Server::start_as(&app_root.0, None);
+    assert!(matches!(
+        rpc(
+            &app.socket,
+            serde_json::json!({"method":"set", "key":"reduceMotion", "value":true})
+        ),
+        RpcResponse::Error {
+            kind: Some(ErrorKind::PermissionDenied),
+            ..
+        }
+    ));
+    assert!(matches!(
+        rpc(
+            &app.socket,
+            serde_json::json!({"method":"get", "key":"reduceMotion"})
+        ),
+        RpcResponse::Value { .. }
+    ));
+
+    for (label, writer) in [
+        ("settings-writer", PreferenceWriter::Settings),
+        ("shell-writer", PreferenceWriter::Shell),
+    ] {
+        let root = Scratch::new(label);
+        let server = Server::start_as(&root.0, Some(writer));
+        assert_eq!(
+            rpc(
+                &server.socket,
+                serde_json::json!({"method":"set", "key":"reduceMotion", "value":true})
+            ),
+            RpcResponse::Value {
+                value: serde_json::json!(true)
+            }
+        );
     }
 }
 
@@ -281,6 +330,7 @@ fn sigterm_removes_socket_and_socket_is_owner_only() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_pf-prefsd"))
         .args(["--state-dir", state.to_str().unwrap(), "--socket"])
         .arg(&socket)
+        .args(["--writer-group", "root"])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -307,6 +357,7 @@ fn first_start_creates_missing_state_and_socket_parents() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_pf-prefsd"))
         .args(["--state-dir", state.to_str().unwrap(), "--socket"])
         .arg(&socket)
+        .args(["--writer-group", "root"])
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()

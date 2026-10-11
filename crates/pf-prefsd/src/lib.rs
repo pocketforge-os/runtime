@@ -4,8 +4,10 @@ use pf_prefs::{PrefKind, PrefValue, PrefsStore, SCHEMA};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
-use std::io;
-use std::os::fd::AsRawFd;
+use std::ffi::{CStr, CString};
+use std::fs::{self, File};
+use std::io::{self, Read};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -50,6 +52,7 @@ pub enum RpcResponse {
 #[serde(rename_all = "snake_case")]
 pub enum ErrorKind {
     InvalidValue,
+    PermissionDenied,
     Store,
     Internal,
     #[serde(other)]
@@ -164,6 +167,100 @@ pub struct PeerCred {
     pub gid: u32,
 }
 
+/// Kernel-derived class of process permitted to change user preferences.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PreferenceWriter {
+    Settings,
+    Shell,
+}
+
+/// One explicit row in the default-deny write policy.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WritePolicyRow {
+    pub key: &'static str,
+    pub writers: &'static [PreferenceWriter],
+}
+
+const SETTINGS_AND_SHELL: &[PreferenceWriter] =
+    &[PreferenceWriter::Settings, PreferenceWriter::Shell];
+
+/// Every currently writable preference is named here. Schema additions do not inherit access.
+pub const WRITE_POLICY: &[WritePolicyRow] = &[
+    WritePolicyRow {
+        key: "appearance",
+        writers: SETTINGS_AND_SHELL,
+    },
+    WritePolicyRow {
+        key: "textScale",
+        writers: SETTINGS_AND_SHELL,
+    },
+    WritePolicyRow {
+        key: "highContrast",
+        writers: SETTINGS_AND_SHELL,
+    },
+    WritePolicyRow {
+        key: "reduceFlashing",
+        writers: SETTINGS_AND_SHELL,
+    },
+    WritePolicyRow {
+        key: "reduceMotion",
+        writers: SETTINGS_AND_SHELL,
+    },
+    WritePolicyRow {
+        key: "hapticsEnabled",
+        writers: SETTINGS_AND_SHELL,
+    },
+    WritePolicyRow {
+        key: "monoAudio",
+        writers: SETTINGS_AND_SHELL,
+    },
+    WritePolicyRow {
+        key: "brightness",
+        writers: SETTINGS_AND_SHELL,
+    },
+];
+
+/// Return whether a kernel-derived writer class may change `key`.
+pub fn write_allowed(writer: PreferenceWriter, key: &str) -> bool {
+    WRITE_POLICY
+        .iter()
+        .find(|row| row.key == key)
+        .is_some_and(|row| row.writers.contains(&writer))
+}
+
+fn writer_from_unit(unit: &str) -> Option<PreferenceWriter> {
+    match unit {
+        "pf-settings.service" => Some(PreferenceWriter::Settings),
+        "pf-shell-selected.service" => Some(PreferenceWriter::Shell),
+        unit if unit
+            .strip_prefix("pf-foreground@")
+            .and_then(|instance| instance.strip_suffix(".service"))
+            .is_some_and(|instance| !instance.is_empty()) =>
+        {
+            Some(PreferenceWriter::Shell)
+        }
+        _ => None,
+    }
+}
+
+/// Classify the systemd service in a `/proc/<pid>/cgroup` document.
+pub fn writer_from_cgroup(cgroup: &str) -> Option<PreferenceWriter> {
+    cgroup.lines().find_map(|line| {
+        let mut fields = line.splitn(3, ':');
+        let hierarchy = fields.next()?;
+        let controllers = fields.next()?;
+        let path = fields.next()?;
+        let is_systemd = (hierarchy == "0" && controllers.is_empty())
+            || controllers.split(',').any(|name| name == "name=systemd");
+        if !is_systemd {
+            return None;
+        }
+        path.rsplit('/')
+            .find(|component| component.ends_with(".service"))
+            .and_then(writer_from_unit)
+    })
+}
+
 /// Read `SO_PEERCRED` from an accepted Unix connection.
 pub fn peer_cred(stream: &UnixStream) -> io::Result<PeerCred> {
     let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
@@ -203,11 +300,281 @@ pub fn verify_peer_uid(cred: PeerCred, allowed_uid: u32) -> io::Result<()> {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PeerProcessKind {
+    SocketPidFd,
+    PidFdOpen,
+    ProcDir,
+}
+
+struct PeerProcess {
+    fd: OwnedFd,
+    kind: PeerProcessKind,
+}
+
+trait PeerProcessSource {
+    fn peer_groups(&self, stream: &UnixStream) -> io::Result<Vec<u32>>;
+    fn socket_pidfd(&self, stream: &UnixStream) -> io::Result<OwnedFd>;
+    fn pidfd_open(&self, pid: i32) -> io::Result<OwnedFd>;
+    fn proc_dir_open(&self, pid: i32) -> io::Result<OwnedFd>;
+    fn cgroup(&self, process: &PeerProcess, pid: i32) -> io::Result<String>;
+}
+
+struct KernelPeerProcessSource;
+
+impl PeerProcessSource for KernelPeerProcessSource {
+    fn peer_groups(&self, stream: &UnixStream) -> io::Result<Vec<u32>> {
+        socket_peer_groups(stream)
+    }
+
+    fn socket_pidfd(&self, stream: &UnixStream) -> io::Result<OwnedFd> {
+        socket_peer_pidfd(stream)
+    }
+
+    fn pidfd_open(&self, pid: i32) -> io::Result<OwnedFd> {
+        // SAFETY: pidfd_open takes a numeric PID and zero flags, and returns a new owned fd.
+        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0u32) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(unsafe { OwnedFd::from_raw_fd(fd as libc::c_int) })
+    }
+
+    fn proc_dir_open(&self, pid: i32) -> io::Result<OwnedFd> {
+        let path = CString::new(format!("/proc/{pid}"))
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+        // SAFETY: `path` is NUL-terminated and the successful descriptor is owned by the caller.
+        let fd = unsafe {
+            libc::open(
+                path.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    }
+
+    fn cgroup(&self, process: &PeerProcess, pid: i32) -> io::Result<String> {
+        match process.kind {
+            PeerProcessKind::SocketPidFd | PeerProcessKind::PidFdOpen => {
+                verify_live_pidfd(&process.fd, pid)?;
+                let cgroup = fs::read_to_string(format!("/proc/{pid}/cgroup"))?;
+                verify_live_pidfd(&process.fd, pid)?;
+                Ok(cgroup)
+            }
+            PeerProcessKind::ProcDir => {
+                verify_proc_dir(&process.fd, pid)?;
+                let cgroup = read_proc_file_at(&process.fd, c"cgroup")?;
+                verify_proc_dir(&process.fd, pid)?;
+                Ok(cgroup)
+            }
+        }
+    }
+}
+
+fn socket_peer_groups(stream: &UnixStream) -> io::Result<Vec<u32>> {
+    // SAFETY: sysconf has no pointer arguments and only queries a process limit.
+    let max_groups = unsafe { libc::sysconf(libc::_SC_NGROUPS_MAX) };
+    if !(0..=65_536).contains(&max_groups) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid NGROUPS_MAX: {max_groups}"),
+        ));
+    }
+    let mut groups = vec![0 as libc::gid_t; max_groups as usize];
+    let mut len = groups
+        .len()
+        .checked_mul(std::mem::size_of::<libc::gid_t>())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "peer groups overflow"))?
+        as libc::socklen_t;
+    // SAFETY: the fd is a live Unix socket and `groups` is writable for exactly `len` bytes.
+    let rc = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERGROUPS,
+            groups.as_mut_ptr().cast(),
+            &mut len,
+        )
+    };
+    if rc < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let gid_size = std::mem::size_of::<libc::gid_t>();
+    if len as usize % gid_size != 0 || len as usize > groups.len() * gid_size {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "SO_PEERGROUPS returned an invalid length",
+        ));
+    }
+    groups.truncate(len as usize / gid_size);
+    Ok(groups)
+}
+
+fn socket_peer_pidfd(stream: &UnixStream) -> io::Result<OwnedFd> {
+    let mut fd: libc::c_int = -1;
+    let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    // SAFETY: the fd is a live Unix socket and `fd` is writable for exactly `len` bytes.
+    let rc = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERPIDFD,
+            (&mut fd as *mut libc::c_int).cast(),
+            &mut len,
+        )
+    };
+    if rc < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if fd < 0 || len as usize != std::mem::size_of::<libc::c_int>() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "SO_PEERPIDFD returned an invalid descriptor",
+        ));
+    }
+    // SAFETY: successful SO_PEERPIDFD returns a new descriptor owned by the caller.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+fn read_proc_file_at(proc_dir: &OwnedFd, name: &CStr) -> io::Result<String> {
+    // SAFETY: `proc_dir` is an open directory and `name` is a NUL-terminated relative name.
+    let fd = unsafe {
+        libc::openat(
+            proc_dir.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut contents = String::new();
+    File::from(unsafe { OwnedFd::from_raw_fd(fd) }).read_to_string(&mut contents)?;
+    Ok(contents)
+}
+
+fn verify_proc_dir(proc_dir: &OwnedFd, expected_pid: i32) -> io::Result<()> {
+    let stat = read_proc_file_at(proc_dir, c"stat")?;
+    let pid = stat
+        .split_once(' ')
+        .map(|(pid, _)| pid)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "process stat has no pid"))?
+        .parse::<i32>()
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    if pid == expected_pid {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("proc directory names pid={pid}, expected peer pid={expected_pid}"),
+        ))
+    }
+}
+
+fn socket_pidfd_unsupported(error: &io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(libc::ENOPROTOOPT | libc::EINVAL | libc::EOPNOTSUPP)
+    )
+}
+
+fn acquire_peer_process<S: PeerProcessSource>(
+    stream: &UnixStream,
+    pid: i32,
+    source: &S,
+) -> io::Result<PeerProcess> {
+    match source.socket_pidfd(stream) {
+        Ok(fd) => Ok(PeerProcess {
+            fd,
+            kind: PeerProcessKind::SocketPidFd,
+        }),
+        Err(error) if socket_pidfd_unsupported(&error) => match source.pidfd_open(pid) {
+            Ok(fd) => Ok(PeerProcess {
+                fd,
+                kind: PeerProcessKind::PidFdOpen,
+            }),
+            Err(error) if error.raw_os_error() == Some(libc::ENOSYS) => {
+                source.proc_dir_open(pid).map(|fd| PeerProcess {
+                    fd,
+                    kind: PeerProcessKind::ProcDir,
+                })
+            }
+            Err(error) => Err(error),
+        },
+        Err(error) => Err(error),
+    }
+}
+
+fn verify_live_pidfd(pidfd: &OwnedFd, expected_pid: i32) -> io::Result<()> {
+    let fdinfo = fs::read_to_string(format!("/proc/self/fdinfo/{}", pidfd.as_raw_fd()))?;
+    let pid = fdinfo
+        .lines()
+        .find_map(|line| line.strip_prefix("Pid:\t"))
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "pidfd has no Pid field"))?
+        .parse::<i32>()
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    if pid != expected_pid {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("pidfd names pid={pid}, expected peer pid={expected_pid}"),
+        ));
+    }
+    let mut pollfd = libc::pollfd {
+        fd: pidfd.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: `pollfd` points to one initialized descriptor and the zero timeout never blocks.
+    let rc = unsafe { libc::poll(&mut pollfd, 1, 0) };
+    if rc < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if rc != 0 || pollfd.revents != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "peer exited during identity lookup",
+        ));
+    }
+    Ok(())
+}
+
+fn peer_writer_with_source<S: PeerProcessSource>(
+    stream: &UnixStream,
+    writer_gid: u32,
+    source: &S,
+) -> io::Result<Option<PreferenceWriter>> {
+    let cred = peer_cred(stream)?;
+    if !source.peer_groups(stream)?.contains(&writer_gid) {
+        return Ok(None);
+    }
+    let process = acquire_peer_process(stream, cred.pid, source)?;
+    let cgroup = source.cgroup(&process, cred.pid)?;
+    Ok(writer_from_cgroup(&cgroup))
+}
+
+/// Resolve a writer only when the socket-bound groups contain `writer_gid` and the peer's
+/// stable process handle names a trusted systemd cgroup.
+pub fn peer_writer(stream: &UnixStream, writer_gid: u32) -> io::Result<Option<PreferenceWriter>> {
+    peer_writer_with_source(stream, writer_gid, &KernelPeerProcessSource)
+}
+
 /// Serve exactly one request and response on a connection.
 pub fn serve_connection(store: &PrefsStore, stream: &mut UnixStream) -> io::Result<()> {
+    serve_connection_as(store, stream, None)
+}
+
+/// Serve one request using a writer identity established outside the request payload.
+pub fn serve_connection_as(
+    store: &PrefsStore,
+    stream: &mut UnixStream,
+    writer: Option<PreferenceWriter>,
+) -> io::Result<()> {
     let body = pf_wire::read_frame(stream).map_err(map_wire_error)?;
     let response = match serde_json::from_slice::<RpcRequest>(&body) {
-        Ok(request) => handle_rpc(store, request),
+        Ok(request) => handle_rpc(store, request, writer),
         Err(error) => RpcResponse::Error {
             message: format!("invalid request: {error}"),
             kind: Some(ErrorKind::Internal),
@@ -234,13 +601,23 @@ fn map_wire_error(error: pf_wire::WireError) -> io::Error {
 }
 
 /// Serve serial, short-lived connections until `stop` is set.
+///
+/// `writer_gid` is the dedicated supplementary group assigned only to control-plane writers.
 pub fn serve_until(
     listener: UnixListener,
     store: &PrefsStore,
     allowed_uid: u32,
+    writer_gid: u32,
     stop: &AtomicBool,
 ) -> io::Result<()> {
-    serve_until_with_timeout(listener, store, allowed_uid, stop, CONNECTION_TIMEOUT)
+    serve_until_with_timeout(
+        listener,
+        store,
+        allowed_uid,
+        writer_gid,
+        stop,
+        CONNECTION_TIMEOUT,
+    )
 }
 
 /// Serve serial connections with an explicit per-I/O timeout.
@@ -251,19 +628,57 @@ pub fn serve_until_with_timeout(
     listener: UnixListener,
     store: &PrefsStore,
     allowed_uid: u32,
+    writer_gid: u32,
     stop: &AtomicBool,
     connection_timeout: Duration,
 ) -> io::Result<()> {
+    serve_until_with_timeout_and_resolver(
+        listener,
+        store,
+        allowed_uid,
+        stop,
+        connection_timeout,
+        move |stream| peer_writer(stream, writer_gid),
+    )
+}
+
+/// Serving loop with an injected kernel-identity resolver for hermetic policy tests.
+pub fn serve_until_with_timeout_and_resolver<F>(
+    listener: UnixListener,
+    store: &PrefsStore,
+    allowed_uid: u32,
+    stop: &AtomicBool,
+    connection_timeout: Duration,
+    resolve_writer: F,
+) -> io::Result<()>
+where
+    F: Fn(&UnixStream) -> io::Result<Option<PreferenceWriter>>,
+{
     listener.set_nonblocking(true)?;
     while !stop.load(Ordering::Acquire) {
         match listener.accept() {
             Ok((mut stream, _)) => {
-                let admitted =
-                    peer_cred(&stream).and_then(|cred| verify_peer_uid(cred, allowed_uid));
-                if let Err(error) = admitted {
+                let cred = match peer_cred(&stream) {
+                    Ok(cred) => cred,
+                    Err(error) => {
+                        eprintln!("pf-prefsd: peer refused: {error}");
+                        continue;
+                    }
+                };
+                if let Err(error) = verify_peer_uid(cred, allowed_uid) {
                     eprintln!("pf-prefsd: peer refused: {error}");
                     continue;
                 }
+                let writer = match resolve_writer(&stream) {
+                    Ok(writer) => writer,
+                    Err(error) => {
+                        eprintln!(
+                            "pf-prefsd: peer pid={} has no write identity: {error}",
+                            cred.pid
+                        );
+                        None
+                    }
+                };
                 if let Err(error) = stream
                     .set_nonblocking(false)
                     .and_then(|()| stream.set_read_timeout(Some(connection_timeout)))
@@ -272,7 +687,7 @@ pub fn serve_until_with_timeout(
                     eprintln!("pf-prefsd: connection setup error: {error}");
                     continue;
                 }
-                if let Err(error) = serve_connection(store, &mut stream) {
+                if let Err(error) = serve_connection_as(store, &mut stream, writer) {
                     eprintln!("pf-prefsd: connection error: {error}");
                 }
             }
@@ -285,7 +700,19 @@ pub fn serve_until_with_timeout(
     Ok(())
 }
 
-fn handle_rpc(store: &PrefsStore, request: RpcRequest) -> RpcResponse {
+fn handle_rpc(
+    store: &PrefsStore,
+    request: RpcRequest,
+    writer: Option<PreferenceWriter>,
+) -> RpcResponse {
+    if let RpcRequest::Set { key, .. } = &request {
+        if !writer.is_some_and(|writer| write_allowed(writer, key)) {
+            return RpcResponse::Error {
+                message: format!("writer is not authorized to change preference '{key}'"),
+                kind: Some(ErrorKind::PermissionDenied),
+            };
+        }
+    }
     let result: Result<RpcResponse, (ErrorKind, pf_prefs::PrefError)> = match request {
         RpcRequest::Get { key } => store
             .load()
@@ -390,6 +817,186 @@ fn value_to_json(value: PrefValue) -> Value {
 mod tests {
     use super::*;
 
+    const TEST_WRITER_GID: u32 = 42_424;
+
+    #[derive(Clone, Copy)]
+    enum ShippingKernel {
+        A133Linux49,
+        A523Linux515,
+    }
+
+    struct ShippingKernelSource {
+        kernel: ShippingKernel,
+        cgroup: &'static str,
+        writer_group: bool,
+    }
+
+    #[derive(Clone, Copy)]
+    enum FailureStage {
+        SocketPidFd,
+        PidFdOpen,
+    }
+
+    struct UnexpectedErrorSource(FailureStage);
+
+    impl PeerProcessSource for UnexpectedErrorSource {
+        fn peer_groups(&self, _stream: &UnixStream) -> io::Result<Vec<u32>> {
+            Ok(vec![TEST_WRITER_GID])
+        }
+
+        fn socket_pidfd(&self, _stream: &UnixStream) -> io::Result<OwnedFd> {
+            match self.0 {
+                FailureStage::SocketPidFd => Err(io::Error::from_raw_os_error(libc::EACCES)),
+                FailureStage::PidFdOpen => Err(io::Error::from_raw_os_error(libc::ENOPROTOOPT)),
+            }
+        }
+
+        fn pidfd_open(&self, _pid: i32) -> io::Result<OwnedFd> {
+            Err(io::Error::from_raw_os_error(libc::EPERM))
+        }
+
+        fn proc_dir_open(&self, _pid: i32) -> io::Result<OwnedFd> {
+            panic!("unexpected identity error must not select the proc fallback")
+        }
+
+        fn cgroup(&self, _process: &PeerProcess, _pid: i32) -> io::Result<String> {
+            panic!("an unverified process handle must not be classified")
+        }
+    }
+
+    impl PeerProcessSource for ShippingKernelSource {
+        fn peer_groups(&self, _stream: &UnixStream) -> io::Result<Vec<u32>> {
+            Ok(if self.writer_group {
+                vec![TEST_WRITER_GID]
+            } else {
+                Vec::new()
+            })
+        }
+
+        fn socket_pidfd(&self, _stream: &UnixStream) -> io::Result<OwnedFd> {
+            assert!(
+                self.writer_group,
+                "an untrusted peer must be denied before numeric PID lookup"
+            );
+            Err(io::Error::from_raw_os_error(libc::ENOPROTOOPT))
+        }
+
+        fn pidfd_open(&self, _pid: i32) -> io::Result<OwnedFd> {
+            match self.kernel {
+                ShippingKernel::A133Linux49 => Err(io::Error::from_raw_os_error(libc::ENOSYS)),
+                ShippingKernel::A523Linux515 => Ok(std::fs::File::open("/dev/null")?.into()),
+            }
+        }
+
+        fn proc_dir_open(&self, _pid: i32) -> io::Result<OwnedFd> {
+            Ok(std::fs::File::open("/dev/null")?.into())
+        }
+
+        fn cgroup(&self, process: &PeerProcess, _pid: i32) -> io::Result<String> {
+            let expected = match self.kernel {
+                ShippingKernel::A133Linux49 => PeerProcessKind::ProcDir,
+                ShippingKernel::A523Linux515 => PeerProcessKind::PidFdOpen,
+            };
+            assert_eq!(process.kind, expected);
+            Ok(self.cgroup.to_owned())
+        }
+    }
+
+    #[test]
+    fn shipping_kernel_fallbacks_keep_trusted_writers_and_apps_denied() {
+        let (peer, _other) = UnixStream::pair().unwrap();
+        for kernel in [ShippingKernel::A133Linux49, ShippingKernel::A523Linux515] {
+            for (cgroup, expected) in [
+                (
+                    "0::/system.slice/pf-settings.service\n",
+                    PreferenceWriter::Settings,
+                ),
+                (
+                    "0::/user.slice/user-1000.slice/pf-shell-selected.service\n",
+                    PreferenceWriter::Shell,
+                ),
+                (
+                    "0::/system.slice/pf-foreground@main.service\n",
+                    PreferenceWriter::Shell,
+                ),
+            ] {
+                let source = ShippingKernelSource {
+                    kernel,
+                    cgroup,
+                    writer_group: true,
+                };
+                let writer = peer_writer_with_source(&peer, TEST_WRITER_GID, &source).unwrap();
+                assert_eq!(writer, Some(expected));
+                for row in WRITE_POLICY {
+                    assert!(write_allowed(expected, row.key));
+                }
+            }
+
+            let source = ShippingKernelSource {
+                kernel,
+                cgroup: "0::/system.slice/pf-app@settings.service\n",
+                writer_group: false,
+            };
+            assert_eq!(
+                peer_writer_with_source(&peer, TEST_WRITER_GID, &source).unwrap(),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn production_fallback_handles_pin_and_read_the_current_process() {
+        let source = KernelPeerProcessSource;
+        let pid = std::process::id() as i32;
+        let expected = std::fs::read_to_string("/proc/self/cgroup").unwrap();
+
+        let pidfd = PeerProcess {
+            fd: source.pidfd_open(pid).unwrap(),
+            kind: PeerProcessKind::PidFdOpen,
+        };
+        assert_eq!(source.cgroup(&pidfd, pid).unwrap(), expected);
+
+        let proc_dir = PeerProcess {
+            fd: source.proc_dir_open(pid).unwrap(),
+            kind: PeerProcessKind::ProcDir,
+        };
+        assert_eq!(source.cgroup(&proc_dir, pid).unwrap(), expected);
+    }
+
+    #[test]
+    fn compatibility_fallbacks_do_not_swallow_unexpected_identity_errors() {
+        let (peer, _other) = UnixStream::pair().unwrap();
+        for (stage, expected_errno) in [
+            (FailureStage::SocketPidFd, libc::EACCES),
+            (FailureStage::PidFdOpen, libc::EPERM),
+        ] {
+            let error =
+                peer_writer_with_source(&peer, TEST_WRITER_GID, &UnexpectedErrorSource(stage))
+                    .unwrap_err();
+            assert_eq!(error.raw_os_error(), Some(expected_errno));
+        }
+    }
+
+    #[test]
+    fn socket_peer_groups_match_the_connecting_process() {
+        let (peer, _other) = UnixStream::pair().unwrap();
+        let mut expected = vec![0u32; 256];
+        // SAFETY: `expected` is writable for the supplied element count.
+        let count =
+            unsafe { libc::getgroups(expected.len() as libc::c_int, expected.as_mut_ptr()) };
+        assert!(
+            count >= 0,
+            "getgroups failed: {}",
+            io::Error::last_os_error()
+        );
+        expected.truncate(count as usize);
+        expected.sort_unstable();
+
+        let mut actual = socket_peer_groups(&peer).unwrap();
+        actual.sort_unstable();
+        assert_eq!(actual, expected);
+    }
+
     #[test]
     fn peer_uid_verification_accepts_match_and_rejects_mismatch() {
         let cred = PeerCred {
@@ -401,6 +1008,106 @@ mod tests {
         assert_eq!(
             verify_peer_uid(cred, 41).unwrap_err().kind(),
             io::ErrorKind::PermissionDenied
+        );
+    }
+
+    #[test]
+    fn app_cgroup_set_is_refused_while_settings_and_shell_are_accepted() {
+        let root =
+            std::env::temp_dir().join(format!("pf-prefsd-write-policy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let store = PrefsStore::at(&root);
+        let request = || RpcRequest::Set {
+            key: "reduceMotion".into(),
+            value: Value::Bool(true),
+        };
+
+        let app = writer_from_cgroup("0::/system.slice/pf-app@steamlink.service\n");
+        assert_eq!(app, None);
+        assert!(matches!(
+            handle_rpc(&store, request(), app),
+            RpcResponse::Error {
+                kind: Some(ErrorKind::PermissionDenied),
+                ..
+            }
+        ));
+        assert!(!root.join("prefs.json").exists(), "denial must not mutate");
+
+        for (cgroup, expected_writer) in [
+            (
+                "0::/system.slice/pf-settings.service\n",
+                PreferenceWriter::Settings,
+            ),
+            (
+                "0::/user.slice/user-1000.slice/pf-shell-selected.service\n",
+                PreferenceWriter::Shell,
+            ),
+            (
+                "0::/system.slice/pf-foreground@main.service\n",
+                PreferenceWriter::Shell,
+            ),
+        ] {
+            let writer = writer_from_cgroup(cgroup);
+            assert_eq!(writer, Some(expected_writer));
+            assert!(matches!(
+                handle_rpc(&store, request(), writer),
+                RpcResponse::Value {
+                    value: Value::Bool(true)
+                }
+            ));
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn write_policy_covers_schema_exactly_and_unknown_keys_default_deny() {
+        let policy_keys: std::collections::BTreeSet<_> =
+            WRITE_POLICY.iter().map(|row| row.key).collect();
+        let schema_keys: std::collections::BTreeSet<_> = SCHEMA.iter().map(|row| row.key).collect();
+        assert_eq!(policy_keys, schema_keys);
+        assert_eq!(
+            WRITE_POLICY.len(),
+            schema_keys.len(),
+            "duplicate policy row"
+        );
+
+        for spec in SCHEMA {
+            assert!(write_allowed(PreferenceWriter::Settings, spec.key));
+            assert!(write_allowed(PreferenceWriter::Shell, spec.key));
+        }
+        assert!(!write_allowed(PreferenceWriter::Settings, "futureKey"));
+    }
+
+    #[test]
+    fn cgroup_identity_ignores_app_broker_scopes_and_client_like_text() {
+        for cgroup in [
+            "0::/system.slice/pf-app@settings.service\n",
+            "0::/system.slice/pf-input-broker.service\n",
+            "0::/user.slice/user-1000.slice/session-3.scope\n",
+            "0::/system.slice/not-pf-settings.service\n",
+            "5:freezer:/pf-settings.service\n",
+        ] {
+            assert_eq!(writer_from_cgroup(cgroup), None, "{cgroup:?}");
+        }
+        assert_eq!(
+            writer_from_cgroup("1:name=systemd:/system.slice/pf-settings.service\n"),
+            Some(PreferenceWriter::Settings)
+        );
+    }
+
+    #[test]
+    fn socket_peer_pidfd_stabilizes_the_proc_cgroup_lookup() {
+        let (peer, _other) = UnixStream::pair().unwrap();
+        let cred = peer_cred(&peer).unwrap();
+        assert_eq!(cred.pid, std::process::id() as i32);
+        assert_eq!(cred.uid, unsafe { libc::geteuid() });
+
+        let source = KernelPeerProcessSource;
+        let process = acquire_peer_process(&peer, cred.pid, &source).unwrap();
+        assert_eq!(process.kind, PeerProcessKind::SocketPidFd);
+        assert_eq!(
+            source.cgroup(&process, cred.pid).unwrap(),
+            std::fs::read_to_string("/proc/self/cgroup").unwrap()
         );
     }
 }
