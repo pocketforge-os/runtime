@@ -480,6 +480,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "pf-input-ipc"
+version = "0.0.1"
+dependencies = [
+ "pf-input-broker",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "pf-input-map"
 version = "0.0.1"
 dependencies = [

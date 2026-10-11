@@ -1,0 +1,8 @@
+{
+  "version": 1,
+  "type": "trusted_connection_result",
+  "request_id": 9,
+  "result": {
+    "status": "ok"
+  }
+}

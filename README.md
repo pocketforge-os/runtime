@@ -47,6 +47,7 @@ crates/
                    default-deny + manifest ceiling + SO_PEERCRED + per-cap quota (docs/BROKER-DESIGN.md)
 wire/WIRE-PROTOCOL.md   the byte-level, reimplementable wire spec (folds in SPIKE-1's verdict)
 docs/BROKER-DESIGN.md   the broker architecture + threat model + what v0 enforces vs. substrate-gated
+docs/input-ipc.md       the frozen router ↔ gamescope ↔ pf-osk ↔ system-menu contract (crates/pf-input-ipc)
 include/pocketforge.h   the hand-maintained C header (matches libpocketforge)
 ctest/                  a gcc C smoke test that links the staticlib and checks the contract
 crates/pocketforge/tests/README.md   why this repo vendors NO descriptor copy: the suite reads

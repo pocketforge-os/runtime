@@ -1,0 +1,7 @@
+{
+  "version": 1,
+  "type": "trusted_connection",
+  "request_id": 9,
+  "role": "keyboard",
+  "unit": "pf-osk.service"
+}

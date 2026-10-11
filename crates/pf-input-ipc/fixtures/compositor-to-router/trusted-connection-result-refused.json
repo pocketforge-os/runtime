@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "type": "trusted_connection_result",
+  "request_id": 9,
+  "result": {
+    "status": "refused",
+    "reason": "role keyboard already bound"
+  }
+}

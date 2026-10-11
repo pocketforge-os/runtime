@@ -29,6 +29,7 @@ members = [
     "crates/pf-session-authority",
     "crates/pf-session-client",
     "crates/pf-session-contract",
+    "crates/pf-input-ipc",
 ]
 
 # Shared metadata for every crate in the runtime workspace (tsp-e1b.2 / E2).
@@ -57,6 +58,7 @@ pf-framehost-wayland = { path = "crates/pf-framehost-wayland", version = "0.0.1"
 pf-app-manifest = { path = "crates/pf-app-manifest", version = "0.0.1" }
 pf-session-authority = { path = "crates/pf-session-authority", version = "0.0.1" }
 pf-session-contract = { path = "crates/pf-session-contract", version = "0.0.1" }
+pf-input-ipc = { path = "crates/pf-input-ipc", version = "0.0.1" }
 serde = { version = "1", features = ["derive"] }
 # serde_json backs the single current-state JSON preference document (owner ruling Q2). Only the
 # NEW pf-prefs leaf crate depends on it; the dependency-light wire/facade crates are untouched.

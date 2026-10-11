@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "type": "focus",
+  "surface": {
+    "kind": "trusted",
+    "role": "menu"
+  },
+  "text_input": {
+    "active": false,
+    "purpose": "normal"
+  },
+  "secure_entry": true
+}

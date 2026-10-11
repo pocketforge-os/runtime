@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "type": "system_menu",
+  "front": {
+    "app_id": "org.example.browser",
+    "name": "Browser",
+    "unit": "pf-app@org.example.browser.service"
+  }
+}
