@@ -1,7 +1,7 @@
 //! Which input device is the built-in controller (`tsp-ihne1.8`).
 //!
 //! **This module is the only way to answer that question.** The session input router, the
-//! broker's `--require-builtin` source check and the new-keyboard confirm card all call
+//! broker's default source check and the new-keyboard confirm card all call
 //! [`Trust::identify_fd`]; nothing may decide it from the device name, the vid/pid or the
 //! capabilities, because a USB device or another `uinput` creator can copy all of them.
 //!
