@@ -17,9 +17,10 @@ and the authority uses it for both of the following; nothing forks it.
 - **No transitive trust.** Every front request carries exactly one caller process handle over
   `SCM_RIGHTS`: a pidfd, or on the A133/4.9 kernel (no pidfds) the front's opened `/proc/<pid>`
   directory. The authority classifies the handle from the kernel's own description of the
-  descriptor, reads its cgroup, and requires `pf-app@<id>.service`. The derived id must equal the
-  front's `app_id` claim; multiple handles fail the frame as ambiguous, while a mismatch, a
-  missing handle or a non-app handle answers `denied` and logs
+  descriptor, reads its cgroup, and requires a valid leaf `pf-app@<id>.service` immediately below
+  `system-pf\x2dapp.slice`. The derived id must equal the front's `app_id` claim; multiple handles
+  fail the frame as ambiguous, while a mismatch, a missing handle or a non-app handle answers
+  `denied` and logs
   `url_refused reason=identity_mismatch|identity_unverified|missing_claim`.
 
 ## Wire (versioned, minimal)

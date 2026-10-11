@@ -353,8 +353,12 @@ pub fn peer_cgroup_with_source<S: PeerProcessSource>(
     source.cgroup(&process, pid)
 }
 
-/// The systemd service unit (`<name>.service`) a `/proc/<pid>/cgroup` document places the
-/// process in, taken only from the systemd hierarchy (v2 `0::` or v1 `name=systemd`).
+const PF_APP_SLICE_COMPONENT: &str = r"system-pf\x2dapp.slice";
+
+/// The leaf systemd service unit (`<name>.service`) a `/proc/<pid>/cgroup` document places the
+/// process in, taken only from the systemd hierarchy (v2 `0::` or v1 `name=systemd`). A
+/// `pf-app@` unit is an identity boundary: it must be a valid leaf immediately below the
+/// dedicated app slice, and no nested path below a `pf-app@` service is accepted.
 pub fn service_unit_from_cgroup(cgroup: &str) -> Option<String> {
     cgroup.lines().find_map(|line| {
         let mut fields = line.splitn(3, ':');
@@ -366,9 +370,27 @@ pub fn service_unit_from_cgroup(cgroup: &str) -> Option<String> {
         if !is_systemd {
             return None;
         }
-        path.rsplit('/')
-            .find(|component| component.ends_with(".service"))
-            .map(str::to_owned)
+        let components = path
+            .split('/')
+            .filter(|component| !component.is_empty())
+            .collect::<Vec<_>>();
+        let (leaf, ancestors) = components.split_last()?;
+        if !leaf.ends_with(".service") {
+            return None;
+        }
+        if ancestors
+            .iter()
+            .any(|component| component.starts_with("pf-app@") && component.ends_with(".service"))
+        {
+            return None;
+        }
+        if leaf.starts_with("pf-app@")
+            && (app_id_from_unit(leaf).is_none()
+                || ancestors.last().copied() != Some(PF_APP_SLICE_COMPONENT))
+        {
+            return None;
+        }
+        Some((*leaf).to_owned())
     })
 }
 
@@ -621,8 +643,11 @@ mod tests {
     #[test]
     fn service_unit_and_app_id_come_only_from_the_systemd_hierarchy() {
         assert_eq!(
-            service_unit_from_cgroup("0::/system.slice/pf-app@org.example.game.service\n")
-                .as_deref(),
+            service_unit_from_cgroup(
+                r"0::/system.slice/system-pf\x2dapp.slice/pf-app@org.example.game.service
+"
+            )
+            .as_deref(),
             Some("pf-app@org.example.game.service")
         );
         assert_eq!(
@@ -659,6 +684,40 @@ mod tests {
             "0::/system.slice/pf-input-broker.service\n",
             "pf-app@pf-input-broker.service"
         ));
+    }
+
+    #[test]
+    fn app_service_identity_requires_the_expected_slice_and_a_genuine_leaf() {
+        let genuine = r"0::/system.slice/system-pf\x2dapp.slice/pf-app@org.example.game.service
+";
+        assert_eq!(
+            service_unit_from_cgroup(genuine).as_deref(),
+            Some("pf-app@org.example.game.service")
+        );
+
+        for forged in [
+            r"0::/system.slice/system-pf\x2dapp.slice/pf-app@org.example.game.service/child.scope
+",
+            r"0::/system.slice/system-pf\x2dapp.slice/pf-app@org.example.game.service/child.service
+",
+            "0::/system.slice/pf-app@org.example.game.service\n",
+            r"0::/user.slice/user-1000.slice/user@1000.service/pf-app@org.example.game.service
+",
+            r"0::/system.slice/system-pf\x2dapp.slice/pf-app@.service
+",
+            r"0::/system.slice/system-pf\x2dapp.slice/pf-app@bad!.service
+",
+        ] {
+            assert_eq!(service_unit_from_cgroup(forged), None, "{forged:?}");
+        }
+
+        let user_service =
+            "0::/user.slice/user-1000.slice/user@1000.service/app.slice/pf-shell.service\n";
+        assert_eq!(
+            service_unit_from_cgroup(user_service).as_deref(),
+            Some("pf-shell.service"),
+            "non-app services may legitimately have a service ancestor"
+        );
     }
 
     #[test]
