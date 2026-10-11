@@ -87,8 +87,13 @@ The epic acceptance is explicit: `PrefsDidChange` fires on **any** write path. T
 On the image, read-only-to-apps is also an enforced process boundary. App units cannot reach
 `/run/pocketforge/prefsd.sock`; their preference reads use the input broker's read-only
 `GetAppearance`, `GetAppearanceSource`, and `GetPreference` operations. `pf-prefsd` independently
-default-denies every `Set` unless `SO_PEERCRED`, the socket peer pidfd, and `/proc/<pid>/cgroup`
-identify a trusted Settings or PocketForge shell service. A request never declares its own role.
+default-denies every `Set` unless `SO_PEERCRED`, a stable handle for that process, and its systemd
+cgroup identify a trusted Settings or PocketForge shell service. On kernels with
+`SO_PEERPIDFD`, the socket supplies the pidfd directly. The shipping A523/5.15 kernel falls back to
+`pidfd_open`; the A133/4.9 kernel holds an opened `/proc/<pid>` directory and reads `stat` and
+`cgroup` relative to that descriptor, so later PID-name reuse cannot replace the directory being
+inspected. Unsupported-kernel fallback is narrow; every other identity error denies the write. A
+request never declares its own role.
 
 The executable policy is `pf_prefsd::WRITE_POLICY`; its schema-exhaustiveness test makes a newly
 added preference deny-by-default until an explicit row is reviewed.

@@ -4,8 +4,9 @@ use pf_prefs::{PrefKind, PrefValue, PrefsStore, SCHEMA};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
-use std::fs;
-use std::io;
+use std::ffi::{CStr, CString};
+use std::fs::{self, File};
+use std::io::{self, Read};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -299,7 +300,76 @@ pub fn verify_peer_uid(cred: PeerCred, allowed_uid: u32) -> io::Result<()> {
     }
 }
 
-fn peer_pidfd(stream: &UnixStream) -> io::Result<OwnedFd> {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PeerProcessKind {
+    SocketPidFd,
+    PidFdOpen,
+    ProcDir,
+}
+
+struct PeerProcess {
+    fd: OwnedFd,
+    kind: PeerProcessKind,
+}
+
+trait PeerProcessSource {
+    fn socket_pidfd(&self, stream: &UnixStream) -> io::Result<OwnedFd>;
+    fn pidfd_open(&self, pid: i32) -> io::Result<OwnedFd>;
+    fn proc_dir_open(&self, pid: i32) -> io::Result<OwnedFd>;
+    fn cgroup(&self, process: &PeerProcess, pid: i32) -> io::Result<String>;
+}
+
+struct KernelPeerProcessSource;
+
+impl PeerProcessSource for KernelPeerProcessSource {
+    fn socket_pidfd(&self, stream: &UnixStream) -> io::Result<OwnedFd> {
+        socket_peer_pidfd(stream)
+    }
+
+    fn pidfd_open(&self, pid: i32) -> io::Result<OwnedFd> {
+        // SAFETY: pidfd_open takes a numeric PID and zero flags, and returns a new owned fd.
+        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0u32) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(unsafe { OwnedFd::from_raw_fd(fd as libc::c_int) })
+    }
+
+    fn proc_dir_open(&self, pid: i32) -> io::Result<OwnedFd> {
+        let path = CString::new(format!("/proc/{pid}"))
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+        // SAFETY: `path` is NUL-terminated and the successful descriptor is owned by the caller.
+        let fd = unsafe {
+            libc::open(
+                path.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    }
+
+    fn cgroup(&self, process: &PeerProcess, pid: i32) -> io::Result<String> {
+        match process.kind {
+            PeerProcessKind::SocketPidFd | PeerProcessKind::PidFdOpen => {
+                verify_live_pidfd(&process.fd, pid)?;
+                let cgroup = fs::read_to_string(format!("/proc/{pid}/cgroup"))?;
+                verify_live_pidfd(&process.fd, pid)?;
+                Ok(cgroup)
+            }
+            PeerProcessKind::ProcDir => {
+                verify_proc_dir(&process.fd, pid)?;
+                let cgroup = read_proc_file_at(&process.fd, c"cgroup")?;
+                verify_proc_dir(&process.fd, pid)?;
+                Ok(cgroup)
+            }
+        }
+    }
+}
+
+fn socket_peer_pidfd(stream: &UnixStream) -> io::Result<OwnedFd> {
     let mut fd: libc::c_int = -1;
     let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
     // SAFETY: the fd is a live Unix socket and `fd` is writable for exactly `len` bytes.
@@ -323,6 +393,75 @@ fn peer_pidfd(stream: &UnixStream) -> io::Result<OwnedFd> {
     }
     // SAFETY: successful SO_PEERPIDFD returns a new descriptor owned by the caller.
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+fn read_proc_file_at(proc_dir: &OwnedFd, name: &CStr) -> io::Result<String> {
+    // SAFETY: `proc_dir` is an open directory and `name` is a NUL-terminated relative name.
+    let fd = unsafe {
+        libc::openat(
+            proc_dir.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut contents = String::new();
+    File::from(unsafe { OwnedFd::from_raw_fd(fd) }).read_to_string(&mut contents)?;
+    Ok(contents)
+}
+
+fn verify_proc_dir(proc_dir: &OwnedFd, expected_pid: i32) -> io::Result<()> {
+    let stat = read_proc_file_at(proc_dir, c"stat")?;
+    let pid = stat
+        .split_once(' ')
+        .map(|(pid, _)| pid)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "process stat has no pid"))?
+        .parse::<i32>()
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    if pid == expected_pid {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("proc directory names pid={pid}, expected peer pid={expected_pid}"),
+        ))
+    }
+}
+
+fn socket_pidfd_unsupported(error: &io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(libc::ENOPROTOOPT | libc::EINVAL | libc::EOPNOTSUPP)
+    )
+}
+
+fn acquire_peer_process<S: PeerProcessSource>(
+    stream: &UnixStream,
+    pid: i32,
+    source: &S,
+) -> io::Result<PeerProcess> {
+    match source.socket_pidfd(stream) {
+        Ok(fd) => Ok(PeerProcess {
+            fd,
+            kind: PeerProcessKind::SocketPidFd,
+        }),
+        Err(error) if socket_pidfd_unsupported(&error) => match source.pidfd_open(pid) {
+            Ok(fd) => Ok(PeerProcess {
+                fd,
+                kind: PeerProcessKind::PidFdOpen,
+            }),
+            Err(error) if error.raw_os_error() == Some(libc::ENOSYS) => {
+                source.proc_dir_open(pid).map(|fd| PeerProcess {
+                    fd,
+                    kind: PeerProcessKind::ProcDir,
+                })
+            }
+            Err(error) => Err(error),
+        },
+        Err(error) => Err(error),
+    }
 }
 
 fn verify_live_pidfd(pidfd: &OwnedFd, expected_pid: i32) -> io::Result<()> {
@@ -358,14 +497,19 @@ fn verify_live_pidfd(pidfd: &OwnedFd, expected_pid: i32) -> io::Result<()> {
     Ok(())
 }
 
-/// Resolve the write class from the exact live socket peer's systemd cgroup.
-pub fn peer_writer(stream: &UnixStream) -> io::Result<Option<PreferenceWriter>> {
+fn peer_writer_with_source<S: PeerProcessSource>(
+    stream: &UnixStream,
+    source: &S,
+) -> io::Result<Option<PreferenceWriter>> {
     let cred = peer_cred(stream)?;
-    let pidfd = peer_pidfd(stream)?;
-    verify_live_pidfd(&pidfd, cred.pid)?;
-    let cgroup = fs::read_to_string(format!("/proc/{}/cgroup", cred.pid))?;
-    verify_live_pidfd(&pidfd, cred.pid)?;
+    let process = acquire_peer_process(stream, cred.pid, source)?;
+    let cgroup = source.cgroup(&process, cred.pid)?;
     Ok(writer_from_cgroup(&cgroup))
+}
+
+/// Resolve the write class from the live socket peer's stable process handle and systemd cgroup.
+pub fn peer_writer(stream: &UnixStream) -> io::Result<Option<PreferenceWriter>> {
+    peer_writer_with_source(stream, &KernelPeerProcessSource)
 }
 
 /// Serve exactly one request and response on a connection.
@@ -612,6 +756,137 @@ fn value_to_json(value: PrefValue) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Clone, Copy)]
+    enum ShippingKernel {
+        A133Linux49,
+        A523Linux515,
+    }
+
+    struct ShippingKernelSource {
+        kernel: ShippingKernel,
+        cgroup: &'static str,
+    }
+
+    #[derive(Clone, Copy)]
+    enum FailureStage {
+        SocketPidFd,
+        PidFdOpen,
+    }
+
+    struct UnexpectedErrorSource(FailureStage);
+
+    impl PeerProcessSource for UnexpectedErrorSource {
+        fn socket_pidfd(&self, _stream: &UnixStream) -> io::Result<OwnedFd> {
+            match self.0 {
+                FailureStage::SocketPidFd => Err(io::Error::from_raw_os_error(libc::EACCES)),
+                FailureStage::PidFdOpen => Err(io::Error::from_raw_os_error(libc::ENOPROTOOPT)),
+            }
+        }
+
+        fn pidfd_open(&self, _pid: i32) -> io::Result<OwnedFd> {
+            Err(io::Error::from_raw_os_error(libc::EPERM))
+        }
+
+        fn proc_dir_open(&self, _pid: i32) -> io::Result<OwnedFd> {
+            panic!("unexpected identity error must not select the proc fallback")
+        }
+
+        fn cgroup(&self, _process: &PeerProcess, _pid: i32) -> io::Result<String> {
+            panic!("an unverified process handle must not be classified")
+        }
+    }
+
+    impl PeerProcessSource for ShippingKernelSource {
+        fn socket_pidfd(&self, _stream: &UnixStream) -> io::Result<OwnedFd> {
+            Err(io::Error::from_raw_os_error(libc::ENOPROTOOPT))
+        }
+
+        fn pidfd_open(&self, _pid: i32) -> io::Result<OwnedFd> {
+            match self.kernel {
+                ShippingKernel::A133Linux49 => Err(io::Error::from_raw_os_error(libc::ENOSYS)),
+                ShippingKernel::A523Linux515 => Ok(std::fs::File::open("/dev/null")?.into()),
+            }
+        }
+
+        fn proc_dir_open(&self, _pid: i32) -> io::Result<OwnedFd> {
+            Ok(std::fs::File::open("/dev/null")?.into())
+        }
+
+        fn cgroup(&self, process: &PeerProcess, _pid: i32) -> io::Result<String> {
+            let expected = match self.kernel {
+                ShippingKernel::A133Linux49 => PeerProcessKind::ProcDir,
+                ShippingKernel::A523Linux515 => PeerProcessKind::PidFdOpen,
+            };
+            assert_eq!(process.kind, expected);
+            Ok(self.cgroup.to_owned())
+        }
+    }
+
+    #[test]
+    fn shipping_kernel_fallbacks_keep_trusted_writers_and_apps_denied() {
+        let (peer, _other) = UnixStream::pair().unwrap();
+        for kernel in [ShippingKernel::A133Linux49, ShippingKernel::A523Linux515] {
+            for (cgroup, expected) in [
+                (
+                    "0::/system.slice/pf-settings.service\n",
+                    PreferenceWriter::Settings,
+                ),
+                (
+                    "0::/user.slice/user-1000.slice/pf-shell-selected.service\n",
+                    PreferenceWriter::Shell,
+                ),
+                (
+                    "0::/system.slice/pf-foreground@main.service\n",
+                    PreferenceWriter::Shell,
+                ),
+            ] {
+                let source = ShippingKernelSource { kernel, cgroup };
+                let writer = peer_writer_with_source(&peer, &source).unwrap();
+                assert_eq!(writer, Some(expected));
+                for row in WRITE_POLICY {
+                    assert!(write_allowed(expected, row.key));
+                }
+            }
+
+            let source = ShippingKernelSource {
+                kernel,
+                cgroup: "0::/system.slice/pf-app@settings.service\n",
+            };
+            assert_eq!(peer_writer_with_source(&peer, &source).unwrap(), None);
+        }
+    }
+
+    #[test]
+    fn production_fallback_handles_pin_and_read_the_current_process() {
+        let source = KernelPeerProcessSource;
+        let pid = std::process::id() as i32;
+        let expected = std::fs::read_to_string("/proc/self/cgroup").unwrap();
+
+        let pidfd = PeerProcess {
+            fd: source.pidfd_open(pid).unwrap(),
+            kind: PeerProcessKind::PidFdOpen,
+        };
+        assert_eq!(source.cgroup(&pidfd, pid).unwrap(), expected);
+
+        let proc_dir = PeerProcess {
+            fd: source.proc_dir_open(pid).unwrap(),
+            kind: PeerProcessKind::ProcDir,
+        };
+        assert_eq!(source.cgroup(&proc_dir, pid).unwrap(), expected);
+    }
+
+    #[test]
+    fn compatibility_fallbacks_do_not_swallow_unexpected_identity_errors() {
+        let (peer, _other) = UnixStream::pair().unwrap();
+        for (stage, expected_errno) in [
+            (FailureStage::SocketPidFd, libc::EACCES),
+            (FailureStage::PidFdOpen, libc::EPERM),
+        ] {
+            let error = peer_writer_with_source(&peer, &UnexpectedErrorSource(stage)).unwrap_err();
+            assert_eq!(error.raw_os_error(), Some(expected_errno));
+        }
+    }
 
     #[test]
     fn peer_uid_verification_accepts_match_and_rejects_mismatch() {
