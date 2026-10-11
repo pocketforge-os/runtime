@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "type": "overlay",
+  "role": "keyboard",
+  "state": "mapped",
+  "rect": {
+    "x": 0,
+    "y": 420,
+    "width": 1280,
+    "height": 300
+  }
+}

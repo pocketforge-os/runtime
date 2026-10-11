@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "type": "focus",
+  "surface": {
+    "kind": "none"
+  },
+  "text_input": {
+    "active": false,
+    "purpose": "normal"
+  },
+  "secure_entry": false
+}
