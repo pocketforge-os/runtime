@@ -1,12 +1,15 @@
-//! The real `pf-session-authorityd` keeps its self-driven tick while clients stall (tsp-f3fm.219).
+//! The real `pf-session-authorityd` keeps its self-driven tick while untrusted clients attack the
+//! authenticated shell socket (tsp-f3fm.219, tsp-ght0z).
 //!
 //! The daemon is started from the persisted state bench boot P3 wedged in (restoring a crashed
 //! session at the presentation-acknowledgement rung). Before its deadline, one client connects
-//! and sends nothing and another sends half a frame length; both stay connected. The deadline
-//! must still expire on schedule, and the daemon must keep answering well-formed requests.
+//! twice from a process outside an authorized service. Both connections must be closed before
+//! framing. The deadline must still expire on
+//! schedule. Accepted stalled-client behavior is covered through the hermetic identity seam in
+//! the library test `stalled_clients_never_block_the_service_loop_tick`.
 
 use std::fs;
-use std::io::{Read, Write};
+use std::io::Read;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -50,13 +53,14 @@ fn start_daemon() -> (Daemon, PathBuf, PathBuf) {
         .arg("--socket")
         .arg(&socket)
         .args(["--command-preset", "desktop-sim"])
+        .args(["--shell-user", "root"])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
         .unwrap();
     let daemon = Daemon { child, dir };
     let until = Instant::now() + Duration::from_secs(5);
-    while UnixStream::connect(&socket).is_err() {
+    while !socket.exists() {
         assert!(Instant::now() < until, "daemon socket never appeared");
         std::thread::sleep(Duration::from_millis(20));
     }
@@ -68,27 +72,21 @@ fn phase(state: &Path) -> serde_json::Value {
     value["phase"].clone()
 }
 
-fn rpc(socket: &Path, request: &str, timeout: Duration) -> std::io::Result<serde_json::Value> {
-    let mut stream = UnixStream::connect(socket)?;
-    stream.set_read_timeout(Some(timeout))?;
-    stream.write_all(&(request.len() as u32).to_be_bytes())?;
-    stream.write_all(request.as_bytes())?;
-    let mut len = [0; 4];
-    stream.read_exact(&mut len)?;
-    let mut body = vec![0; u32::from_be_bytes(len) as usize];
-    stream.read_exact(&mut body)?;
-    Ok(serde_json::from_slice(&body).unwrap())
-}
-
 #[test]
-fn silent_and_partial_clients_never_stall_the_presentation_deadline() {
+fn untrusted_clients_are_closed_and_never_stall_the_presentation_deadline() {
     let (daemon, socket, state) = start_daemon();
     let started = Instant::now();
-    // The startup readiness probe above connected and closed without a frame; keep two more
-    // stalled clients connected for the whole test.
-    let silent = UnixStream::connect(&socket).unwrap();
-    let mut partial = UnixStream::connect(&socket).unwrap();
-    partial.write_all(&[0, 0]).unwrap();
+    let mut silent = UnixStream::connect(&socket).unwrap();
+    silent
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
+    let mut second = UnixStream::connect(&socket).unwrap();
+    second
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
+    let mut byte = [0];
+    assert_eq!(silent.read(&mut byte).unwrap(), 0);
+    assert_eq!(second.read(&mut byte).unwrap(), 0);
 
     let mut reached = None;
     while started.elapsed() < EXPIRY_BOUND {
@@ -114,8 +112,5 @@ fn silent_and_partial_clients_never_stall_the_presentation_deadline() {
         .unwrap()
         .starts_with("presentation_not_acknowledged:"));
 
-    // Still serving: a well-formed request answers promptly while the stalled clients linger.
-    let history = rpc(&socket, r#"{"method":"history"}"#, Duration::from_secs(3)).unwrap();
-    assert_eq!(history["result"], "history");
-    drop((silent, partial, daemon));
+    drop((silent, second, daemon));
 }

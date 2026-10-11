@@ -159,12 +159,18 @@ fn entropy_is_ungated_on_both() {
 
 #[test]
 fn input_action_map_is_pure_descriptor_data() {
-    let a133 = Pf::in_process(common::descriptor("a133"));
+    let d133 = common::descriptor("a133");
+    let confirm = d133.accept_default.as_deref().unwrap_or("south").to_owned();
+    let cancel = if confirm == "south" { "east" } else { "south" };
+    let a133 = Pf::in_process(d133);
     let a523 = Pf::in_process(common::descriptor("a523"));
 
     let m133 = a133.acquire::<Input>().unwrap();
     let m523 = a523.acquire::<Input>().unwrap();
 
+    // The mapping follows the platform-owned descriptor, with no per-device code here.
+    assert_eq!(m133.map().resolve("confirm"), Some(confirm.as_str()));
+    assert_eq!(m133.map().resolve("cancel"), Some(cancel));
     // accept_default = "east" on both (X18: Nintendo-arranged chassis, printed A is east)
     // → confirm resolves to the east face button and cancel to south.
     assert_eq!(m133.map().resolve("confirm"), Some("east"));

@@ -187,11 +187,16 @@ fn egress_quota_exhaustion_is_policy_blocked() {
 
 #[test]
 fn input_manager_is_pure_descriptor_data() {
-    let a133 = Pf::in_process(common::descriptor("a133"));
+    let d133 = common::descriptor("a133");
+    let confirm = d133.accept_default.as_deref().unwrap_or("south").to_owned();
+    let cancel = if confirm == "south" { "east" } else { "south" };
+    let a133 = Pf::in_process(d133);
     let a523 = Pf::in_process(common::descriptor("a523"));
     let m133 = a133.input_manager();
     let m523 = a523.input_manager();
 
+    assert_eq!(m133.resolve("confirm"), Some(confirm.as_str()));
+    assert_eq!(m133.resolve("cancel"), Some(cancel));
     // X18: descriptors ship accept_default = "east" (printed A on Nintendo-arranged chassis).
     assert_eq!(m133.resolve("confirm"), Some("east"));
     assert_eq!(m133.resolve("cancel"), Some("south"));

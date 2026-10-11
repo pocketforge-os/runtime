@@ -10,6 +10,7 @@ authors.workspace = true
 
 [dependencies]
 libc.workspace = true
+pf-peer-identity.workspace = true
 pf-prefs.workspace = true
 pf-wire.workspace = true
 serde.workspace = true
