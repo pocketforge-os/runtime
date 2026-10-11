@@ -313,6 +313,7 @@ struct PeerProcess {
 }
 
 trait PeerProcessSource {
+    fn peer_groups(&self, stream: &UnixStream) -> io::Result<Vec<u32>>;
     fn socket_pidfd(&self, stream: &UnixStream) -> io::Result<OwnedFd>;
     fn pidfd_open(&self, pid: i32) -> io::Result<OwnedFd>;
     fn proc_dir_open(&self, pid: i32) -> io::Result<OwnedFd>;
@@ -322,6 +323,10 @@ trait PeerProcessSource {
 struct KernelPeerProcessSource;
 
 impl PeerProcessSource for KernelPeerProcessSource {
+    fn peer_groups(&self, stream: &UnixStream) -> io::Result<Vec<u32>> {
+        socket_peer_groups(stream)
+    }
+
     fn socket_pidfd(&self, stream: &UnixStream) -> io::Result<OwnedFd> {
         socket_peer_pidfd(stream)
     }
@@ -367,6 +372,45 @@ impl PeerProcessSource for KernelPeerProcessSource {
             }
         }
     }
+}
+
+fn socket_peer_groups(stream: &UnixStream) -> io::Result<Vec<u32>> {
+    // SAFETY: sysconf has no pointer arguments and only queries a process limit.
+    let max_groups = unsafe { libc::sysconf(libc::_SC_NGROUPS_MAX) };
+    if !(0..=65_536).contains(&max_groups) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid NGROUPS_MAX: {max_groups}"),
+        ));
+    }
+    let mut groups = vec![0 as libc::gid_t; max_groups as usize];
+    let mut len = groups
+        .len()
+        .checked_mul(std::mem::size_of::<libc::gid_t>())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "peer groups overflow"))?
+        as libc::socklen_t;
+    // SAFETY: the fd is a live Unix socket and `groups` is writable for exactly `len` bytes.
+    let rc = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERGROUPS,
+            groups.as_mut_ptr().cast(),
+            &mut len,
+        )
+    };
+    if rc < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let gid_size = std::mem::size_of::<libc::gid_t>();
+    if len as usize % gid_size != 0 || len as usize > groups.len() * gid_size {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "SO_PEERGROUPS returned an invalid length",
+        ));
+    }
+    groups.truncate(len as usize / gid_size);
+    Ok(groups)
 }
 
 fn socket_peer_pidfd(stream: &UnixStream) -> io::Result<OwnedFd> {
@@ -499,17 +543,22 @@ fn verify_live_pidfd(pidfd: &OwnedFd, expected_pid: i32) -> io::Result<()> {
 
 fn peer_writer_with_source<S: PeerProcessSource>(
     stream: &UnixStream,
+    writer_gid: u32,
     source: &S,
 ) -> io::Result<Option<PreferenceWriter>> {
     let cred = peer_cred(stream)?;
+    if !source.peer_groups(stream)?.contains(&writer_gid) {
+        return Ok(None);
+    }
     let process = acquire_peer_process(stream, cred.pid, source)?;
     let cgroup = source.cgroup(&process, cred.pid)?;
     Ok(writer_from_cgroup(&cgroup))
 }
 
-/// Resolve the write class from the live socket peer's stable process handle and systemd cgroup.
-pub fn peer_writer(stream: &UnixStream) -> io::Result<Option<PreferenceWriter>> {
-    peer_writer_with_source(stream, &KernelPeerProcessSource)
+/// Resolve a writer only when the socket-bound groups contain `writer_gid` and the peer's
+/// stable process handle names a trusted systemd cgroup.
+pub fn peer_writer(stream: &UnixStream, writer_gid: u32) -> io::Result<Option<PreferenceWriter>> {
+    peer_writer_with_source(stream, writer_gid, &KernelPeerProcessSource)
 }
 
 /// Serve exactly one request and response on a connection.
@@ -552,13 +601,23 @@ fn map_wire_error(error: pf_wire::WireError) -> io::Error {
 }
 
 /// Serve serial, short-lived connections until `stop` is set.
+///
+/// `writer_gid` is the dedicated supplementary group assigned only to control-plane writers.
 pub fn serve_until(
     listener: UnixListener,
     store: &PrefsStore,
     allowed_uid: u32,
+    writer_gid: u32,
     stop: &AtomicBool,
 ) -> io::Result<()> {
-    serve_until_with_timeout(listener, store, allowed_uid, stop, CONNECTION_TIMEOUT)
+    serve_until_with_timeout(
+        listener,
+        store,
+        allowed_uid,
+        writer_gid,
+        stop,
+        CONNECTION_TIMEOUT,
+    )
 }
 
 /// Serve serial connections with an explicit per-I/O timeout.
@@ -569,6 +628,7 @@ pub fn serve_until_with_timeout(
     listener: UnixListener,
     store: &PrefsStore,
     allowed_uid: u32,
+    writer_gid: u32,
     stop: &AtomicBool,
     connection_timeout: Duration,
 ) -> io::Result<()> {
@@ -578,7 +638,7 @@ pub fn serve_until_with_timeout(
         allowed_uid,
         stop,
         connection_timeout,
-        peer_writer,
+        move |stream| peer_writer(stream, writer_gid),
     )
 }
 
@@ -757,6 +817,8 @@ fn value_to_json(value: PrefValue) -> Value {
 mod tests {
     use super::*;
 
+    const TEST_WRITER_GID: u32 = 42_424;
+
     #[derive(Clone, Copy)]
     enum ShippingKernel {
         A133Linux49,
@@ -766,6 +828,7 @@ mod tests {
     struct ShippingKernelSource {
         kernel: ShippingKernel,
         cgroup: &'static str,
+        writer_group: bool,
     }
 
     #[derive(Clone, Copy)]
@@ -777,6 +840,10 @@ mod tests {
     struct UnexpectedErrorSource(FailureStage);
 
     impl PeerProcessSource for UnexpectedErrorSource {
+        fn peer_groups(&self, _stream: &UnixStream) -> io::Result<Vec<u32>> {
+            Ok(vec![TEST_WRITER_GID])
+        }
+
         fn socket_pidfd(&self, _stream: &UnixStream) -> io::Result<OwnedFd> {
             match self.0 {
                 FailureStage::SocketPidFd => Err(io::Error::from_raw_os_error(libc::EACCES)),
@@ -798,7 +865,19 @@ mod tests {
     }
 
     impl PeerProcessSource for ShippingKernelSource {
+        fn peer_groups(&self, _stream: &UnixStream) -> io::Result<Vec<u32>> {
+            Ok(if self.writer_group {
+                vec![TEST_WRITER_GID]
+            } else {
+                Vec::new()
+            })
+        }
+
         fn socket_pidfd(&self, _stream: &UnixStream) -> io::Result<OwnedFd> {
+            assert!(
+                self.writer_group,
+                "an untrusted peer must be denied before numeric PID lookup"
+            );
             Err(io::Error::from_raw_os_error(libc::ENOPROTOOPT))
         }
 
@@ -841,8 +920,12 @@ mod tests {
                     PreferenceWriter::Shell,
                 ),
             ] {
-                let source = ShippingKernelSource { kernel, cgroup };
-                let writer = peer_writer_with_source(&peer, &source).unwrap();
+                let source = ShippingKernelSource {
+                    kernel,
+                    cgroup,
+                    writer_group: true,
+                };
+                let writer = peer_writer_with_source(&peer, TEST_WRITER_GID, &source).unwrap();
                 assert_eq!(writer, Some(expected));
                 for row in WRITE_POLICY {
                     assert!(write_allowed(expected, row.key));
@@ -852,8 +935,12 @@ mod tests {
             let source = ShippingKernelSource {
                 kernel,
                 cgroup: "0::/system.slice/pf-app@settings.service\n",
+                writer_group: false,
             };
-            assert_eq!(peer_writer_with_source(&peer, &source).unwrap(), None);
+            assert_eq!(
+                peer_writer_with_source(&peer, TEST_WRITER_GID, &source).unwrap(),
+                None
+            );
         }
     }
 
@@ -883,9 +970,31 @@ mod tests {
             (FailureStage::SocketPidFd, libc::EACCES),
             (FailureStage::PidFdOpen, libc::EPERM),
         ] {
-            let error = peer_writer_with_source(&peer, &UnexpectedErrorSource(stage)).unwrap_err();
+            let error =
+                peer_writer_with_source(&peer, TEST_WRITER_GID, &UnexpectedErrorSource(stage))
+                    .unwrap_err();
             assert_eq!(error.raw_os_error(), Some(expected_errno));
         }
+    }
+
+    #[test]
+    fn socket_peer_groups_match_the_connecting_process() {
+        let (peer, _other) = UnixStream::pair().unwrap();
+        let mut expected = vec![0u32; 256];
+        // SAFETY: `expected` is writable for the supplied element count.
+        let count =
+            unsafe { libc::getgroups(expected.len() as libc::c_int, expected.as_mut_ptr()) };
+        assert!(
+            count >= 0,
+            "getgroups failed: {}",
+            io::Error::last_os_error()
+        );
+        expected.truncate(count as usize);
+        expected.sort_unstable();
+
+        let mut actual = socket_peer_groups(&peer).unwrap();
+        actual.sort_unstable();
+        assert_eq!(actual, expected);
     }
 
     #[test]
@@ -993,7 +1102,12 @@ mod tests {
         assert_eq!(cred.pid, std::process::id() as i32);
         assert_eq!(cred.uid, unsafe { libc::geteuid() });
 
-        let expected = writer_from_cgroup(&std::fs::read_to_string("/proc/self/cgroup").unwrap());
-        assert_eq!(peer_writer(&peer).unwrap(), expected);
+        let source = KernelPeerProcessSource;
+        let process = acquire_peer_process(&peer, cred.pid, &source).unwrap();
+        assert_eq!(process.kind, PeerProcessKind::SocketPidFd);
+        assert_eq!(
+            source.cgroup(&process, cred.pid).unwrap(),
+            std::fs::read_to_string("/proc/self/cgroup").unwrap()
+        );
     }
 }

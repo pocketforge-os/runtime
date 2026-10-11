@@ -17,6 +17,7 @@ extern "C" fn on_signal(_signal: c_int) {
 struct Args {
     state_dir: PathBuf,
     socket: PathBuf,
+    writer_group: String,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -26,6 +27,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
     let args = parse_args(raw_args.into_iter())?;
+    let writer_gid = resolve_writer_gid(&args.writer_group)?;
     create_dir_all(&args.state_dir, "state directory")?;
     prepare_socket(&args.socket)
         .map_err(|error| path_error("prepare socket", &args.socket, error))?;
@@ -47,6 +49,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         listener,
         &PrefsStore::at(args.state_dir),
         allowed_uid,
+        writer_gid,
         &STOP,
     )?;
     Ok(())
@@ -99,6 +102,7 @@ impl Drop for SocketGuard {
 fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
     let mut state_dir = None;
     let mut socket = None;
+    let mut writer_group = None;
     while let Some(flag) = args.next() {
         let value = args
             .next()
@@ -106,16 +110,37 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
         match flag.as_str() {
             "--state-dir" => state_dir = Some(value.into()),
             "--socket" => socket = Some(value.into()),
+            "--writer-group" => writer_group = Some(value),
             _ => return Err(format!("unknown argument: {flag}")),
         }
     }
     Ok(Args {
         state_dir: state_dir.ok_or("--state-dir is required")?,
         socket: socket.ok_or("--socket is required")?,
+        writer_group: writer_group.ok_or("--writer-group is required")?,
     })
 }
 
-const HELP: &str = "Usage: pf-prefsd --state-dir PATH --socket PATH";
+fn resolve_writer_gid(name: &str) -> io::Result<u32> {
+    let groups = fs::read_to_string("/etc/group")?;
+    group_gid(&groups, name).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("writer group '{name}' does not exist"),
+        )
+    })
+}
+
+fn group_gid(groups: &str, name: &str) -> Option<u32> {
+    groups.lines().find_map(|line| {
+        let mut fields = line.split(':');
+        (fields.next()? == name)
+            .then(|| fields.nth(1)?.parse().ok())
+            .flatten()
+    })
+}
+
+const HELP: &str = "Usage: pf-prefsd --state-dir PATH --socket PATH --writer-group GROUP";
 
 #[cfg(test)]
 mod tests {
@@ -124,13 +149,34 @@ mod tests {
     #[test]
     fn required_args_parse() {
         let args = parse_args(
-            ["--socket", "/tmp/prefs.sock", "--state-dir", "/tmp/prefs"]
-                .into_iter()
-                .map(str::to_owned),
+            [
+                "--socket",
+                "/tmp/prefs.sock",
+                "--state-dir",
+                "/tmp/prefs",
+                "--writer-group",
+                "pf-pref-writer",
+            ]
+            .into_iter()
+            .map(str::to_owned),
         )
         .unwrap();
         assert_eq!(args.socket, PathBuf::from("/tmp/prefs.sock"));
         assert_eq!(args.state_dir, PathBuf::from("/tmp/prefs"));
+        assert_eq!(args.writer_group, "pf-pref-writer");
+    }
+
+    #[test]
+    fn writer_group_lookup_is_exact_and_typed() {
+        let groups = "root:x:0:\npf-pref-writer:x:4242:\npf-pref-writer-extra:x:4243:\n";
+        assert_eq!(group_gid(groups, "pf-pref-writer"), Some(4242));
+        assert_eq!(group_gid(groups, "pf-pref"), None);
+    }
+
+    #[test]
+    fn installed_unit_requires_the_dedicated_writer_group() {
+        let unit = include_str!("../../../../systemd/pf-prefsd.service");
+        assert!(unit.contains("--writer-group pf-pref-writer"));
     }
 
     #[test]

@@ -87,13 +87,19 @@ The epic acceptance is explicit: `PrefsDidChange` fires on **any** write path. T
 On the image, read-only-to-apps is also an enforced process boundary. App units cannot reach
 `/run/pocketforge/prefsd.sock`; their preference reads use the input broker's read-only
 `GetAppearance`, `GetAppearanceSource`, and `GetPreference` operations. `pf-prefsd` independently
-default-denies every `Set` unless `SO_PEERCRED`, a stable handle for that process, and its systemd
-cgroup identify a trusted Settings or PocketForge shell service. On kernels with
-`SO_PEERPIDFD`, the socket supplies the pidfd directly. The shipping A523/5.15 kernel falls back to
-`pidfd_open`; the A133/4.9 kernel holds an opened `/proc/<pid>` directory and reads `stat` and
-`cgroup` relative to that descriptor, so later PID-name reuse cannot replace the directory being
-inspected. Unsupported-kernel fallback is narrow; every other identity error denies the write. A
-request never declares its own role.
+default-denies every `Set` unless socket-bound `SO_PEERCRED` and `SO_PEERGROUPS` include the daemon
+uid and the dedicated `pf-pref-writer` group, and the peer's systemd cgroup identifies a trusted
+Settings or PocketForge shell service. The writer group is assigned only to those control-plane
+units; app units do not receive it. This socket-bound prerequisite closes the old-kernel PID-reuse
+gap before any numeric-PID lookup, while the cgroup check prevents a trusted socket from being
+reclassified as an app after process exit.
+
+On kernels with `SO_PEERPIDFD`, the socket supplies the pidfd directly. The shipping A523/5.15
+kernel falls back to `pidfd_open`; the A133/4.9 kernel holds an opened `/proc/<pid>` directory and
+reads `stat` and `cgroup` relative to that descriptor. These compatibility handles narrow an
+already socket-authorized writer; they never grant authority by themselves. Unsupported-kernel
+fallback is narrow, and every other identity error denies the write. A request never declares its
+own role.
 
 The executable policy is `pf_prefsd::WRITE_POLICY`; its schema-exhaustiveness test makes a newly
 added preference deny-by-default until an explicit row is reviewed.
