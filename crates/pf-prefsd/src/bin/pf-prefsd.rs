@@ -18,7 +18,11 @@ struct Args {
     state_dir: PathBuf,
     socket: PathBuf,
     writer_group: String,
+    seed_file: PathBuf,
 }
+
+/// Default first-boot seed document (rendered by cloud-init-tsp).
+const DEFAULT_SEED_FILE: &str = "/etc/pocketforge/prefs.seed.json";
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let raw_args: Vec<_> = std::env::args().skip(1).collect();
@@ -47,7 +51,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let allowed_uid = unsafe { libc::geteuid() };
     serve_until(
         listener,
-        &PrefsStore::at(args.state_dir),
+        &PrefsStore::at(args.state_dir).with_seed(args.seed_file),
         allowed_uid,
         writer_gid,
         &STOP,
@@ -103,6 +107,7 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
     let mut state_dir = None;
     let mut socket = None;
     let mut writer_group = None;
+    let mut seed_file = None;
     while let Some(flag) = args.next() {
         let value = args
             .next()
@@ -111,6 +116,7 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
             "--state-dir" => state_dir = Some(value.into()),
             "--socket" => socket = Some(value.into()),
             "--writer-group" => writer_group = Some(value),
+            "--seed-file" => seed_file = Some(value.into()),
             _ => return Err(format!("unknown argument: {flag}")),
         }
     }
@@ -118,6 +124,7 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
         state_dir: state_dir.ok_or("--state-dir is required")?,
         socket: socket.ok_or("--socket is required")?,
         writer_group: writer_group.ok_or("--writer-group is required")?,
+        seed_file: seed_file.unwrap_or_else(|| PathBuf::from(DEFAULT_SEED_FILE)),
     })
 }
 
@@ -140,7 +147,8 @@ fn group_gid(groups: &str, name: &str) -> Option<u32> {
     })
 }
 
-const HELP: &str = "Usage: pf-prefsd --state-dir PATH --socket PATH --writer-group GROUP";
+const HELP: &str =
+    "Usage: pf-prefsd --state-dir PATH --socket PATH --writer-group GROUP [--seed-file PATH]";
 
 #[cfg(test)]
 mod tests {
@@ -164,6 +172,27 @@ mod tests {
         assert_eq!(args.socket, PathBuf::from("/tmp/prefs.sock"));
         assert_eq!(args.state_dir, PathBuf::from("/tmp/prefs"));
         assert_eq!(args.writer_group, "pf-pref-writer");
+    }
+
+    #[test]
+    fn seed_file_defaults_to_the_provisioned_path_and_is_overridable() {
+        let base = [
+            "--socket",
+            "/tmp/prefs.sock",
+            "--state-dir",
+            "/tmp/prefs",
+            "--writer-group",
+            "pf-pref-writer",
+        ];
+        let args = parse_args(base.into_iter().map(str::to_owned)).unwrap();
+        assert_eq!(
+            args.seed_file,
+            PathBuf::from("/etc/pocketforge/prefs.seed.json")
+        );
+        let mut with_flag = base.to_vec();
+        with_flag.extend(["--seed-file", "/tmp/other-seed.json"]);
+        let args = parse_args(with_flag.into_iter().map(str::to_owned)).unwrap();
+        assert_eq!(args.seed_file, PathBuf::from("/tmp/other-seed.json"));
     }
 
     #[test]
