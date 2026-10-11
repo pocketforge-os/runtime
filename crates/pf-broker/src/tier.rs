@@ -112,6 +112,11 @@ mod tests {
             "accelerometer",
             "gyroscope",
             "magnetometer",
+            // System input layer services (design/input-layer): system-drawn UI, no
+            // user-environment read, so Normal per the §7 future-capability rule.
+            "pointer",
+            "menu",
+            "options",
         ] {
             assert_eq!(
                 tier_of(c, None),
