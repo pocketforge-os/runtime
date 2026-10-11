@@ -47,8 +47,10 @@ reason is never sent to the caller beyond the typed result.
 2. app id re-derived from the handle and compared with the claim;
 3. rate limit: 3 per 10 s per caller (the shell counts as one caller);
 4. flags;
-5. URL: `http`/`https` only (any case), an authority with a host, printable ASCII, at most 8 KiB;
-   `file:`, `data:`, `javascript:` and everything else are `invalid_url`;
+5. URL: `http`/`https` only (any case), a syntactically valid non-empty host (including bracketed
+   IPv6), printable ASCII, at most 8 KiB; an empty host hidden behind userinfo, a port-only
+   authority, malformed brackets, `file:`, `data:`, `javascript:` and everything else are
+   `invalid_url`;
 6. the caller's manifest declares the `open_url` capability (owner decision B);
 7. the caller is the foreground app (`denied` otherwise); the slot is free and the phase is
    `running` (`busy` otherwise);
@@ -61,6 +63,13 @@ reason is never sent to the caller beyond the typed result.
 
 A successful `OpenUrl` records `ReturnSlot { caller, handler_session_id, handler_item_id }` in the
 persisted state. It never stacks: a second `OpenUrl` while a slot exists is `busy`.
+
+Every foreground-changing `open_url` or `restore_caller` first persists a transition intent that
+contains its stable session identity. The system integration is idempotent for that identity.
+After a daemon crash—or an ambiguous save failure after the side effect—startup reconciliation
+replays the intent and only then commits the slot/history terminal state. Thus none of the shell
+handoff, distinct-app handoff, explicit return, or handler-exit return paths has an unrecorded
+side-effect window.
 
 - **App caller** (owner decision A): the caller keeps running behind the handler. The handler gets
   a history entry. `ReturnToCaller` from the handler restores the caller through

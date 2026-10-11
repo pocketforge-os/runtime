@@ -1079,6 +1079,51 @@ impl StateStore for RefusingStore {
     }
 }
 
+#[derive(Default)]
+struct FailOnceStore {
+    state: Option<PersistedState>,
+    successful_saves_before_failure: Option<usize>,
+}
+
+impl FailOnceStore {
+    fn with_state(state: PersistedState) -> Self {
+        Self {
+            state: Some(state),
+            successful_saves_before_failure: None,
+        }
+    }
+
+    fn fail_after(&mut self, successful_saves: usize) {
+        self.successful_saves_before_failure = Some(successful_saves);
+    }
+}
+
+impl StateStore for FailOnceStore {
+    fn load(&self) -> Result<Option<PersistedState>, AuthorityError> {
+        Ok(self.state.clone())
+    }
+
+    fn save(&mut self, state: &PersistedState) -> Result<(), AuthorityError> {
+        match self.successful_saves_before_failure {
+            Some(0) => {
+                self.successful_saves_before_failure = None;
+                Err(AuthorityError::Persistence(
+                    "injected transition save failure".into(),
+                ))
+            }
+            Some(remaining) => {
+                self.successful_saves_before_failure = Some(remaining - 1);
+                self.state = Some(state.clone());
+                Ok(())
+            }
+            None => {
+                self.state = Some(state.clone());
+                Ok(())
+            }
+        }
+    }
+}
+
 #[test]
 fn initial_state_publication_failure_aborts_open() {
     struct RefusingInitialStore;
@@ -1686,6 +1731,35 @@ fn linker_in_front() -> (Authority<MemoryStore, FakeSystem, TestClock>, Log, Str
     (a, log, session_id)
 }
 
+fn transition_authority() -> Authority<FailOnceStore, FakeSystem, TestClock> {
+    Authority::open_with_resolver(
+        FailOnceStore::with_state(PersistedState::default()),
+        FakeSystem::available(),
+        TestClock::new(),
+        3,
+        Duration::from_millis(10),
+        test_resolver(),
+    )
+    .unwrap()
+    .with_url_handler(FixedUrlHandler(BROWSER_ID.into()))
+}
+
+fn reopen_transition_authority(
+    store: FailOnceStore,
+    system: FakeSystem,
+) -> Authority<FailOnceStore, FakeSystem, TestClock> {
+    Authority::open_with_resolver(
+        store,
+        system,
+        TestClock::new(),
+        3,
+        Duration::from_millis(10),
+        test_resolver(),
+    )
+    .unwrap()
+    .with_url_handler(FixedUrlHandler(BROWSER_ID.into()))
+}
+
 fn refusals(log: &Log) -> Vec<String> {
     log.lock()
         .unwrap()
@@ -1699,6 +1773,11 @@ fn refusals(log: &Log) -> Vec<String> {
 fn url_policy_accepts_http_and_https_and_refuses_everything_else() {
     assert_eq!(validate_url("http://example.org"), Ok("http"));
     assert_eq!(validate_url("HTTPS://Example.org/a?b=c#d"), Ok("https"));
+    assert_eq!(
+        validate_url("http://user@example.org:8080/path"),
+        Ok("http")
+    );
+    assert_eq!(validate_url("https://[2001:db8::1]:443/path"), Ok("https"));
     let longest = format!("https://example.org/{}", "a".repeat(MAX_URL_BYTES - 20));
     assert_eq!(longest.len(), MAX_URL_BYTES);
     assert_eq!(validate_url(&longest), Ok("https"));
@@ -1712,6 +1791,14 @@ fn url_policy_accepts_http_and_https_and_refuses_everything_else() {
         ("http:example.org".into(), UrlRejection::NoAuthority),
         ("http:///path".into(), UrlRejection::EmptyHost),
         ("http://".into(), UrlRejection::EmptyHost),
+        ("http://user@".into(), UrlRejection::EmptyHost),
+        ("https://user@".into(), UrlRejection::EmptyHost),
+        ("http://:443".into(), UrlRejection::EmptyHost),
+        ("https://:443".into(), UrlRejection::EmptyHost),
+        ("http://[::".into(), UrlRejection::EmptyHost),
+        ("https://[::".into(), UrlRejection::EmptyHost),
+        ("http://[]".into(), UrlRejection::EmptyHost),
+        ("https://[::1]extra".into(), UrlRejection::EmptyHost),
         (
             "http://exa mple.org".into(),
             UrlRejection::ControlOrNonAscii,
@@ -1792,6 +1879,169 @@ fn front_open_url_launches_the_handler_with_the_url_as_data_and_opens_the_slot()
         .unwrap()
         .contains("reason=slot_occupied"));
     assert_eq!(a.system.handoffs.len(), 1);
+}
+
+#[test]
+fn shell_handoff_replays_a_durable_intent_after_the_post_effect_save_fails() {
+    let mut a = transition_authority();
+    // Positive control: one durable pre-effect save succeeds. The injected failure is the first
+    // save after the foreground-changing handoff.
+    a.store.fail_after(1);
+    let response = dispatch_rpc(&mut a, open_url_request(None, URL, 0));
+    assert!(
+        matches!(response, RpcResponse::Error { .. }),
+        "{response:?}"
+    );
+    assert_eq!(a.system.handoffs.len(), 1, "the side effect happened once");
+    a.system.lifecycle = Some(SystemLifecycle {
+        app: AppUnitState::Active,
+        foreground_target_active: true,
+        selected_owner_active: false,
+    });
+
+    let (store, system, _) = a.into_parts();
+    let mut reopened = reopen_transition_authority(store, system);
+    reopened.reconcile().unwrap();
+    assert_eq!(
+        reopened.system.handoffs.len(),
+        2,
+        "restart replays the intent"
+    );
+    assert!(matches!(
+        reopened.state.return_slot,
+        Some(ReturnSlot {
+            caller: SlotCaller::Shell,
+            ..
+        })
+    ));
+    assert!(matches!(reopened.state.phase, Phase::Running { .. }));
+}
+
+#[test]
+fn app_handoff_replays_a_durable_intent_after_the_terminal_save_fails() {
+    let mut a = transition_authority();
+    assert!(matches!(
+        a.launch(LaunchRequest {
+            item_id: LINKER_ID.into()
+        })
+        .unwrap(),
+        LaunchResult::Accepted { .. }
+    ));
+    a.store.fail_after(1);
+    let response = dispatch_rpc_from(
+        &mut a,
+        front(LINKER_ID),
+        open_url_request(Some(LINKER_ID), URL, 0),
+    );
+    assert!(
+        matches!(response, RpcResponse::Error { .. }),
+        "{response:?}"
+    );
+    assert_eq!(a.system.handoffs.len(), 1);
+
+    let (store, system, _) = a.into_parts();
+    let mut reopened = reopen_transition_authority(store, system);
+    reopened.reconcile().unwrap();
+    assert_eq!(reopened.system.handoffs.len(), 2);
+    assert!(matches!(
+        reopened.state.return_slot,
+        Some(ReturnSlot {
+            caller: SlotCaller::App { .. },
+            ..
+        })
+    ));
+    assert_eq!(
+        reopened
+            .state
+            .history
+            .iter()
+            .filter(|entry| entry.session_id == "session-2")
+            .count(),
+        1,
+        "replay commits one handler history entry"
+    );
+}
+
+#[test]
+fn explicit_return_replays_a_durable_restore_after_the_terminal_save_fails() {
+    let mut a = transition_authority();
+    assert!(matches!(
+        a.launch(LaunchRequest {
+            item_id: LINKER_ID.into()
+        })
+        .unwrap(),
+        LaunchResult::Accepted { .. }
+    ));
+    assert!(matches!(
+        dispatch_rpc_from(
+            &mut a,
+            front(LINKER_ID),
+            open_url_request(Some(LINKER_ID), URL, 0)
+        ),
+        RpcResponse::Launched { .. }
+    ));
+    a.store.fail_after(1);
+    let response = dispatch_rpc_from(&mut a, front(BROWSER_ID), return_request(BROWSER_ID, None));
+    assert!(
+        matches!(response, RpcResponse::Error { .. }),
+        "{response:?}"
+    );
+    assert_eq!(a.system.restores.len(), 1);
+
+    let (store, system, _) = a.into_parts();
+    let mut reopened = reopen_transition_authority(store, system);
+    reopened.reconcile().unwrap();
+    assert_eq!(reopened.system.restores.len(), 2);
+    assert!(reopened.state.return_slot.is_none());
+}
+
+#[test]
+fn handler_exit_replays_a_durable_restore_after_the_terminal_save_fails() {
+    let mut a = transition_authority();
+    assert!(matches!(
+        a.launch(LaunchRequest {
+            item_id: LINKER_ID.into()
+        })
+        .unwrap(),
+        LaunchResult::Accepted { .. }
+    ));
+    assert!(matches!(
+        dispatch_rpc_from(
+            &mut a,
+            front(LINKER_ID),
+            open_url_request(Some(LINKER_ID), URL, 0)
+        ),
+        RpcResponse::Launched { .. }
+    ));
+    a.system.lifecycles.insert(
+        BROWSER_ID.into(),
+        SystemLifecycle {
+            app: AppUnitState::InactiveSuccess,
+            foreground_target_active: true,
+            selected_owner_active: false,
+        },
+    );
+    a.store.fail_after(1);
+    assert!(matches!(
+        a.tick(),
+        Err(AuthorityError::Persistence(reason)) if reason == "injected transition save failure"
+    ));
+    assert_eq!(a.system.restores.len(), 1);
+
+    let (store, system, _) = a.into_parts();
+    let mut reopened = reopen_transition_authority(store, system);
+    reopened.reconcile().unwrap();
+    assert_eq!(reopened.system.restores.len(), 2);
+    assert!(reopened.state.return_slot.is_none());
+    assert_eq!(
+        reopened
+            .state
+            .history
+            .iter()
+            .find(|entry| entry.session_id == "session-2")
+            .and_then(|entry| entry.receipt.as_ref()),
+        Some(&Receipt::Returned)
+    );
 }
 
 #[test]

@@ -261,6 +261,16 @@ pub struct ReturnSlot {
     pub caller_gone: bool,
 }
 
+/// A foreground-changing URL operation that was made durable before its external side effect.
+/// Reconciliation may replay it, so [`SessionSystem`] implementations must be idempotent for the
+/// session ids carried by the handoff or slot.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "operation", rename_all = "snake_case")]
+enum UrlTransition {
+    Opening { handoff: UrlHandoff },
+    Restoring { slot: ReturnSlot },
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct PersistedState {
     pub phase: Phase,
@@ -273,6 +283,8 @@ pub struct PersistedState {
     acknowledged: BTreeMap<String, u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub return_slot: Option<ReturnSlot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    url_transition: Option<UrlTransition>,
 }
 
 impl Default for PersistedState {
@@ -287,6 +299,7 @@ impl Default for PersistedState {
             safe_return_binding_revision: 0,
             acknowledged: BTreeMap::new(),
             return_slot: None,
+            url_transition: None,
         }
     }
 }
@@ -553,7 +566,7 @@ impl<E: CommandExecutor> CommandSystem<E> {
 }
 
 /// One URL handoff for the session system: the URL is data here, never an argv token.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct UrlHandoff {
     pub caller: SlotCaller,
     pub handler_item_id: String,
@@ -582,12 +595,16 @@ pub trait SessionSystem {
         Ok(None)
     }
     /// Start the handler (or deliver to a running one) with the URL as data and switch the
-    /// foreground to it, leaving an app caller running behind it. The default refuses: the
-    /// switch belongs to the trusted session path (G2.2–G2.4).
+    /// foreground to it, leaving an app caller running behind it. Calls with the same handler
+    /// session id must be idempotent because a durable intent is replayed after an ambiguous
+    /// crash boundary. The default refuses: the switch belongs to the trusted session path
+    /// (G2.2–G2.4).
     fn open_url(&mut self, _handoff: &UrlHandoff) -> Result<UrlHandoffOutcome, String> {
         Err(FOREGROUND_HANDOFF_UNAVAILABLE.to_owned())
     }
-    /// Bring the slot's app caller back to the front; the handler keeps running behind it.
+    /// Bring the slot's app caller back to the front; the handler keeps running behind it. Calls
+    /// for the same slot must be idempotent because a durable intent is replayed after an
+    /// ambiguous crash boundary.
     fn restore_caller(&mut self, _slot: &ReturnSlot) -> Result<(), String> {
         Err(FOREGROUND_HANDOFF_UNAVAILABLE.to_owned())
     }
@@ -1395,11 +1412,89 @@ pub fn validate_url(url: &str) -> Result<&'static str, UrlRejection> {
         return Err(UrlRejection::SchemeNotAllowed);
     };
     let authority = rest.strip_prefix("//").ok_or(UrlRejection::NoAuthority)?;
-    let host = authority.split(['/', '?', '#']).next().unwrap_or("");
-    if host.is_empty() {
+    let authority = authority.split(['/', '?', '#']).next().unwrap_or("");
+    let host_port = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    if !valid_host_port(host_port) {
         return Err(UrlRejection::EmptyHost);
     }
     Ok(scheme)
+}
+
+fn valid_host_port(host_port: &str) -> bool {
+    if let Some(bracketed) = host_port.strip_prefix('[') {
+        let Some((host, rest)) = bracketed.split_once(']') else {
+            return false;
+        };
+        return host.parse::<std::net::Ipv6Addr>().is_ok() && valid_port_suffix(rest);
+    }
+    if host_port.contains(['[', ']']) {
+        return false;
+    }
+    let (host, port) = match host_port.split_once(':') {
+        Some((host, port)) if !port.contains(':') => (host, Some(port)),
+        Some(_) => return false,
+        None => (host_port, None),
+    };
+    !host.is_empty() && valid_reg_name(host) && port.is_none_or(valid_port)
+}
+
+fn valid_port_suffix(suffix: &str) -> bool {
+    if suffix.is_empty() {
+        return true;
+    }
+    let Some(port) = suffix.strip_prefix(':') else {
+        return false;
+    };
+    valid_port(port)
+}
+
+fn valid_port(port: &str) -> bool {
+    !port.is_empty()
+        && port.bytes().all(|byte| byte.is_ascii_digit())
+        && port.parse::<u16>().is_ok()
+}
+
+fn valid_reg_name(host: &str) -> bool {
+    let bytes = host.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if byte == b'%' {
+            if index + 2 >= bytes.len()
+                || !bytes[index + 1].is_ascii_hexdigit()
+                || !bytes[index + 2].is_ascii_hexdigit()
+            {
+                return false;
+            }
+            index += 3;
+            continue;
+        }
+        if !(byte.is_ascii_alphanumeric()
+            || matches!(
+                byte,
+                b'-' | b'.'
+                    | b'_'
+                    | b'~'
+                    | b'!'
+                    | b'$'
+                    | b'&'
+                    | b'\''
+                    | b'('
+                    | b')'
+                    | b'*'
+                    | b'+'
+                    | b','
+                    | b';'
+                    | b'='
+            ))
+        {
+            return false;
+        }
+        index += 1;
+    }
+    true
 }
 
 fn declares_open_url(manifest: &pf_app_manifest::Manifest) -> bool {
@@ -1607,6 +1702,7 @@ impl<S: StateStore, B: SessionSystem, C: Clock> Authority<S, B, C> {
         self.persist()
     }
     pub fn reconcile(&mut self) -> Result<(), AuthorityError> {
+        self.reconcile_url_transition()?;
         if let Some(item_id) = self.item_id() {
             if !matches!(self.state.phase, Phase::RecoveryRequired { .. })
                 && validate_app_id(&item_id).is_err()
@@ -2079,6 +2175,87 @@ impl<S: StateStore, B: SessionSystem, C: Clock> Authority<S, B, C> {
         stamps.push_back(now);
         false
     }
+    fn begin_url_transition(&mut self, transition: UrlTransition) -> Result<(), AuthorityError> {
+        let before = self.state.clone();
+        self.state.url_transition = Some(transition);
+        if let Err(error) = self.persist() {
+            self.state = before;
+            return Err(error);
+        }
+        Ok(())
+    }
+    fn finish_url_handoff(&mut self, handoff: &UrlHandoff) -> Result<(), AuthorityError> {
+        let durable_intent = self.state.clone();
+        if matches!(handoff.caller, SlotCaller::App { .. })
+            && !self
+                .state
+                .history
+                .iter()
+                .any(|entry| entry.session_id == handoff.handler_session_id)
+        {
+            self.state.history.push_front(HistoryEntry {
+                session_id: handoff.handler_session_id.clone(),
+                item_id: handoff.handler_item_id.clone(),
+                receipt: None,
+                started_at: Some((self.now_fn)()),
+                ended_at: None,
+            });
+            self.state.history.truncate(self.recent_bound);
+        }
+        let slot = ReturnSlot {
+            caller: handoff.caller.clone(),
+            handler_session_id: handoff.handler_session_id.clone(),
+            handler_item_id: handoff.handler_item_id.clone(),
+            caller_gone: false,
+        };
+        self.state.return_slot = Some(slot.clone());
+        self.state.url_transition = None;
+        if let Err(error) = self.persist() {
+            self.state = durable_intent;
+            return Err(error);
+        }
+        let line = url_handoff_line("opened", &slot);
+        self.log(&line);
+        Ok(())
+    }
+    fn begin_restore(&mut self, slot: &ReturnSlot) -> Result<(), AuthorityError> {
+        self.begin_url_transition(UrlTransition::Restoring { slot: slot.clone() })
+    }
+    fn finish_restore(&mut self) -> Result<(), AuthorityError> {
+        let durable_intent = self.state.clone();
+        self.state.return_slot = None;
+        self.state.url_transition = None;
+        if let Err(error) = self.persist() {
+            self.state = durable_intent;
+            return Err(error);
+        }
+        Ok(())
+    }
+    fn reconcile_url_transition(&mut self) -> Result<(), AuthorityError> {
+        let Some(transition) = self.state.url_transition.clone() else {
+            return Ok(());
+        };
+        match transition {
+            UrlTransition::Opening { handoff } => {
+                if let Err(reason) = self.system.open_url(&handoff) {
+                    return Err(self.handoff_failure(&handoff.handler_item_id, &reason));
+                }
+                self.finish_url_handoff(&handoff)
+            }
+            UrlTransition::Restoring { slot } => {
+                if let Err(reason) = self.system.restore_caller(&slot) {
+                    let line = lifecycle_failure_line(
+                        ReasonCode::OwnerNotActive.as_str(),
+                        &slot.handler_item_id,
+                        &format!("caller restore replay failed: {reason}"),
+                    );
+                    self.log(&line);
+                    return Err(AuthorityError::Backend(reason));
+                }
+                self.finish_restore()
+            }
+        }
+    }
     /// Re-verifies the front's claim against the kernel-derived app id. Any mismatch or missing
     /// identity is refused and logged; the derived id, never the claim, is what the authority
     /// acts on.
@@ -2225,30 +2402,26 @@ impl<S: StateStore, B: SessionSystem, C: Clock> Authority<S, B, C> {
         match slot_caller {
             SlotCaller::Shell => {
                 // The handler is a real foreground session launched by the shell's request.
+                let handoff = UrlHandoff {
+                    caller: SlotCaller::Shell,
+                    handler_item_id: handler.clone(),
+                    handler_session_id: format!("session-{}", self.state.next_session),
+                    url,
+                    flags,
+                };
+                let transition = UrlTransition::Opening {
+                    handoff: handoff.clone(),
+                };
                 let (session_id, outcome) =
-                    self.start_session(&handler, |system, session_id| {
-                        system.open_url(&UrlHandoff {
-                            caller: SlotCaller::Shell,
-                            handler_item_id: handler.clone(),
-                            handler_session_id: session_id.to_owned(),
-                            url,
-                            flags,
-                        })
+                    self.start_session(&handler, Some(transition), |system, _session_id| {
+                        system.open_url(&handoff)
                     })?;
                 let Some(outcome) = outcome else {
                     return Ok(RpcResponse::Error {
                         message: "URL handoff failed".into(),
                     });
                 };
-                self.state.return_slot = Some(ReturnSlot {
-                    caller: SlotCaller::Shell,
-                    handler_session_id: session_id.clone(),
-                    handler_item_id: handler,
-                    caller_gone: false,
-                });
-                let line = url_handoff_line("opened", self.state.return_slot.as_ref().unwrap());
-                self.log(&line);
-                self.persist()?;
+                self.finish_url_handoff(&handoff)?;
                 Ok(match outcome {
                     UrlHandoffOutcome::Launched => RpcResponse::Launched { session_id },
                     UrlHandoffOutcome::Delivered => RpcResponse::Delivered,
@@ -2277,29 +2450,23 @@ impl<S: StateStore, B: SessionSystem, C: Clock> Authority<S, B, C> {
                     url,
                     flags,
                 };
+                let before_intent = self.state.clone();
+                self.state.next_session += 1;
+                if let Err(error) = self.begin_url_transition(UrlTransition::Opening {
+                    handoff: handoff.clone(),
+                }) {
+                    self.state = before_intent;
+                    return Err(error);
+                }
                 let outcome = match self.system.open_url(&handoff) {
                     Ok(outcome) => outcome,
-                    Err(reason) => return Err(self.handoff_failure(&handler, &reason)),
+                    Err(reason) => {
+                        self.state = before_intent;
+                        self.persist()?;
+                        return Err(self.handoff_failure(&handler, &reason));
+                    }
                 };
-                self.state.next_session += 1;
-                self.state.history.push_front(HistoryEntry {
-                    session_id: session_id.clone(),
-                    item_id: handler.clone(),
-                    receipt: None,
-                    started_at: Some((self.now_fn)()),
-                    ended_at: None,
-                });
-                self.state.history.truncate(self.recent_bound);
-                let slot = ReturnSlot {
-                    caller: slot_caller,
-                    handler_session_id: session_id.clone(),
-                    handler_item_id: handler,
-                    caller_gone: false,
-                };
-                let line = url_handoff_line("opened", &slot);
-                self.log(&line);
-                self.state.return_slot = Some(slot);
-                self.persist()?;
+                self.finish_url_handoff(&handoff)?;
                 Ok(match outcome {
                     UrlHandoffOutcome::Launched => RpcResponse::Launched { session_id },
                     UrlHandoffOutcome::Delivered => RpcResponse::Delivered,
@@ -2357,6 +2524,7 @@ impl<S: StateStore, B: SessionSystem, C: Clock> Authority<S, B, C> {
                 Ok(RpcResponse::CallerGone)
             }
             SlotCaller::App { .. } => {
+                self.begin_restore(&slot)?;
                 if let Err(reason) = self.system.restore_caller(&slot) {
                     let line = lifecycle_failure_line(
                         ReasonCode::OwnerNotActive.as_str(),
@@ -2366,10 +2534,9 @@ impl<S: StateStore, B: SessionSystem, C: Clock> Authority<S, B, C> {
                     self.log(&line);
                     return Err(AuthorityError::Backend(reason));
                 }
-                self.state.return_slot = None;
+                self.finish_restore()?;
                 let line = url_handoff_line("restored", &slot);
                 self.log(&line);
-                self.persist()?;
                 Ok(RpcResponse::Restored)
             }
         }
@@ -2403,14 +2570,14 @@ impl<S: StateStore, B: SessionSystem, C: Clock> Authority<S, B, C> {
         self.close_history_entry(&slot.handler_session_id, receipt, precision);
         let line = url_handoff_line("handler_exited", &slot);
         self.log(&line);
+        self.begin_restore(&slot)?;
         if let Err(reason) = self.system.restore_caller(&slot) {
             return self.recover(format!(
                 "{}: caller restore failed: {reason}",
                 ReasonCode::OwnerNotActive.as_str()
             ));
         }
-        self.state.return_slot = None;
-        self.persist()
+        self.finish_restore()
     }
     /// The app caller ended while the handler was in front: the handler becomes the foreground
     /// session and the slot remembers that the caller is gone. Nothing is published, because
@@ -2494,6 +2661,7 @@ impl<S: StateStore, B: SessionSystem, C: Clock> Authority<S, B, C> {
     fn start_session<T>(
         &mut self,
         item_id: &str,
+        url_transition: Option<UrlTransition>,
         start: impl FnOnce(&mut B, &str) -> Result<T, String>,
     ) -> Result<(String, Option<T>), AuthorityError> {
         let id = format!("session-{}", self.state.next_session);
@@ -2504,11 +2672,13 @@ impl<S: StateStore, B: SessionSystem, C: Clock> Authority<S, B, C> {
             item_id: item_id.to_owned(),
             start_invoked: false,
         };
+        self.state.url_transition = url_transition;
         if let Err(error) = self.persist() {
             self.state = before_intent;
             return Err(error);
         }
         let start_result = start(&mut self.system, &id);
+        let durable_intent = self.state.clone();
         self.state.phase = Phase::Starting {
             session_id: id.clone(),
             item_id: item_id.to_owned(),
@@ -2523,7 +2693,13 @@ impl<S: StateStore, B: SessionSystem, C: Clock> Authority<S, B, C> {
         });
         self.state.history.truncate(self.recent_bound);
         self.publish(WireEvent::ObservedStarting);
-        self.persist()?;
+        if start_result.is_err() {
+            self.state.url_transition = None;
+        }
+        if let Err(error) = self.persist() {
+            self.state = durable_intent;
+            return Err(error);
+        }
         match start_result {
             Ok(value) => {
                 self.observe(Observation::SessionRunning)?;
@@ -2643,7 +2819,7 @@ impl<S: StateStore, B: SessionSystem, C: Clock> AuthorityApi for Authority<S, B,
             return Ok(LaunchResult::ItemUnavailable);
         }
         let item_id = request.item_id.clone();
-        let (session_id, _) = self.start_session(&item_id, |system, session_id| {
+        let (session_id, _) = self.start_session(&item_id, None, |system, session_id| {
             system.start_foreground(&request, session_id)
         })?;
         Ok(LaunchResult::Accepted { session_id })
