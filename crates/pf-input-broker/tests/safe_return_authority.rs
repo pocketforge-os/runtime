@@ -244,6 +244,8 @@ fn broker_safe_return(authority: &mut TestAuthority) {
     let (mut stream, _) = listener.accept().unwrap();
     let mut writer = stream.try_clone().unwrap();
     serve_connection(authority, &mut stream, &mut writer).unwrap();
+    // Event-driven wait: the round trip is already complete, so the outcome line is in the
+    // channel; the 5 s bound is a safety net, not a timing window.
     let line = log.recv_timeout(Duration::from_secs(5)).unwrap();
     assert!(line.ends_with(": ok"), "{line}");
     let _ = fs::remove_file(sock);

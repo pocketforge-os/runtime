@@ -197,6 +197,9 @@ fn input_manager_is_pure_descriptor_data() {
 
     assert_eq!(m133.resolve("confirm"), Some(confirm.as_str()));
     assert_eq!(m133.resolve("cancel"), Some(cancel));
+    // X18: descriptors ship accept_default = "east" (printed A on Nintendo-arranged chassis).
+    assert_eq!(m133.resolve("confirm"), Some("east"));
+    assert_eq!(m133.resolve("cancel"), Some("south"));
     // a523-only controls appear by DATA, no per-device code.
     assert!(m133.by_id("home").is_none(), "base Pro has no home button");
     assert!(

@@ -8,6 +8,7 @@
 //!   pf-input-broker --descriptor <caps.toml> [--source <event-node>] [--acquire-sock <path>]
 //!                   [--safe-return-sock <authority.sock>]
 //!                   [--system-menu-sock <provider.sock>]
+//!                   [--allow-unidentified-pad]
 //!
 //! Each `--acquire-sock` connection is a persistent PFW1 session: repeated `Acquire("input")`
 //! (each answered with a fresh re-emit fd), read-only preference operations (prefsd via
@@ -30,7 +31,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use pf_input_broker::{
-    serve_client, serve_system_menu_provider, InputBroker, SafeReturnIntake, SystemMenuRouter,
+    serve_client, serve_system_menu_provider, InputBroker, SafeReturnIntake, SourceIdentity,
+    SystemMenuRouter,
 };
 use pocketforge::backends::InProcessBackend;
 use pocketforge::{Backend, Descriptor};
@@ -60,16 +62,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("--system-menu-sock requires --safe-return-sock".into());
     }
     let grab = !args.iter().any(|a| a == "--no-grab");
-    // --require-builtin (tsp-ihne1.8): the source must be the built-in controller by
-    // pf_input_decode::builtin (virtual path + decoder phys + decoder record), not just by name.
-    let builtin = require_builtin(&args).then(pf_input_decode::builtin::Trust::system);
+    // Identity is fail-closed by default: the source must be the decoder's built-in controller
+    // (virtual path + decoder phys + trusted record), not merely descriptor-compatible.
+    let identity = source_identity(&args);
+    if let Some(warning) = identity_warning(&identity) {
+        eprintln!("{warning}");
+    }
 
     let descriptor = Descriptor::load(&desc_path)?;
     let source = match arg(&args, "--source") {
         Some(path) => std::path::PathBuf::from(path),
-        None => discover_with_timeout(&descriptor, builtin.as_ref())?,
+        None => discover_with_timeout(&descriptor, &identity)?,
     };
-    let mut broker = InputBroker::start_checked(&source, &descriptor, grab, builtin.as_ref())?;
+    let mut broker = InputBroker::start_checked(&source, &descriptor, grab, &identity)?;
     let system_menu_router = safe_return_sock
         .as_deref()
         .map(SafeReturnIntake::spawn)
@@ -206,17 +211,27 @@ fn supervise(
     }
 }
 
-fn require_builtin(args: &[String]) -> bool {
-    args.iter().any(|a| a == "--require-builtin")
+fn source_identity(args: &[String]) -> SourceIdentity {
+    if args.iter().any(|a| a == "--allow-unidentified-pad") {
+        SourceIdentity::allow_unidentified()
+    } else {
+        SourceIdentity::system()
+    }
+}
+
+fn identity_warning(identity: &SourceIdentity) -> Option<&'static str> {
+    (!identity.is_enforcing()).then_some(
+        "pf-input-broker: WARNING: --allow-unidentified-pad disables built-in controller identity checks; use only for desktop simulation and tests",
+    )
 }
 
 fn discover_with_timeout(
     descriptor: &Descriptor,
-    builtin: Option<&pf_input_decode::builtin::Trust>,
+    identity: &SourceIdentity,
 ) -> std::io::Result<std::path::PathBuf> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     loop {
-        match InputBroker::discover_checked(descriptor, builtin) {
+        match InputBroker::discover_checked(descriptor, identity) {
             Ok(path) => return Ok(path),
             Err(e)
                 if e.kind() == std::io::ErrorKind::NotFound
@@ -285,6 +300,25 @@ fn send_ready(socket: &str) -> std::io::Result<()> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn built_in_pad_identity_is_default_and_opt_out_is_explicit_and_loud() {
+        let default = source_identity(&[]);
+        assert!(default.is_enforcing());
+        assert_eq!(identity_warning(&default), None);
+
+        let opt_out = source_identity(&["--allow-unidentified-pad".to_owned()]);
+        assert!(!opt_out.is_enforcing());
+        assert_eq!(
+            identity_warning(&opt_out),
+            Some(
+                "pf-input-broker: WARNING: --allow-unidentified-pad disables built-in controller identity checks; use only for desktop simulation and tests"
+            )
+        );
+
+        // The old opt-in cannot accidentally become an opt-out.
+        assert!(source_identity(&["--require-builtin".to_owned()]).is_enforcing());
+    }
+
     fn test_backend() -> Arc<dyn Backend> {
         Arc::new(InProcessBackend::new(Arc::new(
             pocketforge::test_support::gnss_descriptor(),
@@ -316,6 +350,10 @@ mod tests {
 
     #[test]
     fn stalled_client_does_not_hide_pump_failure() {
+        // The 1 s ceiling is a liveness safety net, not a synchronisation window: supervise
+        // polls its command channel every 50 ms, so the pump failure surfaces within one
+        // tick of a healthy run; only a regression that blocks on the silent client can
+        // reach the ceiling.
         let path =
             std::env::temp_dir().join(format!("pf-input-broker-acquire-{}", std::process::id()));
         let _ = std::fs::remove_file(&path);
@@ -350,6 +388,10 @@ mod tests {
 
     #[test]
     fn stalled_client_does_not_delay_stop_cleanup() {
+        // The 1 s ceiling is a liveness safety net, not a synchronisation window: supervise
+        // observes the pre-set stop flag on its first 50 ms poll tick, so a healthy run
+        // returns immediately; only a regression that blocks on the silent client can reach
+        // the ceiling.
         let path = std::env::temp_dir().join(format!(
             "pf-input-broker-acquire-stop-{}",
             std::process::id()

@@ -5,7 +5,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::io;
-use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -26,6 +26,57 @@ use crate::uinput::Uinput;
 
 const MAX_REPORT_EVENTS: usize = 256;
 const ACQUIRE_CLIENT_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// How the broker authenticates its source device.
+///
+/// Production callers use [`SourceIdentity::system`], which requires the decoder's virtual path,
+/// `phys` value and trusted runtime record. Simulation and test callers must opt out by spelling
+/// [`SourceIdentity::allow_unidentified`]; there is no implicit `None` policy.
+#[derive(Debug, Clone)]
+pub struct SourceIdentity {
+    trust: Option<Trust>,
+}
+
+impl SourceIdentity {
+    /// Require the decoder identity record in the production `/sys` and `/run` trees.
+    pub fn system() -> SourceIdentity {
+        SourceIdentity::require_builtin(Trust::system())
+    }
+
+    /// Require built-in identity according to an explicit trust source (for hermetic tests).
+    pub fn require_builtin(trust: Trust) -> SourceIdentity {
+        SourceIdentity { trust: Some(trust) }
+    }
+
+    /// Explicitly accept a descriptor-matching source without decoder identity.
+    ///
+    /// This is only for desktop simulation and tests. The daemon logs a warning when its CLI flag
+    /// selects this policy.
+    pub fn allow_unidentified() -> SourceIdentity {
+        SourceIdentity { trust: None }
+    }
+
+    /// Whether decoder identity is enforced.
+    pub fn is_enforcing(&self) -> bool {
+        self.trust.is_some()
+    }
+
+    fn verify_fd(&self, fd: BorrowedFd<'_>) -> io::Result<()> {
+        match self.trust.as_ref() {
+            Some(trust) => require_builtin(trust.identify_fd(fd)),
+            None => Ok(()),
+        }
+    }
+
+    #[cfg(test)]
+    fn verify_verdict(&self, verdict: io::Result<Verdict>) -> io::Result<()> {
+        if self.is_enforcing() {
+            require_builtin(verdict)
+        } else {
+            Ok(())
+        }
+    }
+}
 
 /// A source that can answer the `EVIOCGBIT` question the broker's capability check asks: does it
 /// advertise every one of `codes` for `event_type`? [`Evdev`] answers from the opened fd; a
@@ -239,17 +290,18 @@ impl InputBroker {
         descriptor: &Descriptor,
         grab: bool,
     ) -> io::Result<InputBroker> {
-        InputBroker::start_checked(source_path, descriptor, grab, None)
+        InputBroker::start_checked(source_path, descriptor, grab, &SourceIdentity::system())
     }
 
-    /// As [`start_with`](Self::start_with); with `builtin` set, the opened source must also be the
-    /// built-in controller by [`pf_input_decode::builtin`] (`--require-builtin`, `tsp-ihne1.8`).
-    /// The check runs on the opened fd, before the grab, so a lookalike is never grabbed.
+    /// As [`start_with`](Self::start_with), with an explicit source-identity policy. The production
+    /// default requires the built-in controller by [`pf_input_decode::builtin`]; simulation/tests
+    /// can explicitly allow an unidentified source. The check runs on the opened fd, before the
+    /// grab, so a lookalike is never grabbed.
     pub fn start_checked(
         source_path: impl AsRef<Path>,
         descriptor: &Descriptor,
         grab: bool,
-        builtin: Option<&Trust>,
+        identity: &SourceIdentity,
     ) -> io::Result<InputBroker> {
         let remap = Remap::from_descriptor(descriptor)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
@@ -257,9 +309,7 @@ impl InputBroker {
             || {
                 let mut source = Evdev::open(source_path)?;
                 Self::validate_source(&source, descriptor, &remap)?;
-                if let Some(trust) = builtin {
-                    require_builtin(trust.identify_fd(source.as_fd()))?;
-                }
+                identity.verify_fd(source.as_fd())?;
                 if grab {
                     source.grab()?;
                 }
@@ -305,14 +355,15 @@ impl InputBroker {
     /// Discover exactly one descriptor-matching event node. Every candidate is identified from
     /// its opened fd; `start` opens and validates the winner again before grabbing it.
     pub fn discover(descriptor: &Descriptor) -> io::Result<PathBuf> {
-        InputBroker::discover_checked(descriptor, None)
+        InputBroker::discover_checked(descriptor, &SourceIdentity::system())
     }
 
-    /// As [`discover`](Self::discover); with `builtin` set, only the built-in controller is a
-    /// candidate, so a lookalike cannot make discovery ambiguous or win it.
+    /// As [`discover`](Self::discover), with an explicit source-identity policy. Under the
+    /// production default only the built-in controller is a candidate, so a lookalike cannot make
+    /// discovery ambiguous or win it.
     pub fn discover_checked(
         descriptor: &Descriptor,
-        builtin: Option<&Trust>,
+        identity: &SourceIdentity,
     ) -> io::Result<PathBuf> {
         let expected = ExpectedIdentity::from_descriptor(descriptor)?;
         let remap = Remap::from_descriptor(descriptor)
@@ -329,28 +380,33 @@ impl InputBroker {
             }
             candidates.push(path);
         }
-        discover_candidates(candidates, |path| {
+        let mut identity_rejection = None;
+        let result = discover_candidates(candidates, |path| {
             let dev = Evdev::open(path)?;
             if !(expected.matches(&dev.name()?, dev.id()?)
                 && missing_source_capabilities(&dev, &remap)?.is_empty())
             {
                 return Ok(false);
             }
-            match builtin {
+            match identity.trust.as_ref() {
                 Some(trust) => match trust.identify_fd(dev.as_fd()) {
                     Ok(Verdict::BuiltIn { .. }) => Ok(true),
-                    Ok(Verdict::NotBuiltIn(_)) => Ok(false),
+                    Ok(Verdict::NotBuiltIn(reason)) => {
+                        identity_rejection
+                            .get_or_insert_with(|| format!("{}: {reason:?}", path.display()));
+                        Ok(false)
+                    }
                     Err(error) => {
-                        eprintln!(
-                            "pf-input-broker: cannot identify candidate {} as the built-in controller: {error}",
-                            path.display()
-                        );
+                        identity_rejection.get_or_insert_with(|| {
+                            format!("{}: identification error: {error}", path.display())
+                        });
                         Ok(false)
                     }
                 },
                 None => Ok(true),
             }
-        })
+        });
+        finish_discovery(result, identity_rejection)
     }
 
     fn resolve_matches(mut matches: Vec<PathBuf>) -> io::Result<PathBuf> {
@@ -430,6 +486,21 @@ impl InputBroker {
             .node_path()
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "re-emit node not resolved"))?;
         open_read_fd(&node)
+    }
+}
+
+fn finish_discovery(
+    result: io::Result<PathBuf>,
+    identity_rejection: Option<String>,
+) -> io::Result<PathBuf> {
+    match (result, identity_rejection) {
+        (Err(error), Some(reason)) if error.kind() == io::ErrorKind::NotFound => {
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("descriptor-matching source failed built-in controller identity: {reason}"),
+            ))
+        }
+        (result, _) => result,
     }
 }
 
@@ -897,6 +968,10 @@ mod readiness_tests {
         }));
         assert!(unit.lines().any(|line| line == "Restart=on-failure"));
         assert!(
+            !unit.contains("--allow-unidentified-pad"),
+            "the production service must keep built-in controller identity enforcement"
+        );
+        assert!(
             !unit.lines().any(|line| {
                 line.starts_with("BindsTo=")
                     || (line.starts_with("Requires=")
@@ -951,6 +1026,57 @@ mod readiness_tests {
             err.kind(),
             io::ErrorKind::NotFound,
             "an I/O error is never a pass"
+        );
+    }
+
+    #[test]
+    fn source_identity_policy_refuses_lookalikes_and_missing_records_by_default() {
+        use pf_input_decode::builtin::Reason;
+
+        let default = SourceIdentity::system();
+        assert!(default
+            .verify_verdict(Ok(Verdict::BuiltIn {
+                sysname: "input5".into(),
+            }))
+            .is_ok());
+        for reason in [
+            Reason::SysnameMismatch {
+                device: "input9".into(),
+                record: "input5".into(),
+            },
+            Reason::RecordAbsent,
+        ] {
+            assert!(
+                default
+                    .verify_verdict(Ok(Verdict::NotBuiltIn(reason.clone())))
+                    .is_err(),
+                "default must fail closed for {reason:?}"
+            );
+        }
+
+        let simulation = SourceIdentity::allow_unidentified();
+        assert!(simulation
+            .verify_verdict(Ok(Verdict::NotBuiltIn(Reason::SysnameMismatch {
+                device: "input9".into(),
+                record: "input5".into(),
+            })))
+            .is_ok());
+        assert!(simulation
+            .verify_verdict(Ok(Verdict::NotBuiltIn(Reason::RecordAbsent)))
+            .is_ok());
+
+        let missing_record = finish_discovery(
+            Err(io::Error::new(io::ErrorKind::NotFound, "no match")),
+            Some("/dev/input/event9: RecordAbsent".into()),
+        )
+        .unwrap_err();
+        assert_eq!(missing_record.kind(), io::ErrorKind::PermissionDenied);
+        assert!(missing_record.to_string().contains("RecordAbsent"));
+        let decoder = PathBuf::from("/dev/input/event5");
+        assert_eq!(
+            finish_discovery(Ok(decoder.clone()), Some("ignored lookalike".into())).unwrap(),
+            decoder,
+            "a valid decoder device remains the positive control"
         );
     }
 
@@ -1080,6 +1206,10 @@ mod readiness_tests {
 
     #[test]
     fn stalled_acquire_client_is_deadline_bounded() {
+        // The ceiling is the SUBJECT of the test, not a synchronisation window: a silent
+        // client must be cut off by the production ACQUIRE_CLIENT_TIMEOUT (250 ms), so a
+        // healthy run finishes at the deadline; only a regression to unbounded blocking can
+        // reach the 1 s assert bound.
         let (server, _silent_client) = UnixStream::pair().unwrap();
         let started = std::time::Instant::now();
         handle_acquire(server, "/unused").unwrap();
@@ -1293,13 +1423,21 @@ range = { min = 0, max = 255, fuzz = 0, flat = 0 }
         let stop = Arc::new(AtomicBool::new(false));
         let server_stop = stop.clone();
         let server = std::thread::spawn(move || {
+            // Bounded polling wait, not an assertion window: the thread exits on the stop
+            // flag, and a connection that never arrives fails the test through the bounded
+            // channel receives in the test body.
             while !server_stop.load(Ordering::Acquire) {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
                         stream.set_nonblocking(false).unwrap();
                         let body = pf_wire::read_frame(&mut stream).unwrap();
-                        pf_wire::write_frame(&mut stream, br#"{"result":"ok"}"#).unwrap();
+                        // Publish the frame BEFORE answering: the intake worker can observe
+                        // "ok" only after this send, so once the test has seen the outcome
+                        // line and both gates are idle, every completed round trip's frame
+                        // is already in the channel — the final drain is exhaustive with a
+                        // zero window.
                         frames_tx.send(body).unwrap();
+                        pf_wire::write_frame(&mut stream, br#"{"result":"ok"}"#).unwrap();
                     }
                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                         std::thread::sleep(Duration::from_millis(5))
@@ -1323,34 +1461,26 @@ range = { min = 0, max = 255, fuzz = 0, flat = 0 }
                     syn(),
                 ],
             );
-            let line = log.recv_timeout(Duration::from_secs(5)).unwrap();
+            // Event-driven receives with generous bounds: the "ok" line is emitted after the
+            // intake worker re-armed its gate, and the router barrier drains its command
+            // queue, so the flag asserts below are direct — no polling window.
+            let line = log.recv_timeout(Duration::from_secs(10)).unwrap();
             assert!(line.ends_with(": ok"), "press {press}: {line}");
             assert_eq!(
-                frames.recv_timeout(Duration::from_secs(1)).unwrap(),
+                frames.recv_timeout(Duration::from_secs(10)).unwrap(),
                 SAFE_RETURN_BODY
             );
-            let completed = Instant::now() + Duration::from_secs(1);
-            while p
-                .system_menu
-                .as_ref()
-                .unwrap()
-                .router()
-                .fallback_in_flight()
-                && Instant::now() < completed
-            {
-                std::thread::sleep(Duration::from_millis(2));
-            }
-            assert!(!p
-                .system_menu
-                .as_ref()
-                .unwrap()
-                .router()
-                .fallback_in_flight());
+            let router = p.system_menu.as_ref().unwrap().router();
+            router.sync().unwrap();
+            assert!(
+                !router.in_flight() && !router.fallback_in_flight(),
+                "press {press} left a request in flight"
+            );
         }
-        assert!(
-            frames.recv_timeout(Duration::from_millis(300)).is_err(),
-            "no frame beyond one per press"
-        );
+        // Zero-window negative control: idle gates mean no dispatch can still be in flight,
+        // and the fake authority publishes every frame before answering, so a duplicate frame
+        // from a regressed coalescing path would already sit in the channel.
+        assert!(frames.try_recv().is_err(), "no frame beyond one per press");
         stop.store(true, Ordering::Release);
         server.join().unwrap();
         let _ = std::fs::remove_file(sock);
@@ -1363,8 +1493,7 @@ range = { min = 0, max = 255, fuzz = 0, flat = 0 }
         let sock = scratch("stalled.sock");
         let _ = std::fs::remove_file(&sock);
         let listener = UnixListener::bind(&sock).unwrap();
-        listener.set_nonblocking(true).unwrap();
-        let (intake, _log) = intake(&sock);
+        let (intake, log) = intake(&sock);
         let mut p = pump(Some(intake));
         let mut events = Vec::new();
         for _ in 0..50 {
@@ -1373,43 +1502,61 @@ range = { min = 0, max = 255, fuzz = 0, flat = 0 }
         }
         let started = Instant::now();
         let out = run(&mut p, &events);
+        // Generous liveness bound, not a synchronisation window: the pump path performs no
+        // I/O, so a healthy run finishes in milliseconds; only a regression that blocks the
+        // pump on the authority (which would stall on the 5 s socket read) can reach 1 s.
         let elapsed = started.elapsed();
         assert!(elapsed < Duration::from_secs(1), "pump took {elapsed:?}");
         let south: Vec<_> = out.iter().filter(|e| e.1 == SOUTH).collect();
         assert_eq!(south.len(), 100, "every non-guide event still flows");
         assert!(!out.iter().any(|&(_, code, _)| code == GUIDE_CODE));
-        let fallback_deadline = Instant::now() + Duration::from_secs(1);
-        while !p
-            .system_menu
-            .as_ref()
-            .unwrap()
-            .router()
-            .fallback_in_flight()
-            && Instant::now() < fallback_deadline
-        {
-            std::thread::sleep(Duration::from_millis(2));
-        }
+
+        let router = p.system_menu.as_ref().unwrap().router().clone();
+        // FIFO barrier: once sync() returns, all 50 presses have been coalesced or processed.
+        // Exactly one of them dispatched a SafeReturn request, which is stalled on the socket
+        // read (the authority never answers; the production IO_TIMEOUT of 5 s has not
+        // elapsed), so the fallback gate must still be armed — a direct assert, no polling
+        // window.
+        router.sync().unwrap();
         assert!(
-            p.system_menu
-                .as_ref()
-                .unwrap()
-                .router()
-                .fallback_in_flight(),
+            router.fallback_in_flight(),
             "the first press is still waiting on fallback return"
         );
-        // 50 presses while that request is in flight coalesce into exactly one connection.
-        let deadline = Instant::now() + Duration::from_secs(1);
-        let first = loop {
-            match listener.accept() {
-                Ok(conn) => break conn,
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock && Instant::now() < deadline => {
-                    std::thread::sleep(Duration::from_millis(5))
-                }
-                Err(e) => panic!("no SafeReturn connection: {e}"),
-            }
-        };
+
+        // The dispatched request surfaces as exactly one connection in the listener's
+        // backlog. Accept it on a blocking helper thread bounded by a channel timeout
+        // instead of racing a non-blocking accept against a sleep.
+        let blocking = listener.try_clone().unwrap();
+        let (conn_tx, conn_rx) = channel();
+        std::thread::spawn(move || {
+            let _ = conn_tx.send(blocking.accept());
+        });
+        let (first, _) = conn_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("no SafeReturn connection within 10 s")
+            .expect("accept failed");
         drop(first);
-        std::thread::sleep(Duration::from_millis(50));
+        // Dropping the connection ends the worker's stalled round trip with an error. The
+        // intake worker re-arms its gate BEFORE emitting the outcome line, so receiving that
+        // line proves the request completed and nothing can still be pending: the router
+        // barrier above drained its command queue, and its busy gate coalesced all 50
+        // presses into the single dispatch.
+        let line = log
+            .recv_timeout(Duration::from_secs(10))
+            .expect("no safe_return outcome line within 10 s");
+        assert!(
+            line.contains("safe_return") && line.contains("failed"),
+            "{line}"
+        );
+        assert!(
+            !router.in_flight() && !router.fallback_in_flight(),
+            "the completed round trip must re-arm both gates"
+        );
+        // Zero-window negative control: with the command queue drained and both gates
+        // re-armed, no further dispatch can exist, so a second connection could only come
+        // from a regression that re-dispatched a coalesced press — which would have opened
+        // it before the outcome line above was ever logged.
+        listener.set_nonblocking(true).unwrap();
         assert_eq!(
             listener.accept().unwrap_err().kind(),
             io::ErrorKind::WouldBlock,
@@ -1425,20 +1572,21 @@ range = { min = 0, max = 255, fuzz = 0, flat = 0 }
         let (intake, log) = intake(&sock);
         let mut p = pump(Some(intake));
         let out = run(&mut p, &guide_press_release());
-        let line = log.recv_timeout(Duration::from_secs(2)).unwrap();
+        // The absent socket fails the round trip immediately (NotFound), and the intake worker
+        // re-arms its gate BEFORE emitting the outcome line, so receiving the line is the
+        // completion event itself — a generous bound that only a regression can reach, not a
+        // timing window.
+        let line = log.recv_timeout(Duration::from_secs(10)).unwrap();
         assert!(
             line.contains("safe_return") && line.contains("failed") && line.contains("NotFound"),
             "{line}"
         );
         assert!(!out.iter().any(|&(_, code, _)| code == GUIDE_CODE));
-        let deadline = Instant::now() + Duration::from_secs(1);
-        while {
-            let router = p.system_menu.as_ref().unwrap().router();
-            (router.in_flight() || router.fallback_in_flight()) && Instant::now() < deadline
-        } {
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        let router = p.system_menu.as_ref().unwrap().router();
+        // The router barrier proves the Press command was fully processed (its busy gate
+        // re-armed), so the flag asserts are direct and the next press cannot be silently
+        // coalesced into a completed request.
+        let router = p.system_menu.as_ref().unwrap().router().clone();
+        router.sync().unwrap();
         assert!(
             !router.in_flight() && !router.fallback_in_flight(),
             "first failed return did not become idle"
@@ -1449,7 +1597,7 @@ range = { min = 0, max = 255, fuzz = 0, flat = 0 }
             vec![(ioc::EV_KEY, SOUTH, 1), (ioc::EV_SYN, ioc::SYN_REPORT, 0)]
         );
         run(&mut p, &guide_press_release());
-        let again = log.recv_timeout(Duration::from_secs(2)).unwrap();
+        let again = log.recv_timeout(Duration::from_secs(10)).unwrap();
         assert!(again.contains("failed"), "the next press retries: {again}");
     }
 
@@ -1476,8 +1624,11 @@ range = { min = 0, max = 255, fuzz = 0, flat = 0 }
             vec![(ioc::EV_KEY, SOUTH, 1), (ioc::EV_SYN, ioc::SYN_REPORT, 0)]
         );
         assert!(!p.pressed.contains(&GUIDE_CODE));
+        // Event-driven completion: the press edge's fallback attempt fails immediately on
+        // the absent socket and the outcome line arrives through the channel; the bound is
+        // generous and only a regression can reach it.
         assert!(
-            log.recv_timeout(Duration::from_secs(2)).is_ok(),
+            log.recv_timeout(Duration::from_secs(10)).is_ok(),
             "press edge requested"
         );
     }
@@ -1601,6 +1752,10 @@ range = { min = 0, max = 255, fuzz = 0, flat = 0 }
 
     #[test]
     fn client_stalled_mid_frame_is_deadline_bounded() {
+        // The ceiling is the SUBJECT of the test, not a synchronisation window: serve_client
+        // must cut a mid-frame stall at the acquisition I/O deadline (250 ms), so a healthy
+        // run finishes at the deadline; only a regression to unbounded blocking can reach
+        // the 1 s assert bound.
         let node = node_file("stalled-frame.node");
         let (mut client, server) = serve_pair(&node);
         client.write_all(&[0, 0]).unwrap(); // half a length prefix, then silence
