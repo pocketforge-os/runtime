@@ -1,0 +1,32 @@
+{
+  "old_epoch": 41,
+  "new_epoch": 42,
+  "request_id": 7001,
+  "next_power_sequence": 93,
+  "sequence": [
+    "delta_before_snapshot",
+    "snapshot",
+    "pending_trust",
+    "eof",
+    "reconnect",
+    "old_epoch_result_with_fd",
+    "replay",
+    "remint_roles_with_fresh_fds",
+    "power",
+    "replayed_power_sequence"
+  ],
+  "snapshot": {
+    "epoch": 41,
+    "focus": {
+      "surface": { "kind": "app", "app_id": "org.pocketforge.browser" },
+      "text_input": { "active": true, "purpose": "password" },
+      "secure_entry": true
+    },
+    "overlays": [
+      { "role": "keyboard", "state": "mapped", "rect": { "x": 0, "y": 420, "width": 1280, "height": 300 } },
+      { "role": "menu", "state": "mapped", "rect": { "x": 0, "y": 96, "width": 1280, "height": 624 } },
+      { "role": "toast", "state": "unmapped" }
+    ],
+    "power": { "pressed": false, "last_sequence": 92 }
+  }
+}

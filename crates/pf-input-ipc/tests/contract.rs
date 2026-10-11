@@ -2,7 +2,10 @@
 //! fixture, unknown majors are refused before the shape is looked at, and the pure state
 //! machines honour the timeout constants defined once in the crate.
 
-use pf_input_ipc::compositor::{CompositorToRouter, OverlayState, RouterToCompositor};
+use pf_input_ipc::compositor::{
+    CompositorSession, CompositorSnapshot, CompositorStateError, CompositorToRouter, OverlayState,
+    PowerState, PowerStep, RouterToCompositor,
+};
 use pf_input_ipc::events::RouterEvent;
 use pf_input_ipc::keyboard::{KeyboardToRouter, RouterToKeyboard};
 use pf_input_ipc::menu::{DismissReason, MenuAction, MenuToRouter, RouterToMenu};
@@ -11,7 +14,7 @@ use pf_input_ipc::{
     PadGate, Secret, SCHEMA_MAJOR,
 };
 use serde::de::DeserializeOwned;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeSet;
 use std::fmt::Debug;
@@ -545,4 +548,272 @@ fn menu_session_fallback_steps_always_request_safe_return() {
         open.held(timeouts::MENU_HOLD_RETURN),
         MenuStep::DismissAndReturn(DismissReason::HoldReturn)
     );
+}
+
+#[derive(Debug, Deserialize)]
+struct RecoveryTranscript {
+    old_epoch: u64,
+    new_epoch: u64,
+    request_id: u64,
+    next_power_sequence: u64,
+    snapshot: CompositorSnapshot,
+    sequence: Vec<String>,
+}
+
+fn recovery_transcript(name: &str) -> RecoveryTranscript {
+    let path = fixture_dir("transcripts").join(format!("{name}.json"));
+    serde_json::from_slice(&fs::read(&path).expect("recovery transcript bytes"))
+        .expect("recovery transcript shape")
+}
+
+/// Router death: the new connection refuses deltas and the old epoch until a complete replay,
+/// then accepts only fresh Power sequencing and fresh fd-bearing trust results.
+#[test]
+fn router_restart_requires_snapshot_and_refuses_old_epoch_state() {
+    let tx = recovery_transcript("router-restart");
+    assert_eq!(
+        tx.sequence,
+        [
+            "delta_before_snapshot",
+            "snapshot",
+            "pending_trust",
+            "eof",
+            "reconnect",
+            "old_epoch_result_with_fd",
+            "replay",
+            "remint_roles_with_fresh_fds",
+            "power",
+            "replayed_power_sequence",
+        ]
+    );
+    let mut old = CompositorSession::new(tx.old_epoch);
+
+    assert_eq!(
+        old.accept_delta(tx.old_epoch),
+        Err(CompositorStateError::SnapshotRequired),
+        "negative control: no deltas before the authoritative snapshot"
+    );
+    old.apply_snapshot(tx.snapshot.clone()).unwrap();
+    assert_eq!(old.accept_delta(tx.old_epoch), Ok(()));
+    old.begin_trusted_connection(
+        tx.old_epoch,
+        tx.request_id,
+        pf_input_ipc::OverlayRole::Keyboard,
+    )
+    .unwrap();
+
+    let effects = old.disconnect(true);
+    assert!(effects.secure_entry);
+    assert!(effects.quarantine_pad);
+    assert!(effects.close_role_peers);
+    assert!(effects.safe_return);
+    assert_eq!(effects.invalidated_request_ids, vec![tx.request_id]);
+
+    let mut fresh = CompositorSession::new(tx.new_epoch);
+    assert_eq!(
+        fresh.apply_snapshot(tx.snapshot.clone()),
+        Err(CompositorStateError::OldEpoch {
+            got: tx.old_epoch,
+            current: tx.new_epoch,
+        })
+    );
+    assert_eq!(
+        fresh.finish_trusted_connection(tx.old_epoch, tx.request_id, 1),
+        Err(CompositorStateError::OldEpoch {
+            got: tx.old_epoch,
+            current: tx.new_epoch,
+        }),
+        "an old result and attached fd cannot revive trust"
+    );
+
+    let mut replay = tx.snapshot.clone();
+    replay.epoch = tx.new_epoch;
+    fresh.apply_snapshot(replay).unwrap();
+    assert_eq!(fresh.snapshot().unwrap().epoch, tx.new_epoch);
+    assert!(fresh.snapshot().unwrap().focus.secure_entry);
+    assert_eq!(
+        fresh
+            .snapshot()
+            .unwrap()
+            .overlays
+            .iter()
+            .filter(|overlay| overlay.state == OverlayState::Mapped)
+            .count(),
+        2,
+        "unchanged keyboard and menu overlay state is restored by replay"
+    );
+    assert_eq!(fresh.accept_delta(tx.new_epoch), Ok(()));
+    assert_eq!(
+        fresh.apply_snapshot({
+            let mut duplicate = tx.snapshot.clone();
+            duplicate.epoch = tx.new_epoch;
+            duplicate
+        }),
+        Err(CompositorStateError::SnapshotAlreadyApplied)
+    );
+
+    assert_eq!(
+        fresh.protected_power(tx.new_epoch, tx.next_power_sequence, PowerState::Pressed),
+        Ok(PowerStep::Accepted)
+    );
+    let fresh_request = tx.request_id + 1;
+    fresh
+        .begin_trusted_connection(
+            tx.new_epoch,
+            fresh_request,
+            pf_input_ipc::OverlayRole::Keyboard,
+        )
+        .unwrap();
+    fresh
+        .finish_trusted_connection(tx.new_epoch, fresh_request, 1)
+        .unwrap();
+    fresh
+        .begin_trusted_connection(
+            tx.new_epoch,
+            fresh_request + 1,
+            pf_input_ipc::OverlayRole::Menu,
+        )
+        .unwrap();
+    fresh
+        .finish_trusted_connection(tx.new_epoch, fresh_request + 1, 1)
+        .unwrap();
+    assert_eq!(
+        fresh.protected_power(tx.new_epoch, tx.next_power_sequence, PowerState::Pressed),
+        Err(CompositorStateError::NonMonotonicPowerSequence {
+            got: tx.next_power_sequence,
+            last: tx.next_power_sequence,
+        })
+    );
+}
+
+/// Gamescope death: pending trust is invalidated fail-closed; recovery needs a complete snapshot,
+/// and a replacement Wayland fd is accepted only for a pending request in the new epoch.
+#[test]
+fn gamescope_restart_remints_roles_and_rejects_missing_or_unexpected_fds() {
+    let tx = recovery_transcript("gamescope-restart");
+    assert_eq!(
+        tx.sequence,
+        [
+            "snapshot",
+            "live_role_and_pending_trust",
+            "eof",
+            "reconnect",
+            "incomplete_replay",
+            "duplicate_role_replay",
+            "replay",
+            "old_epoch_result_with_fd",
+            "unexpected_result_with_fd",
+            "pending_result_without_fd",
+            "pending_result_with_two_fds",
+            "remint_roles_with_fresh_fds",
+            "refused_result_with_fd",
+            "refused_result_without_fd",
+        ]
+    );
+    let mut session = CompositorSession::new(tx.old_epoch);
+    session.apply_snapshot(tx.snapshot.clone()).unwrap();
+    session
+        .begin_trusted_connection(tx.old_epoch, tx.request_id, pf_input_ipc::OverlayRole::Menu)
+        .unwrap();
+    session
+        .finish_trusted_connection(tx.old_epoch, tx.request_id, 1)
+        .unwrap();
+    assert_eq!(
+        session.begin_trusted_connection(
+            tx.old_epoch,
+            tx.request_id + 99,
+            pf_input_ipc::OverlayRole::Menu,
+        ),
+        Err(CompositorStateError::RoleAlreadyBound(
+            pf_input_ipc::OverlayRole::Menu,
+        ))
+    );
+    let pending_id = tx.request_id + 1;
+    session
+        .begin_trusted_connection(
+            tx.old_epoch,
+            pending_id,
+            pf_input_ipc::OverlayRole::Keyboard,
+        )
+        .unwrap();
+    let effects = session.disconnect(false);
+    assert!(effects.secure_entry && effects.quarantine_pad && effects.close_role_peers);
+    assert!(!effects.safe_return);
+    assert_eq!(effects.invalidated_request_ids, vec![pending_id]);
+
+    let mut fresh = CompositorSession::new(tx.new_epoch);
+    let mut incomplete = tx.snapshot.clone();
+    incomplete.epoch = tx.new_epoch;
+    incomplete.overlays.pop();
+    assert_eq!(
+        fresh.apply_snapshot(incomplete),
+        Err(CompositorStateError::IncompleteSnapshot)
+    );
+    let mut duplicate_role = tx.snapshot.clone();
+    duplicate_role.epoch = tx.new_epoch;
+    duplicate_role.overlays[2].role = pf_input_ipc::OverlayRole::Keyboard;
+    assert_eq!(
+        fresh.apply_snapshot(duplicate_role),
+        Err(CompositorStateError::IncompleteSnapshot)
+    );
+
+    let mut replay = tx.snapshot.clone();
+    replay.epoch = tx.new_epoch;
+    fresh.apply_snapshot(replay).unwrap();
+    assert_eq!(fresh.snapshot().unwrap().focus, tx.snapshot.focus);
+    assert_eq!(
+        fresh.finish_trusted_connection(tx.old_epoch, pending_id, 1),
+        Err(CompositorStateError::OldEpoch {
+            got: tx.old_epoch,
+            current: tx.new_epoch,
+        }),
+        "the fd from the dead compositor cannot revive trust"
+    );
+    assert_eq!(
+        fresh.finish_trusted_connection(tx.new_epoch, pending_id, 1),
+        Err(CompositorStateError::UnexpectedRequestId(pending_id)),
+        "an fd is accepted only for a request issued in this epoch"
+    );
+    fresh
+        .begin_trusted_connection(tx.new_epoch, tx.request_id, pf_input_ipc::OverlayRole::Menu)
+        .unwrap();
+    assert_eq!(
+        fresh.finish_trusted_connection(tx.new_epoch, tx.request_id, 0),
+        Err(CompositorStateError::MissingFileDescriptor(tx.request_id))
+    );
+    assert_eq!(
+        fresh.finish_trusted_connection(tx.new_epoch, tx.request_id, 2),
+        Err(CompositorStateError::UnexpectedFileDescriptorCount {
+            request_id: tx.request_id,
+            got: 2,
+        })
+    );
+    assert_eq!(
+        fresh.finish_trusted_connection(tx.new_epoch, tx.request_id, 1),
+        Ok(())
+    );
+    fresh
+        .begin_trusted_connection(
+            tx.new_epoch,
+            pending_id,
+            pf_input_ipc::OverlayRole::Keyboard,
+        )
+        .unwrap();
+    fresh
+        .finish_trusted_connection(tx.new_epoch, pending_id, 1)
+        .unwrap();
+    let refused_id = pending_id + 1;
+    fresh
+        .begin_trusted_connection(tx.new_epoch, refused_id, pf_input_ipc::OverlayRole::Toast)
+        .unwrap();
+    assert_eq!(
+        fresh.refuse_trusted_connection(tx.new_epoch, refused_id, 1),
+        Err(CompositorStateError::UnexpectedFileDescriptorCount {
+            request_id: refused_id,
+            got: 1,
+        })
+    );
+    fresh
+        .refuse_trusted_connection(tx.new_epoch, refused_id, 0)
+        .unwrap();
 }

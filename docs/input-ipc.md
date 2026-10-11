@@ -2,7 +2,7 @@
 
 > **Status:** frozen interface for epic `tsp-ihne1` (bead `tsp-ihne1.36`). This page is the
 > contract; `crates/pf-input-ipc` is its machine-checkable half (types, constants, fixtures,
-> two pure state machines). A second-language peer (gamescope is C++) can be written from this
+> pure state machines). A second-language peer (gamescope is C++) can be written from this
 > page alone. The design it freezes is mission-control `design/input-layer/` (sections
 > *Router and Menu*, *System menu*, *Security*, *How a keypress reaches an app*) with the round-7
 > adjudication folded in (items 1, 14, 15, 17). Changes to this page are contract changes: bump
@@ -13,11 +13,14 @@ Four parties share the built-in controller and the screen:
 | Party | Process | Owns |
 |---|---|---|
 | **Router** | `pf-input-broker`, root, session-wide | the `EVIOCGRAB` on the pad, one virtual device per destination, Menu, modality, the one return path |
-| **Compositor** | gamescope (PocketForge fork), session user | real keyboards/mice/touch (libinput), focus, trusted overlays, `secure_entry` |
+| **Compositor** | gamescope (PocketForge fork), session user | separate keyboard/mouse/touch and AXP-PEK nodes (libinput), protected Power, focus, trusted overlays, `secure_entry` |
 | **Keyboard** | pf-osk, session user, system-launched | the keyboard surfaces |
 | **Menu** | the system-menu provider, session user, resident, system-launched | the sheet, its items, its heartbeat |
 
-The router is the hub. It is the only listener; the other three connect to it and reconnect
+The router is the hub and exclusively owns/grabs the built-in gamepad. gamescope exclusively
+owns the separate keyboard/AXP-PEK devices which can emit `KEY_POWER`; the router never opens
+or grabs those nodes. Thus there is exactly one evdev owner and never a second `EVIOCGRAB` for
+either topology. The router is the only listener; the other three connect to it and reconnect
 after EOF. Nothing on these sockets is the pad stream: the pad reaches the keyboard and the menu
 as an evdev file descriptor handed over `SCM_RIGHTS`, exactly like the app's `Acquire("input")`.
 
@@ -35,7 +38,9 @@ as an evdev file descriptor handed over `SCM_RIGHTS`, exactly like the app's `Ac
   change; changing a meaning, removing a field or making a new field mandatory is a new major.
 * File descriptors travel with the frame that announces them (`registered`,
   `trusted_connection_result`) as `SCM_RIGHTS` ancillary data on the frame's first byte. A
-  frame that announces an fd and arrives without one is `Malformed` and closes the connection.
+  successful trust result without exactly one fd is refused; the request stays pending, no trust
+  is installed, and the connection is closed. Ancillary fds attached to refused, unexpected,
+  wrong-epoch or otherwise invalid frames are closed immediately.
 * **Nothing sent here blocks the router's input pump.** The pump only flips atomics and hands
   tokens to a worker thread; all socket I/O, deadlines and fallbacks run on that thread
   (`crates/pf-input-broker/src/safe_return.rs` already works this way).
@@ -63,10 +68,18 @@ second registration replaces the first after the router has released that destin
 to the app, `dismiss`/`hide` sent to the old peer, its connection shut). A connection that sends
 anything else first is closed.
 
+The compositor handshake is stricter. The router mints an unpredictable, nonzero `u64` connection
+epoch and answers `registered{epoch}`. gamescope must next send one complete
+`state_snapshot{epoch,focus,overlays,power}` before any delta. The snapshot names keyboard, menu
+and toast exactly once and carries the Power level plus its last sequence. Duplicate or incomplete
+snapshots, pre-snapshot deltas, and messages whose epoch does not equal the current connection are
+refused without mutating state. Every later message in either direction carries that epoch.
+
 **Reconnect.** Clients retry after EOF starting at 100 ms and doubling to 2 s
 (`sockets::RECONNECT_INITIAL`, `RECONNECT_MAX`). The router restarts under systemd; the
 "you are never trapped" guarantee holds through the restart because the router grabs the pad
-and Menu before it serves any endpoint, and Menu with no provider is a direct return.
+and Menu before it serves any endpoint, and Menu with no provider is a direct return. §9 defines
+the fail-closed state and replay required on either side of compositor EOF.
 
 ## 2. Timeouts (defined once: `pf_input_ipc::timeouts`)
 
@@ -150,29 +163,35 @@ gamescope → router:
 | `type` | Fields | Meaning |
 |---|---|---|
 | `register` | — | first frame |
-| `focus` | `surface: {kind: none \| app{app_id} \| trusted{role}}, text_input{active, purpose}, secure_entry` | sent on the frame the focus, the text-input state or `secure_entry` changes |
-| `overlay` | `role: keyboard \| menu \| toast, state: mapped \| unmapped, rect?` | a trusted overlay was mapped or unmapped |
-| `physical_input` | `class: keyboard \| mouse \| touch` | first event of a class and every class change, never per event; the router owns modality and answers a real keypress with `hide{physical_keyboard}` |
-| `trusted_connection_result` | `request_id, result: {status: ok} (+ fd) \| {status: refused, reason}` | answer to `trusted_connection` |
-| `pong` | `seq` | |
+| `state_snapshot` | `epoch, focus:{surface,text_input,secure_entry}, overlays:[{role,state,rect?}], power:{pressed,last_sequence}` | mandatory authoritative replay immediately after `registered`; applying the Power watermark never triggers an action |
+| `focus` | `epoch, surface: {kind: none \| app{app_id} \| trusted{role}}, text_input{active, purpose}, secure_entry` | sent on the frame the focus, the text-input state or `secure_entry` changes |
+| `overlay` | `epoch, role: keyboard \| menu \| toast, state: mapped \| unmapped, rect?` | a trusted overlay was mapped or unmapped |
+| `physical_input` | `epoch, class: keyboard \| mouse \| touch` | first event of a class and every class change, never per event; the router owns modality and answers a real keypress with `hide{physical_keyboard}` |
+| `protected_power` | `epoch, sequence, state: pressed \| released` | `KEY_POWER`/AXP PEK transition consumed before seat delivery; sequence strictly increases within the authoritative stream |
+| `trusted_connection_result` | `epoch, request_id, result: {status: ok} (+ fd) \| {status: refused, reason}` | answer to a pending request in this epoch only |
+| `pong` | `epoch, seq` | |
 
 Router → gamescope:
 
 | `type` | Fields | Meaning |
 |---|---|---|
-| `registered` | — | |
-| `trusted_connection` | `request_id, role, unit` | the provenance API (§6) |
-| `surface_secure_entry` | `role, active` | relay of a trusted surface's own flag (§3) |
-| `ping` | `seq` | |
+| `registered` | `epoch` | starts a new authority epoch and requires a full snapshot |
+| `trusted_connection` | `epoch, request_id, role, unit` | the provenance API (§6) |
+| `surface_secure_entry` | `epoch, role, active` | relay of a trusted surface's own flag (§3) |
+| `ping` | `epoch, seq` | |
 
 `purpose` is the text-input-v3 `content_purpose` name: `normal, alpha, digits, number, phone,
 url, email, name, password, pin, date, time, datetime, terminal`.
 
 ## 6. Trusted-overlay provenance
 
-gamescope (fork, PR #9, tsp-op5a.440.11) trusts a Wayland client by **connection provenance**:
-only a `wl_client` gamescope itself created from a socketpair, and handed out through its private
-broker, may bind the privileged globals. This contract extends that check with a **role**:
+gamescope (fork, PR #9, tsp-op5a.440.11) already has an unnamed one-byte `SOCK_SEQPACKET`
+broker at Build 7 pin `c30e8cee` for its reaper, with a boolean trusted-client gate. The
+`compositor.sock` client, role-aware registry, epoch/replay protocol, and fd reply below are a
+**new gamescope facility**, not a claim that the existing broker can admit the router unchanged.
+They reuse the existing connection-provenance trust primitive instead of creating a name- or
+pid-based authority. Implementation is jointly owned by `tsp-op5a.440.13` and
+`tsp-op5a.440.5`:
 
 1. The router, on behalf of a system-launched process (a systemd unit the session started: pf-osk,
    the system menu), sends `trusted_connection{request_id, role, unit}`.
@@ -189,8 +208,9 @@ broker, may bind the privileged globals. This contract extends that check with a
 5. One live connection per role. A second `trusted_connection` for a role already bound is
    `refused` until the router has shut the previous peer (registration replacement, §1).
 
-gamescope's private broker today serves only its reaper; admitting the router as a second caller
-is the gamescope side of this contract (`tsp-op5a.440.13`, `.5`).
+On reconnect every prior router-minted `wl_client` is destroyed and every role binding is cleared;
+new fds are minted only after the new epoch's snapshot. A reply for an old epoch or an unknown,
+already-completed request id grants nothing and its received fd is closed.
 
 ## 7. `secure_entry`
 
@@ -206,6 +226,11 @@ router publishes a secure_entry signal" (adjudication item 14).
 
 * **(a) Menu first.** The router consumes every Menu transition before any routing. Menu never
   reaches the app, the keyboard or the pointer, including after a dropped-event resync.
+* **(a2) Protected Power before the seat.** gamescope consumes every `KEY_POWER`/AXP-PEK
+  transition before `wlr_seat_keyboard_notify_key`, root-server hotkeys, or app delivery, assigns
+  a strictly increasing sequence, and sends `protected_power`. The router feeds accepted
+  transitions to the power policy. Neither gamescope nor the router replays a press as an action
+  from the snapshot watermark.
 * **(b) Releases before a switch.** Before the pad is re-pointed, the router synthesises releases
   for every held button and centred axes on the device it is leaving. No reader ever sees a
   press without its release, and no two readers ever share a stream.
@@ -232,7 +257,29 @@ router publishes a secure_entry signal" (adjudication item 14).
   router routed to that app; otherwise the SDK call fails with `PF_ERR_NOT_USER_INITIATED`
   (adjudication item 15). Measured by the router; pf-osk trusts the router.
 
-## 9. What is deliberately not here
+## 9. Crash and restart recovery
+
+**gamescope/compositor EOF as observed by the router.** The router immediately publishes
+`secure_entry=true`, synthesises releases, changes pad destination to `quarantined`, clears focus
+and all overlay claims, invalidates pending trust request ids and closes any received fds. It
+closes the keyboard and menu IPC connections so their old pad and Wayland fds die; if the menu
+was open it also runs the one safe-return path. No app, keyboard or menu receives pad events while
+authority is absent. After gamescope reconnects, the router accepts no delta until the full new
+epoch snapshot, then issues new trusted-connection requests and gives fresh Wayland fds to newly
+registered role peers.
+
+**router EOF as observed by gamescope.** gamescope continues consuming protected Power before
+the seat, destroys all router-minted trusted clients, clears its role registry and reconnects with
+backoff. Once it receives `registered{epoch}`, it sends the complete current snapshot before any
+queued/current delta. It never reuses request ids, fds, deltas, or a snapshot from the old epoch.
+The snapshot's Power level and watermark establish continuity but do not synthesize a power-policy
+action.
+
+`CompositorSession` is the executable receiver model: it refuses the wrong epoch, pre-snapshot
+deltas, incomplete/duplicate snapshots, nonmonotonic Power sequences, unexpected request ids and
+successful trust results without an fd. Its disconnect result describes the fail-closed actions.
+
+## 10. What is deliberately not here
 
 * No CBOR. The merged broker already speaks JSON bodies in pf-wire frames, no CBOR crate is
   vendored, and the pad is an fd, not frames. The fixture set is JSON only.
@@ -242,10 +289,14 @@ router publishes a secure_entry signal" (adjudication item 14).
 * The directory, groups and units are image work (tmpfiles, `pf-osk.service`,
   `pf-system-menu.service`); this page fixes their names.
 
-## 10. Fixtures and tests
+## 11. Fixtures and tests
 
-`crates/pf-input-ipc/fixtures/<channel>/*.json` holds one file per message (60 files); the tests
+`crates/pf-input-ipc/fixtures/<channel>/*.json` holds one or more examples per message; the tests
 decode, re-encode and compare each one and check that the `type` set equals the published list,
 so a new message without a fixture fails CI. `fixtures/refused/` holds the frames that must be
 refused (majors 0 and 2, missing version, unknown type, wrong shape, non-object). The menu frames
 are compared against `pf-input-broker`'s merged provider constants so the two cannot drift.
+`fixtures/transcripts/` records both restart directions. One test drives EOF → reconnect → full
+replay → old-epoch refusal → Power sequence continuity; the other proves pending trust is
+invalidated, an incomplete replay is rejected, and a missing or unexpected `SCM_RIGHTS` fd cannot
+install trust. Each invocation also contains the successful fresh-epoch controls.

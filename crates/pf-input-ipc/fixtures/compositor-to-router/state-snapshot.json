@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "type": "state_snapshot",
+  "epoch": 42,
+  "focus": {
+    "surface": { "kind": "none" },
+    "text_input": { "active": false, "purpose": "normal" },
+    "secure_entry": false
+  },
+  "overlays": [
+    { "role": "keyboard", "state": "unmapped" },
+    { "role": "menu", "state": "unmapped" },
+    { "role": "toast", "state": "unmapped" }
+  ],
+  "power": { "pressed": false, "last_sequence": 92 }
+}

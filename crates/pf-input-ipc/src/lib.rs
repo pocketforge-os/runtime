@@ -3,9 +3,9 @@
 //! Frozen interface for the PocketForge system input layer (epic `tsp-ihne1`, bead
 //! `tsp-ihne1.36`). The human-readable contract is [`docs/input-ipc.md`](../../docs/input-ipc.md);
 //! this crate is its machine-checkable half: the socket constants, the timeout constants, the
-//! message types of every channel, the versioned envelope, and two pure state machines
-//! (`MenuSession`, `PadGate`) that encode the ordering rules so the router and its tests share one
-//! definition.
+//! message types of every channel, the versioned envelope, and pure state machines
+//! (`MenuSession`, `PadGate`, `CompositorSession`) that encode the ordering and recovery rules so
+//! the router and its tests share one definition.
 //!
 //! The crate performs **no I/O** and links only `serde` + `serde_json`. The input router
 //! (`pf-input-broker`), gamescope (C++) and pf-osk (Rust) each implement the transport
@@ -183,7 +183,7 @@ pub enum Role {
 }
 
 /// The trusted overlay roles gamescope admits. A trusted connection is bound to exactly one.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OverlayRole {
     Keyboard,
@@ -198,6 +198,8 @@ pub enum PadDestination {
     App,
     Keyboard,
     Menu,
+    /// No recipient while compositor authority is absent or its snapshot is incomplete.
+    Quarantined,
 }
 
 /// Integer rectangle in compositor (logical, rotated) pixels.
@@ -463,6 +465,7 @@ pub mod keyboard {
 
 pub mod compositor {
     use super::*;
+    use std::collections::{BTreeMap, BTreeSet};
 
     /// What has keyboard focus in gamescope.
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -484,6 +487,46 @@ pub mod compositor {
     pub enum OverlayState {
         Mapped,
         Unmapped,
+    }
+
+    /// One overlay's authoritative state in a registration snapshot.
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct OverlaySnapshot {
+        pub role: OverlayRole,
+        pub state: OverlayState,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub rect: Option<Rect>,
+    }
+
+    /// Focus and secure-entry state replayed on every compositor registration.
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct FocusSnapshot {
+        pub surface: FocusedSurface,
+        pub text_input: TextInputState,
+        pub secure_entry: bool,
+    }
+
+    /// Protected Power's level and sequence watermark. Applying this never synthesises an action.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct ProtectedPowerSnapshot {
+        pub pressed: bool,
+        pub last_sequence: u64,
+    }
+
+    /// Complete compositor authority replay. It must name every overlay role exactly once.
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct CompositorSnapshot {
+        pub epoch: u64,
+        pub focus: FocusSnapshot,
+        pub overlays: Vec<OverlaySnapshot>,
+        pub power: ProtectedPowerSnapshot,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    pub enum PowerState {
+        Pressed,
+        Released,
     }
 
     /// Classes of real devices gamescope owns through libinput.
@@ -510,15 +553,22 @@ pub mod compositor {
     #[serde(tag = "type", rename_all = "snake_case")]
     pub enum CompositorToRouter {
         Register,
+        /// Mandatory full replay after `registered`; no deltas are accepted before it.
+        StateSnapshot {
+            #[serde(flatten)]
+            snapshot: CompositorSnapshot,
+        },
         /// Sent on the frame the focus, the text-input state or `secure_entry` changes.
         /// `secure_entry` is computed here and only here.
         Focus {
+            epoch: u64,
             surface: FocusedSurface,
             text_input: TextInputState,
             secure_entry: bool,
         },
         /// A trusted overlay was mapped or unmapped.
         Overlay {
+            epoch: u64,
             role: OverlayRole,
             state: OverlayState,
             #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -527,14 +577,23 @@ pub mod compositor {
         /// A real device produced input. Sent on the first event of a class and on every class
         /// change, never per event. The router owns modality.
         PhysicalInput {
+            epoch: u64,
             class: PhysicalInputClass,
+        },
+        /// KEY_POWER/AXP PEK consumed by gamescope before normal seat or hotkey delivery.
+        ProtectedPower {
+            epoch: u64,
+            sequence: u64,
+            state: PowerState,
         },
         /// Answer to `trusted_connection`.
         TrustedConnectionResult {
+            epoch: u64,
             request_id: u64,
             result: TrustedConnectionOutcome,
         },
         Pong {
+            epoch: u64,
             seq: u64,
         },
     }
@@ -543,11 +602,14 @@ pub mod compositor {
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
     #[serde(tag = "type", rename_all = "snake_case")]
     pub enum RouterToCompositor {
-        Registered,
+        Registered {
+            epoch: u64,
+        },
         /// The provenance API. gamescope creates a socketpair, registers the server-side
         /// `wl_client` as trusted **for `role` only**, then replies `trusted_connection_result`
         /// with the client end. The router hands that fd to the system-launched process.
         TrustedConnection {
+            epoch: u64,
             request_id: u64,
             role: OverlayRole,
             /// systemd unit of the process that will own the connection (diagnostics only;
@@ -556,19 +618,23 @@ pub mod compositor {
         },
         /// Relay of a trusted surface's own `secure_entry` flag (menu channel).
         SurfaceSecureEntry {
+            epoch: u64,
             role: OverlayRole,
             active: bool,
         },
         Ping {
+            epoch: u64,
             seq: u64,
         },
     }
 
     pub const TO_ROUTER_TYPES: &[&str] = &[
         "register",
+        "state_snapshot",
         "focus",
         "overlay",
         "physical_input",
+        "protected_power",
         "trusted_connection_result",
         "pong",
     ];
@@ -578,6 +644,217 @@ pub mod compositor {
         "surface_secure_entry",
         "ping",
     ];
+
+    /// Refusals made by the pure recovery model before callers mutate router state.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum CompositorStateError {
+        OldEpoch { got: u64, current: u64 },
+        SnapshotRequired,
+        SnapshotAlreadyApplied,
+        IncompleteSnapshot,
+        NonMonotonicPowerSequence { got: u64, last: u64 },
+        UnexpectedRequestId(u64),
+        MissingFileDescriptor(u64),
+        UnexpectedFileDescriptorCount { request_id: u64, got: usize },
+        RoleAlreadyBound(OverlayRole),
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum PowerStep {
+        Accepted,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct DisconnectEffects {
+        pub secure_entry: bool,
+        pub quarantine_pad: bool,
+        pub close_role_peers: bool,
+        pub safe_return: bool,
+        pub invalidated_request_ids: Vec<u64>,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum SessionPhase {
+        AwaitingSnapshot,
+        Active,
+        Disconnected,
+    }
+
+    /// Transport-independent enforcement for one compositor connection epoch.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct CompositorSession {
+        epoch: u64,
+        phase: SessionPhase,
+        last_power_sequence: u64,
+        pending_requests: BTreeMap<u64, OverlayRole>,
+        live_roles: BTreeSet<OverlayRole>,
+        snapshot: Option<CompositorSnapshot>,
+    }
+
+    impl CompositorSession {
+        pub fn new(epoch: u64) -> Self {
+            assert_ne!(epoch, 0, "connection epochs are nonzero");
+            Self {
+                epoch,
+                phase: SessionPhase::AwaitingSnapshot,
+                last_power_sequence: 0,
+                pending_requests: BTreeMap::new(),
+                live_roles: BTreeSet::new(),
+                snapshot: None,
+            }
+        }
+
+        fn check_epoch(&self, epoch: u64) -> Result<(), CompositorStateError> {
+            if epoch != self.epoch {
+                Err(CompositorStateError::OldEpoch {
+                    got: epoch,
+                    current: self.epoch,
+                })
+            } else {
+                Ok(())
+            }
+        }
+
+        pub fn apply_snapshot(
+            &mut self,
+            snapshot: CompositorSnapshot,
+        ) -> Result<(), CompositorStateError> {
+            self.check_epoch(snapshot.epoch)?;
+            if self.phase != SessionPhase::AwaitingSnapshot {
+                return Err(CompositorStateError::SnapshotAlreadyApplied);
+            }
+            let mut roles = BTreeSet::new();
+            for overlay in &snapshot.overlays {
+                roles.insert(match overlay.role {
+                    OverlayRole::Keyboard => 0,
+                    OverlayRole::Menu => 1,
+                    OverlayRole::Toast => 2,
+                });
+            }
+            if snapshot.overlays.len() != 3 || roles.len() != 3 {
+                return Err(CompositorStateError::IncompleteSnapshot);
+            }
+            self.last_power_sequence = snapshot.power.last_sequence;
+            self.snapshot = Some(snapshot);
+            self.phase = SessionPhase::Active;
+            Ok(())
+        }
+
+        pub fn snapshot(&self) -> Option<&CompositorSnapshot> {
+            self.snapshot.as_ref()
+        }
+
+        pub fn accept_delta(&self, epoch: u64) -> Result<(), CompositorStateError> {
+            self.check_epoch(epoch)?;
+            if self.phase != SessionPhase::Active {
+                return Err(CompositorStateError::SnapshotRequired);
+            }
+            Ok(())
+        }
+
+        pub fn begin_trusted_connection(
+            &mut self,
+            epoch: u64,
+            request_id: u64,
+            role: OverlayRole,
+        ) -> Result<(), CompositorStateError> {
+            self.accept_delta(epoch)?;
+            if self.pending_requests.contains_key(&request_id) {
+                return Err(CompositorStateError::UnexpectedRequestId(request_id));
+            }
+            if self.live_roles.contains(&role)
+                || self
+                    .pending_requests
+                    .values()
+                    .any(|pending| *pending == role)
+            {
+                return Err(CompositorStateError::RoleAlreadyBound(role));
+            }
+            self.pending_requests.insert(request_id, role);
+            Ok(())
+        }
+
+        pub fn finish_trusted_connection(
+            &mut self,
+            epoch: u64,
+            request_id: u64,
+            fd_count: usize,
+        ) -> Result<(), CompositorStateError> {
+            self.accept_delta(epoch)?;
+            let Some(&role) = self.pending_requests.get(&request_id) else {
+                return Err(CompositorStateError::UnexpectedRequestId(request_id));
+            };
+            if fd_count == 0 {
+                return Err(CompositorStateError::MissingFileDescriptor(request_id));
+            }
+            if fd_count != 1 {
+                return Err(CompositorStateError::UnexpectedFileDescriptorCount {
+                    request_id,
+                    got: fd_count,
+                });
+            }
+            self.pending_requests.remove(&request_id);
+            self.live_roles.insert(role);
+            Ok(())
+        }
+
+        /// A compositor refusal consumes the pending id and never carries an fd.
+        pub fn refuse_trusted_connection(
+            &mut self,
+            epoch: u64,
+            request_id: u64,
+            fd_count: usize,
+        ) -> Result<(), CompositorStateError> {
+            self.accept_delta(epoch)?;
+            if !self.pending_requests.contains_key(&request_id) {
+                return Err(CompositorStateError::UnexpectedRequestId(request_id));
+            }
+            if fd_count != 0 {
+                return Err(CompositorStateError::UnexpectedFileDescriptorCount {
+                    request_id,
+                    got: fd_count,
+                });
+            }
+            self.pending_requests.remove(&request_id);
+            Ok(())
+        }
+
+        pub fn protected_power(
+            &mut self,
+            epoch: u64,
+            sequence: u64,
+            state: PowerState,
+        ) -> Result<PowerStep, CompositorStateError> {
+            self.accept_delta(epoch)?;
+            if sequence <= self.last_power_sequence {
+                return Err(CompositorStateError::NonMonotonicPowerSequence {
+                    got: sequence,
+                    last: self.last_power_sequence,
+                });
+            }
+            self.last_power_sequence = sequence;
+            if let Some(snapshot) = &mut self.snapshot {
+                snapshot.power.pressed = state == PowerState::Pressed;
+                snapshot.power.last_sequence = sequence;
+            }
+            Ok(PowerStep::Accepted)
+        }
+
+        pub fn disconnect(&mut self, menu_open: bool) -> DisconnectEffects {
+            self.phase = SessionPhase::Disconnected;
+            self.snapshot = None;
+            let invalidated_request_ids = self.pending_requests.keys().copied().collect();
+            self.pending_requests.clear();
+            self.live_roles.clear();
+            DisconnectEffects {
+                secure_entry: true,
+                quarantine_pad: true,
+                close_role_peers: true,
+                safe_return: menu_open,
+                invalidated_request_ids,
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
