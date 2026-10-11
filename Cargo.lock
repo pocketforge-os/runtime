@@ -606,6 +606,7 @@ name = "pf-text-raster"
 version = "0.0.1"
 dependencies = [
  "cosmic-text",
+ "memmap2",
  "tiny-skia",
 ]
 

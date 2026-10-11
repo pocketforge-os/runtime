@@ -214,7 +214,8 @@ impl Descriptor {
 
     /// Is the named capability **present** on this device (descriptor-derived, zero per-device
     /// code)? Hardware caps map to sensor/actuator rows; platform caps (input/entropy/audio/
-    /// settings) are constant. Unknown names are not present.
+    /// settings and the system-input-layer services pointer/menu/options) are constant.
+    /// Unknown names are not present.
     ///
     /// This is the exact `_CAP_PRESENCE` table from the sim's `broker_stub.py`, plus the
     /// platform-constant caps that have no descriptor row.
@@ -232,6 +233,11 @@ impl Descriptor {
             // are platform services, present on every device.
             "input" => !self.inputs.is_empty(),
             "entropy" | "audio" | "settings" => true,
+            // System input layer services (design/input-layer): the SYSTEM draws the pointer
+            // (a D-pad pointer covers !has_sticks devices, every-menu-spec §9.4), the app
+            // section of the system menu, and declared options pages, so they are present on
+            // every device with no descriptor row — same class as entropy/audio/settings.
+            "pointer" | "menu" | "options" => true,
             _ => false,
         }
     }
