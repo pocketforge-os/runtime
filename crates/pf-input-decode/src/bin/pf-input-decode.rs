@@ -78,6 +78,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let right = arg(&args, "--right").unwrap_or_else(|| "/dev/ttyS3".to_string());
     let left = arg(&args, "--left").unwrap_or_else(|| "/dev/ttyS4".to_string());
 
+    // Linux may reuse an inputN sysname after teardown. Remove any stale trust record before
+    // creating this instance, so no device is trusted until the fresh record is published.
+    builtin::clear_record(std::path::Path::new(builtin::RECORD_DIR))?;
     let uinput = Uinput::create(&a133_spec())?;
     let node = uinput.node().unwrap_or("<unresolved>").to_string();
     // Publish which kernel device is the built-in pad (tsp-ihne1.8). Without the record the pad
@@ -85,7 +88,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // confirmations) trusts it: fail closed for trust, never strand basic input.
     match uinput.sysname() {
         Some(sysname) => {
-            if let Err(e) = builtin::write_record(std::path::Path::new(builtin::RECORD_DIR), sysname)
+            if let Err(e) =
+                builtin::write_record(std::path::Path::new(builtin::RECORD_DIR), sysname)
             {
                 eprintln!(
                     "pf-input-decode: ERROR: cannot write {}/{}: {e}; the pad will not be trusted as built-in",

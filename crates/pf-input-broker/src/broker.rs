@@ -310,7 +310,10 @@ impl InputBroker {
 
     /// As [`discover`](Self::discover); with `builtin` set, only the built-in controller is a
     /// candidate, so a lookalike cannot make discovery ambiguous or win it.
-    pub fn discover_checked(descriptor: &Descriptor, builtin: Option<&Trust>) -> io::Result<PathBuf> {
+    pub fn discover_checked(
+        descriptor: &Descriptor,
+        builtin: Option<&Trust>,
+    ) -> io::Result<PathBuf> {
         let expected = ExpectedIdentity::from_descriptor(descriptor)?;
         let remap = Remap::from_descriptor(descriptor)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
@@ -334,7 +337,17 @@ impl InputBroker {
                 return Ok(false);
             }
             match builtin {
-                Some(trust) => Ok(require_builtin(trust.identify_fd(dev.as_fd())).is_ok()),
+                Some(trust) => match trust.identify_fd(dev.as_fd()) {
+                    Ok(Verdict::BuiltIn { .. }) => Ok(true),
+                    Ok(Verdict::NotBuiltIn(_)) => Ok(false),
+                    Err(error) => {
+                        eprintln!(
+                            "pf-input-broker: cannot identify candidate {} as the built-in controller: {error}",
+                            path.display()
+                        );
+                        Ok(false)
+                    }
+                },
                 None => Ok(true),
             }
         })
@@ -932,8 +945,13 @@ mod readiness_tests {
             assert_eq!(err.kind(), io::ErrorKind::PermissionDenied, "{reason:?}");
             assert!(err.to_string().contains("not the built-in controller"));
         }
-        let err = require_builtin(Err(io::Error::new(io::ErrorKind::NotFound, "gone"))).unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::NotFound, "an I/O error is never a pass");
+        let err =
+            require_builtin(Err(io::Error::new(io::ErrorKind::NotFound, "gone"))).unwrap_err();
+        assert_eq!(
+            err.kind(),
+            io::ErrorKind::NotFound,
+            "an I/O error is never a pass"
+        );
     }
 
     #[test]

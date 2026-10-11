@@ -61,7 +61,11 @@ impl Sys {
         fs::write(dev.join("capabilities/key"), KEY_CAPS).unwrap();
         fs::write(dev.join("capabilities/abs"), "3003b\n").unwrap();
         fs::create_dir_all(dev.join(event)).unwrap();
-        fs::write(dev.join(event).join("dev"), format!("{INPUT_MAJOR}:{minor}\n")).unwrap();
+        fs::write(
+            dev.join(event).join("dev"),
+            format!("{INPUT_MAJOR}:{minor}\n"),
+        )
+        .unwrap();
         let chr = self.root.join("dev/char");
         fs::create_dir_all(&chr).unwrap();
         // Relative, like the kernel's own links: ../../devices/...
@@ -144,7 +148,10 @@ fn real_decoder_device_is_built_in_and_clones_are_not() {
         },
         "positive control: the decoder's own device"
     );
-    assert_eq!(identify(&sys, 68), Verdict::NotBuiltIn(Reason::PhysMismatch));
+    assert_eq!(
+        identify(&sys, 68),
+        Verdict::NotBuiltIn(Reason::PhysMismatch)
+    );
     assert!(matches!(
         identify(&sys, 69),
         Verdict::NotBuiltIn(Reason::NotVirtual { .. })
@@ -258,7 +265,15 @@ fn a_symlinked_or_malformed_record_is_not_trusted() {
     ));
     fs::remove_file(&record).unwrap();
 
-    for bad in ["", "input5", "input5\ninput9\n", "event3\n", "input\n", "input5 \n", "../input5\n"] {
+    for bad in [
+        "",
+        "input5",
+        "input5\ninput9\n",
+        "event3\n",
+        "input\n",
+        "input5 \n",
+        "../input5\n",
+    ] {
         sys.record(bad);
         assert!(
             matches!(
@@ -299,4 +314,18 @@ fn the_decoder_record_round_trips_through_the_helper() {
         Verdict::NotBuiltIn(Reason::SysnameMismatch { .. })
     ));
     assert!(builtin::write_record(&sys.record_dir, "../input5").is_err());
+}
+
+#[test]
+fn decoder_start_clears_a_stale_record_before_creating_a_device() {
+    let sys = scenario(builtin::PHYS);
+    assert!(matches!(identify(&sys, 67), Verdict::BuiltIn { .. }));
+
+    builtin::clear_record(&sys.record_dir).unwrap();
+    assert_eq!(
+        identify(&sys, 67),
+        Verdict::NotBuiltIn(Reason::RecordAbsent),
+        "the prior device must stop being trusted before a replacement can reuse its input number"
+    );
+    builtin::clear_record(&sys.record_dir).unwrap();
 }

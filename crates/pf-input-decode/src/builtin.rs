@@ -16,8 +16,9 @@
 //!    [`RECORD_DIR`] right after creating the device. The record and its directory must be owned by
 //!    root and writable by nobody else. `phys` is readable by everyone, so another `uinput` holder
 //!    could copy it; the record binds trust to the one kernel device the decoder created.
-//!    `input<N>` comes from a counter the kernel never reuses within a boot, so a stale record
-//!    cannot match a later device.
+//!    Linux may reuse `input<N>` after a device disappears, so the decoder clears any stale record
+//!    before creating its device. Its systemd `RuntimeDirectory` is also removed when the service
+//!    stops. Trust therefore exists only after this decoder instance publishes its new record.
 //!
 //! Apps cannot open `/dev/uinput` at all (the image's `pf-app@.service` hides it), so in practice
 //! only root services can create virtual input devices; (3) keeps a bug in one of those from
@@ -139,7 +140,11 @@ impl Trust {
                 }))
             }
         };
-        let phys = fs::read(root.join("devices/virtual/input").join(&sysname).join("phys"))?;
+        let phys = fs::read(
+            root.join("devices/virtual/input")
+                .join(&sysname)
+                .join("phys"),
+        )?;
         if phys.strip_suffix(b"\n").unwrap_or(&phys) != PHYS.as_bytes() {
             return Ok(Verdict::NotBuiltIn(Reason::PhysMismatch));
         }
@@ -208,20 +213,37 @@ impl Trust {
 
     fn ownership_problem(&self, meta: &fs::Metadata) -> Option<String> {
         if meta.uid() != self.owner_uid {
-            return Some(format!("owned by uid {} (want {})", meta.uid(), self.owner_uid));
+            return Some(format!(
+                "owned by uid {} (want {})",
+                meta.uid(),
+                self.owner_uid
+            ));
         }
         if meta.mode() & 0o022 != 0 {
-            return Some(format!("mode {:o} is group- or other-writable", meta.mode() & 0o7777));
+            return Some(format!(
+                "mode {:o} is group- or other-writable",
+                meta.mode() & 0o7777
+            ));
         }
         None
     }
 }
 
-
 /// `input12`, `event3`: the prefix followed by one or more ASCII digits and nothing else.
 fn is_numbered(s: &str, prefix: &str) -> bool {
     s.strip_prefix(prefix)
         .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// Remove the prior decoder record before creating a new virtual device. Linux can reuse an
+/// `input<N>` sysname after device teardown, so leaving an old record in place during creation
+/// could transiently trust the wrong instance. Absence is already the desired fail-closed state.
+pub fn clear_record(dir: &Path) -> io::Result<()> {
+    match fs::remove_file(dir.join(RECORD_NAME)) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
 }
 
 /// Write the record for `sysname` into `dir` (the decoder's call). The file is replaced
