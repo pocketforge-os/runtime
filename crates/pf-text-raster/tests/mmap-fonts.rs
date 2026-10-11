@@ -205,36 +205,82 @@ fn default_fonts_are_disk_backed_and_measure_without_copies() {
 fn default_fonts_partial_override_dir_fails_closed() {
     let _guard = lock();
     // End-to-end complement to the resolver unit test: a partial $PF_FONTS_DIR
-    // override (one canonical face missing) must fail closed at the public entry
-    // point, never silently substitute another face and shift metrics.
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("clock")
-        .as_nanos();
-    let dir = std::env::temp_dir().join(format!(
-        "pf-default-fonts-partial-{}-{}",
-        std::process::id(),
-        nanos
-    ));
-    std::fs::create_dir_all(&dir).expect("create partial font dir");
-    std::fs::write(dir.join("Manrope[wght].ttf"), b"").expect("write Manrope stub");
-    // Fraunces is deliberately absent.
+    // override (any canonical face missing) must fail closed at the public entry
+    // point FOR THE CANONICAL-MISSING REASON, never silently substitute another
+    // face and shift metrics. The latin-only case is the tsp-ihne1.12 reopen
+    // regression: dropping NotoSansCJK-Regular.ttc removes the guaranteed CJK
+    // fallback and must be refused by name, not merely trip over empty stubs.
+    for (tag, stubs, expected_named) in [
+        (
+            "manrope-only",
+            &["Manrope[wght].ttf"][..],
+            &[
+                "Fraunces[SOFT,WONK,opsz,wght].ttf",
+                "NotoSansCJK-Regular.ttc",
+            ][..],
+        ),
+        (
+            "latin-only",
+            &["Manrope[wght].ttf", "Fraunces[SOFT,WONK,opsz,wght].ttf"][..],
+            &["NotoSansCJK-Regular.ttc"][..],
+        ),
+    ] {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "pf-default-fonts-partial-{tag}-{}-{nanos}",
+            std::process::id(),
+        ));
+        std::fs::create_dir_all(&dir).expect("create partial font dir");
+        for stub in stubs {
+            std::fs::write(dir.join(stub), b"").expect("write font stub");
+        }
 
-    std::env::set_var("PF_FONTS_DIR", &dir);
-    let prev = std::panic::take_hook();
-    std::panic::set_hook(Box::new(|_| {}));
-    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let _ = pf_text_raster::pocketforge_default_fonts();
-    }));
-    std::panic::set_hook(prev);
-    std::env::remove_var("PF_FONTS_DIR");
+        std::env::set_var("PF_FONTS_DIR", &dir);
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let captured_hook = captured.clone();
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let text = info
+                .payload()
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| {
+                    info.payload()
+                        .downcast_ref::<&str>()
+                        .map(|s| (*s).to_owned())
+                })
+                .unwrap_or_default();
+            *captured_hook.lock().expect("capture lock") = text;
+        }));
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = pf_text_raster::pocketforge_default_fonts();
+        }));
+        std::panic::set_hook(prev);
+        std::env::remove_var("PF_FONTS_DIR");
 
-    // Cleanup: remove the stub then the dir (no recursive delete, no rm -rf).
-    let _ = std::fs::remove_file(dir.join("Manrope[wght].ttf"));
-    let _ = std::fs::remove_dir(&dir);
+        // Cleanup: remove each stub then the dir (no recursive delete, no rm -rf).
+        for stub in stubs {
+            let _ = std::fs::remove_file(dir.join(stub));
+        }
+        let _ = std::fs::remove_dir(&dir);
 
-    assert!(
-        outcome.is_err(),
-        "a partial PF_FONTS_DIR override must fail closed, not substitute another face"
-    );
+        assert!(
+            outcome.is_err(),
+            "case {tag}: a partial PF_FONTS_DIR override must fail closed, not substitute another face"
+        );
+        let message = captured.lock().expect("capture lock").clone();
+        assert!(
+            message.contains("missing canonical font"),
+            "case {tag}: rejection must state the missing-canonical reason; got: {message}"
+        );
+        for name in expected_named {
+            assert!(
+                message.contains(name),
+                "case {tag}: rejection must name the missing face {name}; got: {message}"
+            );
+        }
+    }
 }
