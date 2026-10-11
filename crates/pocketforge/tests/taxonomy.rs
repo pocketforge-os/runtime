@@ -165,9 +165,12 @@ fn input_action_map_is_pure_descriptor_data() {
     let m133 = a133.acquire::<Input>().unwrap();
     let m523 = a523.acquire::<Input>().unwrap();
 
-    // accept_default = "south" on both → confirm resolves to the south face button.
-    assert_eq!(m133.map().resolve("confirm"), Some("south"));
-    assert_eq!(m133.map().resolve("cancel"), Some("east"));
+    // accept_default = "east" on both: confirm follows the printed A button and cancel is its
+    // opposite positional face button. Exercise both descriptors through the same code path.
+    for input in [&m133, &m523] {
+        assert_eq!(input.map().resolve("confirm"), Some("east"));
+        assert_eq!(input.map().resolve("cancel"), Some("south"));
+    }
 
     // The a523-only controls (home / clickable sticks) appear by DATA, with no per-device code.
     assert!(
