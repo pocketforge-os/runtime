@@ -130,13 +130,16 @@ impl PrefsStore {
         })?;
         for (key, raw) in obj {
             let spec = schema::spec(key).ok_or_else(|| PrefError::UnknownKey(key.clone()))?;
+            // An explicit user value completely shadows its provisioning seed,
+            // including a stale seed whose old value is no longer valid.
+            if prefs.stored.contains_key(key) {
+                continue;
+            }
             // Same typed conversions as the stored document: a seed value is
             // provisioning data, so a bad token/type/range stays a typed error.
             let value = json_to_pref(key, spec.kind, raw)?;
             let validated = spec.validate(value)?;
-            if !prefs.stored.contains_key(key) {
-                prefs.seeded.insert(key.clone(), validated);
-            }
+            prefs.seeded.insert(key.clone(), validated);
         }
         Ok(prefs)
     }
@@ -552,6 +555,24 @@ mod tests {
         let text = std::fs::read_to_string(store.path()).unwrap();
         assert!(text.contains("\"keyboardLayout\": \"us\""));
         assert!(!text.contains("de"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn explicit_store_shadows_an_invalid_seed_for_the_same_key() {
+        let (dir, seed) = seeded_scratch("seed-invalid-shadowed", br#"{"keyboardLayout":"de"}"#);
+        let store = PrefsStore::at(&dir).with_seed(&seed);
+        store
+            .apply("keyboardLayout", PrefValue::Enum("us"))
+            .unwrap();
+
+        // Negative control: this token is invalid when it is effective, but a
+        // stale provisioned value must be ignored after an explicit user write.
+        std::fs::write(&seed, br#"{"keyboardLayout":"klingon"}"#).unwrap();
+        let p = store.load().unwrap();
+        assert_eq!(p.value("keyboardLayout").unwrap(), PrefValue::Enum("us"));
+        assert!(p.is_explicit("keyboardLayout"));
+        assert_eq!(p.source("keyboardLayout"), crate::prefs::Source::Stored);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
