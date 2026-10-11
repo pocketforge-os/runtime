@@ -808,15 +808,21 @@ mod tests {
         )
         .unwrap();
         // The "acknowledged" line is emitted after the worker re-armed the busy gate, so
-        // receiving it proves the press completed — no polling window.
+        // receiving it proves the press completed — no polling window. A regressed dispatch
+        // of the fallback would have set the intake gate synchronously BEFORE the line was
+        // logged, so the flag assert is the deterministic negative control; the backlog
+        // check below is only a backstop (the dispatched connect lands asynchronously).
         wait_for_line(&router_log, "acknowledged");
         assert!(
             !router.in_flight(),
             "provider acknowledgement was not observed"
         );
-        // Zero-window negative control: the acknowledged press must never dispatch the
-        // fallback, and the router worker (the only would-be client) is provably idle, so a
-        // connection in the backlog could only come from a regressed dispatch.
+        assert!(
+            !router.fallback_in_flight(),
+            "an acknowledged provider must suppress fallback return"
+        );
+        // Zero-window backstop: the router worker (the only would-be client) is provably
+        // idle, so a connection in the backlog could only come from a regressed dispatch.
         assert_eq!(
             authority.accept().unwrap_err().kind(),
             io::ErrorKind::WouldBlock,
@@ -857,8 +863,10 @@ mod tests {
             "{lines:?}"
         );
         // "acknowledged" was emitted after the worker re-armed the busy gate, so receiving it
-        // proves the press completed — no polling window.
+        // proves the press completed — no polling window; a regressed fallback dispatch would
+        // have set the intake gate synchronously before the line was logged.
         assert!(!router.in_flight());
+        assert!(!router.fallback_in_flight());
         assert_eq!(
             authority.accept().unwrap_err().kind(),
             io::ErrorKind::WouldBlock
@@ -874,6 +882,7 @@ mod tests {
         // The provider survived the post-ack "shown": the second press is acknowledged too.
         wait_for_line(&menu_log_rx, "acknowledged");
         assert!(!router.in_flight());
+        assert!(!router.fallback_in_flight());
         assert_eq!(
             authority.accept().unwrap_err().kind(),
             io::ErrorKind::WouldBlock
