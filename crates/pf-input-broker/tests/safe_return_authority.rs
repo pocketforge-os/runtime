@@ -11,7 +11,9 @@
 //!   anything) starts the graceful stop of the running app;
 //! * when that app ignores SIGTERM and systemd SIGKILLs it at `TimeoutStopSec`, the unit is
 //!   `failed` with `Result=timeout` (`InactiveFailure`). During `StoppingGracefully` that still
-//!   completes as `Returned`, never `Crash`/`ForcedClose`, and never escalates to `systemctl kill`.
+//!   completes as `Returned`, never `Crash`/`ForcedClose`, and never escalates to `systemctl
+//!   kill` — the pinned race-fallback contract the authority's own escalation (tsp-ihne1.10)
+//!   must never double-kill.
 
 use std::fs;
 use std::io::Cursor;
@@ -30,6 +32,7 @@ use pf_ports::TestClock;
 use pf_session_authority::{
     serve_connection, Authority, CommandExecutor, CommandOutput, CommandSystem, CommandTemplates,
     MemoryStore, Phase, Receipt, RpcEvent, RpcObservation, RpcRequest, RpcResponse,
+    SESSION_RPC_CONTRACT_V1,
 };
 
 const APP_ID: &str = "org.example.game";
@@ -43,8 +46,9 @@ type TestAuthority = Authority<MemoryStore, CommandSystem<FakeSystemd>, TestCloc
 enum StopModel {
     /// The unit is still deactivating when the authority next looks (the SIGKILL lands later).
     StillDeactivating,
-    /// `systemctl stop` returned after systemd's TimeoutStopSec SIGKILL: failed/timeout.
-    KilledAtTimeout,
+    /// The unit already failed with Result=timeout (systemd's own TimeoutStopSec SIGKILL won
+    /// the race) by the time the non-blocking stop job lands.
+    AlreadyFailedAtStop,
 }
 
 #[derive(Default)]
@@ -100,14 +104,16 @@ impl CommandExecutor for FakeSystemd {
                 u.target_active = true;
                 u.owner_active = false; // the shell steps aside for the foreground app
             }
-            [verb, unit] if verb == "stop" && unit == APP_UNIT => match self.stop {
-                StopModel::StillDeactivating => u.app_state = "deactivating".into(),
-                StopModel::KilledAtTimeout => {
-                    u.app_state = "failed".into();
-                    u.app_result = "timeout".into();
-                    u.target_active = false;
+            [verb, flag, unit] if verb == "stop" && flag == "--no-block" && unit == APP_UNIT => {
+                match self.stop {
+                    StopModel::StillDeactivating => u.app_state = "deactivating".into(),
+                    StopModel::AlreadyFailedAtStop => {
+                        u.app_state = "failed".into();
+                        u.app_result = "timeout".into();
+                        u.target_active = false;
+                    }
                 }
-            },
+            }
             [verb, unit] if verb == "start" && unit == "pf-shell-selected.service" => {
                 u.owner_active = true;
             }
@@ -244,10 +250,11 @@ fn broker_safe_return(authority: &mut TestAuthority) {
 }
 
 fn terminal_events(authority: &mut TestAuthority) -> Vec<RpcEvent> {
-    let RpcResponse::Events { events } = rpc(
+    let RpcResponse::Events { events, .. } = rpc(
         authority,
         RpcRequest::Events {
             client_id: "restored-shell".into(),
+            contract: SESSION_RPC_CONTRACT_V1,
         },
     ) else {
         panic!("events")
@@ -298,7 +305,7 @@ fn safe_return_from_a_non_shell_client_starts_the_graceful_stop() {
     assert_eq!(
         calls
             .iter()
-            .filter(|c| *c == &format!("systemctl stop {APP_UNIT}"))
+            .filter(|c| *c == &format!("systemctl stop --no-block {APP_UNIT}"))
             .count(),
         1,
         "{calls:?}"
@@ -336,10 +343,11 @@ fn timeout_inactive_failure_during_graceful_stop_is_returned() {
 }
 
 #[test]
-fn blocking_stop_that_ends_in_sigkill_timeout_is_returned() {
-    // A real `systemctl stop` blocks until the unit is gone. When it returns after the
-    // TimeoutStopSec SIGKILL, the SafeReturn RPC itself walks the ladder up to presentation.
-    let systemd = FakeSystemd::new(StopModel::KilledAtTimeout);
+fn stop_requested_after_the_backstop_sigkill_is_returned() {
+    // `systemctl stop --no-block` returns immediately, and its job can land on a unit that
+    // systemd's own TimeoutStopSec SIGKILL has already failed (Result=timeout). The SafeReturn
+    // RPC itself then walks the ladder up to presentation: Returned, never a second kill.
+    let systemd = FakeSystemd::new(StopModel::AlreadyFailedAtStop);
     let mut a = authority(&systemd);
     let session_id = launch_running(&mut a);
 

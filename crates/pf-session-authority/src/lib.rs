@@ -18,11 +18,23 @@
 //!
 //! The authority never waits on a client to make progress: [`run_service_loop`] drives
 //! [`Authority::tick`] at least once per tick interval between RPCs, so crash/exit detection,
-//! the restoration ladder and its deadlines advance while no shell is connected. The
+//! the restoration ladder and its deadlines advance while no shell is connected. The loop also
+//! wakes at armed deadlines themselves ([`Authority::time_until_next_deadline`]), so a graceful
+//! stop escalates at its deadline instead of up to a tick later. The
 //! presentation-acknowledgement rung has a deadline ([`DEFAULT_PRESENTATION_TIMEOUT`]); on expiry
 //! the authority records `RecoveryRequired` with reason `presentation_not_acknowledged` and keeps
 //! the owed receipt, so a late acknowledgement still completes the ladder truthfully. That is the
 //! only recovery a client can complete; every other `RecoveryRequired` reason stays terminal.
+//!
+//! Closes are the authority's own escalation ladder, and contract v2 of the RPC publishes its
+//! progress for the system menu (every-menu spec §9.6): `StoppingGracefully` when a graceful stop
+//! is accepted, `ForceStopping` (with its [`ForceStopReason`]) when the authority escalates by
+//! itself, and `StopFailed` when even the forced kill fails. `StopFailed` is durable and
+//! retryable — a further `SafeReturn` runs the whole close sequence again — because the menu row
+//! offers exactly that retry. Contract v1 clients never see these events; see
+//! `docs/SESSION-AUTHORITY-CONTRACT.md`. Right before every close-path escalation the optional
+//! [`EscalationHook`] fires synchronously so the root hang sampler can take its sample; with no
+//! hook attached the escalation path adds no observable delay.
 
 use pf_app_manifest::{validate_app_id, ReasonCode, Resolver};
 use pf_ports::{
@@ -47,6 +59,33 @@ pub const DEFAULT_PRESENTATION_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Default cadence of the daemon's self-driven reconcile/deadline tick.
 pub const DEFAULT_TICK_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Default graceful-stop window before the authority escalates by itself.
+///
+/// Budget: grace (1500 ms) plus the root hang sampler's own bound (≤300 ms, `cr-collect`)
+/// must stay inside the app unit's `TimeoutStopSec=2 s` SIGKILL backstop, so escalation is
+/// the authority's decision and the backstop stays the last resort.
+pub const DEFAULT_GRACE_PERIOD: Duration = Duration::from_millis(1500);
+
+/// Baseline session RPC contract: launch/safe-return/events/acknowledge/history/observe/tick
+/// with the original event vocabulary. Requests without a `contract` field mean v1.
+pub const SESSION_RPC_CONTRACT_V1: u32 = 1;
+
+/// Adds the close-progress events the system menu renders (every-menu spec §9.6):
+/// `stopping_gracefully`, `force_stopping` and `stop_failed`. Purely additive: the v1 stream
+/// and its persisted sequences are unchanged.
+pub const SESSION_RPC_CONTRACT_V2: u32 = 2;
+
+/// Newest contract this authority serves. A request for a newer one is refused explicitly.
+pub const SESSION_RPC_CONTRACT_CURRENT: u32 = SESSION_RPC_CONTRACT_V2;
+
+const fn default_rpc_contract() -> u32 {
+    SESSION_RPC_CONTRACT_V1
+}
+
+const fn is_v1_rpc_contract(contract: &u32) -> bool {
+    *contract == SESSION_RPC_CONTRACT_V1
+}
 
 /// Bounds for the daemon's connection I/O, which runs off the authority loop.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -159,6 +198,16 @@ pub enum Phase {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pending_receipt: Option<Receipt>,
     },
+    /// A close path could not kill the app (`systemctl kill` itself failed). Durable and
+    /// retryable: a further `SafeReturn` runs the full close sequence again, and the session
+    /// only ends through the ordinary observation ladder. `reason` uses the same
+    /// `{code}: {detail}` shape as [`Phase::RecoveryRequired`].
+    StopFailed {
+        session_id: String,
+        #[serde(default)]
+        item_id: String,
+        reason: String,
+    },
 }
 
 impl Phase {
@@ -172,6 +221,7 @@ impl Phase {
             Self::ForceStopping { .. } => "force_stopping",
             Self::Restoring { .. } => "restoring",
             Self::RecoveryRequired { .. } => "recovery_required",
+            Self::StopFailed { .. } => "stop_failed",
         }
     }
 }
@@ -203,6 +253,40 @@ enum WireEvent {
         session_id: String,
         reason: String,
     },
+    // Contract v2 close-progress events (every-menu spec §9.6). Durable like every other
+    // published event; never delivered to a v1 client.
+    StoppingGracefully {
+        session_id: String,
+    },
+    ForceStopping {
+        session_id: String,
+        reason: ForceStopReason,
+    },
+    StopFailed {
+        session_id: String,
+        reason: String,
+    },
+}
+
+/// Why the authority escalated to its forced kill. The menu shows `StopTimeout` as
+/// "‹App› didn't stop in time" (§9.6).
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ForceStopReason {
+    /// The app did not stop inside the graceful window.
+    StopTimeout,
+    /// The graceful-stop request itself failed, so the kill was immediate.
+    StopRequestFailed,
+}
+
+impl ForceStopReason {
+    /// Stable snake_case name used in diagnostics and on the wire.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::StopTimeout => "stop_timeout",
+            Self::StopRequestFailed => "stop_request_failed",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -358,7 +442,11 @@ impl Default for CommandTemplates {
     fn default() -> Self {
         Self {
             start_foreground: words("systemctl start pf-app@{item_id}.service"),
-            request_graceful_stop: words("systemctl stop pf-app@{item_id}.service"),
+            // --no-block: a blocking `systemctl stop` only returns after the unit's own
+            // TimeoutStopSec SIGKILL, which made the authority's escalation unreachable and
+            // burned the whole app window. The non-blocking job leaves the window to
+            // DEFAULT_GRACE_PERIOD, and the unit's TimeoutStopSec stays the last-resort backstop.
+            request_graceful_stop: words("systemctl stop --no-block pf-app@{item_id}.service"),
             enforce_termination: words("systemctl kill --kill-who=all pf-app@{item_id}.service"),
             activate_selected_owner: words("systemctl start pf-shell-selected.service"),
             systemd_reconciliation: true,
@@ -627,12 +715,29 @@ pub trait AuthorityApi {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "method", rename_all = "snake_case")]
 pub enum RpcRequest {
-    Launch { item_id: String },
+    Launch {
+        item_id: String,
+    },
     SafeReturn,
-    Events { client_id: String },
-    Acknowledge { client_id: String, sequence: u64 },
+    Events {
+        client_id: String,
+        /// Highest contract the client speaks. Absent means v1 (byte-identical requests for
+        /// old clients and old servers); a value above [`SESSION_RPC_CONTRACT_CURRENT`] is
+        /// refused with [`RpcResponse::Error`].
+        #[serde(
+            default = "default_rpc_contract",
+            skip_serializing_if = "is_v1_rpc_contract"
+        )]
+        contract: u32,
+    },
+    Acknowledge {
+        client_id: String,
+        sequence: u64,
+    },
     History,
-    Observe { observation: RpcObservation },
+    Observe {
+        observation: RpcObservation,
+    },
     Tick,
 }
 
@@ -665,54 +770,111 @@ impl From<RpcObservation> for Observation {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "result", rename_all = "snake_case")]
 pub enum RpcResponse {
-    Accepted { session_id: String },
+    Accepted {
+        session_id: String,
+    },
     RejectedBusy,
     ItemUnavailable,
-    Events { events: Vec<(u64, RpcEvent)> },
-    History { entries: Vec<HistoryEntry> },
+    Events {
+        events: Vec<(u64, RpcEvent)>,
+        /// The contract the events were selected for. Omitted on the wire for v1 so the
+        /// response stays byte-identical for pre-negotiation clients.
+        #[serde(
+            default = "default_rpc_contract",
+            skip_serializing_if = "is_v1_rpc_contract"
+        )]
+        contract: u32,
+    },
+    History {
+        entries: Vec<HistoryEntry>,
+    },
     Ok,
-    Error { message: String },
+    Error {
+        message: String,
+    },
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum RpcEvent {
     Starting,
     Running,
     ObservationComplete,
-    Returned { session_id: String },
-    ForcedClose { session_id: String },
-    Crash { session_id: String, summary: String },
-    RecoveryRequired { session_id: String, reason: String },
+    Returned {
+        session_id: String,
+    },
+    ForcedClose {
+        session_id: String,
+    },
+    Crash {
+        session_id: String,
+        summary: String,
+    },
+    RecoveryRequired {
+        session_id: String,
+        reason: String,
+    },
+    /// Contract v2 close-progress events (every-menu spec §9.6). `ForcedClose` is the
+    /// "Returned with escalated flag" of the spec: the menu closes and toasts
+    /// "‹App› was force-closed".
+    StoppingGracefully {
+        session_id: String,
+    },
+    ForceStopping {
+        session_id: String,
+        reason: ForceStopReason,
+    },
+    StopFailed {
+        session_id: String,
+        reason: String,
+    },
 }
 
-impl From<SessionEvent> for RpcEvent {
-    fn from(value: SessionEvent) -> Self {
-        match value {
-            SessionEvent::Observed(ObservedSessionState::Starting) => Self::Starting,
-            SessionEvent::Observed(ObservedSessionState::Running) => Self::Running,
-            SessionEvent::Observed(ObservedSessionState::ObservationComplete) => {
-                Self::ObservationComplete
-            }
-            SessionEvent::Observed(ObservedSessionState::Suspended) => Self::Running,
-            SessionEvent::Terminal(TerminalReceipt::Returned { session_id }) => {
-                Self::Returned { session_id }
-            }
-            SessionEvent::Terminal(TerminalReceipt::ForcedClose { session_id }) => {
-                Self::ForcedClose { session_id }
-            }
-            SessionEvent::Terminal(TerminalReceipt::Crash {
-                session_id,
-                summary,
-            }) => Self::Crash {
-                session_id,
-                summary,
+/// True for events that exist only in contract v2 and must never reach a v1 client.
+const fn is_close_progress(event: &WireEvent) -> bool {
+    matches!(
+        event,
+        WireEvent::StoppingGracefully { .. }
+            | WireEvent::ForceStopping { .. }
+            | WireEvent::StopFailed { .. }
+    )
+}
+
+fn wire_to_rpc(event: &WireEvent) -> RpcEvent {
+    match event {
+        WireEvent::ObservedStarting => RpcEvent::Starting,
+        WireEvent::ObservedRunning => RpcEvent::Running,
+        WireEvent::ObservationComplete => RpcEvent::ObservationComplete,
+        WireEvent::Terminal {
+            session_id,
+            receipt,
+        } => match receipt {
+            Receipt::Returned => RpcEvent::Returned {
+                session_id: session_id.clone(),
             },
-            SessionEvent::RecoveryRequired(value) => Self::RecoveryRequired {
-                session_id: value.session_id,
-                reason: value.reason,
+            Receipt::ForcedClose => RpcEvent::ForcedClose {
+                session_id: session_id.clone(),
             },
-        }
+            Receipt::Crash { summary } => RpcEvent::Crash {
+                session_id: session_id.clone(),
+                summary: summary.clone(),
+            },
+        },
+        WireEvent::RecoveryRequired { session_id, reason } => RpcEvent::RecoveryRequired {
+            session_id: session_id.clone(),
+            reason: reason.clone(),
+        },
+        WireEvent::StoppingGracefully { session_id } => RpcEvent::StoppingGracefully {
+            session_id: session_id.clone(),
+        },
+        WireEvent::ForceStopping { session_id, reason } => RpcEvent::ForceStopping {
+            session_id: session_id.clone(),
+            reason: *reason,
+        },
+        WireEvent::StopFailed { session_id, reason } => RpcEvent::StopFailed {
+            session_id: session_id.clone(),
+            reason: reason.clone(),
+        },
     }
 }
 
@@ -838,23 +1000,28 @@ fn handle_rpc<S: StateStore, B: SessionSystem, C: Clock>(
         RpcRequest::SafeReturn => {
             if matches!(
                 authority.state.phase,
-                Phase::Starting { .. } | Phase::Running { .. }
+                Phase::Starting { .. } | Phase::Running { .. } | Phase::StopFailed { .. }
             ) {
                 authority.intake_safe_return()?;
                 authority.reconcile()?;
             }
             RpcResponse::Ok
         }
-        RpcRequest::Events { client_id } => RpcResponse::Events {
-            events: {
-                authority.reconcile()?;
-                authority
-                    .events_for(&client_id)
-                    .into_iter()
-                    .map(|(s, e)| (s, e.into()))
-                    .collect()
-            },
-        },
+        RpcRequest::Events {
+            client_id,
+            contract,
+        } => {
+            if contract > SESSION_RPC_CONTRACT_CURRENT {
+                return Ok(RpcResponse::Error {
+                    message: format!("unsupported session rpc contract {contract}"),
+                });
+            }
+            authority.reconcile()?;
+            RpcResponse::Events {
+                events: authority.rpc_events_for(&client_id, contract),
+                contract,
+            }
+        }
         RpcRequest::Acknowledge {
             client_id,
             sequence,
@@ -883,6 +1050,19 @@ fn stderr_log_sink() -> LogSink {
     Box::new(|line: &str| eprintln!("{line}"))
 }
 
+/// Everything a sampler needs to capture the hang it is about to escalate out of.
+pub struct EscalationContext<'a> {
+    pub session_id: &'a str,
+    pub item_id: &'a str,
+    pub reason: ForceStopReason,
+}
+
+/// Fires synchronously immediately before every close-path `enforce_termination`, so the root
+/// hang sampler (`cr-collect`) can seize, unwind and detach inside its own budget. The
+/// authority adds no delay of its own: with no hook attached the escalation is a single
+/// branch. The hook owns its time bound; the close is never delayed past it by the authority.
+pub type EscalationHook = Box<dyn FnMut(&EscalationContext) + Send>;
+
 pub struct Authority<S, B, C> {
     store: S,
     system: B,
@@ -895,6 +1075,7 @@ pub struct Authority<S, B, C> {
     presentation_timeout: Duration,
     presentation_deadline: Option<MonotonicTime>,
     log: LogSink,
+    escalation: Option<EscalationHook>,
     now_fn: fn() -> SystemTime,
 }
 
@@ -985,6 +1166,7 @@ impl<S: StateStore, B: SessionSystem, C: Clock> Authority<S, B, C> {
             presentation_timeout: DEFAULT_PRESENTATION_TIMEOUT,
             presentation_deadline: None,
             log: stderr_log_sink(),
+            escalation: None,
             now_fn,
         })
     }
@@ -997,6 +1179,14 @@ impl<S: StateStore, B: SessionSystem, C: Clock> Authority<S, B, C> {
     /// Replaces the default stderr diagnostic sink (tests capture lines with this).
     pub fn with_log_sink(mut self, sink: impl FnMut(&str) + Send + 'static) -> Self {
         self.log = Box::new(sink);
+        self
+    }
+    /// Attaches the sampler hook that fires immediately before every close-path escalation.
+    pub fn with_escalation_hook(
+        mut self,
+        hook: impl FnMut(&EscalationContext) + Send + 'static,
+    ) -> Self {
+        self.escalation = Some(Box::new(hook));
         self
     }
     fn log(&mut self, line: &str) {
@@ -1019,7 +1209,8 @@ impl<S: StateStore, B: SessionSystem, C: Clock> Authority<S, B, C> {
             | Phase::StoppingGracefully { session_id, .. }
             | Phase::ForceStopping { session_id, .. }
             | Phase::Restoring { session_id, .. }
-            | Phase::RecoveryRequired { session_id, .. } => Some(session_id.clone()),
+            | Phase::RecoveryRequired { session_id, .. }
+            | Phase::StopFailed { session_id, .. } => Some(session_id.clone()),
         }
     }
     fn item_id(&self) -> Option<String> {
@@ -1030,7 +1221,8 @@ impl<S: StateStore, B: SessionSystem, C: Clock> Authority<S, B, C> {
             | Phase::StoppingGracefully { item_id, .. }
             | Phase::ForceStopping { item_id, .. }
             | Phase::Restoring { item_id, .. }
-            | Phase::RecoveryRequired { item_id, .. } => Some(item_id.clone()),
+            | Phase::RecoveryRequired { item_id, .. }
+            | Phase::StopFailed { item_id, .. } => Some(item_id.clone()),
         }
     }
     fn publish(&mut self, event: WireEvent) {
@@ -1073,6 +1265,47 @@ impl<S: StateStore, B: SessionSystem, C: Clock> Authority<S, B, C> {
             pending_receipt,
         };
         self.publish(WireEvent::RecoveryRequired { session_id, reason });
+        self.persist()
+    }
+    /// Runs the sampler hook (if any) and then the forced kill. Every close-path escalation
+    /// goes through here so the hook can never be bypassed; with no hook attached this is one
+    /// branch and the kill itself.
+    fn escalate(
+        &mut self,
+        item_id: &str,
+        session_id: &str,
+        reason: ForceStopReason,
+    ) -> Result<(), String> {
+        if let Some(hook) = self.escalation.as_mut() {
+            hook(&EscalationContext {
+                session_id,
+                item_id,
+                reason,
+            });
+        }
+        self.system.enforce_termination(item_id, session_id)
+    }
+    /// Records a kill failure on a close path as the durable, retryable `StopFailed` phase
+    /// (§9.6 "Stop failed") instead of a terminal recovery: the menu row keeps offering the
+    /// retry, and a further `SafeReturn` runs the whole close sequence again.
+    fn stop_failed(&mut self, detail: String) -> Result<(), AuthorityError> {
+        let session_id = self
+            .session_id()
+            .ok_or(AuthorityError::InvalidObservation)?;
+        let item_id = self.item_id().unwrap_or_default();
+        self.graceful_deadline = None;
+        let reason = format!("{}: {detail}", ReasonCode::AppExitFailed.as_str());
+        self.log(&lifecycle_failure_line(
+            ReasonCode::AppExitFailed.as_str(),
+            &item_id,
+            &detail,
+        ));
+        self.state.phase = Phase::StopFailed {
+            session_id: session_id.clone(),
+            item_id,
+            reason: reason.clone(),
+        };
+        self.publish(WireEvent::StopFailed { session_id, reason });
         self.persist()
     }
     pub fn update_safe_return_binding(&mut self, revision: u64) -> Result<(), AuthorityError> {
@@ -1156,21 +1389,42 @@ impl<S: StateStore, B: SessionSystem, C: Clock> Authority<S, B, C> {
         } = self.state.phase.clone()
         {
             if self.graceful_deadline.is_none() {
-                if let Err(reason) = self.system.enforce_termination(&item_id, &session_id) {
-                    return self
-                        .recover(format!("{}: {reason}", ReasonCode::AppExitFailed.as_str()));
-                }
-                self.state.phase = Phase::ForceStopping {
-                    session_id,
-                    item_id,
+                // The monotonic deadline was lost to a daemon restart. Read the unit before
+                // acting: if the app already stopped while the daemon was down (by itself or
+                // by the unit's own TimeoutStopSec backstop), the close completes as Returned
+                // through reconcile_systemd() below. Killing a dead unit would publish a
+                // wrong ForcedClose — and sample a hang that is already gone.
+                let still_running = match self.system.lifecycle(&item_id) {
+                    Ok(Some(snapshot)) => matches!(snapshot.app, AppUnitState::Active),
+                    // No lifecycle source (fakes, the desktop-sim preset): a lost deadline
+                    // stays immediately due, as before.
+                    Ok(None) => true,
+                    // Unknown unit state: never kill blind; reconcile_systemd() below records
+                    // the typed systemd_state_unknown recovery.
+                    Err(_) => false,
                 };
-                self.persist()?;
+                if still_running {
+                    if let Err(reason) =
+                        self.escalate(&item_id, &session_id, ForceStopReason::StopTimeout)
+                    {
+                        return self.stop_failed(reason);
+                    }
+                    self.publish(WireEvent::ForceStopping {
+                        session_id: session_id.clone(),
+                        reason: ForceStopReason::StopTimeout,
+                    });
+                    self.state.phase = Phase::ForceStopping {
+                        session_id,
+                        item_id,
+                    };
+                    self.persist()?;
+                }
             }
         }
         if self.state.safe_return_queue > 0
             && matches!(
                 self.state.phase,
-                Phase::Starting { .. } | Phase::Running { .. }
+                Phase::Starting { .. } | Phase::Running { .. } | Phase::StopFailed { .. }
             )
         {
             self.state.safe_return_queue -= 1;
@@ -1179,6 +1433,9 @@ impl<S: StateStore, B: SessionSystem, C: Clock> Authority<S, B, C> {
             match self.system.request_graceful_stop(&item_id, &id) {
                 Ok(()) => {
                     self.graceful_deadline = Some(self.clock.deadline_after(self.grace).0);
+                    self.publish(WireEvent::StoppingGracefully {
+                        session_id: id.clone(),
+                    });
                     self.state.phase = Phase::StoppingGracefully {
                         session_id: id,
                         item_id,
@@ -1186,10 +1443,15 @@ impl<S: StateStore, B: SessionSystem, C: Clock> Authority<S, B, C> {
                     }
                 }
                 Err(_) => {
-                    if let Err(reason) = self.system.enforce_termination(&item_id, &id) {
-                        return self
-                            .recover(format!("{}: {reason}", ReasonCode::AppExitFailed.as_str()));
+                    if let Err(reason) =
+                        self.escalate(&item_id, &id, ForceStopReason::StopRequestFailed)
+                    {
+                        return self.stop_failed(reason);
                     }
+                    self.publish(WireEvent::ForceStopping {
+                        session_id: id.clone(),
+                        reason: ForceStopReason::StopRequestFailed,
+                    });
                     self.state.phase = Phase::ForceStopping {
                         session_id: id,
                         item_id,
@@ -1212,10 +1474,15 @@ impl<S: StateStore, B: SessionSystem, C: Clock> Authority<S, B, C> {
                 .graceful_deadline
                 .is_some_and(|deadline| self.clock.now() >= deadline)
             {
-                if let Err(reason) = self.system.enforce_termination(&item_id, &session_id) {
-                    return self
-                        .recover(format!("{}: {reason}", ReasonCode::AppExitFailed.as_str()));
+                if let Err(reason) =
+                    self.escalate(&item_id, &session_id, ForceStopReason::StopTimeout)
+                {
+                    return self.stop_failed(reason);
                 }
+                self.publish(WireEvent::ForceStopping {
+                    session_id: session_id.clone(),
+                    reason: ForceStopReason::StopTimeout,
+                });
                 self.state.phase = Phase::ForceStopping {
                     session_id,
                     item_id,
@@ -1306,6 +1573,7 @@ impl<S: StateStore, B: SessionSystem, C: Clock> Authority<S, B, C> {
                 (
                     Phase::StoppingGracefully { .. }
                     | Phase::ForceStopping { .. }
+                    | Phase::StopFailed { .. }
                     | Phase::Restoring {
                         rung: RestorationRung::UnitInactive,
                         ..
@@ -1419,6 +1687,11 @@ impl<S: StateStore, B: SessionSystem, C: Clock> Authority<S, B, C> {
             (Phase::ForceStopping { .. }, Observation::UnitInactive) => {
                 self.unit_inactive(Receipt::ForcedClose)
             }
+            // The kill failed, but the unit is gone now (systemd's own backstop or the app
+            // itself): the close the user asked for did happen, as a forced close.
+            (Phase::StopFailed { .. }, Observation::UnitInactive) => {
+                self.unit_inactive(Receipt::ForcedClose)
+            }
             (
                 Phase::Restoring {
                     session_id,
@@ -1521,6 +1794,58 @@ impl<S: StateStore, B: SessionSystem, C: Clock> Authority<S, B, C> {
         self.state.phase = Phase::Idle;
         self.persist()
     }
+    /// Pending events deliverable to `client_id`: past its cursor, minus the observed
+    /// Starting/Running of ended sessions (see [`Self::ended_session_observation_bound`]).
+    fn deliverable_events(&self, client_id: &str) -> impl Iterator<Item = &PublishedEvent> {
+        let sequence = self.state.acknowledged.get(client_id).copied().unwrap_or(0);
+        let ended_bound = self.ended_session_observation_bound();
+        self.state
+            .pending
+            .iter()
+            .filter(move |e| e.sequence > sequence)
+            .filter(move |e| {
+                !(matches!(
+                    e.event,
+                    WireEvent::ObservedStarting | WireEvent::ObservedRunning
+                ) && e.sequence < ended_bound)
+            })
+    }
+    /// The router/menu view: pending events as RPC payloads, selected for `contract`. A v1
+    /// client never sees the v2-only close-progress events, but its cursor and compaction are
+    /// untouched by them (the same delivery-filter discipline as the ended-session bound).
+    fn rpc_events_for(&self, client_id: &str, contract: u32) -> Vec<(u64, RpcEvent)> {
+        self.deliverable_events(client_id)
+            .filter(|e| contract >= SESSION_RPC_CONTRACT_V2 || !is_close_progress(&e.event))
+            .map(|e| (e.sequence, wire_to_rpc(&e.event)))
+            .collect()
+    }
+    /// Time until the nearest armed deadline that the current phase can still enforce, or
+    /// `None`. [`run_service_loop`] wakes at the deadline itself instead of waiting for the
+    /// next periodic tick; `Duration::ZERO` means a deadline is already due. A deadline whose
+    /// phase has moved on is deliberately ignored so a stale value can never busy-spin the
+    /// loop.
+    pub fn time_until_next_deadline(&self) -> Option<Duration> {
+        let now = self.clock.now();
+        let graceful = self
+            .graceful_deadline
+            .filter(|_| matches!(self.state.phase, Phase::StoppingGracefully { .. }));
+        let presentation = self.presentation_deadline.filter(|_| {
+            matches!(
+                self.state.phase,
+                Phase::Restoring {
+                    rung: RestorationRung::PresentationAcknowledged,
+                    ..
+                }
+            )
+        });
+        [graceful, presentation]
+            .into_iter()
+            .flatten()
+            .map(|deadline| {
+                Duration::from_nanos(deadline.as_nanos().saturating_sub(now.as_nanos()))
+            })
+            .min()
+    }
     /// Pending observed Starting/Running events with a sequence below this bound belong to a
     /// session that has already ended and are never delivered. While a session is Starting or
     /// Running, every earlier session ended at its last Terminal/RecoveryRequired event; in any
@@ -1558,9 +1883,11 @@ fn is_presentation_timeout(reason: &str) -> bool {
 ///
 /// Each received connection is handed to `serve`; between connections the loop calls
 /// [`Authority::tick`] at least once per `tick_interval`, so the authority reconciles systemd and
-/// enforces its deadlines with no client RPC. Waiting uses a channel timeout, never a spin; a tick
-/// that overruns the interval is followed by a full idle interval. A tick error is logged once
-/// until it changes or clears. A connection-source error or a `serve` error ends the loop.
+/// enforces its deadlines with no client RPC. It also wakes at an armed deadline itself
+/// ([`Authority::time_until_next_deadline`]), so an escalation lands at its deadline, not up to a
+/// tick later. Waiting uses a channel timeout, never a spin; a tick that overruns the interval is
+/// followed by a full idle interval. A tick error is logged once until it changes or clears. A
+/// connection-source error or a `serve` error ends the loop.
 pub fn run_service_loop<S, B, C, T>(
     authority: &mut Authority<S, B, C>,
     connections: &mpsc::Receiver<io::Result<T>>,
@@ -1576,7 +1903,10 @@ where
     let mut next_tick = Instant::now() + tick_interval;
     let mut last_error: Option<String> = None;
     loop {
-        let wait = next_tick.saturating_duration_since(Instant::now());
+        let mut wait = next_tick.saturating_duration_since(Instant::now());
+        if let Some(deadline_wait) = authority.time_until_next_deadline() {
+            wait = wait.min(deadline_wait);
+        }
         match connections.recv_timeout(wait) {
             Ok(Ok(connection)) => serve(authority, connection)?,
             Ok(Err(error)) => return Err(error),
@@ -1584,7 +1914,10 @@ where
             Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
         }
         let started = Instant::now();
-        if started < next_tick {
+        let deadline_due = authority
+            .time_until_next_deadline()
+            .is_some_and(|wait| wait.is_zero());
+        if started < next_tick && !deadline_due {
             continue;
         }
         match authority.tick() {
@@ -1665,19 +1998,8 @@ impl<S: StateStore, B: SessionSystem, C: Clock> AuthorityApi for Authority<S, B,
         Ok(LaunchResult::Accepted { session_id: id })
     }
     fn events_for(&self, client_id: &str) -> Vec<(u64, SessionEvent)> {
-        let sequence = self.state.acknowledged.get(client_id).copied().unwrap_or(0);
-        let ended_bound = self.ended_session_observation_bound();
-        self.state
-            .pending
-            .iter()
-            .filter(|e| e.sequence > sequence)
-            .filter(|e| {
-                !(matches!(
-                    e.event,
-                    WireEvent::ObservedStarting | WireEvent::ObservedRunning
-                ) && e.sequence < ended_bound)
-            })
-            .map(|e| (e.sequence, wire_to_port(&e.event)))
+        self.deliverable_events(client_id)
+            .filter_map(|e| wire_to_port(&e.event).map(|event| (e.sequence, event)))
             .collect()
     }
     fn acknowledge(&mut self, client_id: &str, sequence: u64) -> Result<(), AuthorityError> {
@@ -1761,23 +2083,28 @@ fn receipt_to_port(receipt: &Receipt, id: &str) -> TerminalReceipt {
         },
     }
 }
-fn wire_to_port(event: &WireEvent) -> SessionEvent {
+/// The v1 port view of a wire event. Contract v2 close-progress events have no
+/// [`SessionEvent`] shape and are never delivered through this surface.
+fn wire_to_port(event: &WireEvent) -> Option<SessionEvent> {
     match event {
-        WireEvent::ObservedStarting => SessionEvent::Observed(ObservedSessionState::Starting),
-        WireEvent::ObservedRunning => SessionEvent::Observed(ObservedSessionState::Running),
-        WireEvent::ObservationComplete => {
-            SessionEvent::Observed(ObservedSessionState::ObservationComplete)
-        }
+        WireEvent::ObservedStarting => Some(SessionEvent::Observed(ObservedSessionState::Starting)),
+        WireEvent::ObservedRunning => Some(SessionEvent::Observed(ObservedSessionState::Running)),
+        WireEvent::ObservationComplete => Some(SessionEvent::Observed(
+            ObservedSessionState::ObservationComplete,
+        )),
         WireEvent::Terminal {
             session_id,
             receipt,
-        } => SessionEvent::Terminal(receipt_to_port(receipt, session_id)),
+        } => Some(SessionEvent::Terminal(receipt_to_port(receipt, session_id))),
         WireEvent::RecoveryRequired { session_id, reason } => {
-            SessionEvent::RecoveryRequired(RecoveryRequired {
+            Some(SessionEvent::RecoveryRequired(RecoveryRequired {
                 session_id: session_id.clone(),
                 reason: reason.clone(),
-            })
+            }))
         }
+        WireEvent::StoppingGracefully { .. }
+        | WireEvent::ForceStopping { .. }
+        | WireEvent::StopFailed { .. } => None,
     }
 }
 
