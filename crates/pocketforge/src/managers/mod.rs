@@ -566,6 +566,10 @@ mod tests {
             "accelerometer",
             "gyroscope",
             "magnetometer",
+            // System input layer services (design/input-layer): Normal tier, ungated.
+            "pointer",
+            "menu",
+            "options",
         ] {
             assert!(
                 QuotaLedger::default_config_for(c).is_ungated(),

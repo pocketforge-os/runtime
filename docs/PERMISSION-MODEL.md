@@ -59,6 +59,9 @@ change is egress (§4).
 | `leds` | Normal | cosmetic actuator |
 | `audio` | Normal | **playback only** — see §3.1 (mic/capture is a future Dangerous cap, not in today's vocabulary) |
 | `settings` | Normal | local user settings |
+| `pointer` | Normal | system-input-layer service (design/input-layer §9.4): the system-drawn pointer; no descriptor row; the per-app `app:<id>/pointer` toggle is the user off-switch — §3.3 |
+| `menu` | Normal | system-input-layer service: fills the app section of the system menu; no descriptor row — §3.3 |
+| `options` | Normal | system-input-layer service: a declared options.toml the system draws (fw-options); no descriptor row — §3.3 |
 | `entropy` | Normal (**ungated**) | auto-granted **even when undeclared**; no ceiling, no consent, no quota — §5 |
 | `imu` / `accelerometer` / `gyroscope` / `magnetometer` | Normal | motion sensors; **future-dangerous candidate** — see §3.1 |
 | `location` | Dangerous | default-deny + consent + quota; presence derives from a gnss/gps sensor row |
@@ -89,6 +92,19 @@ The descriptor schema does **not** yet model the GNSS *kind* (constellation / fi
 `tsp-9sx.6` (open, E1-side, claimed by a sibling E3 worker). This bead **references** it: the tier
 model treats `location`/`gnss` as one Dangerous class and does not depend on the unmodeled `kind`.
 Do not solve `tsp-9sx.6` here.
+
+### 3.3 The system-input-layer words (`pointer`, `menu`, `options`) — §7 justification
+
+Added by the system input layer (design/input-layer; every-menu-spec §9.4/§10.2; `tsp-ihne1`).
+Per the §7 rule, the written justification for shipping them Normal: all three are **system-drawn
+UI services, not user-environment reads**. `pointer` asks the system to draw a cursor from input
+the app already declared (`input`); the data flows *out* to the screen, never *in* from sensors or
+user files. `menu` lets the app hand the system menu a bounded item list the system renders in its
+own chrome. `options` declares an app-shipped options.toml that the *system* draws and the *user*
+edits — the values are the app's own settings, and the user keeps a per-app off-switch for the
+pointer (`app:<id>/pointer` = auto|on|off, default from the declaration). None of them reads
+camera/mic/motion/location data, so none is born Dangerous. Like `settings`, they have no
+descriptor hardware row: they are platform-constant services (`descriptor.rs` `cap_present`).
 
 ## 4. Egress — a deliberate, documented tightening vs merged v0
 
