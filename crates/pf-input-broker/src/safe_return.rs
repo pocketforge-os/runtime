@@ -83,6 +83,8 @@ enum SystemMenuCommand {
         ready: SyncSender<io::Result<()>>,
     },
     Press,
+    /// FIFO barrier: answered only after every command enqueued before it was fully processed.
+    Sync(SyncSender<()>),
 }
 
 /// Routes protected Menu presses to one registered provider, with fail-safe return fallback.
@@ -145,20 +147,30 @@ impl SystemMenuRouter {
                                     )
                                 })
                                 .and_then(|provider| send_system_menu(provider, ack_timeout));
+                            // Re-arm the busy gate after the fallback dispatch but before the
+                            // log line is emitted, so a waiter that observed the log line also
+                            // observes `in_flight() == false` (channel happens-before). Hermetic
+                            // tests synchronize on the log line instead of polling the flag.
                             match outcome {
-                                Ok(()) => log("pf-input-broker: system_menu acknowledged"),
+                                Ok(()) => {
+                                    worker_busy.store(false, Ordering::Release);
+                                    log("pf-input-broker: system_menu acknowledged");
+                                }
                                 Err(error) => {
                                     if let Some(failed) = provider.take() {
                                         failed.shutdown();
                                     }
                                     let dispatched = fallback.request();
+                                    worker_busy.store(false, Ordering::Release);
                                     log(&format!(
                                         "pf-input-broker: system_menu fallback to safe_return ({:?}): {error}; dispatched={dispatched}",
                                         error.kind()
                                     ));
                                 }
                             }
-                            worker_busy.store(false, Ordering::Release);
+                        }
+                        SystemMenuCommand::Sync(ready) => {
+                            let _ = ready.send(());
                         }
                     }
                 }
@@ -199,7 +211,9 @@ impl SystemMenuRouter {
                 self.safe_return.request()
             }
             Err(TrySendError::Full(SystemMenuCommand::Register { .. }))
-            | Err(TrySendError::Disconnected(SystemMenuCommand::Register { .. })) => {
+            | Err(TrySendError::Disconnected(SystemMenuCommand::Register { .. }))
+            | Err(TrySendError::Full(SystemMenuCommand::Sync(_)))
+            | Err(TrySendError::Disconnected(SystemMenuCommand::Sync(_))) => {
                 unreachable!("press sends only Press")
             }
         }
@@ -208,6 +222,20 @@ impl SystemMenuRouter {
     /// The menu's Return item uses the exact same authority intake as fail-safe fallback.
     pub fn return_item(&self) -> bool {
         self.safe_return.request()
+    }
+
+    /// FIFO barrier over the worker's command queue: once this returns, every press enqueued
+    /// before the call has been fully processed (its provider outcome observed, its fallback
+    /// dispatch decided, and the busy gate re-armed). Hermetic tests use it to replace
+    /// wall-clock polling windows with explicit synchronisation; the input pump never calls it.
+    pub fn sync(&self) -> io::Result<()> {
+        let (ready_tx, ready_rx) = sync_channel(0);
+        self.tx
+            .send(SystemMenuCommand::Sync(ready_tx))
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "system-menu worker stopped"))?;
+        ready_rx
+            .recv()
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "system-menu worker stopped"))
     }
 
     pub fn in_flight(&self) -> bool {
@@ -384,8 +412,12 @@ impl SafeReturnIntake {
                 // Ends when the intake (the only sender) is dropped.
                 while rx.recv().is_ok() {
                     let outcome = send_safe_return(&sock, connect_timeout, io_timeout);
-                    log(&outcome_line(&sock, &outcome));
+                    // Re-arm the gate before emitting the outcome line, so a waiter that
+                    // observed the line also observes `in_flight() == false` (channel
+                    // happens-before). Hermetic tests synchronize on the log line instead of
+                    // polling the flag.
                     worker_busy.store(false, Ordering::Release);
+                    log(&outcome_line(&sock, &outcome));
                 }
             })?;
         Ok(SafeReturnIntake { tx, busy })
@@ -652,7 +684,49 @@ mod tests {
         (intake, rx)
     }
 
-    fn accept_safe_return(listener: &UnixListener, timeout: Duration) -> (Vec<u8>, Duration) {
+    /// Block until the next log line arrives. The bound is generous (10 s) and is only ever
+    /// reached when the behaviour under test regressed; healthy runs resolve in milliseconds,
+    /// so this is an event-driven wait, not a timing window.
+    fn wait_for_any_line(rx: &Receiver<String>) -> String {
+        rx.recv_timeout(Duration::from_secs(10))
+            .expect("log line did not arrive within 10 s")
+    }
+
+    /// Block until a log line containing `needle` arrives; other lines are discarded. Both
+    /// workers re-arm their busy gate BEFORE emitting their outcome line, so receiving a line
+    /// proves the corresponding `in_flight()` flag is already false (channel happens-before) —
+    /// tests never poll the flag on a wall-clock window.
+    fn wait_for_line(rx: &Receiver<String>, needle: &str) -> String {
+        loop {
+            let line = wait_for_any_line(rx);
+            if line.contains(needle) {
+                return line;
+            }
+        }
+    }
+
+    /// A router whose log lines go to a channel so tests can synchronize on worker completion.
+    fn logging_router(
+        intake: SafeReturnIntake,
+        ack_timeout: Duration,
+    ) -> (SystemMenuRouter, Receiver<String>) {
+        let (tx, rx) = channel();
+        let router = SystemMenuRouter::spawn_with(
+            intake,
+            ack_timeout,
+            Box::new(move |line| {
+                let _ = tx.send(line.to_owned());
+            }),
+        )
+        .unwrap();
+        (router, rx)
+    }
+
+    /// Wait for one SafeReturn connection, answer `{"result":"ok"}`, return the request body.
+    /// Event-driven bounded wait: returns as soon as the connection arrives (the 2 ms pause
+    /// only yields the CPU while polling); the generous bound is reached solely when the
+    /// dispatch under test regressed.
+    fn accept_safe_return(listener: &UnixListener, timeout: Duration) -> Vec<u8> {
         listener.set_nonblocking(true).unwrap();
         let started = Instant::now();
         loop {
@@ -661,7 +735,7 @@ mod tests {
                     stream.set_nonblocking(false).unwrap();
                     let body = pf_wire::read_frame(&mut stream).unwrap();
                     pf_wire::write_frame(&mut stream, br#"{"result":"ok"}"#).unwrap();
-                    return (body, started.elapsed());
+                    return body;
                 }
                 Err(error)
                     if error.kind() == io::ErrorKind::WouldBlock && started.elapsed() < timeout =>
@@ -704,7 +778,7 @@ mod tests {
 
         assert!(router.press());
 
-        let (body, _) = accept_safe_return(&authority, Duration::from_secs(1));
+        let body = accept_safe_return(&authority, Duration::from_secs(10));
         assert_eq!(body, SAFE_RETURN_BODY);
         let _ = std::fs::remove_file(sock);
     }
@@ -716,9 +790,7 @@ mod tests {
         let authority = UnixListener::bind(&sock).unwrap();
         authority.set_nonblocking(true).unwrap();
         let (intake, _log) = logging_intake(&sock, IO_TIMEOUT);
-        let router =
-            SystemMenuRouter::spawn_with(intake, Duration::from_millis(50), Box::new(|_| {}))
-                .unwrap();
+        let (router, router_log) = logging_router(intake, Duration::from_millis(50));
         let mut provider = register_test_provider(&router);
         provider
             .set_read_timeout(Some(Duration::from_millis(500)))
@@ -735,14 +807,16 @@ mod tests {
             br#"{"version":1,"type":"ack","action":"system_menu"}"#,
         )
         .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(1);
-        while router.in_flight() && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(2));
-        }
+        // The "acknowledged" line is emitted after the worker re-armed the busy gate, so
+        // receiving it proves the press completed — no polling window.
+        wait_for_line(&router_log, "acknowledged");
         assert!(
             !router.in_flight(),
             "provider acknowledgement was not observed"
         );
+        // Zero-window negative control: the acknowledged press must never dispatch the
+        // fallback, and the router worker (the only would-be client) is provably idle, so a
+        // connection in the backlog could only come from a regressed dispatch.
         assert_eq!(
             authority.accept().unwrap_err().kind(),
             io::ErrorKind::WouldBlock,
@@ -758,15 +832,7 @@ mod tests {
         let authority = UnixListener::bind(&sock).unwrap();
         authority.set_nonblocking(true).unwrap();
         let (intake, _return_log) = logging_intake(&sock, IO_TIMEOUT);
-        let (menu_log_tx, menu_log_rx) = channel();
-        let router = SystemMenuRouter::spawn_with(
-            intake,
-            Duration::from_millis(50),
-            Box::new(move |line| {
-                let _ = menu_log_tx.send(line.to_owned());
-            }),
-        )
-        .unwrap();
+        let (router, menu_log_rx) = logging_router(intake, Duration::from_millis(50));
         let mut provider = register_test_provider(&router);
         provider
             .set_read_timeout(Some(Duration::from_millis(500)))
@@ -779,24 +845,24 @@ mod tests {
         );
         pf_wire::write_frame(&mut provider, SYSTEM_MENU_ACK_BODY).unwrap();
         pf_wire::write_frame(&mut provider, SYSTEM_MENU_SHOWN_BODY).unwrap();
-        let shown_deadline = Instant::now() + Duration::from_secs(1);
-        loop {
-            let line = menu_log_rx
-                .recv_timeout(shown_deadline.saturating_duration_since(Instant::now()))
-                .unwrap();
-            if line.contains("shown") {
-                break;
-            }
-        }
+        // "shown" is logged by the provider reader thread and "acknowledged" by the router
+        // worker; the two lines may arrive in either order, so collect both order-independently.
+        let lines = [
+            wait_for_any_line(&menu_log_rx),
+            wait_for_any_line(&menu_log_rx),
+        ];
+        assert!(lines.iter().any(|l| l.contains("shown")), "{lines:?}");
+        assert!(
+            lines.iter().any(|l| l.contains("acknowledged")),
+            "{lines:?}"
+        );
+        // "acknowledged" was emitted after the worker re-armed the busy gate, so receiving it
+        // proves the press completed — no polling window.
+        assert!(!router.in_flight());
         assert_eq!(
             authority.accept().unwrap_err().kind(),
             io::ErrorKind::WouldBlock
         );
-        let first_deadline = Instant::now() + Duration::from_secs(1);
-        while router.in_flight() && Instant::now() < first_deadline {
-            std::thread::sleep(Duration::from_millis(2));
-        }
-        assert!(!router.in_flight());
         while menu_log_rx.try_recv().is_ok() {}
 
         assert!(router.press());
@@ -805,15 +871,9 @@ mod tests {
             SYSTEM_MENU_ACTION_BODY
         );
         pf_wire::write_frame(&mut provider, SYSTEM_MENU_ACK_BODY).unwrap();
-        let acknowledged_deadline = Instant::now() + Duration::from_secs(1);
-        loop {
-            let line = menu_log_rx
-                .recv_timeout(acknowledged_deadline.saturating_duration_since(Instant::now()))
-                .unwrap();
-            if line.contains("acknowledged") {
-                break;
-            }
-        }
+        // The provider survived the post-ack "shown": the second press is acknowledged too.
+        wait_for_line(&menu_log_rx, "acknowledged");
+        assert!(!router.in_flight());
         assert_eq!(
             authority.accept().unwrap_err().kind(),
             io::ErrorKind::WouldBlock
@@ -831,10 +891,16 @@ mod tests {
         let router = SystemMenuRouter::spawn_with(intake, ack_timeout, Box::new(|_| {})).unwrap();
         let _hung_provider = register_test_provider(&router);
 
+        // The clock starts BEFORE the press: the fallback can only be dispatched after the
+        // acknowledgement wait expired, and [press, connection accepted] is a superset of that
+        // wait, so the lower bound cannot false-fail under load — it is the property itself
+        // (no early fallback), not a scheduling window.
+        let started = Instant::now();
         assert!(router.press());
 
-        let (body, elapsed) = accept_safe_return(&authority, Duration::from_secs(1));
+        let body = accept_safe_return(&authority, Duration::from_secs(10));
         assert_eq!(body, SAFE_RETURN_BODY);
+        let elapsed = started.elapsed();
         assert!(
             elapsed >= ack_timeout,
             "fallback fired too early: {elapsed:?}"
@@ -847,10 +913,13 @@ mod tests {
         let sock = scratch("menu-invalid-provider");
         let _ = std::fs::remove_file(&sock);
         let authority = UnixListener::bind(&sock).unwrap();
-        let (intake, _log) = logging_intake(&sock, IO_TIMEOUT);
-        let router =
-            SystemMenuRouter::spawn_with(intake, Duration::from_millis(50), Box::new(|_| {}))
-                .unwrap();
+        let (intake, intake_log) = logging_intake(&sock, IO_TIMEOUT);
+        // A deliberately huge ack deadline creates a deterministic separation instead of a
+        // timing window: an unregistered provider is never consulted, so the second press's
+        // fallback must arrive promptly. A regression that kept the invalid provider
+        // registered would first wait out this 30 s deadline, and the 10 s bounded accept
+        // below would fail.
+        let (router, router_log) = logging_router(intake, Duration::from_secs(30));
         let mut provider = register_test_provider(&router);
 
         assert!(router.press());
@@ -864,25 +933,20 @@ mod tests {
         )
         .unwrap();
 
-        let (body, _) = accept_safe_return(&authority, Duration::from_secs(1));
+        let body = accept_safe_return(&authority, Duration::from_secs(10));
         assert_eq!(body, SAFE_RETURN_BODY);
-        let deadline = Instant::now() + Duration::from_secs(1);
-        while router.in_flight() && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(2));
-        }
+        // Both outcome lines are emitted after their worker re-armed its busy gate, and the
+        // router barrier proves the Press command was fully processed — so the flag asserts
+        // below are direct, with no polling window.
+        wait_for_line(&router_log, "fallback to safe_return");
+        wait_for_line(&intake_log, "safe_return");
+        router.sync().unwrap();
         assert!(!router.in_flight());
-        while router.fallback_in_flight() && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(2));
-        }
         assert!(!router.fallback_in_flight());
 
         assert!(router.press());
-        let (second_body, elapsed) = accept_safe_return(&authority, Duration::from_secs(1));
+        let second_body = accept_safe_return(&authority, Duration::from_secs(10));
         assert_eq!(second_body, SAFE_RETURN_BODY);
-        assert!(
-            elapsed < Duration::from_millis(50),
-            "invalid provider remained registered: {elapsed:?}"
-        );
         let _ = std::fs::remove_file(sock);
     }
 
@@ -908,7 +972,7 @@ mod tests {
         );
         server.join().unwrap().unwrap();
 
-        let (body, _) = accept_safe_return(&authority, Duration::from_secs(1));
+        let body = accept_safe_return(&authority, Duration::from_secs(10));
         assert_eq!(body, SAFE_RETURN_BODY);
         let _ = std::fs::remove_file(sock);
     }
@@ -967,6 +1031,9 @@ mod tests {
         let started = Instant::now();
         let err = connect_with_timeout(&sock, CONNECT_TIMEOUT).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::NotFound);
+        // The 1 s ceiling is a hang safety net, not a synchronisation window: `connect(2)`
+        // reports the absent socket immediately, so healthy runs are sub-millisecond; only a
+        // regression that turns ENOENT into deadline waiting can approach the ceiling.
         assert!(started.elapsed() < Duration::from_secs(1));
     }
 
@@ -1006,6 +1073,10 @@ mod tests {
         let err = connect_with_timeout(&sock, CONNECT_TIMEOUT).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::TimedOut);
         let elapsed = started.elapsed();
+        // The bounds ARE the property: connect must wait the full CONNECT_TIMEOUT against a
+        // full backlog, then give up. The lower bound cannot false-fail under load (a deadline
+        // wait only stretches); the 1 s ceiling is a hang safety net, generous versus the
+        // 250 ms deadline — not a synchronisation window.
         assert!(
             elapsed >= CONNECT_TIMEOUT && elapsed < Duration::from_secs(1),
             "connect gave up after {elapsed:?}"
@@ -1018,22 +1089,19 @@ mod tests {
     fn stalled_authority_read_is_bounded_and_logged() {
         let sock = scratch("stalled-read");
         let _ = std::fs::remove_file(&sock);
+        // The 100 ms read deadline is the SUBJECT of the test: a stalled authority must be
+        // bounded. Waiting for the outcome line is event-driven, not a timing window.
         let _listener = UnixListener::bind(&sock).unwrap(); // bound, never accepts, never answers
         let (intake, log) = logging_intake(&sock, Duration::from_millis(100));
         assert!(intake.request());
-        let line = log.recv_timeout(Duration::from_secs(2)).unwrap();
-        assert!(
-            line.contains("safe_return") && line.contains("failed"),
-            "{line}"
-        );
+        let line = wait_for_line(&log, "failed");
+        assert!(line.contains("safe_return"), "{line}");
         assert!(
             line.contains("WouldBlock") || line.contains("TimedOut"),
             "{line}"
         );
-        let deadline = Instant::now() + Duration::from_secs(1);
-        while intake.in_flight() && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(5));
-        }
+        // The outcome line is emitted after the worker re-armed the gate, so receiving it
+        // proves the flag is already false — no polling window.
         assert!(
             !intake.in_flight(),
             "a failed round trip must re-arm the gate"

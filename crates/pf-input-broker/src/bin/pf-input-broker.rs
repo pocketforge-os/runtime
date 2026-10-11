@@ -316,6 +316,10 @@ mod tests {
 
     #[test]
     fn stalled_client_does_not_hide_pump_failure() {
+        // The 1 s ceiling is a liveness safety net, not a synchronisation window: supervise
+        // polls its command channel every 50 ms, so the pump failure surfaces within one
+        // tick of a healthy run; only a regression that blocks on the silent client can
+        // reach the ceiling.
         let path =
             std::env::temp_dir().join(format!("pf-input-broker-acquire-{}", std::process::id()));
         let _ = std::fs::remove_file(&path);
@@ -350,6 +354,10 @@ mod tests {
 
     #[test]
     fn stalled_client_does_not_delay_stop_cleanup() {
+        // The 1 s ceiling is a liveness safety net, not a synchronisation window: supervise
+        // observes the pre-set stop flag on its first 50 ms poll tick, so a healthy run
+        // returns immediately; only a regression that blocks on the silent client can reach
+        // the ceiling.
         let path = std::env::temp_dir().join(format!(
             "pf-input-broker-acquire-stop-{}",
             std::process::id()
