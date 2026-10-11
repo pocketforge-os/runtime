@@ -28,6 +28,14 @@ pub const KNOWN_CAPABILITIES: &[&str] = &[
     "audio",
     "settings",
     "leds",
+    // System input layer (design/input-layer, every-menu-spec §10.2). `pointer` asks for the
+    // system-drawn pointer, `menu` fills the app section of the system menu, and `options`
+    // declares a shipped options.toml the system draws (reserved for fw-options; its schema is
+    // tsp-ihne1.23). All three are system-drawn services — Normal tier, no descriptor row, and
+    // none of them reads user-environment data (PERMISSION-MODEL §7).
+    "pointer",
+    "menu",
+    "options",
 ];
 
 /// Minimum-spec graphics version vocabulary: OpenGL ES.

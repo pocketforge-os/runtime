@@ -659,6 +659,31 @@ mod tests {
         }
     }
 
+    #[test]
+    fn input_layer_caps_need_no_descriptor_row() {
+        // pointer/menu/options are system-drawn services of the input layer
+        // (design/input-layer, every-menu-spec §10.2): the system draws the pointer (a D-pad
+        // pointer covers !has_sticks devices), the app menu section, and declared options
+        // pages on EVERY device, so they are backable even REQUIRED with no descriptor row —
+        // the same class as input/entropy/audio/settings above.
+        for id in ["a133", "a523"] {
+            let v = manifest(&["pointer", "menu", "options"])
+                .validate(&desc(id))
+                .unwrap_or_else(|violations| panic!("{id}: {violations:?}"));
+            for c in ["pointer", "menu", "options"] {
+                assert!(v.allows(c), "{id}: {c} is in the granted ceiling");
+            }
+        }
+        // Negative control, same invocation: the vocabulary stays CLOSED — an unknown
+        // capability is still refused against the same descriptor.
+        assert_eq!(
+            manifest(&["telepathy"])
+                .validate(&desc("a133"))
+                .unwrap_err(),
+            vec![Violation::UnknownCapability("telepathy".into())]
+        );
+    }
+
     // --- [runtime] family/abi cooperative launch-time match (tsp-ziac.5) -------------------------
 
     /// This Platform is the a133-powervr family, advertised (as the supervisor would derive it from

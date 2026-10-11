@@ -289,6 +289,92 @@ fn normalized_capability_compatibility_and_controls_share_one_invocation() {
     fs::remove_dir_all(dir).unwrap();
 }
 
+/// A whole-manifest source declaring exactly `caps`, pinned to the a133 family.
+fn capability_manifest(caps: &[&str]) -> String {
+    let caps = caps
+        .iter()
+        .map(|capability| format!("{capability:?}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "[app]\nid = \"org.example.app\"\nuse = [{caps}]\n\
+         [runtime]\nfamily = \"pocketforge/a133-powervr\"\nabi = \"1\"\nplatform-version = \"20\"\n\
+         [launch]\nexec = \"bin/app\"\n"
+    )
+}
+
+#[test]
+fn input_layer_capability_goldens_and_refusals_share_one_invocation() {
+    // Golden manifests, one per system-input-layer capability (design/input-layer,
+    // every-menu-spec §10.2): `pointer` asks for the system-drawn pointer, `menu` fills the
+    // app section of the system menu, `options` reserves the declared-options page.
+    for cap in ["pointer", "menu", "options"] {
+        let manifest = parse_manifest(&capability_manifest(&[cap]))
+            .unwrap_or_else(|error| panic!("{cap}: {error}"));
+        assert_eq!(manifest.app.capabilities, [cap.to_string()], "{cap}");
+    }
+    // The refusal paths stay closed in the SAME invocation: an unknown capability, a
+    // semantic duplicate, and modifiers on capabilities that define none.
+    for caps in [
+        &["telepathy"][..],
+        &["pointer", "pointer?"],
+        &["menu:large"],
+        &["options:declared"],
+    ] {
+        let error = parse_manifest(&capability_manifest(caps)).unwrap_err();
+        assert_eq!(error.kind, ManifestErrorKind::Invalid, "{caps:?}");
+        assert_eq!(error.message, "invalid or duplicate capability", "{caps:?}");
+    }
+}
+
+#[test]
+fn input_layer_contract_support_gates_required_but_not_optional() {
+    // A device contract may advertise the input-layer capabilities (sorted, as the exact
+    // contract grammar demands)...
+    let supported_line =
+        "supported_capabilities = [\"audio\", \"input\", \"menu\", \"options\", \"pointer\"]";
+    let source = format!(
+        "schema_version = 1\n\
+         runtime_family = \"pocketforge/a133-powervr\"\n\
+         runtime_abi = \"1\"\n\
+         platform_version = \"20\"\n\
+         {supported_line}\n"
+    );
+    let contract = parse_platform_contract(&source).unwrap();
+    // ...and a REQUIRED input-layer capability is then compatible with that contract...
+    for cap in ["pointer", "menu", "options"] {
+        let manifest = parse_manifest(&capability_manifest(&[cap])).unwrap();
+        check_compatibility(&manifest, &contract)
+            .unwrap_or_else(|error| panic!("{cap}: {error:?}"));
+    }
+    // ...while the same set UNSORTED is still refused (negative control, same invocation).
+    let unsorted = source.replace(
+        supported_line,
+        "supported_capabilities = [\"pointer\", \"menu\", \"options\", \"input\", \"audio\"]",
+    );
+    assert_eq!(
+        parse_platform_contract(&unsorted).unwrap_err().reason,
+        PlatformContractErrorReason::UnsortedCapabilities
+    );
+
+    // Staged rollout: a device whose contract predates the input layer refuses a REQUIRED
+    // `pointer`, but the OPTIONAL declaration still resolves (graceful absence) — the
+    // vocabulary reservation is not device support.
+    let legacy = parse_platform_contract(SCHEMA1_SOURCE).unwrap();
+    let error = check_compatibility(
+        &parse_manifest(&capability_manifest(&["pointer"])).unwrap(),
+        &legacy,
+    )
+    .unwrap_err();
+    assert_eq!(error.reason, ReasonCode::UnsupportedCapability);
+    assert_eq!(error.detail, "unsupported required capability pointer");
+    check_compatibility(
+        &parse_manifest(&capability_manifest(&["pointer?"])).unwrap(),
+        &legacy,
+    )
+    .unwrap();
+}
+
 #[test]
 fn path_confinement_negatives_and_positive_share_one_invocation() {
     let dir = scratch("coordinator-controls");
