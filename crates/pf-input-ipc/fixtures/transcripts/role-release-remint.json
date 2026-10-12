@@ -1,0 +1,7 @@
+{
+  "epoch": 42,
+  "first_request_id": 7001,
+  "second_request_id": 7002,
+  "role": "menu",
+  "sequence": ["mint_fresh_fd", "destroy_client", "release_role", "remint_fresh_fd"]
+}

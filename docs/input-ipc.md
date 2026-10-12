@@ -81,6 +81,28 @@ refused without mutating state. Every later message in either direction carries 
 and Menu before it serves any endpoint, and Menu with no provider is a direct return. §9 defines
 the fail-closed state and replay required on either side of compositor EOF.
 
+### Pinned gamescope implementability evidence
+
+This contract was checked against the gamescope SHA selected by platform `6b0efb08`:
+`c30e8ceec43b137c206a445f49853b9fcdc58e71` (`platform.lock:600-617`). At that exact pin:
+
+* physical keyboards join gamescope's wlroots keyboard group
+  ([`src/wlserver.cpp:570-583`](https://github.com/pocketforge-os/gamescope/blob/c30e8ceec43b137c206a445f49853b9fcdc58e71/src/wlserver.cpp#L570-L583));
+* `XF86PowerOff` can reach the root-server seat or the ordinary hotkey/seat path
+  ([`src/wlserver.cpp:383-410`](https://github.com/pocketforge-os/gamescope/blob/c30e8ceec43b137c206a445f49853b9fcdc58e71/src/wlserver.cpp#L383-L410)),
+  which is the insertion point for consume-before-seat `protected_power`;
+* the existing trust broker is an inherited unnamed `SOCK_SEQPACKET` capability accepting one
+  byte and returning one fd
+  ([`src/wayland_security.cpp:106-193`](https://github.com/pocketforge-os/gamescope/blob/c30e8ceec43b137c206a445f49853b9fcdc58e71/src/wayland_security.cpp#L106-L193)),
+  while its registry entry contains no role
+  ([`src/wayland_security.hpp:15-35`](https://github.com/pocketforge-os/gamescope/blob/c30e8ceec43b137c206a445f49853b9fcdc58e71/src/wayland_security.hpp#L15-L35)); and
+* gamescope teardown destroys the broker and every Wayland client
+  ([`src/wlserver.cpp:2427-2429`](https://github.com/pocketforge-os/gamescope/blob/c30e8ceec43b137c206a445f49853b9fcdc58e71/src/wlserver.cpp#L2427-L2429)).
+
+Therefore the required work has explicit source insertion points, but remains the **new**
+compositor-channel facility described in §6; none of this page treats the reaper broker as that
+facility.
+
 ## 2. Timeouts (defined once: `pf_input_ipc::timeouts`)
 
 | Constant | Value | Meaning |
@@ -206,7 +228,9 @@ pid-based authority. Implementation is jointly owned by `tsp-op5a.440.13` and
    menu surface; a public-socket client cannot create any. gamescope reports every map/unmap of
    a trusted overlay as `overlay` on the compositor channel.
 5. One live connection per role. A second `trusted_connection` for a role already bound is
-   `refused` until the router has shut the previous peer (registration replacement, §1).
+   `refused` until the router has shut the previous peer (registration replacement, §1). The
+   registry's `wl_client` destroy listener releases that role; only then may a new request mint a
+   new socketpair. `CompositorSession::release_trusted_role` models this destroy-time release.
 
 On reconnect every prior router-minted `wl_client` is destroyed and every role binding is cleared;
 new fds are minted only after the new epoch's snapshot. A reply for an old epoch or an unknown,
@@ -225,7 +249,10 @@ router publishes a secure_entry signal" (adjudication item 14).
 ## 8. Ordering rules
 
 * **(a) Menu first.** The router consumes every Menu transition before any routing. Menu never
-  reaches the app, the keyboard or the pointer, including after a dropped-event resync.
+  reaches the app, keyboard, pointer, shell or menu provider, including after a dropped-event
+  resync; compositor quarantine does not change that. `route_pad_input` is the executable rule
+  and tests the protected transition plus an ordinary-input negative control against every
+  `PadDestination`.
 * **(a2) Protected Power before the seat.** gamescope consumes every `KEY_POWER`/AXP-PEK
   transition before `wlr_seat_keyboard_notify_key`, root-server hotkeys, or app delivery, assigns
   a strictly increasing sequence, and sends `protected_power`. The router feeds accepted
@@ -299,4 +326,25 @@ are compared against `pf-input-broker`'s merged provider constants so the two ca
 `fixtures/transcripts/` records both restart directions. One test drives EOF → reconnect → full
 replay → old-epoch refusal → Power sequence continuity; the other proves pending trust is
 invalidated, an incomplete replay is rejected, and a missing or unexpected `SCM_RIGHTS` fd cannot
-install trust. Each invocation also contains the successful fresh-epoch controls.
+install trust. `protected-power-before-seat.json` admits only consume → relay and refuses any
+seat-delivery ordering. `menu-before-every-destination.json` proves Menu is consumed before app,
+keyboard, pointer, shell, menu and quarantined destinations while ordinary input still routes.
+`role-release-remint.json` proves destroy-time release precedes a fresh request/fd.
+
+Every stateful refusal also has a separately named fixture, rather than living only as a label in
+a successful transcript: `refused-delta-before-snapshot.json`, `refused-old-epoch.json`,
+`refused-duplicate-snapshot.json`, `refused-incomplete-snapshot.json`,
+`refused-replayed-power-sequence.json`, `refused-stale-request-id.json`,
+`refused-missing-fd.json`, `refused-multiple-fds.json`, `refused-fd-on-refusal.json`,
+`refused-role-already-bound.json` and `refused-role-not-bound.json`. The inventory test fails if
+one disappears and drives each to its exact typed error alongside a complete-snapshot/current-
+epoch/fresh-sequence/exactly-one-fd positive control.
+
+### Platform provider-schema pairing
+
+Platform PR #315's provider `shown` frame is byte-for-byte this contract's
+`{"version":1,"type":"shown"}` and needs no wire change. Its seven-frame schema/fixture is the
+runtime#108 bootstrap compatibility subset, not the exhaustive v1 vocabulary: this contract also
+defines `closed`, `secure_entry`, `pong`, `dismiss` and `ping`. Platform must label that subset as
+such and refer here for the normative 500 ms shown deadline, 1 s health watch and router-owned 2 s
+hold policy; it must not describe those policies as awaiting owner approval.

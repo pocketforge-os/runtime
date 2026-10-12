@@ -197,9 +197,66 @@ pub enum OverlayRole {
 pub enum PadDestination {
     App,
     Keyboard,
+    Pointer,
+    Shell,
     Menu,
     /// No recipient while compositor authority is absent or its snapshot is incomplete.
     Quarantined,
+}
+
+/// A decoded transition from the router-owned built-in pad.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PadControl {
+    /// The protected system Menu control.
+    Menu,
+    /// Any non-Menu pad control; the concrete key/axis remains outside this contract crate.
+    Ordinary,
+}
+
+/// Result of applying the Menu-first rule before selecting a pad destination.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PadInputDisposition {
+    ConsumedByRouter,
+    RoutedTo(PadDestination),
+}
+
+/// Apply ordering rule 8(a). This function deliberately takes the destination as an argument:
+/// callers must run it before writing to *any* destination, including an already-open menu.
+pub fn route_pad_input(destination: PadDestination, control: PadControl) -> PadInputDisposition {
+    match control {
+        PadControl::Menu => PadInputDisposition::ConsumedByRouter,
+        PadControl::Ordinary => PadInputDisposition::RoutedTo(destination),
+    }
+}
+
+/// Observable gamescope steps for a protected Power transition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GamescopeInputStep {
+    Consume,
+    RelayToRouter,
+    SeatDelivery,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProtectedPowerOrderError;
+
+/// Protected Power has exactly one valid disposition: consume it in gamescope, then relay it to
+/// the router. A seat-delivery step anywhere is a contract violation.
+pub fn validate_protected_power_order(
+    steps: &[GamescopeInputStep],
+) -> Result<(), ProtectedPowerOrderError> {
+    if steps
+        == [
+            GamescopeInputStep::Consume,
+            GamescopeInputStep::RelayToRouter,
+        ]
+    {
+        Ok(())
+    } else {
+        Err(ProtectedPowerOrderError)
+    }
 }
 
 /// Integer rectangle in compositor (logical, rotated) pixels.
@@ -657,6 +714,7 @@ pub mod compositor {
         MissingFileDescriptor(u64),
         UnexpectedFileDescriptorCount { request_id: u64, got: usize },
         RoleAlreadyBound(OverlayRole),
+        RoleNotBound(OverlayRole),
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -816,6 +874,20 @@ pub mod compositor {
                 });
             }
             self.pending_requests.remove(&request_id);
+            Ok(())
+        }
+
+        /// Release one role when its trusted `wl_client` is destroyed. A later request may then
+        /// mint a fresh socketpair/fd for that role; the previous fd is never reusable.
+        pub fn release_trusted_role(
+            &mut self,
+            epoch: u64,
+            role: OverlayRole,
+        ) -> Result<(), CompositorStateError> {
+            self.accept_delta(epoch)?;
+            if !self.live_roles.remove(&role) {
+                return Err(CompositorStateError::RoleNotBound(role));
+            }
             Ok(())
         }
 

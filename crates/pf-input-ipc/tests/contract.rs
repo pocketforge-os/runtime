@@ -10,8 +10,9 @@ use pf_input_ipc::events::RouterEvent;
 use pf_input_ipc::keyboard::{KeyboardToRouter, RouterToKeyboard};
 use pf_input_ipc::menu::{DismissReason, MenuAction, MenuToRouter, RouterToMenu};
 use pf_input_ipc::{
-    decode, encode, sockets, timeouts, IpcError, MenuPhase, MenuSession, MenuStep, PadDestination,
-    PadGate, Secret, SCHEMA_MAJOR,
+    decode, encode, route_pad_input, sockets, timeouts, validate_protected_power_order,
+    GamescopeInputStep, IpcError, MenuPhase, MenuSession, MenuStep, PadControl, PadDestination,
+    PadGate, PadInputDisposition, Secret, SCHEMA_MAJOR,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -564,6 +565,284 @@ fn recovery_transcript(name: &str) -> RecoveryTranscript {
     let path = fixture_dir("transcripts").join(format!("{name}.json"));
     serde_json::from_slice(&fs::read(&path).expect("recovery transcript bytes"))
         .expect("recovery transcript shape")
+}
+
+#[derive(Debug, Deserialize)]
+struct ProtectedPowerOrderFixture {
+    accepted: Vec<GamescopeInputStep>,
+    refused: Vec<Vec<GamescopeInputStep>>,
+}
+
+#[test]
+fn protected_power_is_consumed_before_seat_delivery() {
+    let path = fixture_dir("transcripts").join("protected-power-before-seat.json");
+    let fixture: ProtectedPowerOrderFixture =
+        serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+    assert_eq!(validate_protected_power_order(&fixture.accepted), Ok(()));
+    for refused in fixture.refused {
+        assert!(
+            validate_protected_power_order(&refused).is_err(),
+            "negative fixture unexpectedly accepted: {refused:?}"
+        );
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct MenuFirstFixture {
+    destinations: Vec<PadDestination>,
+    protected_control: PadControl,
+    ordinary_control: PadControl,
+}
+
+#[test]
+fn menu_is_consumed_before_every_destination() {
+    let path = fixture_dir("transcripts").join("menu-before-every-destination.json");
+    let fixture: MenuFirstFixture = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+    for destination in fixture.destinations {
+        assert_eq!(
+            route_pad_input(destination, fixture.protected_control),
+            PadInputDisposition::ConsumedByRouter,
+            "Menu leaked to {destination:?}"
+        );
+        assert_eq!(
+            route_pad_input(destination, fixture.ordinary_control),
+            PadInputDisposition::RoutedTo(destination),
+            "negative control did not route to {destination:?}"
+        );
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct RefusalFixture {
+    scenario: String,
+    current_epoch: u64,
+    message_epoch: u64,
+    #[serde(default)]
+    request_id: u64,
+    #[serde(default)]
+    fd_count: usize,
+    #[serde(default)]
+    sequence: u64,
+    #[serde(default)]
+    role: Option<pf_input_ipc::OverlayRole>,
+}
+
+fn snapshot_for_epoch(epoch: u64) -> CompositorSnapshot {
+    let bytes = fs::read(fixture_dir("compositor-to-router").join("state-snapshot.json")).unwrap();
+    let message: CompositorToRouter = decode(&bytes).unwrap();
+    let CompositorToRouter::StateSnapshot { mut snapshot } = message else {
+        panic!("state-snapshot fixture decoded as the wrong message")
+    };
+    snapshot.epoch = epoch;
+    snapshot
+}
+
+#[test]
+fn every_stateful_refusal_has_a_named_fixture_and_positive_control() {
+    let expected: BTreeSet<String> = [
+        "refused-delta-before-snapshot",
+        "refused-duplicate-snapshot",
+        "refused-fd-on-refusal",
+        "refused-incomplete-snapshot",
+        "refused-missing-fd",
+        "refused-multiple-fds",
+        "refused-old-epoch",
+        "refused-replayed-power-sequence",
+        "refused-role-already-bound",
+        "refused-role-not-bound",
+        "refused-stale-request-id",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect();
+    let mut seen = BTreeSet::new();
+
+    for entry in fs::read_dir(fixture_dir("transcripts")).unwrap() {
+        let path = entry.unwrap().path();
+        let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+            continue;
+        };
+        if !stem.starts_with("refused-") {
+            continue;
+        }
+        seen.insert(stem.to_owned());
+        let fixture: RefusalFixture = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        let role = fixture.role.unwrap_or(pf_input_ipc::OverlayRole::Keyboard);
+        let mut session = CompositorSession::new(fixture.current_epoch);
+        let error = match fixture.scenario.as_str() {
+            "delta_before_snapshot" => session.accept_delta(fixture.message_epoch).unwrap_err(),
+            "old_epoch" => session.accept_delta(fixture.message_epoch).unwrap_err(),
+            "duplicate_snapshot" => {
+                let snapshot = snapshot_for_epoch(fixture.current_epoch);
+                session.apply_snapshot(snapshot.clone()).unwrap();
+                session.apply_snapshot(snapshot).unwrap_err()
+            }
+            "incomplete_snapshot" => {
+                let mut snapshot = snapshot_for_epoch(fixture.current_epoch);
+                snapshot.overlays.pop();
+                session.apply_snapshot(snapshot).unwrap_err()
+            }
+            "replayed_power_sequence" => {
+                session
+                    .apply_snapshot(snapshot_for_epoch(fixture.current_epoch))
+                    .unwrap();
+                session
+                    .protected_power(fixture.message_epoch, fixture.sequence, PowerState::Pressed)
+                    .unwrap_err()
+            }
+            "stale_request_id" => {
+                session
+                    .apply_snapshot(snapshot_for_epoch(fixture.current_epoch))
+                    .unwrap();
+                session
+                    .finish_trusted_connection(
+                        fixture.message_epoch,
+                        fixture.request_id,
+                        fixture.fd_count,
+                    )
+                    .unwrap_err()
+            }
+            "missing_fd" | "multiple_fds" | "fd_on_refusal" => {
+                session
+                    .apply_snapshot(snapshot_for_epoch(fixture.current_epoch))
+                    .unwrap();
+                session
+                    .begin_trusted_connection(fixture.message_epoch, fixture.request_id, role)
+                    .unwrap();
+                if fixture.scenario == "fd_on_refusal" {
+                    session
+                        .refuse_trusted_connection(
+                            fixture.message_epoch,
+                            fixture.request_id,
+                            fixture.fd_count,
+                        )
+                        .unwrap_err()
+                } else {
+                    session
+                        .finish_trusted_connection(
+                            fixture.message_epoch,
+                            fixture.request_id,
+                            fixture.fd_count,
+                        )
+                        .unwrap_err()
+                }
+            }
+            "role_already_bound" => {
+                session
+                    .apply_snapshot(snapshot_for_epoch(fixture.current_epoch))
+                    .unwrap();
+                session
+                    .begin_trusted_connection(fixture.message_epoch, fixture.request_id, role)
+                    .unwrap();
+                session
+                    .finish_trusted_connection(
+                        fixture.message_epoch,
+                        fixture.request_id,
+                        fixture.fd_count,
+                    )
+                    .unwrap();
+                session
+                    .begin_trusted_connection(fixture.message_epoch, fixture.request_id + 1, role)
+                    .unwrap_err()
+            }
+            "role_not_bound" => {
+                session
+                    .apply_snapshot(snapshot_for_epoch(fixture.current_epoch))
+                    .unwrap();
+                session
+                    .release_trusted_role(fixture.message_epoch, role)
+                    .unwrap_err()
+            }
+            other => panic!("unknown refusal scenario {other}"),
+        };
+        let expected_error = match fixture.scenario.as_str() {
+            "delta_before_snapshot" => CompositorStateError::SnapshotRequired,
+            "old_epoch" => CompositorStateError::OldEpoch {
+                got: fixture.message_epoch,
+                current: fixture.current_epoch,
+            },
+            "duplicate_snapshot" => CompositorStateError::SnapshotAlreadyApplied,
+            "incomplete_snapshot" => CompositorStateError::IncompleteSnapshot,
+            "replayed_power_sequence" => CompositorStateError::NonMonotonicPowerSequence {
+                got: fixture.sequence,
+                last: fixture.sequence,
+            },
+            "stale_request_id" => CompositorStateError::UnexpectedRequestId(fixture.request_id),
+            "missing_fd" => CompositorStateError::MissingFileDescriptor(fixture.request_id),
+            "multiple_fds" | "fd_on_refusal" => {
+                CompositorStateError::UnexpectedFileDescriptorCount {
+                    request_id: fixture.request_id,
+                    got: fixture.fd_count,
+                }
+            }
+            "role_already_bound" => CompositorStateError::RoleAlreadyBound(role),
+            "role_not_bound" => CompositorStateError::RoleNotBound(role),
+            other => panic!("unknown refusal scenario {other}"),
+        };
+        assert_eq!(error, expected_error, "{stem} exercised the wrong refusal");
+    }
+    assert_eq!(seen, expected);
+
+    // Positive controls run in the same invocation: current epoch, complete snapshot, fresh
+    // Power sequence, one pending request, exactly one fd, destroy-time release, and re-mint.
+    let mut good = CompositorSession::new(42);
+    good.apply_snapshot(snapshot_for_epoch(42)).unwrap();
+    assert_eq!(
+        good.protected_power(42, 93, PowerState::Pressed),
+        Ok(PowerStep::Accepted)
+    );
+    good.begin_trusted_connection(42, 8001, pf_input_ipc::OverlayRole::Menu)
+        .unwrap();
+    good.finish_trusted_connection(42, 8001, 1).unwrap();
+    good.release_trusted_role(42, pf_input_ipc::OverlayRole::Menu)
+        .unwrap();
+    good.begin_trusted_connection(42, 8002, pf_input_ipc::OverlayRole::Menu)
+        .unwrap();
+    good.finish_trusted_connection(42, 8002, 1).unwrap();
+}
+
+#[derive(Debug, Deserialize)]
+struct RoleReleaseRemintFixture {
+    epoch: u64,
+    first_request_id: u64,
+    second_request_id: u64,
+    role: pf_input_ipc::OverlayRole,
+    sequence: Vec<String>,
+}
+
+#[test]
+fn destroyed_role_is_released_before_a_fresh_fd_is_reminted() {
+    let path = fixture_dir("transcripts").join("role-release-remint.json");
+    let fixture: RoleReleaseRemintFixture =
+        serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+    assert_eq!(
+        fixture.sequence,
+        [
+            "mint_fresh_fd",
+            "destroy_client",
+            "release_role",
+            "remint_fresh_fd"
+        ]
+    );
+    let mut session = CompositorSession::new(fixture.epoch);
+    session
+        .apply_snapshot(snapshot_for_epoch(fixture.epoch))
+        .unwrap();
+    session
+        .begin_trusted_connection(fixture.epoch, fixture.first_request_id, fixture.role)
+        .unwrap();
+    session
+        .finish_trusted_connection(fixture.epoch, fixture.first_request_id, 1)
+        .unwrap();
+    session
+        .release_trusted_role(fixture.epoch, fixture.role)
+        .unwrap();
+    session
+        .begin_trusted_connection(fixture.epoch, fixture.second_request_id, fixture.role)
+        .unwrap();
+    session
+        .finish_trusted_connection(fixture.epoch, fixture.second_request_id, 1)
+        .unwrap();
 }
 
 /// Router death: the new connection refuses deltas and the old epoch until a complete replay,
