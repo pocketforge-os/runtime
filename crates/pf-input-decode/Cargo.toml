@@ -25,3 +25,7 @@ path = "src/bin/pf-input-decode.rs"
 # this crate sits BELOW pf-input-broker (it produces the evdev node the broker grabs), so it
 # deliberately takes no dependency on it.
 libc = { workspace = true }
+
+[dev-dependencies]
+# Hermetic fake-sysfs trees for the built-in identity tests (tests/builtin_identity.rs).
+tempfile = "3"

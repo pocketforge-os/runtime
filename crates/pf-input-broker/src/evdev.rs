@@ -4,7 +4,7 @@
 //! cannot bypass the broker to the raw device (R-B), on the vendor 4.9 kernel, with no namespaces.
 
 use std::io;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::path::Path;
 
 use crate::ioc;
@@ -209,6 +209,12 @@ impl Evdev {
 impl AsRawFd for Evdev {
     fn as_raw_fd(&self) -> RawFd {
         self.fd.as_raw_fd()
+    }
+}
+
+impl AsFd for Evdev {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.fd.as_fd()
     }
 }
 

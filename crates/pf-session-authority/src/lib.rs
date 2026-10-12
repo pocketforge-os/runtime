@@ -18,13 +18,40 @@
 //!
 //! The authority never waits on a client to make progress: [`run_service_loop`] drives
 //! [`Authority::tick`] at least once per tick interval between RPCs, so crash/exit detection,
-//! the restoration ladder and its deadlines advance while no shell is connected. The
+//! the restoration ladder and its deadlines advance while no shell is connected. The loop also
+//! wakes at armed deadlines themselves ([`Authority::time_until_next_deadline`]), so a graceful
+//! stop escalates at its deadline instead of up to a tick later. The
 //! presentation-acknowledgement rung has a deadline ([`DEFAULT_PRESENTATION_TIMEOUT`]); on expiry
 //! the authority records `RecoveryRequired` with reason `presentation_not_acknowledged` and keeps
 //! the owed receipt, so a late acknowledgement still completes the ladder truthfully. That is the
 //! only recovery a client can complete; every other `RecoveryRequired` reason stays terminal.
+//!
+//! Closes are the authority's own escalation ladder, and contract v2 of the RPC publishes its
+//! progress for the system menu (every-menu spec §9.6): `StoppingGracefully` when a graceful stop
+//! is accepted, `ForceStopping` (with its [`ForceStopReason`]) when the authority escalates by
+//! itself, and `StopFailed` when even the forced kill fails. `StopFailed` is durable and
+//! retryable — a further `SafeReturn` runs the whole close sequence again — because the menu row
+//! offers exactly that retry. Contract v1 clients never see these events; see
+//! `docs/SESSION-AUTHORITY-CONTRACT.md`. Right before every close-path escalation the optional
+//! [`EscalationHook`] fires synchronously so the root hang sampler can take its sample; with no
+//! hook attached the escalation path adds no observable delay.
 
-use pf_app_manifest::{validate_app_id, ReasonCode, Resolver};
+//! # URL handoff (tsp-ght0z)
+//!
+//! Apps never reach the authority. The input epic's SDK front forwards `OpenUrl` and
+//! `ReturnToCaller` over a private socket ([`spawn_front_acceptor`]), authenticated at accept by
+//! the front's uid and systemd unit, and every request carries the caller's process handle over
+//! `SCM_RIGHTS`. The authority re-derives the app id from that handle with the shared
+//! `pf-peer-identity` crate and compares it with the front's claim; nothing in the payload is
+//! trusted for identity. The trusted shell may also `OpenUrl` on its own socket.
+//!
+//! A successful `OpenUrl` opens the depth-1 [`ReturnSlot`]: the caller keeps running behind the
+//! handler, and `ReturnToCaller` restores it. The slot never stacks. A caller reaped by the
+//! memory policy answers `caller_gone`, a normal outcome. The URL is data in the
+//! [`UrlHandoff`]; no command template ever expands it. The foreground switch itself belongs to
+//! the trusted session path (G2.2–G2.4); [`CommandSystem`] refuses it until that lands.
+
+use pf_app_manifest::{parse_capability_requirement, validate_app_id, ReasonCode, Resolver};
 use pf_ports::{
     Clock, LaunchRequest, LaunchResult, MonotonicTime, ObservedSessionState, RecoveryRequired,
     SessionEvent, TerminalReceipt,
@@ -33,7 +60,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, VecDeque};
 use std::fs;
 use std::io;
-use std::io::Write;
+use std::io::{Read, Write};
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -45,8 +73,53 @@ use std::time::{Duration, Instant, SystemTime};
 /// Default deadline for the restored shell to acknowledge its first presentation.
 pub const DEFAULT_PRESENTATION_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Version of the private SDK-front wire ([`FrontEnvelope`]).
+pub const FRONT_WIRE_VERSION: u32 = 1;
+/// Manifest capability an app must declare to open URLs (owner decision B).
+pub const OPEN_URL_CAPABILITY: &str = "open_url";
+/// `OpenUrl` flag reserved for OAuth auth sessions (tsp-o9fo8); refused in v1.
+pub const OPEN_URL_FLAG_AUTH_SESSION: u32 = 1 << 0;
+/// `OpenUrl` flag for captive-portal sign-in (tsp-7s0ti); accepted only from the shell socket.
+pub const OPEN_URL_FLAG_CAPTIVE_PORTAL: u32 = 1 << 1;
+/// Longest URL the authority accepts, in bytes.
+pub const MAX_URL_BYTES: usize = 8 * 1024;
+/// `OpenUrl` requests allowed per caller within [`URL_RATE_WINDOW`].
+pub const URL_RATE_LIMIT: usize = 3;
+pub const URL_RATE_WINDOW: Duration = Duration::from_secs(10);
+/// Rate-limit key for the shell as a URL caller.
+pub const SHELL_CALLER_KEY: &str = "shell";
+const FOREGROUND_HANDOFF_UNAVAILABLE: &str =
+    "foreground handoff needs the trusted session path (G2.2 tsp-op5a.440.3, G2.3 tsp-op5a.440.4, G2.4 tsp-op5a.440.5)";
+
 /// Default cadence of the daemon's self-driven reconcile/deadline tick.
 pub const DEFAULT_TICK_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Default graceful-stop window before the authority escalates by itself.
+///
+/// Budget: grace (1500 ms) plus the root hang sampler's own bound (≤300 ms, `cr-collect`)
+/// must stay inside the app unit's `TimeoutStopSec=2 s` SIGKILL backstop, so escalation is
+/// the authority's decision and the backstop stays the last resort.
+pub const DEFAULT_GRACE_PERIOD: Duration = Duration::from_millis(1500);
+
+/// Baseline session RPC contract: launch/safe-return/events/acknowledge/history/observe/tick
+/// with the original event vocabulary. Requests without a `contract` field mean v1.
+pub const SESSION_RPC_CONTRACT_V1: u32 = 1;
+
+/// Adds the close-progress events the system menu renders (every-menu spec §9.6):
+/// `stopping_gracefully`, `force_stopping` and `stop_failed`. Purely additive: the v1 stream
+/// and its persisted sequences are unchanged.
+pub const SESSION_RPC_CONTRACT_V2: u32 = 2;
+
+/// Newest contract this authority serves. A request for a newer one is refused explicitly.
+pub const SESSION_RPC_CONTRACT_CURRENT: u32 = SESSION_RPC_CONTRACT_V2;
+
+const fn default_rpc_contract() -> u32 {
+    SESSION_RPC_CONTRACT_V1
+}
+
+const fn is_v1_rpc_contract(contract: &u32) -> bool {
+    *contract == SESSION_RPC_CONTRACT_V1
+}
 
 /// Bounds for the daemon's connection I/O, which runs off the authority loop.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -159,6 +232,16 @@ pub enum Phase {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pending_receipt: Option<Receipt>,
     },
+    /// A close path could not kill the app (`systemctl kill` itself failed). Durable and
+    /// retryable: a further `SafeReturn` runs the full close sequence again, and the session
+    /// only ends through the ordinary observation ladder. `reason` uses the same
+    /// `{code}: {detail}` shape as [`Phase::RecoveryRequired`].
+    StopFailed {
+        session_id: String,
+        #[serde(default)]
+        item_id: String,
+        reason: String,
+    },
 }
 
 impl Phase {
@@ -172,6 +255,7 @@ impl Phase {
             Self::ForceStopping { .. } => "force_stopping",
             Self::Restoring { .. } => "restoring",
             Self::RecoveryRequired { .. } => "recovery_required",
+            Self::StopFailed { .. } => "stop_failed",
         }
     }
 }
@@ -203,6 +287,72 @@ enum WireEvent {
         session_id: String,
         reason: String,
     },
+    // Contract v2 close-progress events (every-menu spec §9.6). Durable like every other
+    // published event; never delivered to a v1 client.
+    StoppingGracefully {
+        session_id: String,
+    },
+    ForceStopping {
+        session_id: String,
+        reason: ForceStopReason,
+    },
+    StopFailed {
+        session_id: String,
+        reason: String,
+    },
+}
+
+/// Why the authority escalated to its forced kill. The menu shows `StopTimeout` as
+/// "‹App› didn't stop in time" (§9.6).
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ForceStopReason {
+    /// The app did not stop inside the graceful window.
+    StopTimeout,
+    /// The graceful-stop request itself failed, so the kill was immediate.
+    StopRequestFailed,
+}
+
+impl ForceStopReason {
+    /// Stable snake_case name used in diagnostics and on the wire.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::StopTimeout => "stop_timeout",
+            Self::StopRequestFailed => "stop_request_failed",
+        }
+    }
+}
+
+/// Who asked for a URL handoff and therefore owns the return.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SlotCaller {
+    /// The trusted shell: returning means Home.
+    Shell,
+    /// The foreground app, which keeps running behind the handler.
+    App { session_id: String, item_id: String },
+}
+
+/// The depth-1 return slot. Exactly one handoff can be outstanding; it never stacks.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ReturnSlot {
+    pub caller: SlotCaller,
+    pub handler_session_id: String,
+    pub handler_item_id: String,
+    /// The app caller ended (memory policy, crash or exit) while the handler was in front. The
+    /// handler was promoted to the foreground session; `ReturnToCaller` answers `caller_gone`.
+    #[serde(default)]
+    pub caller_gone: bool,
+}
+
+/// A foreground-changing URL operation that was made durable before its external side effect.
+/// Reconciliation may replay it, so [`SessionSystem`] implementations must be idempotent for the
+/// session ids carried by the handoff or slot.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "operation", rename_all = "snake_case")]
+enum UrlTransition {
+    Opening { handoff: UrlHandoff },
+    Restoring { slot: ReturnSlot },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -215,6 +365,10 @@ pub struct PersistedState {
     safe_return_queue: u64,
     pub safe_return_binding_revision: u64,
     acknowledged: BTreeMap<String, u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub return_slot: Option<ReturnSlot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    url_transition: Option<UrlTransition>,
 }
 
 impl Default for PersistedState {
@@ -228,6 +382,8 @@ impl Default for PersistedState {
             safe_return_queue: 0,
             safe_return_binding_revision: 0,
             acknowledged: BTreeMap::new(),
+            return_slot: None,
+            url_transition: None,
         }
     }
 }
@@ -358,7 +514,11 @@ impl Default for CommandTemplates {
     fn default() -> Self {
         Self {
             start_foreground: words("systemctl start pf-app@{item_id}.service"),
-            request_graceful_stop: words("systemctl stop pf-app@{item_id}.service"),
+            // --no-block: a blocking `systemctl stop` only returns after the unit's own
+            // TimeoutStopSec SIGKILL, which made the authority's escalation unreachable and
+            // burned the whole app window. The non-blocking job leaves the window to
+            // DEFAULT_GRACE_PERIOD, and the unit's TimeoutStopSec stays the last-resort backstop.
+            request_graceful_stop: words("systemctl stop --no-block pf-app@{item_id}.service"),
             enforce_termination: words("systemctl kill --kill-who=all pf-app@{item_id}.service"),
             activate_selected_owner: words("systemctl start pf-shell-selected.service"),
             systemd_reconciliation: true,
@@ -493,6 +653,25 @@ impl<E: CommandExecutor> CommandSystem<E> {
     }
 }
 
+/// One URL handoff for the session system: the URL is data here, never an argv token.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct UrlHandoff {
+    pub caller: SlotCaller,
+    pub handler_item_id: String,
+    pub handler_session_id: String,
+    pub url: String,
+    pub flags: u32,
+}
+
+/// How the handler took the URL.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UrlHandoffOutcome {
+    /// The handler was started as a new session with the URL.
+    Launched,
+    /// A running handler took the URL (a new tab) and was brought to the front.
+    Delivered,
+}
+
 /// Trait-shaped image/service integration. F13 supplies the real systemd implementation.
 pub trait SessionSystem {
     fn start_foreground(&mut self, request: &LaunchRequest, session_id: &str)
@@ -502,6 +681,44 @@ pub trait SessionSystem {
     fn activate_selected_owner(&mut self) -> Result<(), String>;
     fn lifecycle(&mut self, _item_id: &str) -> Result<Option<SystemLifecycle>, String> {
         Ok(None)
+    }
+    /// Start the handler (or deliver to a running one) with the URL as data and switch the
+    /// foreground to it, leaving an app caller running behind it. Calls with the same handler
+    /// session id must be idempotent because a durable intent is replayed after an ambiguous
+    /// crash boundary. The default refuses: the switch belongs to the trusted session path
+    /// (G2.2–G2.4).
+    fn open_url(&mut self, _handoff: &UrlHandoff) -> Result<UrlHandoffOutcome, String> {
+        Err(FOREGROUND_HANDOFF_UNAVAILABLE.to_owned())
+    }
+    /// Bring the slot's app caller back to the front; the handler keeps running behind it. Calls
+    /// for the same slot must be idempotent because a durable intent is replayed after an
+    /// ambiguous crash boundary.
+    fn restore_caller(&mut self, _slot: &ReturnSlot) -> Result<(), String> {
+        Err(FOREGROUND_HANDOFF_UNAVAILABLE.to_owned())
+    }
+}
+
+/// Resolves the default handler (a pf-app item id) for a URL scheme. The user's choice lives in
+/// pf-prefsd (owner decision D; read API in tsp-mv7zn).
+pub trait UrlHandlerResolver {
+    fn handler_for(&mut self, scheme: &str) -> Result<Option<String>, String>;
+}
+
+/// No handler installed: every `OpenUrl` answers `no_handler` (drives the QR fallback).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NoUrlHandler;
+impl UrlHandlerResolver for NoUrlHandler {
+    fn handler_for(&mut self, _scheme: &str) -> Result<Option<String>, String> {
+        Ok(None)
+    }
+}
+
+/// One fixed handler item for http and https (the daemon's `--url-handler`).
+#[derive(Clone, Debug)]
+pub struct FixedUrlHandler(pub String);
+impl UrlHandlerResolver for FixedUrlHandler {
+    fn handler_for(&mut self, _scheme: &str) -> Result<Option<String>, String> {
+        Ok(Some(self.0.clone()))
     }
 }
 
@@ -627,13 +844,67 @@ pub trait AuthorityApi {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "method", rename_all = "snake_case")]
 pub enum RpcRequest {
-    Launch { item_id: String },
+    Launch {
+        item_id: String,
+    },
     SafeReturn,
-    Events { client_id: String },
-    Acknowledge { client_id: String, sequence: u64 },
+    Events {
+        client_id: String,
+        /// Highest contract the client speaks. Absent means v1 (byte-identical requests for
+        /// old clients and old servers); a value above [`SESSION_RPC_CONTRACT_CURRENT`] is
+        /// refused with [`RpcResponse::Error`].
+        #[serde(
+            default = "default_rpc_contract",
+            skip_serializing_if = "is_v1_rpc_contract"
+        )]
+        contract: u32,
+    },
+    Acknowledge {
+        client_id: String,
+        sequence: u64,
+    },
     History,
-    Observe { observation: RpcObservation },
+    Observe {
+        observation: RpcObservation,
+    },
     Tick,
+    /// Open `url` in the default handler. On the front socket `app_id` is the front's claim,
+    /// re-verified against the forwarded process handle; on the shell socket it must be absent.
+    OpenUrl {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        app_id: Option<String>,
+        url: String,
+        #[serde(default)]
+        flags: u32,
+    },
+    /// Front socket only: the handler returns to the slot's caller. `url` is reserved for auth
+    /// sessions (tsp-o9fo8) and refused in v1.
+    ReturnToCaller {
+        app_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        url: Option<String>,
+    },
+}
+
+/// The private front socket's request: a wire version plus one [`RpcRequest`], of which only
+/// `open_url` and `return_to_caller` are accepted there.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct FrontEnvelope {
+    pub version: u32,
+    #[serde(flatten)]
+    pub request: RpcRequest,
+}
+
+/// Where a decoded request came from. Identity is never read from the payload.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RpcOrigin {
+    /// The shell's own socket (hidden from apps by the image).
+    Shell,
+    /// The root input broker on the shell socket. Its role is restricted to `SafeReturn`.
+    Broker,
+    /// The SDK front's private socket, with the app id re-derived from the forwarded process
+    /// handle, or the reason no app id could be derived.
+    Front { caller: Result<String, String> },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -665,54 +936,131 @@ impl From<RpcObservation> for Observation {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "result", rename_all = "snake_case")]
 pub enum RpcResponse {
-    Accepted { session_id: String },
+    Accepted {
+        session_id: String,
+    },
     RejectedBusy,
     ItemUnavailable,
-    Events { events: Vec<(u64, RpcEvent)> },
-    History { entries: Vec<HistoryEntry> },
+    Events {
+        events: Vec<(u64, RpcEvent)>,
+        /// The contract the events were selected for. Omitted on the wire for v1 so the
+        /// response stays byte-identical for pre-negotiation clients.
+        #[serde(
+            default = "default_rpc_contract",
+            skip_serializing_if = "is_v1_rpc_contract"
+        )]
+        contract: u32,
+    },
+    History {
+        entries: Vec<HistoryEntry>,
+    },
     Ok,
-    Error { message: String },
+    Error {
+        message: String,
+    },
+    /// `OpenUrl`: the handler was started as this session.
+    Launched {
+        session_id: String,
+    },
+    /// `OpenUrl`: a running handler took the URL as a new tab.
+    Delivered,
+    /// `OpenUrl`: no handler is installed (apps fall back, e.g. to a QR code).
+    NoHandler,
+    /// `OpenUrl`/`ReturnToCaller`: the URL is not an allowed http(s) URL.
+    InvalidUrl,
+    /// Refused: identity, capability, flags or not the right caller. The reason is logged.
+    Denied,
+    /// The slot is occupied, or the foreground is not in a state that can hand off.
+    Busy,
+    /// More than [`URL_RATE_LIMIT`] requests within [`URL_RATE_WINDOW`].
+    RateLimited,
+    /// `ReturnToCaller`: the caller is in front again.
+    Restored,
+    /// `ReturnToCaller`: the caller is no longer running (a normal outcome).
+    CallerGone,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum RpcEvent {
     Starting,
     Running,
     ObservationComplete,
-    Returned { session_id: String },
-    ForcedClose { session_id: String },
-    Crash { session_id: String, summary: String },
-    RecoveryRequired { session_id: String, reason: String },
+    Returned {
+        session_id: String,
+    },
+    ForcedClose {
+        session_id: String,
+    },
+    Crash {
+        session_id: String,
+        summary: String,
+    },
+    RecoveryRequired {
+        session_id: String,
+        reason: String,
+    },
+    /// Contract v2 close-progress events (every-menu spec §9.6). `ForcedClose` is the
+    /// "Returned with escalated flag" of the spec: the menu closes and toasts
+    /// "‹App› was force-closed".
+    StoppingGracefully {
+        session_id: String,
+    },
+    ForceStopping {
+        session_id: String,
+        reason: ForceStopReason,
+    },
+    StopFailed {
+        session_id: String,
+        reason: String,
+    },
 }
 
-impl From<SessionEvent> for RpcEvent {
-    fn from(value: SessionEvent) -> Self {
-        match value {
-            SessionEvent::Observed(ObservedSessionState::Starting) => Self::Starting,
-            SessionEvent::Observed(ObservedSessionState::Running) => Self::Running,
-            SessionEvent::Observed(ObservedSessionState::ObservationComplete) => {
-                Self::ObservationComplete
-            }
-            SessionEvent::Observed(ObservedSessionState::Suspended) => Self::Running,
-            SessionEvent::Terminal(TerminalReceipt::Returned { session_id }) => {
-                Self::Returned { session_id }
-            }
-            SessionEvent::Terminal(TerminalReceipt::ForcedClose { session_id }) => {
-                Self::ForcedClose { session_id }
-            }
-            SessionEvent::Terminal(TerminalReceipt::Crash {
-                session_id,
-                summary,
-            }) => Self::Crash {
-                session_id,
-                summary,
+/// True for events that exist only in contract v2 and must never reach a v1 client.
+const fn is_close_progress(event: &WireEvent) -> bool {
+    matches!(
+        event,
+        WireEvent::StoppingGracefully { .. }
+            | WireEvent::ForceStopping { .. }
+            | WireEvent::StopFailed { .. }
+    )
+}
+
+fn wire_to_rpc(event: &WireEvent) -> RpcEvent {
+    match event {
+        WireEvent::ObservedStarting => RpcEvent::Starting,
+        WireEvent::ObservedRunning => RpcEvent::Running,
+        WireEvent::ObservationComplete => RpcEvent::ObservationComplete,
+        WireEvent::Terminal {
+            session_id,
+            receipt,
+        } => match receipt {
+            Receipt::Returned => RpcEvent::Returned {
+                session_id: session_id.clone(),
             },
-            SessionEvent::RecoveryRequired(value) => Self::RecoveryRequired {
-                session_id: value.session_id,
-                reason: value.reason,
+            Receipt::ForcedClose => RpcEvent::ForcedClose {
+                session_id: session_id.clone(),
             },
-        }
+            Receipt::Crash { summary } => RpcEvent::Crash {
+                session_id: session_id.clone(),
+                summary: summary.clone(),
+            },
+        },
+        WireEvent::RecoveryRequired { session_id, reason } => RpcEvent::RecoveryRequired {
+            session_id: session_id.clone(),
+            reason: reason.clone(),
+        },
+        WireEvent::StoppingGracefully { session_id } => RpcEvent::StoppingGracefully {
+            session_id: session_id.clone(),
+        },
+        WireEvent::ForceStopping { session_id, reason } => RpcEvent::ForceStopping {
+            session_id: session_id.clone(),
+            reason: *reason,
+        },
+        WireEvent::StopFailed { session_id, reason } => RpcEvent::StopFailed {
+            session_id: session_id.clone(),
+            reason: reason.clone(),
+        },
     }
 }
 
@@ -727,19 +1075,26 @@ pub fn serve_connection<S: StateStore, B: SessionSystem, C: Clock>(
     let body = pf_wire::read_frame(stream).map_err(|e| AuthorityError::Backend(e.to_string()))?;
     let request: RpcRequest =
         serde_json::from_slice(&body).map_err(|e| AuthorityError::Backend(e.to_string()))?;
-    let response = handle_rpc(authority, request).unwrap_or_else(|error| RpcResponse::Error {
-        message: format!("{error:?}"),
-    });
+    let response = dispatch_rpc(authority, request);
     let body = serde_json::to_vec(&response).map_err(|e| AuthorityError::Backend(e.to_string()))?;
     pf_wire::write_frame(writer, &body).map_err(|e| AuthorityError::Backend(e.to_string()))
 }
 
-/// Runs one complete, decoded request against the authority. Never touches a socket.
+/// Runs one complete, decoded shell-socket request against the authority. Never touches a socket.
 pub fn dispatch_rpc<S: StateStore, B: SessionSystem, C: Clock>(
     authority: &mut Authority<S, B, C>,
     request: RpcRequest,
 ) -> RpcResponse {
-    handle_rpc(authority, request).unwrap_or_else(|error| RpcResponse::Error {
+    dispatch_rpc_from(authority, RpcOrigin::Shell, request)
+}
+
+/// Runs one decoded request of known origin against the authority.
+pub fn dispatch_rpc_from<S: StateStore, B: SessionSystem, C: Clock>(
+    authority: &mut Authority<S, B, C>,
+    origin: RpcOrigin,
+    request: RpcRequest,
+) -> RpcResponse {
+    handle_rpc_from(authority, origin, request).unwrap_or_else(|error| RpcResponse::Error {
         message: format!("{error:?}"),
     })
 }
@@ -748,6 +1103,7 @@ pub fn dispatch_rpc<S: StateStore, B: SessionSystem, C: Clock>(
 pub struct PendingRpc {
     pub request: RpcRequest,
     reply: mpsc::Sender<RpcResponse>,
+    origin: RpcOrigin,
 }
 
 impl PendingRpc {
@@ -755,6 +1111,280 @@ impl PendingRpc {
     pub fn respond(self, response: RpcResponse) {
         let _ = self.reply.send(response);
     }
+    pub fn origin(&self) -> &RpcOrigin {
+        &self.origin
+    }
+    /// Dispatches with the connection's verified origin and answers it.
+    pub fn dispatch<S: StateStore, B: SessionSystem, C: Clock>(
+        self,
+        authority: &mut Authority<S, B, C>,
+    ) {
+        let response = dispatch_rpc_from(authority, self.origin.clone(), self.request.clone());
+        self.respond(response);
+    }
+}
+
+/// How the private front socket authenticates its peer and derives the caller's app id. Both
+/// are injectable so hermetic tests can stand in for the SDK front and app units; production uses
+/// [`FrontPolicy::kernel`], the shared `pf-peer-identity` implementation.
+#[derive(Clone)]
+pub struct FrontPolicy {
+    authenticate_peer: Arc<PeerAuthenticator>,
+    derive_caller: Arc<CallerDeriver>,
+}
+
+/// Accepts or refuses an accepted front connection.
+pub type PeerAuthenticator = dyn Fn(&UnixStream) -> io::Result<()> + Send + Sync;
+/// Derives the caller's app id from the forwarded process handle, or the refusal reason.
+pub type CallerDeriver = dyn Fn(OwnedFd) -> Result<String, String> + Send + Sync;
+
+/// How the shell socket authenticates and classifies its two legitimate peers. The resolver is
+/// injectable for hermetic tests; production uses the shared `pf-peer-identity` implementation.
+#[derive(Clone)]
+pub struct ShellPolicy {
+    shell_uid: u32,
+    shell_unit: String,
+    broker_unit: String,
+    resolve_peer: Arc<ShellPeerResolver>,
+}
+
+type ShellPeerResolver =
+    dyn Fn(&UnixStream) -> io::Result<pf_peer_identity::PeerServiceIdentity> + Send + Sync;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ShellPeerRole {
+    Shell,
+    Broker,
+}
+
+impl ShellPolicy {
+    pub fn kernel(shell_uid: u32, shell_unit: String, broker_unit: String) -> io::Result<Self> {
+        Self::custom(
+            shell_uid,
+            shell_unit,
+            broker_unit,
+            pf_peer_identity::peer_service_identity,
+        )
+    }
+
+    pub fn custom(
+        shell_uid: u32,
+        shell_unit: String,
+        broker_unit: String,
+        resolve_peer: impl Fn(&UnixStream) -> io::Result<pf_peer_identity::PeerServiceIdentity>
+            + Send
+            + Sync
+            + 'static,
+    ) -> io::Result<Self> {
+        if shell_uid == 0 && shell_unit == broker_unit {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("shell uid=0 unit={shell_unit} overlaps the root broker identity"),
+            ));
+        }
+        Ok(Self {
+            shell_uid,
+            shell_unit,
+            broker_unit,
+            resolve_peer: Arc::new(resolve_peer),
+        })
+    }
+
+    fn authenticate_peer(&self, stream: &UnixStream) -> io::Result<ShellPeerRole> {
+        let identity = (self.resolve_peer)(stream)?;
+        if identity.cred.uid == self.shell_uid && identity.unit == self.shell_unit {
+            return Ok(ShellPeerRole::Shell);
+        }
+        if identity.cred.uid == 0 && identity.unit == self.broker_unit {
+            return Ok(ShellPeerRole::Broker);
+        }
+        Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "refused peer pid={} uid={} unit={} (expected uid={} unit={} or uid=0 unit={})",
+                identity.cred.pid,
+                identity.cred.uid,
+                identity.unit,
+                self.shell_uid,
+                self.shell_unit,
+                self.broker_unit
+            ),
+        ))
+    }
+}
+
+impl FrontPolicy {
+    /// The SDK front is exactly `front_unit` running as `front_uid`; callers are the
+    /// `pf-app@<id>.service` unit of the forwarded process handle.
+    pub fn kernel(front_uid: u32, front_unit: String) -> Self {
+        Self {
+            authenticate_peer: Arc::new(move |stream| {
+                pf_peer_identity::verify_peer_service(stream, front_uid, &front_unit)
+            }),
+            derive_caller: Arc::new(|fd| {
+                pf_peer_identity::ReceivedProcess::from_fd(fd)
+                    .and_then(|process| process.app_id())
+                    .map_err(|error| error.to_string())
+            }),
+        }
+    }
+
+    pub fn custom(
+        authenticate_peer: impl Fn(&UnixStream) -> io::Result<()> + Send + Sync + 'static,
+        derive_caller: impl Fn(OwnedFd) -> Result<String, String> + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            authenticate_peer: Arc::new(authenticate_peer),
+            derive_caller: Arc::new(derive_caller),
+        }
+    }
+}
+
+/// Sends one front request: the framed envelope and the caller's process handle in a single
+/// `sendmsg`, as the SDK front does.
+pub fn send_front_request(
+    stream: &UnixStream,
+    envelope: &FrontEnvelope,
+    process_handle: Option<std::os::fd::BorrowedFd<'_>>,
+) -> io::Result<()> {
+    let body = serde_json::to_vec(envelope).map_err(io::Error::other)?;
+    if body.len() > pf_wire::MAX_FRAME {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "frame too large",
+        ));
+    }
+    let mut frame = (body.len() as u32).to_be_bytes().to_vec();
+    frame.extend_from_slice(&body);
+    pf_peer_identity::scm::send_with_fd(stream.as_raw_fd(), &frame, process_handle)
+}
+
+/// Reads one `pf-wire` frame whose first bytes may carry one `SCM_RIGHTS` descriptor.
+fn read_frame_with_fd(stream: &mut UnixStream) -> io::Result<(Vec<u8>, Option<OwnedFd>)> {
+    let mut buffer = vec![0u8; 4 + pf_wire::MAX_FRAME];
+    let (mut filled, fd) = pf_peer_identity::scm::recv_with_fd(stream.as_raw_fd(), &mut buffer)?;
+    if filled == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "peer closed before a request",
+        ));
+    }
+    while filled < 4 {
+        let read = stream.read(&mut buffer[filled..4])?;
+        if read == 0 {
+            return Err(io::ErrorKind::UnexpectedEof.into());
+        }
+        filled += read;
+    }
+    let len = u32::from_be_bytes([buffer[0], buffer[1], buffer[2], buffer[3]]) as usize;
+    if len > pf_wire::MAX_FRAME {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("frame too large: {len}"),
+        ));
+    }
+    let end = 4 + len;
+    if filled < end {
+        stream.read_exact(&mut buffer[filled..end])?;
+    }
+    buffer.truncate(end);
+    buffer.drain(..4);
+    Ok((buffer, fd))
+}
+
+/// Accepts the SDK front on its private socket. Each connection is authenticated by
+/// `policy` before a byte is read; a non-front peer is closed without a frame and logged. One
+/// request per connection, carrying the caller's process handle, decoded under `io_timeout` and
+/// forwarded to the authority loop with its verified origin.
+pub fn spawn_front_acceptor(
+    listener: UnixListener,
+    requests: mpsc::Sender<io::Result<PendingRpc>>,
+    limits: ConnectionLimits,
+    policy: FrontPolicy,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        let active = Arc::new(AtomicUsize::new(0));
+        for connection in listener.incoming() {
+            let stream = match connection {
+                Ok(stream) => stream,
+                Err(error) => {
+                    let _ = requests.send(Err(error));
+                    return;
+                }
+            };
+            if active.fetch_add(1, Ordering::AcqRel) >= limits.max_connections {
+                active.fetch_sub(1, Ordering::AcqRel);
+                eprintln!(
+                    "pf-session-authorityd: front_refused reason=too_many_connections limit={}",
+                    limits.max_connections
+                );
+                continue;
+            }
+            let (requests, active, policy) = (requests.clone(), active.clone(), policy.clone());
+            thread::spawn(move || {
+                if let Err(error) = serve_front_connection(stream, &requests, limits, &policy) {
+                    eprintln!("pf-session-authorityd: front connection error: {error:?}");
+                }
+                active.fetch_sub(1, Ordering::AcqRel);
+            });
+        }
+    })
+}
+
+fn serve_front_connection(
+    mut stream: UnixStream,
+    requests: &mpsc::Sender<io::Result<PendingRpc>>,
+    limits: ConnectionLimits,
+    policy: &FrontPolicy,
+) -> Result<(), AuthorityError> {
+    let backend = |error: &dyn std::fmt::Display| AuthorityError::Backend(error.to_string());
+    if let Err(error) = (policy.authenticate_peer)(&stream) {
+        eprintln!(
+            "pf-session-authorityd: front_refused reason=peer_identity detail={}",
+            json_string(&error.to_string())
+        );
+        return Ok(());
+    }
+    stream
+        .set_read_timeout(Some(limits.io_timeout))
+        .and_then(|()| stream.set_write_timeout(Some(limits.io_timeout)))
+        .map_err(|e| backend(&e))?;
+    let (body, handle) = read_frame_with_fd(&mut stream).map_err(|e| backend(&e))?;
+    let response = match serde_json::from_slice::<FrontEnvelope>(&body) {
+        Ok(envelope) if envelope.version != FRONT_WIRE_VERSION => RpcResponse::Error {
+            message: format!(
+                "unsupported front wire version {} (expected {FRONT_WIRE_VERSION})",
+                envelope.version
+            ),
+        },
+        Ok(FrontEnvelope {
+            request: request @ (RpcRequest::OpenUrl { .. } | RpcRequest::ReturnToCaller { .. }),
+            ..
+        }) => {
+            let caller = match handle {
+                Some(fd) => (policy.derive_caller)(fd),
+                None => Err("missing_process_handle".to_owned()),
+            };
+            let (reply, response) = mpsc::channel();
+            let pending = PendingRpc {
+                request,
+                reply,
+                origin: RpcOrigin::Front { caller },
+            };
+            if requests.send(Ok(pending)).is_err() {
+                return Err(AuthorityError::Backend("authority loop stopped".into()));
+            }
+            response
+                .recv_timeout(limits.response_timeout)
+                .map_err(|e| backend(&e))?
+        }
+        Ok(_) => RpcResponse::Error {
+            message: "verb not accepted on the front socket".into(),
+        },
+        Err(error) => return Err(backend(&error)),
+    };
+    let body = serde_json::to_vec(&response).map_err(|e| backend(&e))?;
+    pf_wire::write_frame(&mut stream, &body).map_err(|e| backend(&e))
 }
 
 /// Accepts connections on a helper thread and serves each on its own bounded thread.
@@ -768,6 +1398,7 @@ pub fn spawn_rpc_acceptor(
     listener: UnixListener,
     requests: mpsc::Sender<io::Result<PendingRpc>>,
     limits: ConnectionLimits,
+    policy: ShellPolicy,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let active = Arc::new(AtomicUsize::new(0));
@@ -787,9 +1418,9 @@ pub fn spawn_rpc_acceptor(
                 );
                 continue;
             }
-            let (requests, active) = (requests.clone(), active.clone());
+            let (requests, active, policy) = (requests.clone(), active.clone(), policy.clone());
             thread::spawn(move || {
-                if let Err(error) = serve_rpc_connection(stream, &requests, limits) {
+                if let Err(error) = serve_rpc_connection(stream, &requests, limits, &policy) {
                     eprintln!("pf-session-authorityd: connection error: {error:?}");
                 }
                 active.fetch_sub(1, Ordering::AcqRel);
@@ -802,8 +1433,20 @@ fn serve_rpc_connection(
     mut stream: UnixStream,
     requests: &mpsc::Sender<io::Result<PendingRpc>>,
     limits: ConnectionLimits,
+    policy: &ShellPolicy,
 ) -> Result<(), AuthorityError> {
     let backend = |error: &dyn std::fmt::Display| AuthorityError::Backend(error.to_string());
+    let origin = match policy.authenticate_peer(&stream) {
+        Ok(ShellPeerRole::Shell) => RpcOrigin::Shell,
+        Ok(ShellPeerRole::Broker) => RpcOrigin::Broker,
+        Err(error) => {
+            eprintln!(
+                "pf-session-authorityd: shell_refused reason=peer_identity detail={}",
+                json_string(&error.to_string())
+            );
+            return Ok(());
+        }
+    };
     stream
         .set_read_timeout(Some(limits.io_timeout))
         .and_then(|()| stream.set_write_timeout(Some(limits.io_timeout)))
@@ -812,7 +1455,12 @@ fn serve_rpc_connection(
     let response = match serde_json::from_slice::<RpcRequest>(&body) {
         Ok(request) => {
             let (reply, response) = mpsc::channel();
-            if requests.send(Ok(PendingRpc { request, reply })).is_err() {
+            let pending = PendingRpc {
+                request,
+                reply,
+                origin,
+            };
+            if requests.send(Ok(pending)).is_err() {
                 return Err(AuthorityError::Backend("authority loop stopped".into()));
             }
             response
@@ -825,11 +1473,68 @@ fn serve_rpc_connection(
     pf_wire::write_frame(&mut stream, &body).map_err(|e| backend(&e))
 }
 
+/// Shell-socket request handling (the existing tests' entry point).
+#[cfg(test)]
 fn handle_rpc<S: StateStore, B: SessionSystem, C: Clock>(
     authority: &mut Authority<S, B, C>,
     request: RpcRequest,
 ) -> Result<RpcResponse, AuthorityError> {
+    handle_rpc_from(authority, RpcOrigin::Shell, request)
+}
+
+fn handle_rpc_from<S: StateStore, B: SessionSystem, C: Clock>(
+    authority: &mut Authority<S, B, C>,
+    origin: RpcOrigin,
+    request: RpcRequest,
+) -> Result<RpcResponse, AuthorityError> {
+    if origin == RpcOrigin::Broker && !matches!(&request, RpcRequest::SafeReturn) {
+        authority.log(&format!(
+            "pf-session-authorityd: shell_refused reason=peer_scope role=broker method={}",
+            rpc_method(&request)
+        ));
+        return Ok(RpcResponse::Denied);
+    }
     Ok(match request {
+        RpcRequest::OpenUrl { app_id, url, flags } => {
+            let caller = match (origin, app_id) {
+                (RpcOrigin::Shell, None) => UrlCaller::Shell,
+                (RpcOrigin::Shell, Some(claimed)) => {
+                    authority.log(&url_refusal_line(
+                        "open_url",
+                        "claim_without_identity",
+                        &claimed,
+                        None,
+                    ));
+                    return Ok(RpcResponse::Denied);
+                }
+                (RpcOrigin::Front { caller }, claimed) => {
+                    match authority.verify_front_caller("open_url", caller, claimed) {
+                        Some(app_id) => UrlCaller::App(app_id),
+                        None => return Ok(RpcResponse::Denied),
+                    }
+                }
+                (RpcOrigin::Broker, _) => unreachable!("broker requests are filtered above"),
+            };
+            authority.open_url(caller, &url, flags)?
+        }
+        RpcRequest::ReturnToCaller { app_id, url } => match origin {
+            RpcOrigin::Shell => {
+                authority.log(&url_refusal_line(
+                    "return_to_caller",
+                    "front_only",
+                    &app_id,
+                    None,
+                ));
+                RpcResponse::Denied
+            }
+            RpcOrigin::Front { caller } => {
+                match authority.verify_front_caller("return_to_caller", caller, Some(app_id)) {
+                    Some(app_id) => authority.return_to_caller(&app_id, url.as_deref())?,
+                    None => RpcResponse::Denied,
+                }
+            }
+            RpcOrigin::Broker => unreachable!("broker requests are filtered above"),
+        },
         RpcRequest::Launch { item_id } => match authority.launch(LaunchRequest { item_id })? {
             LaunchResult::Accepted { session_id } => RpcResponse::Accepted { session_id },
             LaunchResult::RejectedBusy => RpcResponse::RejectedBusy,
@@ -838,23 +1543,28 @@ fn handle_rpc<S: StateStore, B: SessionSystem, C: Clock>(
         RpcRequest::SafeReturn => {
             if matches!(
                 authority.state.phase,
-                Phase::Starting { .. } | Phase::Running { .. }
+                Phase::Starting { .. } | Phase::Running { .. } | Phase::StopFailed { .. }
             ) {
                 authority.intake_safe_return()?;
                 authority.reconcile()?;
             }
             RpcResponse::Ok
         }
-        RpcRequest::Events { client_id } => RpcResponse::Events {
-            events: {
-                authority.reconcile()?;
-                authority
-                    .events_for(&client_id)
-                    .into_iter()
-                    .map(|(s, e)| (s, e.into()))
-                    .collect()
-            },
-        },
+        RpcRequest::Events {
+            client_id,
+            contract,
+        } => {
+            if contract > SESSION_RPC_CONTRACT_CURRENT {
+                return Ok(RpcResponse::Error {
+                    message: format!("unsupported session rpc contract {contract}"),
+                });
+            }
+            authority.reconcile()?;
+            RpcResponse::Events {
+                events: authority.rpc_events_for(&client_id, contract),
+                contract,
+            }
+        }
         RpcRequest::Acknowledge {
             client_id,
             sequence,
@@ -876,12 +1586,39 @@ fn handle_rpc<S: StateStore, B: SessionSystem, C: Clock>(
     })
 }
 
+fn rpc_method(request: &RpcRequest) -> &'static str {
+    match request {
+        RpcRequest::Launch { .. } => "launch",
+        RpcRequest::SafeReturn => "safe_return",
+        RpcRequest::Events { .. } => "events",
+        RpcRequest::Acknowledge { .. } => "acknowledge",
+        RpcRequest::History => "history",
+        RpcRequest::Observe { .. } => "observe",
+        RpcRequest::Tick => "tick",
+        RpcRequest::OpenUrl { .. } => "open_url",
+        RpcRequest::ReturnToCaller { .. } => "return_to_caller",
+    }
+}
+
 /// Receives one complete diagnostic line (no trailing newline).
 pub type LogSink = Box<dyn FnMut(&str) + Send>;
 
 fn stderr_log_sink() -> LogSink {
     Box::new(|line: &str| eprintln!("{line}"))
 }
+
+/// Everything a sampler needs to capture the hang it is about to escalate out of.
+pub struct EscalationContext<'a> {
+    pub session_id: &'a str,
+    pub item_id: &'a str,
+    pub reason: ForceStopReason,
+}
+
+/// Fires synchronously immediately before every close-path `enforce_termination`, so the root
+/// hang sampler (`cr-collect`) can seize, unwind and detach inside its own budget. The
+/// authority adds no delay of its own: with no hook attached the escalation is a single
+/// branch. The hook owns its time bound; the close is never delayed past it by the authority.
+pub type EscalationHook = Box<dyn FnMut(&EscalationContext) + Send>;
 
 pub struct Authority<S, B, C> {
     store: S,
@@ -895,7 +1632,154 @@ pub struct Authority<S, B, C> {
     presentation_timeout: Duration,
     presentation_deadline: Option<MonotonicTime>,
     log: LogSink,
+    escalation: Option<EscalationHook>,
     now_fn: fn() -> SystemTime,
+    url_handler: Box<dyn UrlHandlerResolver + Send>,
+    /// Monotonic `OpenUrl` timestamps per caller, oldest first (memory only).
+    url_rate: BTreeMap<String, VecDeque<MonotonicTime>>,
+}
+
+/// The verified caller of an `OpenUrl`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum UrlCaller {
+    Shell,
+    App(String),
+}
+
+/// Why a URL was refused as `invalid_url`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UrlRejection {
+    TooLong,
+    ControlOrNonAscii,
+    NoScheme,
+    SchemeNotAllowed,
+    NoAuthority,
+    EmptyHost,
+}
+
+impl UrlRejection {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::TooLong => "too_long",
+            Self::ControlOrNonAscii => "control_or_non_ascii",
+            Self::NoScheme => "no_scheme",
+            Self::SchemeNotAllowed => "scheme_not_allowed",
+            Self::NoAuthority => "no_authority",
+            Self::EmptyHost => "empty_host",
+        }
+    }
+}
+
+/// The v1 URL policy: http or https (any case), an authority with a host, printable ASCII only,
+/// at most [`MAX_URL_BYTES`]. Returns the lowercase scheme. `file:`, `data:`, `javascript:` and
+/// every other scheme are refused.
+pub fn validate_url(url: &str) -> Result<&'static str, UrlRejection> {
+    if url.len() > MAX_URL_BYTES {
+        return Err(UrlRejection::TooLong);
+    }
+    if url.bytes().any(|byte| !(0x21..0x7f).contains(&byte)) {
+        return Err(UrlRejection::ControlOrNonAscii);
+    }
+    let (scheme, rest) = url.split_once(':').ok_or(UrlRejection::NoScheme)?;
+    let scheme = if scheme.eq_ignore_ascii_case("http") {
+        "http"
+    } else if scheme.eq_ignore_ascii_case("https") {
+        "https"
+    } else {
+        return Err(UrlRejection::SchemeNotAllowed);
+    };
+    let authority = rest.strip_prefix("//").ok_or(UrlRejection::NoAuthority)?;
+    let authority = authority.split(['/', '?', '#']).next().unwrap_or("");
+    let host_port = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    if !valid_host_port(host_port) {
+        return Err(UrlRejection::EmptyHost);
+    }
+    Ok(scheme)
+}
+
+fn valid_host_port(host_port: &str) -> bool {
+    if let Some(bracketed) = host_port.strip_prefix('[') {
+        let Some((host, rest)) = bracketed.split_once(']') else {
+            return false;
+        };
+        return host.parse::<std::net::Ipv6Addr>().is_ok() && valid_port_suffix(rest);
+    }
+    if host_port.contains(['[', ']']) {
+        return false;
+    }
+    let (host, port) = match host_port.split_once(':') {
+        Some((host, port)) if !port.contains(':') => (host, Some(port)),
+        Some(_) => return false,
+        None => (host_port, None),
+    };
+    !host.is_empty() && valid_reg_name(host) && port.is_none_or(valid_port)
+}
+
+fn valid_port_suffix(suffix: &str) -> bool {
+    if suffix.is_empty() {
+        return true;
+    }
+    let Some(port) = suffix.strip_prefix(':') else {
+        return false;
+    };
+    valid_port(port)
+}
+
+fn valid_port(port: &str) -> bool {
+    !port.is_empty()
+        && port.bytes().all(|byte| byte.is_ascii_digit())
+        && port.parse::<u16>().is_ok()
+}
+
+fn valid_reg_name(host: &str) -> bool {
+    let bytes = host.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if byte == b'%' {
+            if index + 2 >= bytes.len()
+                || !bytes[index + 1].is_ascii_hexdigit()
+                || !bytes[index + 2].is_ascii_hexdigit()
+            {
+                return false;
+            }
+            index += 3;
+            continue;
+        }
+        if !(byte.is_ascii_alphanumeric()
+            || matches!(
+                byte,
+                b'-' | b'.'
+                    | b'_'
+                    | b'~'
+                    | b'!'
+                    | b'$'
+                    | b'&'
+                    | b'\''
+                    | b'('
+                    | b')'
+                    | b'*'
+                    | b'+'
+                    | b','
+                    | b';'
+                    | b'='
+            ))
+        {
+            return false;
+        }
+        index += 1;
+    }
+    true
+}
+
+fn declares_open_url(manifest: &pf_app_manifest::Manifest) -> bool {
+    manifest
+        .app
+        .capabilities
+        .iter()
+        .any(|capability| parse_capability_requirement(capability).base == OPEN_URL_CAPABILITY)
 }
 
 impl<S: StateStore, B: SessionSystem, C: Clock> Authority<S, B, C> {
@@ -985,8 +1869,16 @@ impl<S: StateStore, B: SessionSystem, C: Clock> Authority<S, B, C> {
             presentation_timeout: DEFAULT_PRESENTATION_TIMEOUT,
             presentation_deadline: None,
             log: stderr_log_sink(),
+            escalation: None,
             now_fn,
+            url_handler: Box::new(NoUrlHandler),
+            url_rate: BTreeMap::new(),
         })
+    }
+    /// Replaces the default [`NoUrlHandler`] resolver.
+    pub fn with_url_handler(mut self, handler: impl UrlHandlerResolver + Send + 'static) -> Self {
+        self.url_handler = Box::new(handler);
+        self
     }
     /// Overrides [`DEFAULT_PRESENTATION_TIMEOUT`], the deadline for the restored shell to
     /// acknowledge presentation before the authority records `presentation_not_acknowledged`.
@@ -997,6 +1889,14 @@ impl<S: StateStore, B: SessionSystem, C: Clock> Authority<S, B, C> {
     /// Replaces the default stderr diagnostic sink (tests capture lines with this).
     pub fn with_log_sink(mut self, sink: impl FnMut(&str) + Send + 'static) -> Self {
         self.log = Box::new(sink);
+        self
+    }
+    /// Attaches the sampler hook that fires immediately before every close-path escalation.
+    pub fn with_escalation_hook(
+        mut self,
+        hook: impl FnMut(&EscalationContext) + Send + 'static,
+    ) -> Self {
+        self.escalation = Some(Box::new(hook));
         self
     }
     fn log(&mut self, line: &str) {
@@ -1019,7 +1919,8 @@ impl<S: StateStore, B: SessionSystem, C: Clock> Authority<S, B, C> {
             | Phase::StoppingGracefully { session_id, .. }
             | Phase::ForceStopping { session_id, .. }
             | Phase::Restoring { session_id, .. }
-            | Phase::RecoveryRequired { session_id, .. } => Some(session_id.clone()),
+            | Phase::RecoveryRequired { session_id, .. }
+            | Phase::StopFailed { session_id, .. } => Some(session_id.clone()),
         }
     }
     fn item_id(&self) -> Option<String> {
@@ -1030,7 +1931,8 @@ impl<S: StateStore, B: SessionSystem, C: Clock> Authority<S, B, C> {
             | Phase::StoppingGracefully { item_id, .. }
             | Phase::ForceStopping { item_id, .. }
             | Phase::Restoring { item_id, .. }
-            | Phase::RecoveryRequired { item_id, .. } => Some(item_id.clone()),
+            | Phase::RecoveryRequired { item_id, .. }
+            | Phase::StopFailed { item_id, .. } => Some(item_id.clone()),
         }
     }
     fn publish(&mut self, event: WireEvent) {
@@ -1075,6 +1977,47 @@ impl<S: StateStore, B: SessionSystem, C: Clock> Authority<S, B, C> {
         self.publish(WireEvent::RecoveryRequired { session_id, reason });
         self.persist()
     }
+    /// Runs the sampler hook (if any) and then the forced kill. Every close-path escalation
+    /// goes through here so the hook can never be bypassed; with no hook attached this is one
+    /// branch and the kill itself.
+    fn escalate(
+        &mut self,
+        item_id: &str,
+        session_id: &str,
+        reason: ForceStopReason,
+    ) -> Result<(), String> {
+        if let Some(hook) = self.escalation.as_mut() {
+            hook(&EscalationContext {
+                session_id,
+                item_id,
+                reason,
+            });
+        }
+        self.system.enforce_termination(item_id, session_id)
+    }
+    /// Records a kill failure on a close path as the durable, retryable `StopFailed` phase
+    /// (§9.6 "Stop failed") instead of a terminal recovery: the menu row keeps offering the
+    /// retry, and a further `SafeReturn` runs the whole close sequence again.
+    fn stop_failed(&mut self, detail: String) -> Result<(), AuthorityError> {
+        let session_id = self
+            .session_id()
+            .ok_or(AuthorityError::InvalidObservation)?;
+        let item_id = self.item_id().unwrap_or_default();
+        self.graceful_deadline = None;
+        let reason = format!("{}: {detail}", ReasonCode::AppExitFailed.as_str());
+        self.log(&lifecycle_failure_line(
+            ReasonCode::AppExitFailed.as_str(),
+            &item_id,
+            &detail,
+        ));
+        self.state.phase = Phase::StopFailed {
+            session_id: session_id.clone(),
+            item_id,
+            reason: reason.clone(),
+        };
+        self.publish(WireEvent::StopFailed { session_id, reason });
+        self.persist()
+    }
     pub fn update_safe_return_binding(&mut self, revision: u64) -> Result<(), AuthorityError> {
         if revision > self.state.safe_return_binding_revision {
             self.state.safe_return_binding_revision = revision;
@@ -1088,6 +2031,7 @@ impl<S: StateStore, B: SessionSystem, C: Clock> Authority<S, B, C> {
         self.persist()
     }
     pub fn reconcile(&mut self) -> Result<(), AuthorityError> {
+        self.reconcile_url_transition()?;
         if let Some(item_id) = self.item_id() {
             if !matches!(self.state.phase, Phase::RecoveryRequired { .. })
                 && validate_app_id(&item_id).is_err()
@@ -1156,29 +2100,58 @@ impl<S: StateStore, B: SessionSystem, C: Clock> Authority<S, B, C> {
         } = self.state.phase.clone()
         {
             if self.graceful_deadline.is_none() {
-                if let Err(reason) = self.system.enforce_termination(&item_id, &session_id) {
-                    return self
-                        .recover(format!("{}: {reason}", ReasonCode::AppExitFailed.as_str()));
-                }
-                self.state.phase = Phase::ForceStopping {
-                    session_id,
-                    item_id,
+                // The monotonic deadline was lost to a daemon restart. Read the unit before
+                // acting: if the app already stopped while the daemon was down (by itself or
+                // by the unit's own TimeoutStopSec backstop), the close completes as Returned
+                // through reconcile_systemd() below. Killing a dead unit would publish a
+                // wrong ForcedClose — and sample a hang that is already gone.
+                let still_running = match self.system.lifecycle(&item_id) {
+                    Ok(Some(snapshot)) => matches!(snapshot.app, AppUnitState::Active),
+                    // No lifecycle source (fakes, the desktop-sim preset): a lost deadline
+                    // stays immediately due, as before.
+                    Ok(None) => true,
+                    // Unknown unit state: never kill blind; reconcile_systemd() below records
+                    // the typed systemd_state_unknown recovery.
+                    Err(_) => false,
                 };
-                self.persist()?;
+                if still_running {
+                    if let Err(reason) =
+                        self.escalate(&item_id, &session_id, ForceStopReason::StopTimeout)
+                    {
+                        return self.stop_failed(reason);
+                    }
+                    self.publish(WireEvent::ForceStopping {
+                        session_id: session_id.clone(),
+                        reason: ForceStopReason::StopTimeout,
+                    });
+                    self.state.phase = Phase::ForceStopping {
+                        session_id,
+                        item_id,
+                    };
+                    self.persist()?;
+                }
             }
         }
+        self.reconcile_handler()?;
         if self.state.safe_return_queue > 0
             && matches!(
                 self.state.phase,
-                Phase::Starting { .. } | Phase::Running { .. }
+                Phase::Starting { .. } | Phase::Running { .. } | Phase::StopFailed { .. }
             )
         {
             self.state.safe_return_queue -= 1;
+            self.release_slot_for_safe_return()?;
+            if matches!(self.state.phase, Phase::RecoveryRequired { .. }) {
+                return Ok(());
+            }
             let id = self.session_id().unwrap();
             let item_id = self.item_id().unwrap();
             match self.system.request_graceful_stop(&item_id, &id) {
                 Ok(()) => {
                     self.graceful_deadline = Some(self.clock.deadline_after(self.grace).0);
+                    self.publish(WireEvent::StoppingGracefully {
+                        session_id: id.clone(),
+                    });
                     self.state.phase = Phase::StoppingGracefully {
                         session_id: id,
                         item_id,
@@ -1186,10 +2159,15 @@ impl<S: StateStore, B: SessionSystem, C: Clock> Authority<S, B, C> {
                     }
                 }
                 Err(_) => {
-                    if let Err(reason) = self.system.enforce_termination(&item_id, &id) {
-                        return self
-                            .recover(format!("{}: {reason}", ReasonCode::AppExitFailed.as_str()));
+                    if let Err(reason) =
+                        self.escalate(&item_id, &id, ForceStopReason::StopRequestFailed)
+                    {
+                        return self.stop_failed(reason);
                     }
+                    self.publish(WireEvent::ForceStopping {
+                        session_id: id.clone(),
+                        reason: ForceStopReason::StopRequestFailed,
+                    });
                     self.state.phase = Phase::ForceStopping {
                         session_id: id,
                         item_id,
@@ -1212,10 +2190,15 @@ impl<S: StateStore, B: SessionSystem, C: Clock> Authority<S, B, C> {
                 .graceful_deadline
                 .is_some_and(|deadline| self.clock.now() >= deadline)
             {
-                if let Err(reason) = self.system.enforce_termination(&item_id, &session_id) {
-                    return self
-                        .recover(format!("{}: {reason}", ReasonCode::AppExitFailed.as_str()));
+                if let Err(reason) =
+                    self.escalate(&item_id, &session_id, ForceStopReason::StopTimeout)
+                {
+                    return self.stop_failed(reason);
                 }
+                self.publish(WireEvent::ForceStopping {
+                    session_id: session_id.clone(),
+                    reason: ForceStopReason::StopTimeout,
+                });
                 self.state.phase = Phase::ForceStopping {
                     session_id,
                     item_id,
@@ -1306,6 +2289,7 @@ impl<S: StateStore, B: SessionSystem, C: Clock> Authority<S, B, C> {
                 (
                     Phase::StoppingGracefully { .. }
                     | Phase::ForceStopping { .. }
+                    | Phase::StopFailed { .. }
                     | Phase::Restoring {
                         rung: RestorationRung::UnitInactive,
                         ..
@@ -1376,6 +2360,9 @@ impl<S: StateStore, B: SessionSystem, C: Clock> Authority<S, B, C> {
         if let Observation::Failed { rung, reason } = observation {
             return self.recover(format!("{}: {reason}", rung.reason_code().as_str()));
         }
+        if self.promote_handler_if_caller_ended(&observation)? {
+            return Ok(());
+        }
         match (&self.state.phase, observation) {
             (Phase::Starting { .. }, Observation::SessionRunning) => {
                 let id = self.session_id().unwrap();
@@ -1417,6 +2404,11 @@ impl<S: StateStore, B: SessionSystem, C: Clock> Authority<S, B, C> {
                 self.unit_inactive(Receipt::Returned)
             }
             (Phase::ForceStopping { .. }, Observation::UnitInactive) => {
+                self.unit_inactive(Receipt::ForcedClose)
+            }
+            // The kill failed, but the unit is gone now (systemd's own backstop or the app
+            // itself): the close the user asked for did happen, as a forced close.
+            (Phase::StopFailed { .. }, Observation::UnitInactive) => {
                 self.unit_inactive(Receipt::ForcedClose)
             }
             (
@@ -1519,7 +2511,634 @@ impl<S: StateStore, B: SessionSystem, C: Clock> Authority<S, B, C> {
         });
         self.presentation_deadline = None;
         self.state.phase = Phase::Idle;
+        self.state.return_slot = None;
         self.persist()
+    }
+    /// Stamps a history entry's end and receipt without publishing a Terminal event: used for
+    /// sessions that end behind or beside the foreground session (the slot's caller or handler),
+    /// where the shell is NOT back in front.
+    fn close_history_entry(&mut self, session_id: &str, receipt: Receipt, precision: EndPrecision) {
+        let at = (self.now_fn)();
+        if let Some(entry) = self
+            .state
+            .history
+            .iter_mut()
+            .find(|entry| entry.session_id == session_id)
+        {
+            entry.ended_at = Some(EndStamp { at, precision });
+            entry.receipt = Some(receipt);
+        }
+    }
+    fn rate_limited(&mut self, key: &str) -> bool {
+        let now = self.clock.now();
+        let stamps = self.url_rate.entry(key.to_owned()).or_default();
+        while stamps
+            .front()
+            .is_some_and(|stamp| stamp.saturating_add(URL_RATE_WINDOW) <= now)
+        {
+            stamps.pop_front();
+        }
+        if stamps.len() >= URL_RATE_LIMIT {
+            return true;
+        }
+        stamps.push_back(now);
+        false
+    }
+    fn begin_url_transition(&mut self, transition: UrlTransition) -> Result<(), AuthorityError> {
+        let before = self.state.clone();
+        self.state.url_transition = Some(transition);
+        if let Err(error) = self.persist() {
+            self.state = before;
+            return Err(error);
+        }
+        Ok(())
+    }
+    fn finish_url_handoff(&mut self, handoff: &UrlHandoff) -> Result<(), AuthorityError> {
+        let durable_intent = self.state.clone();
+        if matches!(handoff.caller, SlotCaller::App { .. })
+            && !self
+                .state
+                .history
+                .iter()
+                .any(|entry| entry.session_id == handoff.handler_session_id)
+        {
+            self.state.history.push_front(HistoryEntry {
+                session_id: handoff.handler_session_id.clone(),
+                item_id: handoff.handler_item_id.clone(),
+                receipt: None,
+                started_at: Some((self.now_fn)()),
+                ended_at: None,
+            });
+            self.state.history.truncate(self.recent_bound);
+        }
+        let slot = ReturnSlot {
+            caller: handoff.caller.clone(),
+            handler_session_id: handoff.handler_session_id.clone(),
+            handler_item_id: handoff.handler_item_id.clone(),
+            caller_gone: false,
+        };
+        self.state.return_slot = Some(slot.clone());
+        self.state.url_transition = None;
+        if let Err(error) = self.persist() {
+            self.state = durable_intent;
+            return Err(error);
+        }
+        let line = url_handoff_line("opened", &slot);
+        self.log(&line);
+        Ok(())
+    }
+    fn begin_restore(&mut self, slot: &ReturnSlot) -> Result<(), AuthorityError> {
+        self.begin_url_transition(UrlTransition::Restoring { slot: slot.clone() })
+    }
+    fn finish_restore(&mut self) -> Result<(), AuthorityError> {
+        let durable_intent = self.state.clone();
+        self.state.return_slot = None;
+        self.state.url_transition = None;
+        if let Err(error) = self.persist() {
+            self.state = durable_intent;
+            return Err(error);
+        }
+        Ok(())
+    }
+    fn reconcile_url_transition(&mut self) -> Result<(), AuthorityError> {
+        let Some(transition) = self.state.url_transition.clone() else {
+            return Ok(());
+        };
+        match transition {
+            UrlTransition::Opening { handoff } => {
+                if let Err(reason) = self.system.open_url(&handoff) {
+                    return Err(self.handoff_failure(&handoff.handler_item_id, &reason));
+                }
+                self.finish_url_handoff(&handoff)
+            }
+            UrlTransition::Restoring { slot } => {
+                if let Err(reason) = self.system.restore_caller(&slot) {
+                    let line = lifecycle_failure_line(
+                        ReasonCode::OwnerNotActive.as_str(),
+                        &slot.handler_item_id,
+                        &format!("caller restore replay failed: {reason}"),
+                    );
+                    self.log(&line);
+                    return Err(AuthorityError::Backend(reason));
+                }
+                self.finish_restore()
+            }
+        }
+    }
+    /// Re-verifies the front's claim against the kernel-derived app id. Any mismatch or missing
+    /// identity is refused and logged; the derived id, never the claim, is what the authority
+    /// acts on.
+    fn verify_front_caller(
+        &mut self,
+        verb: &str,
+        derived: Result<String, String>,
+        claimed: Option<String>,
+    ) -> Option<String> {
+        match (derived, claimed) {
+            (Err(reason), claimed) => {
+                let line = url_refusal_line(
+                    verb,
+                    "identity_unverified",
+                    claimed.as_deref().unwrap_or("-"),
+                    Some(&reason),
+                );
+                self.log(&line);
+                None
+            }
+            (Ok(derived), None) => {
+                let line = url_refusal_line(verb, "missing_claim", &derived, None);
+                self.log(&line);
+                None
+            }
+            (Ok(derived), Some(claimed)) if claimed != derived => {
+                let line = url_refusal_line(
+                    verb,
+                    "identity_mismatch",
+                    &claimed,
+                    Some(&format!("derived={derived}")),
+                );
+                self.log(&line);
+                None
+            }
+            (Ok(derived), Some(_)) => Some(derived),
+        }
+    }
+    fn refuse_url(&mut self, verb: &str, reason: &str, caller: &str, detail: Option<&str>) {
+        let line = url_refusal_line(verb, reason, caller, detail);
+        self.log(&line);
+    }
+    /// `OpenUrl` for a verified caller. See the crate docs for the check order.
+    pub fn open_url(
+        &mut self,
+        caller: UrlCaller,
+        url: &str,
+        flags: u32,
+    ) -> Result<RpcResponse, AuthorityError> {
+        const VERB: &str = "open_url";
+        let caller_key = match &caller {
+            UrlCaller::Shell => SHELL_CALLER_KEY.to_owned(),
+            UrlCaller::App(app_id) => app_id.clone(),
+        };
+        if self.rate_limited(&caller_key) {
+            self.refuse_url(VERB, "rate_limited", &caller_key, None);
+            return Ok(RpcResponse::RateLimited);
+        }
+        if flags & OPEN_URL_FLAG_AUTH_SESSION != 0 {
+            self.refuse_url(VERB, "flag_reserved", &caller_key, Some("auth_session"));
+            return Ok(RpcResponse::Denied);
+        }
+        if flags & OPEN_URL_FLAG_CAPTIVE_PORTAL != 0 && matches!(caller, UrlCaller::App(_)) {
+            self.refuse_url(VERB, "flag_shell_only", &caller_key, Some("captive_portal"));
+            return Ok(RpcResponse::Denied);
+        }
+        if flags & !(OPEN_URL_FLAG_AUTH_SESSION | OPEN_URL_FLAG_CAPTIVE_PORTAL) != 0 {
+            self.refuse_url(
+                VERB,
+                "flag_unknown",
+                &caller_key,
+                Some(&format!("{flags:#x}")),
+            );
+            return Ok(RpcResponse::Denied);
+        }
+        let scheme = match validate_url(url) {
+            Ok(scheme) => scheme,
+            Err(rejection) => {
+                self.refuse_url(VERB, "invalid_url", &caller_key, Some(rejection.as_str()));
+                return Ok(RpcResponse::InvalidUrl);
+            }
+        };
+        if let UrlCaller::App(app_id) = &caller {
+            match self.resolver.resolve(app_id) {
+                Ok(resolved) if declares_open_url(&resolved.manifest) => {}
+                Ok(_) => {
+                    self.refuse_url(VERB, "capability", app_id, Some(OPEN_URL_CAPABILITY));
+                    return Ok(RpcResponse::Denied);
+                }
+                Err(error) => {
+                    self.refuse_url(VERB, error.reason.as_str(), app_id, Some(&error.detail));
+                    return Ok(RpcResponse::Denied);
+                }
+            }
+        }
+        if self.state.return_slot.is_some() {
+            self.refuse_url(VERB, "slot_occupied", &caller_key, None);
+            return Ok(RpcResponse::Busy);
+        }
+        let slot_caller = match (&caller, &self.state.phase) {
+            (UrlCaller::Shell, Phase::Idle) => SlotCaller::Shell,
+            (
+                UrlCaller::App(app_id),
+                Phase::Running {
+                    session_id,
+                    item_id,
+                },
+            ) if item_id == app_id => SlotCaller::App {
+                session_id: session_id.clone(),
+                item_id: item_id.clone(),
+            },
+            (UrlCaller::App(_), Phase::Running { .. } | Phase::Idle) => {
+                self.refuse_url(
+                    VERB,
+                    "not_foreground",
+                    &caller_key,
+                    Some(self.state.phase.name()),
+                );
+                return Ok(RpcResponse::Denied);
+            }
+            (_, phase) => {
+                let name = phase.name();
+                self.refuse_url(VERB, "phase", &caller_key, Some(name));
+                return Ok(RpcResponse::Busy);
+            }
+        };
+        let handler = match self.url_handler.handler_for(scheme) {
+            Ok(Some(handler)) => handler,
+            Ok(None) => {
+                self.refuse_url(VERB, "no_handler", &caller_key, Some(scheme));
+                return Ok(RpcResponse::NoHandler);
+            }
+            Err(reason) => {
+                return Err(AuthorityError::Backend(format!(
+                    "handler resolution: {reason}"
+                )))
+            }
+        };
+        if let Err(error) = self.resolver.resolve(&handler) {
+            self.refuse_url(VERB, "no_handler", &caller_key, Some(&error.to_string()));
+            return Ok(RpcResponse::NoHandler);
+        }
+        let url = url.to_owned();
+        match slot_caller {
+            SlotCaller::Shell => {
+                // The handler is a real foreground session launched by the shell's request.
+                let handoff = UrlHandoff {
+                    caller: SlotCaller::Shell,
+                    handler_item_id: handler.clone(),
+                    handler_session_id: format!("session-{}", self.state.next_session),
+                    url,
+                    flags,
+                };
+                let transition = UrlTransition::Opening {
+                    handoff: handoff.clone(),
+                };
+                let (session_id, outcome) =
+                    self.start_session(&handler, Some(transition), |system, _session_id| {
+                        system.open_url(&handoff)
+                    })?;
+                let Some(outcome) = outcome else {
+                    return Ok(RpcResponse::Error {
+                        message: "URL handoff failed".into(),
+                    });
+                };
+                self.finish_url_handoff(&handoff)?;
+                Ok(match outcome {
+                    UrlHandoffOutcome::Launched => RpcResponse::Launched { session_id },
+                    UrlHandoffOutcome::Delivered => RpcResponse::Delivered,
+                })
+            }
+            SlotCaller::App { .. } if handler == caller_key => {
+                // The handler itself is in front: the URL is delivered to it, no handoff.
+                let handoff = UrlHandoff {
+                    caller: slot_caller,
+                    handler_item_id: handler,
+                    handler_session_id: self.session_id().unwrap_or_default(),
+                    url,
+                    flags,
+                };
+                match self.system.open_url(&handoff) {
+                    Ok(_) => Ok(RpcResponse::Delivered),
+                    Err(reason) => Err(self.handoff_failure(&handoff.handler_item_id, &reason)),
+                }
+            }
+            SlotCaller::App { .. } => {
+                let session_id = format!("session-{}", self.state.next_session);
+                let handoff = UrlHandoff {
+                    caller: slot_caller.clone(),
+                    handler_item_id: handler.clone(),
+                    handler_session_id: session_id.clone(),
+                    url,
+                    flags,
+                };
+                let before_intent = self.state.clone();
+                self.state.next_session += 1;
+                if let Err(error) = self.begin_url_transition(UrlTransition::Opening {
+                    handoff: handoff.clone(),
+                }) {
+                    self.state = before_intent;
+                    return Err(error);
+                }
+                let outcome = match self.system.open_url(&handoff) {
+                    Ok(outcome) => outcome,
+                    Err(reason) => {
+                        self.state = before_intent;
+                        self.persist()?;
+                        return Err(self.handoff_failure(&handler, &reason));
+                    }
+                };
+                self.finish_url_handoff(&handoff)?;
+                Ok(match outcome {
+                    UrlHandoffOutcome::Launched => RpcResponse::Launched { session_id },
+                    UrlHandoffOutcome::Delivered => RpcResponse::Delivered,
+                })
+            }
+        }
+    }
+    fn handoff_failure(&mut self, handler: &str, reason: &str) -> AuthorityError {
+        let line = lifecycle_failure_line(ReasonCode::SystemdStartFailed.as_str(), handler, reason);
+        self.log(&line);
+        AuthorityError::Backend(reason.to_owned())
+    }
+    /// `ReturnToCaller` from the verified handler app.
+    pub fn return_to_caller(
+        &mut self,
+        app_id: &str,
+        url: Option<&str>,
+    ) -> Result<RpcResponse, AuthorityError> {
+        const VERB: &str = "return_to_caller";
+        if let Some(url) = url {
+            return Ok(match validate_url(url) {
+                Err(rejection) => {
+                    self.refuse_url(VERB, "invalid_url", app_id, Some(rejection.as_str()));
+                    RpcResponse::InvalidUrl
+                }
+                Ok(_) => {
+                    self.refuse_url(VERB, "return_url_reserved", app_id, Some("auth_session"));
+                    RpcResponse::Denied
+                }
+            });
+        }
+        let Some(slot) = self.state.return_slot.clone() else {
+            self.refuse_url(VERB, "no_return_slot", app_id, None);
+            return Ok(RpcResponse::Denied);
+        };
+        if slot.handler_item_id != app_id {
+            self.refuse_url(VERB, "not_handler", app_id, Some(&slot.handler_item_id));
+            return Ok(RpcResponse::Denied);
+        }
+        match &slot.caller {
+            SlotCaller::Shell => {
+                // Home: the handler session ends through the protected return path.
+                self.state.return_slot = None;
+                let line = url_handoff_line("returned_home", &slot);
+                self.log(&line);
+                self.intake_safe_return()?;
+                self.reconcile()?;
+                Ok(RpcResponse::Restored)
+            }
+            SlotCaller::App { .. } if slot.caller_gone => {
+                self.state.return_slot = None;
+                let line = url_handoff_line("caller_gone_answered", &slot);
+                self.log(&line);
+                self.persist()?;
+                Ok(RpcResponse::CallerGone)
+            }
+            SlotCaller::App { .. } => {
+                self.begin_restore(&slot)?;
+                if let Err(reason) = self.system.restore_caller(&slot) {
+                    let line = lifecycle_failure_line(
+                        ReasonCode::OwnerNotActive.as_str(),
+                        &slot.handler_item_id,
+                        &format!("caller restore failed: {reason}"),
+                    );
+                    self.log(&line);
+                    return Err(AuthorityError::Backend(reason));
+                }
+                self.finish_restore()?;
+                let line = url_handoff_line("restored", &slot);
+                self.log(&line);
+                Ok(RpcResponse::Restored)
+            }
+        }
+    }
+    /// While an app caller waits behind the handler, the handler's own unit is reconciled too:
+    /// when it ends, the caller is restored and the slot clears.
+    fn reconcile_handler(&mut self) -> Result<(), AuthorityError> {
+        let Some(slot) = self.state.return_slot.clone() else {
+            return Ok(());
+        };
+        if slot.caller_gone || !matches!(slot.caller, SlotCaller::App { .. }) {
+            return Ok(());
+        }
+        let snapshot = match self.system.lifecycle(&slot.handler_item_id) {
+            Ok(Some(snapshot)) => snapshot,
+            Ok(None) => return Ok(()),
+            Err(reason) => {
+                return self.recover(format!(
+                    "{}: {reason}",
+                    ReasonCode::SystemdStateUnknown.as_str()
+                ));
+            }
+        };
+        let (receipt, precision) = match snapshot.app {
+            AppUnitState::Active => return Ok(()),
+            AppUnitState::InactiveSuccess => (Receipt::Returned, EndPrecision::Observed),
+            AppUnitState::InactiveFailure { summary } => {
+                (Receipt::Crash { summary }, EndPrecision::Approximate)
+            }
+        };
+        self.close_history_entry(&slot.handler_session_id, receipt, precision);
+        let line = url_handoff_line("handler_exited", &slot);
+        self.log(&line);
+        self.begin_restore(&slot)?;
+        if let Err(reason) = self.system.restore_caller(&slot) {
+            return self.recover(format!(
+                "{}: caller restore failed: {reason}",
+                ReasonCode::OwnerNotActive.as_str()
+            ));
+        }
+        self.finish_restore()
+    }
+    /// The app caller ended while the handler was in front: the handler becomes the foreground
+    /// session and the slot remembers that the caller is gone. Nothing is published, because
+    /// the shell is not back in front.
+    fn promote_handler_if_caller_ended(
+        &mut self,
+        observation: &Observation,
+    ) -> Result<bool, AuthorityError> {
+        let Some(slot) = self.state.return_slot.clone() else {
+            return Ok(false);
+        };
+        let SlotCaller::App { session_id, .. } = &slot.caller else {
+            return Ok(false);
+        };
+        if slot.caller_gone
+            || !matches!(
+                self.state.phase,
+                Phase::Starting { .. } | Phase::Running { .. }
+            )
+            || self.session_id().as_deref() != Some(session_id.as_str())
+        {
+            return Ok(false);
+        }
+        let (receipt, precision) = match observation {
+            Observation::SessionExitedCleanly => (Receipt::Returned, EndPrecision::Observed),
+            Observation::SessionCrashed { summary } => (
+                Receipt::Crash {
+                    summary: summary.clone(),
+                },
+                EndPrecision::Approximate,
+            ),
+            _ => return Ok(false),
+        };
+        self.close_history_entry(session_id, receipt, precision);
+        self.state.phase = Phase::Running {
+            session_id: slot.handler_session_id.clone(),
+            item_id: slot.handler_item_id.clone(),
+        };
+        let line = url_handoff_line("caller_gone", &slot);
+        self.log(&line);
+        self.state.return_slot = Some(ReturnSlot {
+            caller_gone: true,
+            ..slot
+        });
+        self.persist()?;
+        Ok(true)
+    }
+    /// A protected return ends the whole excursion: a handler running beside the phase session
+    /// is stopped first, then the ladder runs on the phase session as usual.
+    fn release_slot_for_safe_return(&mut self) -> Result<(), AuthorityError> {
+        let Some(slot) = self.state.return_slot.take() else {
+            return Ok(());
+        };
+        if matches!(slot.caller, SlotCaller::App { .. }) && !slot.caller_gone {
+            if self
+                .system
+                .request_graceful_stop(&slot.handler_item_id, &slot.handler_session_id)
+                .is_err()
+            {
+                if let Err(reason) = self
+                    .system
+                    .enforce_termination(&slot.handler_item_id, &slot.handler_session_id)
+                {
+                    self.state.return_slot = Some(slot);
+                    return self
+                        .recover(format!("{}: {reason}", ReasonCode::AppExitFailed.as_str()));
+                }
+            }
+            self.close_history_entry(
+                &slot.handler_session_id,
+                Receipt::Returned,
+                EndPrecision::Observed,
+            );
+        }
+        let line = url_handoff_line("safe_return", &slot);
+        self.log(&line);
+        self.persist()
+    }
+    /// Allocates the next session, persists the start intent, runs `start`, records the session
+    /// and its first observation. A failed start is recorded as crash drift, never hidden.
+    fn start_session<T>(
+        &mut self,
+        item_id: &str,
+        url_transition: Option<UrlTransition>,
+        start: impl FnOnce(&mut B, &str) -> Result<T, String>,
+    ) -> Result<(String, Option<T>), AuthorityError> {
+        let id = format!("session-{}", self.state.next_session);
+        let before_intent = self.state.clone();
+        self.state.next_session += 1;
+        self.state.phase = Phase::Starting {
+            session_id: id.clone(),
+            item_id: item_id.to_owned(),
+            start_invoked: false,
+        };
+        self.state.url_transition = url_transition;
+        if let Err(error) = self.persist() {
+            self.state = before_intent;
+            return Err(error);
+        }
+        let start_result = start(&mut self.system, &id);
+        let durable_intent = self.state.clone();
+        self.state.phase = Phase::Starting {
+            session_id: id.clone(),
+            item_id: item_id.to_owned(),
+            start_invoked: true,
+        };
+        self.state.history.push_front(HistoryEntry {
+            session_id: id.clone(),
+            item_id: item_id.to_owned(),
+            receipt: None,
+            started_at: None,
+            ended_at: None,
+        });
+        self.state.history.truncate(self.recent_bound);
+        self.publish(WireEvent::ObservedStarting);
+        if start_result.is_err() {
+            self.state.url_transition = None;
+        }
+        if let Err(error) = self.persist() {
+            self.state = durable_intent;
+            return Err(error);
+        }
+        match start_result {
+            Ok(value) => {
+                self.observe(Observation::SessionRunning)?;
+                Ok((id, Some(value)))
+            }
+            Err(reason) => {
+                let line = lifecycle_failure_line(
+                    ReasonCode::SystemdStartFailed.as_str(),
+                    self.item_id().as_deref().unwrap_or_default(),
+                    &reason,
+                );
+                self.log(&line);
+                self.observe(Observation::SessionCrashed {
+                    summary: format!("{}: {reason}", ReasonCode::SystemdStartFailed.as_str()),
+                })?;
+                Ok((id, None))
+            }
+        }
+    }
+    /// Pending events deliverable to `client_id`: past its cursor, minus the observed
+    /// Starting/Running of ended sessions (see [`Self::ended_session_observation_bound`]).
+    fn deliverable_events(&self, client_id: &str) -> impl Iterator<Item = &PublishedEvent> {
+        let sequence = self.state.acknowledged.get(client_id).copied().unwrap_or(0);
+        let ended_bound = self.ended_session_observation_bound();
+        self.state
+            .pending
+            .iter()
+            .filter(move |e| e.sequence > sequence)
+            .filter(move |e| {
+                !(matches!(
+                    e.event,
+                    WireEvent::ObservedStarting | WireEvent::ObservedRunning
+                ) && e.sequence < ended_bound)
+            })
+    }
+    /// The router/menu view: pending events as RPC payloads, selected for `contract`. A v1
+    /// client never sees the v2-only close-progress events, but its cursor and compaction are
+    /// untouched by them (the same delivery-filter discipline as the ended-session bound).
+    fn rpc_events_for(&self, client_id: &str, contract: u32) -> Vec<(u64, RpcEvent)> {
+        self.deliverable_events(client_id)
+            .filter(|e| contract >= SESSION_RPC_CONTRACT_V2 || !is_close_progress(&e.event))
+            .map(|e| (e.sequence, wire_to_rpc(&e.event)))
+            .collect()
+    }
+    /// Time until the nearest armed deadline that the current phase can still enforce, or
+    /// `None`. [`run_service_loop`] wakes at the deadline itself instead of waiting for the
+    /// next periodic tick; `Duration::ZERO` means a deadline is already due. A deadline whose
+    /// phase has moved on is deliberately ignored so a stale value can never busy-spin the
+    /// loop.
+    pub fn time_until_next_deadline(&self) -> Option<Duration> {
+        let now = self.clock.now();
+        let graceful = self
+            .graceful_deadline
+            .filter(|_| matches!(self.state.phase, Phase::StoppingGracefully { .. }));
+        let presentation = self.presentation_deadline.filter(|_| {
+            matches!(
+                self.state.phase,
+                Phase::Restoring {
+                    rung: RestorationRung::PresentationAcknowledged,
+                    ..
+                }
+            )
+        });
+        [graceful, presentation]
+            .into_iter()
+            .flatten()
+            .map(|deadline| {
+                Duration::from_nanos(deadline.as_nanos().saturating_sub(now.as_nanos()))
+            })
+            .min()
     }
     /// Pending observed Starting/Running events with a sequence below this bound belong to a
     /// session that has already ended and are never delivered. While a session is Starting or
@@ -1558,9 +3177,11 @@ fn is_presentation_timeout(reason: &str) -> bool {
 ///
 /// Each received connection is handed to `serve`; between connections the loop calls
 /// [`Authority::tick`] at least once per `tick_interval`, so the authority reconciles systemd and
-/// enforces its deadlines with no client RPC. Waiting uses a channel timeout, never a spin; a tick
-/// that overruns the interval is followed by a full idle interval. A tick error is logged once
-/// until it changes or clears. A connection-source error or a `serve` error ends the loop.
+/// enforces its deadlines with no client RPC. It also wakes at an armed deadline itself
+/// ([`Authority::time_until_next_deadline`]), so an escalation lands at its deadline, not up to a
+/// tick later. Waiting uses a channel timeout, never a spin; a tick that overruns the interval is
+/// followed by a full idle interval. A tick error is logged once until it changes or clears. A
+/// connection-source error or a `serve` error ends the loop.
 pub fn run_service_loop<S, B, C, T>(
     authority: &mut Authority<S, B, C>,
     connections: &mpsc::Receiver<io::Result<T>>,
@@ -1576,7 +3197,10 @@ where
     let mut next_tick = Instant::now() + tick_interval;
     let mut last_error: Option<String> = None;
     loop {
-        let wait = next_tick.saturating_duration_since(Instant::now());
+        let mut wait = next_tick.saturating_duration_since(Instant::now());
+        if let Some(deadline_wait) = authority.time_until_next_deadline() {
+            wait = wait.min(deadline_wait);
+        }
         match connections.recv_timeout(wait) {
             Ok(Ok(connection)) => serve(authority, connection)?,
             Ok(Err(error)) => return Err(error),
@@ -1584,7 +3208,10 @@ where
             Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
         }
         let started = Instant::now();
-        if started < next_tick {
+        let deadline_due = authority
+            .time_until_next_deadline()
+            .is_some_and(|wait| wait.is_zero());
+        if started < next_tick && !deadline_due {
             continue;
         }
         match authority.tick() {
@@ -1620,64 +3247,15 @@ impl<S: StateStore, B: SessionSystem, C: Clock> AuthorityApi for Authority<S, B,
             self.log(&line);
             return Ok(LaunchResult::ItemUnavailable);
         }
-        let id = format!("session-{}", self.state.next_session);
-        let before_intent = self.state.clone();
-        self.state.next_session += 1;
-        self.state.phase = Phase::Starting {
-            session_id: id.clone(),
-            item_id: request.item_id.clone(),
-            start_invoked: false,
-        };
-        if let Err(error) = self.persist() {
-            self.state = before_intent;
-            return Err(error);
-        }
-        let start_result = self.system.start_foreground(&request, &id);
-        self.state.phase = Phase::Starting {
-            session_id: id.clone(),
-            item_id: request.item_id.clone(),
-            start_invoked: true,
-        };
-        self.state.history.push_front(HistoryEntry {
-            session_id: id.clone(),
-            item_id: request.item_id,
-            receipt: None,
-            started_at: None,
-            ended_at: None,
-        });
-        self.state.history.truncate(self.recent_bound);
-        self.publish(WireEvent::ObservedStarting);
-        self.persist()?;
-        match start_result {
-            Ok(()) => self.observe(Observation::SessionRunning)?,
-            Err(reason) => {
-                let line = lifecycle_failure_line(
-                    ReasonCode::SystemdStartFailed.as_str(),
-                    self.item_id().as_deref().unwrap_or_default(),
-                    &reason,
-                );
-                self.log(&line);
-                self.observe(Observation::SessionCrashed {
-                    summary: format!("{}: {reason}", ReasonCode::SystemdStartFailed.as_str()),
-                })?;
-            }
-        }
-        Ok(LaunchResult::Accepted { session_id: id })
+        let item_id = request.item_id.clone();
+        let (session_id, _) = self.start_session(&item_id, None, |system, session_id| {
+            system.start_foreground(&request, session_id)
+        })?;
+        Ok(LaunchResult::Accepted { session_id })
     }
     fn events_for(&self, client_id: &str) -> Vec<(u64, SessionEvent)> {
-        let sequence = self.state.acknowledged.get(client_id).copied().unwrap_or(0);
-        let ended_bound = self.ended_session_observation_bound();
-        self.state
-            .pending
-            .iter()
-            .filter(|e| e.sequence > sequence)
-            .filter(|e| {
-                !(matches!(
-                    e.event,
-                    WireEvent::ObservedStarting | WireEvent::ObservedRunning
-                ) && e.sequence < ended_bound)
-            })
-            .map(|e| (e.sequence, wire_to_port(&e.event)))
+        self.deliverable_events(client_id)
+            .filter_map(|e| wire_to_port(&e.event).map(|event| (e.sequence, event)))
             .collect()
     }
     fn acknowledge(&mut self, client_id: &str, sequence: u64) -> Result<(), AuthorityError> {
@@ -1733,6 +3311,30 @@ fn launch_busy_line(item_id: &str, phase: &Phase) -> String {
     )
 }
 
+fn url_refusal_line(verb: &str, reason: &str, caller: &str, detail: Option<&str>) -> String {
+    let mut line = format!(
+        "pf-session-authorityd: url_refused verb={verb} reason={reason} caller={}",
+        json_string(caller)
+    );
+    if let Some(detail) = detail {
+        line.push_str(&format!(" detail={}", json_string(detail)));
+    }
+    line
+}
+
+fn url_handoff_line(event: &str, slot: &ReturnSlot) -> String {
+    let caller = match &slot.caller {
+        SlotCaller::Shell => "shell".to_owned(),
+        SlotCaller::App { item_id, .. } => item_id.clone(),
+    };
+    format!(
+        "pf-session-authorityd: url_handoff event={event} caller={} handler={} session={}",
+        json_string(&caller),
+        json_string(&slot.handler_item_id),
+        json_string(&slot.handler_session_id)
+    )
+}
+
 fn lifecycle_failure_line(reason: &str, item_id: &str, detail: &str) -> String {
     format!(
         "pf-session-authorityd: lifecycle_failure reason={reason} item_id={} detail={}",
@@ -1761,23 +3363,28 @@ fn receipt_to_port(receipt: &Receipt, id: &str) -> TerminalReceipt {
         },
     }
 }
-fn wire_to_port(event: &WireEvent) -> SessionEvent {
+/// The v1 port view of a wire event. Contract v2 close-progress events have no
+/// [`SessionEvent`] shape and are never delivered through this surface.
+fn wire_to_port(event: &WireEvent) -> Option<SessionEvent> {
     match event {
-        WireEvent::ObservedStarting => SessionEvent::Observed(ObservedSessionState::Starting),
-        WireEvent::ObservedRunning => SessionEvent::Observed(ObservedSessionState::Running),
-        WireEvent::ObservationComplete => {
-            SessionEvent::Observed(ObservedSessionState::ObservationComplete)
-        }
+        WireEvent::ObservedStarting => Some(SessionEvent::Observed(ObservedSessionState::Starting)),
+        WireEvent::ObservedRunning => Some(SessionEvent::Observed(ObservedSessionState::Running)),
+        WireEvent::ObservationComplete => Some(SessionEvent::Observed(
+            ObservedSessionState::ObservationComplete,
+        )),
         WireEvent::Terminal {
             session_id,
             receipt,
-        } => SessionEvent::Terminal(receipt_to_port(receipt, session_id)),
+        } => Some(SessionEvent::Terminal(receipt_to_port(receipt, session_id))),
         WireEvent::RecoveryRequired { session_id, reason } => {
-            SessionEvent::RecoveryRequired(RecoveryRequired {
+            Some(SessionEvent::RecoveryRequired(RecoveryRequired {
                 session_id: session_id.clone(),
                 reason: reason.clone(),
-            })
+            }))
         }
+        WireEvent::StoppingGracefully { .. }
+        | WireEvent::ForceStopping { .. }
+        | WireEvent::StopFailed { .. } => None,
     }
 }
 

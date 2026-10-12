@@ -30,6 +30,14 @@ pub const UI_SET_KEYBIT: Ioctl = ioc(IOC_WRITE, UI, 101, 4);
 /// `UI_SET_ABSBIT` — advertise an absolute axis (arg: `int`).
 pub const UI_SET_ABSBIT: Ioctl = ioc(IOC_WRITE, UI, 103, 4);
 
+/// `UI_SET_PHYS` — set the device's `phys` string (arg: `const char *`, so the size is a pointer's).
+pub const UI_SET_PHYS: Ioctl = ioc(
+    IOC_WRITE,
+    UI,
+    108,
+    std::mem::size_of::<*const libc::c_char>() as c_ulong,
+);
+
 /// `UI_GET_SYSNAME(len)` — read the created device's `inputN` sysname into a `len`-byte buffer.
 pub fn ui_get_sysname(len: usize) -> Ioctl {
     ioc(IOC_READ, UI, 44, len as c_ulong)
@@ -59,6 +67,15 @@ mod tests {
         assert_eq!(
             UI_SET_ABSBIT as u32, 0x40045567,
             "UI_SET_ABSBIT = _IOW('U', 103, int)"
+        );
+    }
+
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn ui_set_phys_matches_canonical_linux_value() {
+        assert_eq!(
+            UI_SET_PHYS as u32, 0x4008556c,
+            "UI_SET_PHYS = _IOW('U', 108, char *) on LP64"
         );
     }
 

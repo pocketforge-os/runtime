@@ -1,0 +1,28 @@
+{
+  "format": "pocketforge.menu/1",
+  "id": "confirm-action",
+  "root": "root",
+  "pages": [
+    {
+      "id": "root",
+      "title": { "text": "Power" },
+      "sections": [
+        {
+          "items": [
+            {
+              "id": "power-off",
+              "kind": "action",
+              "label": { "text": "Power off" },
+              "confirm": {
+                "title": { "text": "Power off?" },
+                "body": { "text": "The device will shut down." },
+                "confirm_label": { "text": "Power off" },
+                "destructive": true
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
