@@ -11,3 +11,10 @@ authors.workspace = true
 [dependencies]
 serde.workspace = true
 toml.workspace = true
+
+[dev-dependencies]
+# The old-schema compatibility test parses the REAL canonical app manifests from the platform
+# checkout (abi/examples/app-*.toml) through the ONE platform-root resolver, so a fixture copy
+# can never drift from the manifests devices actually ship (same policy as the descriptor tests
+# in pf-input-broker; cargo permits this dev-only cycle because pocketforge is the facade).
+pocketforge = { workspace = true }

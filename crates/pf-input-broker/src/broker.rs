@@ -1298,6 +1298,7 @@ range = { min = 0, max = 255, fuzz = 0, flat = 0 }
     #[derive(Default)]
     struct FakeSource {
         pressed: Vec<u16>,
+        abs: Vec<(u16, i32)>,
     }
     impl SourceState for FakeSource {
         fn pressed_keys(&self, codes: &[u16]) -> io::Result<Vec<u16>> {
@@ -1307,8 +1308,12 @@ range = { min = 0, max = 255, fuzz = 0, flat = 0 }
                 .filter(|c| self.pressed.contains(c))
                 .collect())
         }
-        fn abs_value(&self, _code: u16) -> io::Result<i32> {
-            Ok(0)
+        fn abs_value(&self, code: u16) -> io::Result<i32> {
+            Ok(self
+                .abs
+                .iter()
+                .find(|(held, _)| *held == code)
+                .map_or(0, |(_, value)| *value))
         }
     }
 
@@ -1342,6 +1347,134 @@ range = { min = 0, max = 255, fuzz = 0, flat = 0 }
         })
         .unwrap();
         out
+    }
+
+    // --- posture wiring (tsp-mc9m.41.1026.1) --------------------------------------------------
+    //
+    // The report pump's posture is a PURE INPUT to the axis remap (`remap::Posture`); its
+    // runtime source is designed by tsp-mc9m.41.1026.6 and until that lands production
+    // constructs the pump with Posture::Normal. The rotation convention (body rotated N°
+    // clockwise; logical = rotate-clockwise(body vector, N)) is named and tested in remap.rs;
+    // what is proven HERE is the wiring: only a whole-body rotation rotates the emitted
+    // stream, on both the live path and the SYN_DROPPED resync path.
+
+    /// Synthetic descriptor with the spatial axes (d-pad hat + both stick axes, so every
+    /// rotated code is advertised by the spec) plus one binary trigger.
+    fn posture_descriptor() -> Descriptor {
+        Descriptor::from_toml(
+            r#"
+[identity]
+id = "synthguide"
+manufacturer = "PocketForge"
+model = "Guide Rig (synthetic test descriptor)"
+sdl_guid = "030000005e0400008e02000010010000"
+
+[[inputs]]
+id = "dpad"
+kind = "hat"
+ev_type = "EV_ABS"
+code = "ABS_HAT0X,ABS_HAT0Y"
+
+[[inputs]]
+id = "lstick"
+kind = "stick"
+ev_type = "EV_ABS"
+code = "ABS_X,ABS_Y"
+range = { min = 0, max = 4095, fuzz = 0, flat = 0 }
+
+[[inputs]]
+id = "ltrig"
+kind = "trigger"
+ev_type = "EV_ABS"
+code = "ABS_Z"
+range = { min = 0, max = 255, fuzz = 0, flat = 0 }
+"#,
+        )
+        .unwrap()
+    }
+
+    fn posture_pump() -> ReportPump {
+        ReportPump::new(Remap::from_descriptor(&posture_descriptor()).unwrap())
+    }
+
+    #[test]
+    fn pump_rotates_axes_only_for_whole_body_rotation() {
+        use crate::remap::{Posture, Rotation};
+        let hat_left = [ev(ioc::EV_ABS, 0x10 /* ABS_HAT0X */, -1), syn()];
+        // Production wiring: Posture::Normal. Positive control — the d-pad passes
+        // through untouched, exactly the stream from before postures existed.
+        let mut pump = posture_pump();
+        assert_eq!(pump.posture, Posture::Normal);
+        let out = run(&mut pump, &hat_left);
+        assert!(out.contains(&(ioc::EV_ABS, 0x10, -1)), "{out:?}");
+        // Negative control for the tate remap: a screen-only swivel rotates the PICTURE
+        // but not the control deck, so the gamepad stream is unchanged at every angle.
+        for angle in [Rotation::Cw90, Rotation::Cw180, Rotation::Cw270] {
+            let mut pump = posture_pump();
+            pump.posture = Posture::ScreenOnlyRotated(angle);
+            let out = run(&mut pump, &hat_left);
+            assert!(out.contains(&(ioc::EV_ABS, 0x10, -1)), "{angle:?}: {out:?}");
+        }
+        // Whole-body rotation (tate): the body-left d-pad push is world-up after a 90° cw
+        // body rotation, so it emits logical up (HAT0Y = -1) and the physical HAT0X code
+        // never reaches the app.
+        let mut pump = posture_pump();
+        pump.posture = Posture::WholeBodyRotated(Rotation::Cw90);
+        let out = run(&mut pump, &hat_left);
+        assert!(
+            out.contains(&(ioc::EV_ABS, 0x11 /* ABS_HAT0Y */, -1)),
+            "{out:?}"
+        );
+        assert!(!out.iter().any(|&(_, code, _)| code == 0x10), "{out:?}");
+        // Stick axes ride the same rotation, while the binary trigger (DEPTH, not
+        // direction) emits its identical button under any posture.
+        let out = run(
+            &mut pump,
+            &[
+                ev(ioc::EV_ABS, 0x00 /* ABS_X */, 4095),
+                ev(ioc::EV_ABS, 0x02 /* ABS_Z */, 255),
+                syn(),
+            ],
+        );
+        assert!(
+            out.contains(&(ioc::EV_ABS, 0x01 /* ABS_Y */, 4095)),
+            "{out:?}"
+        );
+        assert!(!out.iter().any(|&(_, code, _)| code == 0x00), "{out:?}");
+        assert!(
+            out.contains(&(ioc::EV_KEY, 0x138 /* BTN_TL2 */, 1)),
+            "{out:?}"
+        );
+    }
+
+    #[test]
+    fn resync_under_tate_reexpresses_held_axes_in_the_logical_frame() {
+        use crate::remap::{Posture, Rotation};
+        let mut pump = posture_pump();
+        pump.posture = Posture::WholeBodyRotated(Rotation::Cw90);
+        // Live path: physical HAT0Y = 1 (body-down) emits logical HAT0X = -1, so the
+        // pump's held state after the report is the LOGICAL frame.
+        let out = run(&mut pump, &[ev(ioc::EV_ABS, 0x11, 1), syn()]);
+        assert!(out.contains(&(ioc::EV_ABS, 0x10, -1)), "{out:?}");
+        // The source now holds HAT0X = 1 physically and released HAT0Y. After SYN_DROPPED
+        // the resync reads the body-frame truth and must re-express it in the logical
+        // frame: logical HAT0X back to 0, logical HAT0Y to 1. A resync that wrote the
+        // unrotated source values would instead emit the spurious (HAT0X, 1).
+        let source = FakeSource {
+            pressed: Vec::new(),
+            abs: vec![(0x10, 1)],
+        };
+        let out = run_with(
+            &mut pump,
+            &[ev(ioc::EV_SYN, ioc::SYN_DROPPED, 0), syn()],
+            &source,
+        );
+        assert!(out.contains(&(ioc::EV_ABS, 0x10, 0)), "{out:?}");
+        assert!(out.contains(&(ioc::EV_ABS, 0x11, 1)), "{out:?}");
+        assert!(
+            !out.iter().any(|&(t, c, v)| t == ioc::EV_ABS && c == 0x10 && v == 1),
+            "{out:?}"
+        );
     }
 
     fn scratch(tag: &str) -> PathBuf {
@@ -1609,6 +1742,7 @@ range = { min = 0, max = 255, fuzz = 0, flat = 0 }
         let mut p = pump(Some(intake));
         let source = FakeSource {
             pressed: vec![SOUTH, GUIDE_CODE],
+            abs: Vec::new(),
         };
         let out = run_with(
             &mut p,

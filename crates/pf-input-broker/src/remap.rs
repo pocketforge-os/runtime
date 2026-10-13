@@ -735,4 +735,101 @@ source = "sunxi-keyboard"
         // A system code is never remapped into the pad (identity fallthrough, never a mapping entry).
         assert_eq!(r.remap_key(0x73), 0x73, "VOL+ has no gamepad remap entry");
     }
+
+    // --- the posture remap (tsp-mc9m.41.1026.1) -------------------------------------------------
+    //
+    // THE NAMED CONVENTION: `Rotation::CwN` is the device BODY rotated N degrees CLOCKWISE as
+    // seen by the user facing the screen. The session orientation policy (tsp-mc9m.41.1026.6)
+    // keeps the logical display user-upright by rotating the logical output COUNTER-clockwise
+    // by the same angle relative to the body, so the broker must express body-frame gamepad
+    // vectors in the logical frame: logical = rotate-clockwise(body vector, N) in evdev screen
+    // coordinates (+x right, +y DOWN). Anchor from the spec: after a 90° cw body rotation the
+    // d-pad direction that is "up" in the user's world is the body's LEFT (HAT0X = -1), and it
+    // must reach the app as logical up (HAT0Y = -1).
+    const ABS_X: u16 = 0x00;
+    const ABS_Y: u16 = 0x01;
+    const ABS_Z: u16 = 0x02;
+    const ABS_RX: u16 = 0x03;
+    const ABS_RY: u16 = 0x04;
+    const ABS_RZ: u16 = 0x05;
+    const ABS_HAT0X: u16 = 0x10;
+    const ABS_HAT0Y: u16 = 0x11;
+
+    #[test]
+    fn whole_body_rotation_rotates_spatial_axes_at_all_four_angles() {
+        // Positive control: angle 0 is the identity on both sticks and the d-pad.
+        let tate0 = Posture::WholeBodyRotated(Rotation::Cw0);
+        for (code, value) in [
+            (ABS_X, -123),
+            (ABS_Y, 456),
+            (ABS_RX, 7),
+            (ABS_RY, -7),
+            (ABS_HAT0X, -1),
+            (ABS_HAT0Y, 1),
+        ] {
+            assert_eq!(remap_axis_event(tate0, code, value), (code, value));
+        }
+        // 90° cw body rotation: logical = (x, y) → (−y, x).
+        let tate90 = Posture::WholeBodyRotated(Rotation::Cw90);
+        for (x, y) in [(ABS_X, ABS_Y), (ABS_RX, ABS_RY), (ABS_HAT0X, ABS_HAT0Y)] {
+            assert_eq!(remap_axis_event(tate90, x, 100), (y, 100));
+            assert_eq!(remap_axis_event(tate90, y, 100), (x, -100));
+        }
+        // The spec anchor, spelled out: body-left d-pad (world-up after the 90° cw body
+        // rotation) emits logical up, and body-up (world-right) emits logical right.
+        assert_eq!(remap_axis_event(tate90, ABS_HAT0X, -1), (ABS_HAT0Y, -1));
+        assert_eq!(remap_axis_event(tate90, ABS_HAT0Y, -1), (ABS_HAT0X, 1));
+        // 180°: logical = (x, y) → (−x, −y).
+        let tate180 = Posture::WholeBodyRotated(Rotation::Cw180);
+        for (x, y) in [(ABS_X, ABS_Y), (ABS_RX, ABS_RY), (ABS_HAT0X, ABS_HAT0Y)] {
+            assert_eq!(remap_axis_event(tate180, x, 100), (x, -100));
+            assert_eq!(remap_axis_event(tate180, y, 100), (y, -100));
+        }
+        // 270° cw (= 90° ccw): logical = (x, y) → (y, −x).
+        let tate270 = Posture::WholeBodyRotated(Rotation::Cw270);
+        for (x, y) in [(ABS_X, ABS_Y), (ABS_RX, ABS_RY), (ABS_HAT0X, ABS_HAT0Y)] {
+            assert_eq!(remap_axis_event(tate270, x, 100), (y, -100));
+            assert_eq!(remap_axis_event(tate270, y, 100), (x, 100));
+        }
+    }
+
+    #[test]
+    fn screen_only_swivel_and_normal_posture_never_touch_input() {
+        // Negative control for the tate test above: a screen-only swivel rotates the PICTURE
+        // but not the control deck, so the gamepad stays in the control-deck frame at every
+        // angle — and the Normal posture is the identity by definition.
+        for angle in [
+            Rotation::Cw0,
+            Rotation::Cw90,
+            Rotation::Cw180,
+            Rotation::Cw270,
+        ] {
+            for posture in [Posture::Normal, Posture::ScreenOnlyRotated(angle)] {
+                for (code, value) in [
+                    (ABS_X, -123),
+                    (ABS_Y, 456),
+                    (ABS_RX, 7),
+                    (ABS_RY, -7),
+                    (ABS_HAT0X, -1),
+                    (ABS_HAT0Y, 1),
+                ] {
+                    assert_eq!(
+                        remap_axis_event(posture, code, value),
+                        (code, value),
+                        "{posture:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn whole_body_rotation_leaves_non_spatial_axes_untouched() {
+        // Analog triggers are DEPTH, not direction: rotating the body never swaps or
+        // negates them (they keep riding the binary-trigger classification instead).
+        let tate = Posture::WholeBodyRotated(Rotation::Cw90);
+        assert_eq!(remap_axis_event(tate, ABS_Z, 255), (ABS_Z, 255));
+        assert_eq!(remap_axis_event(tate, ABS_RZ, 0), (ABS_RZ, 0));
+        assert_eq!(remap_axis_event(tate, ABS_Z, 0), (ABS_Z, 0));
+    }
 }

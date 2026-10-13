@@ -613,6 +613,18 @@ fn check(table: &str, contract: &PlatformContract) -> Result<(), ResolveError> {
     check_compatibility(&manifest, contract)
 }
 
+/// Same as [`manifest_with`] but declaring schema_version 2, the version that
+/// admits the `[display]` table. The key must precede every table header.
+fn manifest_schema2_with(table: &str) -> String {
+    format!("schema_version = 2\n{}", manifest_with(table))
+}
+
+/// [`check`] for manifests that declare the schema-2 `[display]` table.
+fn check_display(table: &str, contract: &PlatformContract) -> Result<(), ResolveError> {
+    let manifest = parse_manifest(&manifest_schema2_with(table)).unwrap();
+    check_compatibility(&manifest, contract)
+}
+
 const SCHEMA1_SOURCE: &str = "schema_version = 1\n\
                               runtime_family = \"pocketforge/a133-powervr\"\n\
                               runtime_abi = \"1\"\n\
@@ -676,20 +688,54 @@ fn missing_input_refuses_with_positive_controls_in_one_invocation() {
 }
 
 #[test]
-fn display_too_small_refuses_with_positive_controls_in_one_invocation() {
-    let contract = parse_platform_contract(&contract_v2(&v2_facts(""))).unwrap();
-    // Positive controls: exact fit passes, and either orientation passes
-    // because the comparison is orientation-independent (sorted sides).
-    for table in [
-        "[requirements.display_min]\nwidth = 1280\nheight = 720\n",
-        "[requirements.display_min]\nwidth = 720\nheight = 1280\n",
-        "[requirements.display_min]\nwidth = 480\nheight = 640\n",
-    ] {
-        assert!(check(table, &contract).is_ok(), "{table}");
-    }
-    // One physical pixel over on either sorted side refuses.
-    let error = check(
-        "[requirements.display_min]\nwidth = 1281\nheight = 720\n",
+fn display_min_refuses_only_when_no_allowed_orientation_meets_it() {
+    let contract = parse_platform_contract(&contract_v2(&v2_facts(""))).unwrap(); // display 1280x720
+    let landscape_exact = "[requirements.display_min]\nwidth = 1280\nheight = 720\n";
+    let portrait_exact = "[requirements.display_min]\nwidth = 720\nheight = 1280\n";
+    // Positive controls: with the default orientations = ["landscape"] the exact
+    // landscape minimum and a smaller minimum fit the 1280x720 logical canvas.
+    assert!(check(landscape_exact, &contract).is_ok());
+    assert!(check("[requirements.display_min]\nwidth = 480\nheight = 640\n", &contract).is_ok());
+    // Negative control for the orientation-aware rule: a portrait-shaped minimum
+    // refuses under the default landscape-only orientations. The old
+    // orientation-independent sorted-sides comparison passed this manifest.
+    let error = check(portrait_exact, &contract).unwrap_err();
+    assert_eq!(error.reason, ReasonCode::DisplayTooSmall);
+    assert_eq!(error.helper_exit_code(), 65);
+    assert_eq!(
+        error.detail,
+        "display_min 720x1280 exceeds display 1280x720 in allowed orientations landscape"
+    );
+    // Positive control: with ["portrait"] the logical canvas swaps to 720x1280,
+    // so the portrait minimum now fits…
+    assert!(check_display(
+        &format!("[display]\norientations = [\"portrait\"]\n{portrait_exact}"),
+        &contract
+    )
+    .is_ok());
+    // …and the landscape minimum refuses: the swap cuts both ways.
+    let error = check_display(
+        &format!("[display]\norientations = [\"portrait\"]\n{landscape_exact}"),
+        &contract,
+    )
+    .unwrap_err();
+    assert_eq!(error.reason, ReasonCode::DisplayTooSmall);
+    assert_eq!(
+        error.detail,
+        "display_min 1280x720 exceeds display 1280x720 in allowed orientations portrait"
+    );
+    // Positive control: ANY allowed orientation meeting the minimum passes —
+    // 720x1280 fits only the portrait canvas, and portrait is allowed.
+    assert!(check_display(
+        &format!("[display]\norientations = [\"landscape\", \"portrait\"]\n{portrait_exact}"),
+        &contract
+    )
+    .is_ok());
+    // Negative control: over the logical canvas in EVERY allowed orientation
+    // refuses with the frozen exit code and both allowed orientations named.
+    let error = check_display(
+        "[display]\norientations = [\"landscape\", \"portrait_flipped\"]\n\
+         [requirements.display_min]\nwidth = 1281\nheight = 721\n",
         &contract,
     )
     .unwrap_err();
@@ -697,14 +743,121 @@ fn display_too_small_refuses_with_positive_controls_in_one_invocation() {
     assert_eq!(error.helper_exit_code(), 65);
     assert_eq!(
         error.detail,
-        "display_min 1281x720 exceeds display 1280x720"
+        "display_min 1281x721 exceeds display 1280x720 in allowed orientations landscape, portrait_flipped"
     );
-    let error = check(
-        "[requirements.display_min]\nwidth = 720\nheight = 1281\n",
-        &contract,
-    )
+    // The fail-closed path is unchanged: a schema-1 contract carries no display
+    // fact, so any display_min is unverifiable regardless of orientations.
+    let schema1 = parse_platform_contract(SCHEMA1_SOURCE).unwrap();
+    let error = check(landscape_exact, &schema1).unwrap_err();
+    assert_eq!(error.reason, ReasonCode::RequirementUnverifiable);
+}
+
+#[test]
+fn schema_version_gates_the_display_table_and_old_manifests_keep_parsing() {
+    // Positive control: an absent schema_version means the old version 1 — it
+    // parses unchanged and gets the default orientations.
+    let manifest = parse_manifest(&manifest_with("")).unwrap();
+    assert_eq!(manifest.schema_version, 1);
+    assert!(manifest.display.is_none());
+    assert_eq!(manifest.display_orientations(), DEFAULT_ORIENTATIONS);
+    // Positive control: an explicit schema_version 2 without [display] parses
+    // and gets the same default.
+    let manifest = parse_manifest(&manifest_schema2_with("")).unwrap();
+    assert_eq!(manifest.schema_version, 2);
+    assert_eq!(manifest.display_orientations(), DEFAULT_ORIENTATIONS);
+    // Positive control: schema_version 2 admits the new [display] table.
+    let manifest =
+        parse_manifest(&manifest_schema2_with("[display]\norientations = [\"portrait\"]\n"))
+            .unwrap();
+    assert_eq!(manifest.display_orientations(), ["portrait"]);
+    // Negative control: an explicit schema_version 1 must not declare the
+    // schema-2 table (the same gate the platform contract applies).
+    let error = parse_manifest(&format!(
+        "schema_version = 1\n{}",
+        manifest_with("[display]\norientations = [\"portrait\"]\n")
+    ))
     .unwrap_err();
-    assert_eq!(error.reason, ReasonCode::DisplayTooSmall);
+    assert_eq!(error.kind, ManifestErrorKind::Invalid);
+    assert_eq!(
+        error.message,
+        "schema_version 1 must not declare schema 2 fields"
+    );
+    // Negative control: a version outside the accepted set is refused by name.
+    for version in [0u32, 3, 99] {
+        let error =
+            parse_manifest(&format!("schema_version = {version}\n{}", manifest_with("")))
+                .unwrap_err();
+        assert_eq!(error.kind, ManifestErrorKind::Invalid);
+        assert_eq!(error.message, "schema_version must be 1 or 2");
+    }
+}
+
+#[test]
+fn display_orientations_validate_against_the_sdl_vocabulary() {
+    // Positive controls: every SDL display-orientation name parses alone…
+    for orientation in KNOWN_ORIENTATIONS {
+        parse_manifest(&manifest_schema2_with(&format!(
+            "[display]\norientations = [\"{orientation}\"]\n"
+        )))
+        .unwrap_or_else(|error| panic!("{orientation}: {}", error.message));
+    }
+    // …and all four together parse.
+    parse_manifest(&manifest_schema2_with(
+        "[display]\norientations = [\"landscape\", \"landscape_flipped\", \"portrait\", \"portrait_flipped\"]\n",
+    ))
+    .unwrap();
+    // Negative control: an unknown value is refused with a named error.
+    let error =
+        parse_manifest(&manifest_schema2_with("[display]\norientations = [\"upside_down\"]\n"))
+            .unwrap_err();
+    assert_eq!(error.kind, ManifestErrorKind::Invalid);
+    assert_eq!(error.message, "invalid display orientation");
+    // Negative control: a duplicate is refused with a named error.
+    let error = parse_manifest(&manifest_schema2_with(
+        "[display]\norientations = [\"portrait\", \"portrait\"]\n",
+    ))
+    .unwrap_err();
+    assert_eq!(error.kind, ManifestErrorKind::Invalid);
+    assert_eq!(error.message, "duplicate display orientation");
+    // Negative control: an empty array is refused — the list must be non-empty.
+    let error =
+        parse_manifest(&manifest_schema2_with("[display]\norientations = []\n")).unwrap_err();
+    assert_eq!(error.kind, ManifestErrorKind::Invalid);
+    assert_eq!(error.message, "empty display orientations");
+    // Negative control: the [display] table itself still rejects unknown fields.
+    let error = parse_manifest(&manifest_schema2_with("[display]\nrotation = 90\n")).unwrap_err();
+    assert_eq!(error.kind, ManifestErrorKind::Invalid);
+    assert!(
+        error.message.contains("unknown field"),
+        "unexpected message: {}",
+        error.message
+    );
+}
+
+#[test]
+fn real_old_schema_manifests_from_the_platform_checkout_parse_with_default_orientations() {
+    // The REAL canonical app manifests the platform repo ships (old schema: no
+    // schema_version key, no [display] table) must keep parsing and get the
+    // default orientations. Read through the one platform-root resolver — never
+    // from a vendored copy, so the fixtures cannot drift.
+    let root = pocketforge::test_support::platform_root().expect(
+        "PF_PLATFORM_DIR (or a sibling platform checkout) must point at the platform repo",
+    );
+    for example in [
+        "abi/examples/app-a133-powervr.toml",
+        "abi/examples/app-a523-mali.toml",
+    ] {
+        let source = fs::read_to_string(root.join(example)).unwrap();
+        let manifest =
+            parse_manifest(&source).unwrap_or_else(|error| panic!("{example}: {}", error.message));
+        assert_eq!(manifest.schema_version, 1, "{example}");
+        assert!(manifest.display.is_none(), "{example}");
+        assert_eq!(
+            manifest.display_orientations(),
+            DEFAULT_ORIENTATIONS,
+            "{example}"
+        );
+    }
 }
 
 #[test]
