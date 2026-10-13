@@ -165,7 +165,7 @@ pub fn required_launch_paths(app_id: &str) -> Result<LaunchPaths, LaunchError> {
             "XDG_CACHE_HOME",
             PathBuf::from("/var/cache/pocketforge/apps").join(app_id),
         )?,
-        platform_runtime: PathBuf::from("/run/pocketforge/platform-runtime"),
+        platform_runtime: inventory.platform_runtime,
         resource_paths: ["/usr", "/lib", "/lib64", "/bin", "/sbin", "/etc"]
             .into_iter()
             .map(PathBuf::from)

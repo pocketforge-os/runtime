@@ -1,5 +1,6 @@
 use pf_app_launch::policy::{
     derive_policy, render_systemd_dropin, AppClass, MediatedEndpoint, NetAccess, PolicyInputs,
+    PolicyResourceInventory,
 };
 use pf_app_manifest::{parse_manifest, parse_platform_contract, ResolvedApp};
 use std::collections::BTreeMap;
@@ -212,4 +213,20 @@ fn networked_policy_derives_dns_without_manifest_capability() {
     assert!(!offline.network.dns);
     assert!(offline.landlock.tcp_connect_ports.is_empty());
     assert!(offline.landlock.udp_connect_ports.is_empty());
+}
+
+#[test]
+fn resource_inventory_requires_its_platform_runtime() {
+    let missing = serde_json::from_str::<PolicyResourceInventory>(r#"{"resources":{}}"#);
+    assert!(missing.is_err());
+
+    let inventory: PolicyResourceInventory = serde_json::from_str(
+        r#"{"platform_runtime":"/usr","resources":{"input-devices":["/dev/input/event0"]}}"#,
+    )
+    .unwrap();
+    assert_eq!(inventory.platform_runtime, Path::new("/usr"));
+    assert_eq!(
+        inventory.resources["input-devices"],
+        vec![PathBuf::from("/dev/input/event0")]
+    );
 }

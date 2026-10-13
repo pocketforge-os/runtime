@@ -22,8 +22,9 @@ pub struct PolicyInputs {
     pub resources: BTreeMap<String, Vec<PathBuf>>,
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct PolicyResourceInventory {
+    pub platform_runtime: PathBuf,
     #[serde(default)]
     pub resources: BTreeMap<String, Vec<PathBuf>>,
 }

@@ -20,7 +20,7 @@ fn run() -> Result<(), String> {
     let platform_contract = required(&args, "--platform-contract")?;
     let resource_inventory = required(&args, "--resource-inventory")?;
     let app_dir = PathBuf::from(required(&args, "--app-dir")?);
-    let platform_runtime = PathBuf::from(required(&args, "--platform-runtime")?);
+    let requested_platform_runtime = PathBuf::from(required(&args, "--platform-runtime")?);
     let xdg_config = PathBuf::from(required(&args, "--xdg-config")?);
     let xdg_state = PathBuf::from(required(&args, "--xdg-state")?);
     let xdg_cache = PathBuf::from(required(&args, "--xdg-cache")?);
@@ -68,6 +68,9 @@ fn run() -> Result<(), String> {
             .map_err(|error| format!("read resource inventory: {error}"))?,
     )
     .map_err(|error| format!("parse resource inventory: {error}"))?;
+    if inventory.platform_runtime != requested_platform_runtime {
+        return Err("--platform-runtime differs from signed resource inventory".to_owned());
+    }
     if inventory
         .resources
         .values()
@@ -79,7 +82,7 @@ fn run() -> Result<(), String> {
     let policy = derive_policy(
         &resolved,
         &PolicyInputs {
-            platform_runtime,
+            platform_runtime: inventory.platform_runtime,
             xdg_config,
             xdg_state,
             xdg_cache,
