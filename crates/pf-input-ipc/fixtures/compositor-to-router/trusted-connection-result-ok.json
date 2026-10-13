@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "type": "trusted_connection_result",
+  "epoch": 42,
+  "request_id": 9,
+  "result": {
+    "status": "ok"
+  }
+}
