@@ -19,7 +19,7 @@ use pocketforge::Backend;
 use crate::evdev::Evdev;
 use crate::ioc;
 use crate::policy::TokenBucket;
-use crate::remap::{remap_axis_event, AbsAction, Posture, Remap};
+use crate::remap::{AbsAction, Posture, Remap};
 use crate::safe_return::{SystemMenuGate, SystemMenuRouter, GUIDE_CODE};
 use crate::scm;
 use crate::uinput::Uinput;
@@ -198,7 +198,7 @@ impl SourceState for Evdev {
 /// `SYN_DROPPED` resync and (with `--safe-return-sock`) the protected System Menu gate.
 pub(crate) struct ReportPump {
     remap: Remap,
-    /// The posture [`remap_axis_event`] re-expresses spatial axis events for.
+    /// The posture [`Remap::remap_axis_event`] re-expresses spatial axis events for.
     /// Production wiring is [`Posture::Normal`]: TODO(tsp-mc9m.41.1026.6) — the
     /// session orientation policy designs where the runtime posture comes from;
     /// do not invent a source here.
@@ -599,7 +599,8 @@ impl ReportPump {
                     AbsAction::Passthrough => {
                         // Spatial axes are re-expressed in the logical frame for the
                         // current posture (identity for Normal / a screen-only swivel).
-                        let (code, value) = remap_axis_event(self.posture, ev.code, ev.value);
+                        let (code, value) =
+                            self.remap.remap_axis_event(self.posture, ev.code, ev.value);
                         push_report_event(
                             &mut self.pending_report,
                             &mut self.pending_report_oversized,
@@ -647,7 +648,7 @@ impl ReportPump {
                 // emitted codes), so the authoritative body-frame value is re-expressed
                 // for the current posture exactly like the live path.
                 AbsAction::Passthrough => {
-                    actual_abs.push(remap_axis_event(self.posture, code, value))
+                    actual_abs.push(self.remap.remap_axis_event(self.posture, code, value))
                 }
                 AbsAction::Button { code, value } => actual_binary.push((code, value != 0)),
                 AbsAction::None => unreachable!("resync_abs always yields authoritative state"),
@@ -1397,7 +1398,8 @@ id = "lstick"
 kind = "stick"
 ev_type = "EV_ABS"
 code = "ABS_X,ABS_Y"
-range = { min = 0, max = 4095, fuzz = 0, flat = 0 }
+x = { min = 0, max = 4095, fuzz = 0, flat = 0 }
+y = { min = 0, max = 4095, fuzz = 0, flat = 0 }
 
 [[inputs]]
 id = "ltrig"
@@ -1448,16 +1450,10 @@ range = { min = 0, max = 255, fuzz = 0, flat = 0 }
                 .any(|&(t, code, _)| t == ioc::EV_ABS && code == 0x10),
             "{out:?}"
         );
-        // Stick axes ride the same rotation, while the binary trigger (DEPTH, not
-        // direction) emits its identical button under any posture.
-        let out = run(
-            &mut pump,
-            &[
-                ev(ioc::EV_ABS, 0x00 /* ABS_X */, 4095),
-                ev(ioc::EV_ABS, 0x02 /* ABS_Z */, 255),
-                syn(),
-            ],
-        );
+        // Stick axes (UNSIGNED 0..4095, the a133's real calibration shape) ride the same
+        // rotation with values kept inside the advertised range: the copy branch keeps the
+        // value, the negating branch reflects it about the range (4095−v), never about zero.
+        let out = run(&mut pump, &[ev(ioc::EV_ABS, 0x00 /* ABS_X */, 4095), syn()]);
         assert!(
             out.contains(&(ioc::EV_ABS, 0x01 /* ABS_Y */, 4095)),
             "{out:?}"
@@ -1467,8 +1463,26 @@ range = { min = 0, max = 255, fuzz = 0, flat = 0 }
                 .any(|&(t, code, _)| t == ioc::EV_ABS && code == 0x00),
             "{out:?}"
         );
+        let out = run(&mut pump, &[ev(ioc::EV_ABS, 0x01 /* ABS_Y */, 0), syn()]);
+        assert!(
+            out.contains(&(ioc::EV_ABS, 0x00 /* ABS_X */, 4095)),
+            "body-up stick must emit logical-right at full scale, not -0: {out:?}"
+        );
+        assert!(
+            !out.iter()
+                .any(|&(t, code, _)| t == ioc::EV_ABS && code == 0x01),
+            "{out:?}"
+        );
+        // The binary trigger (DEPTH, not direction) emits its identical button under any
+        // posture and never leaks onto the axis wire.
+        let out = run(&mut pump, &[ev(ioc::EV_ABS, 0x02 /* ABS_Z */, 255), syn()]);
         assert!(
             out.contains(&(ioc::EV_KEY, 0x138 /* BTN_TL2 */, 1)),
+            "{out:?}"
+        );
+        assert!(
+            !out.iter()
+                .any(|&(t, code, _)| t == ioc::EV_ABS && code == 0x02),
             "{out:?}"
         );
     }
@@ -1482,13 +1496,16 @@ range = { min = 0, max = 255, fuzz = 0, flat = 0 }
         // pump's held state after the report is the LOGICAL frame.
         let out = run(&mut pump, &[ev(ioc::EV_ABS, 0x11, 1), syn()]);
         assert!(out.contains(&(ioc::EV_ABS, 0x10, -1)), "{out:?}");
-        // The source now holds HAT0X = 1 physically and released HAT0Y. After SYN_DROPPED
-        // the resync reads the body-frame truth and must re-express it in the logical
-        // frame: logical HAT0X back to 0, logical HAT0Y to 1. A resync that wrote the
-        // unrotated source values would instead emit the spurious (HAT0X, 1).
+        // The source now holds HAT0X = 1 physically, released HAT0Y, holds the left stick
+        // full-right (ABS_X = 4095) with ABS_Y = 0. After SYN_DROPPED the resync reads the
+        // body-frame truth and must re-express it in the logical frame: logical HAT0X back
+        // to 0, logical HAT0Y to 1, logical ABS_Y to 4095 and logical ABS_X to 4095
+        // (0 reflected about the unsigned range, NOT -0/about zero). A resync that wrote
+        // the unrotated source values would instead emit the spurious (HAT0X, 1) and miss
+        // the stick corrections entirely.
         let source = FakeSource {
             pressed: Vec::new(),
-            abs: vec![(0x10, 1)],
+            abs: vec![(0x10, 1), (0x00, 4095)],
         };
         let out = run_with(
             &mut pump,
@@ -1497,6 +1514,14 @@ range = { min = 0, max = 255, fuzz = 0, flat = 0 }
         );
         assert!(out.contains(&(ioc::EV_ABS, 0x10, 0)), "{out:?}");
         assert!(out.contains(&(ioc::EV_ABS, 0x11, 1)), "{out:?}");
+        assert!(
+            out.contains(&(ioc::EV_ABS, 0x01 /* ABS_Y */, 4095)),
+            "{out:?}"
+        );
+        assert!(
+            out.contains(&(ioc::EV_ABS, 0x00 /* ABS_X */, 4095)),
+            "{out:?}"
+        );
         assert!(
             !out.iter()
                 .any(|&(t, c, v)| t == ioc::EV_ABS && c == 0x10 && v == 1),
