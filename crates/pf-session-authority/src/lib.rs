@@ -70,6 +70,8 @@ use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
+pub mod orientation;
+
 /// Default deadline for the restored shell to acknowledge its first presentation.
 pub const DEFAULT_PRESENTATION_TIMEOUT: Duration = Duration::from_secs(10);
 
