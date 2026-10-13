@@ -53,6 +53,7 @@ fn start_daemon() -> (Daemon, PathBuf, PathBuf) {
         .arg("--socket")
         .arg(&socket)
         .args(["--command-preset", "desktop-sim"])
+        .args(["--orientation-mode", "static"])
         .args(["--shell-user", "root"])
         .stdout(Stdio::null())
         .stderr(Stdio::null())

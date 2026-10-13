@@ -1,6 +1,7 @@
 [Unit]
 Description=PocketForge durable session authority
-After=local-fs.target
+After=local-fs.target pf-prefsd.service
+Requires=pf-prefsd.service
 Before=pf-shell-selected.service
 
 [Service]
