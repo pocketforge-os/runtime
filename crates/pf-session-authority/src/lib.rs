@@ -1493,6 +1493,8 @@ pub fn spawn_rpc_acceptor_with_orientation(
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let lifecycle_active = Arc::new(AtomicUsize::new(0));
+        let connections_active = Arc::new(AtomicUsize::new(0));
+        let total_bound = limits.max_connections.saturating_add(watch.max_waiters());
         for connection in listener.incoming() {
             let stream = match connection {
                 Ok(stream) => stream,
@@ -1501,13 +1503,19 @@ pub fn spawn_rpc_acceptor_with_orientation(
                     return;
                 }
             };
-            let (requests, lifecycle_active, policy, watch) = (
+            if connections_active.fetch_add(1, Ordering::AcqRel) >= total_bound {
+                connections_active.fetch_sub(1, Ordering::AcqRel);
+                continue;
+            }
+            let (requests, lifecycle_active, connections_active, policy, watch) = (
                 requests.clone(),
                 Arc::clone(&lifecycle_active),
+                Arc::clone(&connections_active),
                 policy.clone(),
                 Arc::clone(&watch),
             );
             thread::spawn(move || {
+                let _connection_permit = CounterPermit(&connections_active);
                 if let Err(error) = serve_orientation_aware_connection(
                     stream,
                     &requests,
@@ -1589,7 +1597,7 @@ fn serve_orientation_aware_connection(
                 lifecycle_active.fetch_sub(1, Ordering::AcqRel);
                 return Ok(());
             }
-            let _permit = LifecyclePermit(lifecycle_active);
+            let _permit = CounterPermit(lifecycle_active);
             let (reply, response) = mpsc::channel();
             requests
                 .send(Ok(PendingRpc {
@@ -1607,8 +1615,8 @@ fn serve_orientation_aware_connection(
     pf_wire::write_frame(&mut stream, &body).map_err(|e| backend(&e))
 }
 
-struct LifecyclePermit<'a>(&'a AtomicUsize);
-impl Drop for LifecyclePermit<'_> {
+struct CounterPermit<'a>(&'a AtomicUsize);
+impl Drop for CounterPermit<'_> {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::AcqRel);
     }

@@ -407,6 +407,10 @@ impl OrientationWatch {
     pub fn active_waiters(&self) -> usize {
         self.active.load(Ordering::Acquire)
     }
+
+    pub fn max_waiters(&self) -> usize {
+        self.max_waiters
+    }
     pub fn wait_after(
         &self,
         after_serial: u64,
