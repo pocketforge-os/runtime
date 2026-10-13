@@ -2,7 +2,9 @@ use pf_ports::{Clock, MonotonicTime};
 use pf_session_authority::orientation::{
     refresh_from_source, spawn_input_driver, OrientationInputs,
 };
-use pf_session_authority::orientation_source::{LinuxOrientationPaths, LinuxOrientationSource};
+use pf_session_authority::orientation_source::{
+    production_descriptor_path, LinuxOrientationPaths, LinuxOrientationSource,
+};
 use pf_session_authority::{
     run_service_loop, spawn_front_acceptor, spawn_rpc_acceptor_with_orientation, Authority,
     CommandSystem, CommandTemplates, FileStore, FixedUrlHandler, FrontPolicy, PendingRpc,
@@ -33,7 +35,7 @@ struct Args {
     shell_unit: String,
     broker_unit: String,
     compositor_unit: String,
-    descriptor: PathBuf,
+    descriptor: Option<PathBuf>,
     prefs_socket: PathBuf,
     orientation_live: bool,
     templates: CommandTemplates,
@@ -89,7 +91,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     authority.reconcile()?;
     let _orientation_driver = if args.orientation_live {
         let orientation_paths = LinuxOrientationPaths {
-            descriptor: args.descriptor,
+            descriptor: args
+                .descriptor
+                .map(Ok)
+                .unwrap_or_else(production_descriptor_path)?,
             prefs_socket: args.prefs_socket,
             ..LinuxOrientationPaths::default()
         };
@@ -218,7 +223,9 @@ Options:
   --shell-unit UNIT                Full-access shell unit (default pf-shell-selected.service)
   --broker-unit UNIT               Root SafeReturn-only unit (default pf-input-broker.service)
   --compositor-unit UNIT           Read-only orientation consumer (default gamescope-session.service)
-  --descriptor PATH               Device capabilities descriptor (default $PF_DESCRIPTOR or installed platform contract)
+  --descriptor PATH               Device capabilities descriptor (default $PF_DESCRIPTOR,
+                                   $PF_PLATFORM/devices/$PF_DEVICE_ID/capabilities.toml,
+                                   or the sole installed per-device descriptor)
   --prefsd-socket PATH             User rotation preferences (default /run/pocketforge/prefsd.sock)
   --orientation-mode MODE          live (default); static only with desktop-sim test preset
   --front-socket PATH              Private socket for the SDK front (OpenUrl/ReturnToCaller);
@@ -236,7 +243,7 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
     let mut broker_unit = "pf-input-broker.service".to_owned();
     let mut compositor_unit = "gamescope-session.service".to_owned();
     let defaults = LinuxOrientationPaths::default();
-    let mut descriptor = defaults.descriptor;
+    let mut descriptor = None;
     let mut prefs_socket = defaults.prefs_socket;
     let mut orientation_live = true;
     let mut preset = "device".to_owned();
@@ -260,7 +267,7 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
             "--shell-unit" => shell_unit = value,
             "--broker-unit" => broker_unit = value,
             "--compositor-unit" => compositor_unit = value,
-            "--descriptor" => descriptor = value.into(),
+            "--descriptor" => descriptor = Some(value.into()),
             "--prefsd-socket" => prefs_socket = value.into(),
             "--orientation-mode" => match value.as_str() {
                 "live" => orientation_live = true,

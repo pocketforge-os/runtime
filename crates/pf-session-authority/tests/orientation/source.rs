@@ -77,7 +77,9 @@ screen_rotation = { screen_main="cw90" }
     );
     write(
         root.join("apps/org.example.game/app.toml"),
-        "[display]\norientations=[\"landscape_flipped\"]\n",
+        "[app]\nid=\"org.example.game\"\nuse=[]\n\
+         [runtime]\nfamily=\"pocketforge/a133-powervr\"\nabi=\"1\"\n\
+         [display]\norientations=[\"landscape_flipped\"]\n",
     );
 
     let prefs_socket = root.join("prefsd.sock");
@@ -101,8 +103,8 @@ screen_rotation = { screen_main="cw90" }
     prefs.set("user_rotation", "left".into()).unwrap();
 
     let mut source = LinuxOrientationSource::open(LinuxOrientationPaths {
-        descriptor,
-        prefs_socket,
+        descriptor: descriptor.clone(),
+        prefs_socket: prefs_socket.clone(),
         app_root: root.join("apps"),
         drm_class: root.join("drm"),
         device_tree: root.join("dt"),
@@ -135,6 +137,61 @@ screen_rotation = { screen_main="cw90" }
     let second = source.snapshot(Some("org.example.game"), &first).unwrap();
     assert!(second.auto_rotate);
     assert_eq!(second.accelerometer, Some(SensorObservation::Right));
+
+    for (label, switches) in [
+        (
+            "SW_ROTATE_LOCK",
+            r#"{"Hall":{"SW_LID":true},"Buttons":{"SW_ROTATE_LOCK":{"error":"EIO"},"SW_TABLET_MODE":true}}"#,
+        ),
+        (
+            "SW_TABLET_MODE",
+            r#"{"Hall":{"SW_LID":true},"Buttons":{"SW_ROTATE_LOCK":false,"SW_TABLET_MODE":{"error":"EIO"}}}"#,
+        ),
+        (
+            "SW_LID",
+            r#"{"Hall":{"SW_LID":{"error":"EIO"}},"Buttons":{"SW_ROTATE_LOCK":false,"SW_TABLET_MODE":true}}"#,
+        ),
+    ] {
+        write(root.join("switches.json"), switches);
+        let error = source
+            .snapshot(Some("org.example.game"), &second)
+            .unwrap_err();
+        assert!(error.contains(label), "{error}");
+    }
+    write(
+        root.join("switches.json"),
+        r#"{"Hall":{"SW_LID":true},"Buttons":{"SW_ROTATE_LOCK":false,"SW_TABLET_MODE":true}}"#,
+    );
+    let recovered = source.snapshot(Some("org.example.game"), &second).unwrap();
+    assert_eq!(recovered.rotate_locks, second.rotate_locks);
+    assert_eq!(recovered.tablet_mode, second.tablet_mode);
+    assert_eq!(recovered.screen_posture, second.screen_posture);
+
+    for (label, input_class) in [
+        ("enumerate", root.join("missing-input-class")),
+        ("open", root.join("unopenable-input-class")),
+    ] {
+        if label == "open" {
+            write(input_class.join("event0/device/name"), "Buttons\n");
+        }
+        let mut failing = LinuxOrientationSource::open(LinuxOrientationPaths {
+            descriptor: descriptor.clone(),
+            prefs_socket: prefs_socket.clone(),
+            app_root: root.join("apps"),
+            drm_class: root.join("drm"),
+            device_tree: root.join("dt"),
+            input_class,
+            input_devices: root.join("missing-input-devices"),
+            iio_devices: root.join("iio"),
+            sensor_orientation_file: Some(root.join("sensor-orientation")),
+            switch_state_file: None,
+        })
+        .unwrap();
+        let error = failing
+            .snapshot(Some("org.example.game"), &second)
+            .unwrap_err();
+        assert!(error.contains("evdev"), "{label}: {error}");
+    }
 
     stop.store(true, Ordering::Release);
     daemon.join().unwrap();

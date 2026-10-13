@@ -25,6 +25,13 @@ const SW_LID: u16 = 0x00;
 const SW_TABLET_MODE: u16 = 0x01;
 const SW_ROTATE_LOCK: u16 = 0x0c;
 
+#[derive(Clone, Debug, Deserialize)]
+#[serde(untagged)]
+enum FixtureSwitch {
+    Value(bool),
+    Error { error: String },
+}
+
 #[derive(Clone, Debug)]
 pub struct LinuxOrientationPaths {
     pub descriptor: PathBuf,
@@ -45,9 +52,7 @@ pub struct LinuxOrientationPaths {
 impl Default for LinuxOrientationPaths {
     fn default() -> Self {
         Self {
-            descriptor: std::env::var_os("PF_DESCRIPTOR")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from(pf_app_manifest::PLATFORM_CONTRACT_PATH)),
+            descriptor: PathBuf::from("/run/pocketforge/missing-device-capabilities.toml"),
             prefs_socket: PathBuf::from("/run/pocketforge/prefsd.sock"),
             app_root: PathBuf::from(pf_app_manifest::APP_ROOT),
             drm_class: PathBuf::from("/sys/class/drm"),
@@ -63,7 +68,6 @@ impl Default for LinuxOrientationPaths {
 
 #[derive(Debug, Deserialize)]
 struct Descriptor {
-    #[serde(default)]
     screens: Vec<Screen>,
     #[serde(default)]
     sensors: Vec<Sensor>,
@@ -126,8 +130,14 @@ impl LinuxOrientationSource {
     pub fn open(paths: LinuxOrientationPaths) -> Result<Self, String> {
         let text = fs::read_to_string(&paths.descriptor)
             .map_err(|error| format!("read {}: {error}", paths.descriptor.display()))?;
-        let descriptor = toml::from_str(&text)
+        let descriptor: Descriptor = toml::from_str(&text)
             .map_err(|error| format!("parse {}: {error}", paths.descriptor.display()))?;
+        if descriptor.screens.is_empty() {
+            return Err(format!(
+                "parse {}: device descriptor has no screens",
+                paths.descriptor.display()
+            ));
+        }
         Ok(Self {
             paths,
             descriptor,
@@ -175,24 +185,25 @@ impl LinuxOrientationSource {
         let path = self.paths.app_root.join(app).join("app.toml");
         let text = fs::read_to_string(&path)
             .map_err(|error| format!("read {}: {error}", path.display()))?;
-        let value: toml::Value =
-            toml::from_str(&text).map_err(|error| format!("parse {}: {error}", path.display()))?;
-        let Some(values) = value
-            .get("display")
-            .and_then(|display| display.get("orientations"))
-            .and_then(toml::Value::as_array)
-        else {
+        let manifest = pf_app_manifest::parse_manifest(&text)
+            .map_err(|error| format!("parse {}: {error}", path.display()))?;
+        let Some(display) = manifest.display else {
             return Ok(vec![LogicalOrientation::Landscape]);
         };
-        values
-            .iter()
-            .map(|value| {
-                value
-                    .as_str()
-                    .and_then(parse_logical_orientation)
-                    .ok_or_else(|| "active app has an invalid display orientation".to_owned())
+        Ok(display
+            .orientations
+            .into_iter()
+            .map(|orientation| match orientation {
+                pf_app_manifest::DisplayOrientation::Landscape => LogicalOrientation::Landscape,
+                pf_app_manifest::DisplayOrientation::LandscapeFlipped => {
+                    LogicalOrientation::LandscapeFlipped
+                }
+                pf_app_manifest::DisplayOrientation::Portrait => LogicalOrientation::Portrait,
+                pf_app_manifest::DisplayOrientation::PortraitFlipped => {
+                    LogicalOrientation::PortraitFlipped
+                }
             })
-            .collect()
+            .collect())
     }
 
     fn accelerometer(&self, inputs: &mut OrientationInputs) {
@@ -213,35 +224,64 @@ impl LinuxOrientationSource {
         inputs.accelerometer_mount_matches = descriptor_matrix == kernel_matrix;
     }
 
-    fn switches(&mut self, inputs: &mut OrientationInputs) {
-        let fixture: BTreeMap<String, BTreeMap<String, bool>> = self
-            .paths
-            .switch_state_file
-            .as_ref()
-            .and_then(|path| fs::read(path).ok())
-            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-            .unwrap_or_default();
-        let devices = discover_switch_devices(&self.paths.input_class, &self.paths.input_devices);
-        let fixture_values = |token: &str| {
+    fn switches(&mut self, inputs: &mut OrientationInputs) -> Result<(), String> {
+        let fixture: BTreeMap<String, BTreeMap<String, FixtureSwitch>> =
+            match &self.paths.switch_state_file {
+                Some(path) => serde_json::from_slice(
+                    &fs::read(path).map_err(|error| format!("read {}: {error}", path.display()))?,
+                )
+                .map_err(|error| format!("parse {}: {error}", path.display()))?,
+                None => BTreeMap::new(),
+            };
+        let devices = if self.paths.switch_state_file.is_some() {
+            Vec::new()
+        } else {
+            discover_switch_devices(&self.paths.input_class, &self.paths.input_devices)
+                .map_err(|error| format!("discover evdev switches: {error}"))?
+        };
+        let fixture_value = |source: &str, token: &str| -> Result<Option<bool>, String> {
+            match fixture.get(source).and_then(|values| values.get(token)) {
+                Some(FixtureSwitch::Value(value)) => Ok(Some(*value)),
+                Some(FixtureSwitch::Error { error }) => {
+                    Err(format!("read {token} from {source}: {error}"))
+                }
+                None => Ok(None),
+            }
+        };
+        let fixture_values = |token: &str| -> Result<Vec<bool>, String> {
             fixture
-                .values()
-                .filter_map(|values| values.get(token).copied())
-                .collect::<Vec<_>>()
+                .keys()
+                .map(|source| fixture_value(source, token))
+                .collect::<Result<Vec<_>, _>>()
+                .map(|values| values.into_iter().flatten().collect())
         };
         inputs.rotate_locks = if self.paths.switch_state_file.is_some() {
-            fixture_values("SW_ROTATE_LOCK")
+            fixture_values("SW_ROTATE_LOCK")?
         } else {
             devices
                 .iter()
-                .filter_map(|device| device.switch(SW_ROTATE_LOCK).ok().flatten())
+                .map(|device| {
+                    device.switch(SW_ROTATE_LOCK).map_err(|error| {
+                        format!("read SW_ROTATE_LOCK from {}: {error}", device.name)
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .flatten()
                 .collect()
         };
         inputs.tablet_mode = if self.paths.switch_state_file.is_some() {
-            fixture_values("SW_TABLET_MODE").into_iter().next()
+            fixture_values("SW_TABLET_MODE")?.into_iter().next()
         } else {
-            devices
+            let values = devices
                 .iter()
-                .find_map(|device| device.switch(SW_TABLET_MODE).ok().flatten())
+                .map(|device| {
+                    device.switch(SW_TABLET_MODE).map_err(|error| {
+                        format!("read SW_TABLET_MODE from {}: {error}", device.name)
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            values.into_iter().flatten().next()
         };
         inputs.tablet_mode_is_posture = false;
 
@@ -252,7 +292,7 @@ impl LinuxOrientationSource {
             .find(|joint| joint.kind == "swivel" || joint.kind == "hinge")
         else {
             inputs.screen_posture = QuarterTurn::Normal;
-            return;
+            return Ok(());
         };
         let default_value = joint.default.unwrap_or_else(|| {
             joint
@@ -267,19 +307,22 @@ impl LinuxOrientationSource {
                 continue;
             };
             let set = if self.paths.switch_state_file.is_some() {
-                fixture
-                    .get(&switch.source)
-                    .and_then(|values| values.get(&switch.code))
-                    .copied()
+                fixture_value(&switch.source, &switch.code)?
             } else {
-                devices
+                let device = devices
                     .iter()
                     .find(|device| device.name == switch.source)
-                    .and_then(|device| device.switch(code).ok().flatten())
+                    .ok_or_else(|| format!("required evdev source {} is absent", switch.source))?;
+                device.switch(code).map_err(|error| {
+                    format!("read {} from {}: {error}", switch.code, switch.source)
+                })?
             };
-            let Some(set) = set else {
-                continue;
-            };
+            let set = set.ok_or_else(|| {
+                format!(
+                    "required switch {} is unsupported by {}",
+                    switch.code, switch.source
+                )
+            })?;
             if code == SW_TABLET_MODE {
                 inputs.tablet_mode_is_posture = true;
             }
@@ -294,6 +337,60 @@ impl LinuxOrientationSource {
             .get_or_insert_with(|| HallDebouncer::new(proposed, 50));
         hall.observe(proposed, now_ms);
         inputs.screen_posture = hall.advance(now_ms);
+        Ok(())
+    }
+}
+
+/// Resolve the canonical per-device descriptor using the runtime's device-selection contract.
+pub fn production_descriptor_path() -> Result<PathBuf, String> {
+    resolve_descriptor_path(
+        std::env::var_os("PF_DESCRIPTOR"),
+        std::env::var_os("PF_DEVICE_ID"),
+        std::env::var_os("PF_PLATFORM"),
+        Path::new("/usr/share/pocketforge/devices"),
+    )
+}
+
+fn resolve_descriptor_path(
+    explicit: Option<std::ffi::OsString>,
+    device_id: Option<std::ffi::OsString>,
+    platform: Option<std::ffi::OsString>,
+    installed_devices: &Path,
+) -> Result<PathBuf, String> {
+    if let Some(path) = explicit {
+        return Ok(path.into());
+    }
+    match (device_id, platform) {
+        (Some(id), Some(root)) => {
+            return Ok(PathBuf::from(root)
+                .join("devices")
+                .join(id)
+                .join("capabilities.toml"));
+        }
+        (Some(_), None) | (None, Some(_)) => {
+            return Err("PF_DEVICE_ID and PF_PLATFORM must be set together".to_owned());
+        }
+        (None, None) => {}
+    }
+    let mut candidates = fs::read_dir(installed_devices)
+        .map_err(|error| format!("read {}: {error}", installed_devices.display()))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("read {}: {error}", installed_devices.display()))?
+        .into_iter()
+        .map(|entry| entry.path().join("capabilities.toml"))
+        .filter(|path| path.is_file())
+        .collect::<Vec<_>>();
+    candidates.sort();
+    match candidates.as_slice() {
+        [only] => Ok(only.clone()),
+        [] => Err(format!(
+            "no installed device descriptor beneath {}",
+            installed_devices.display()
+        )),
+        _ => Err(format!(
+            "multiple installed device descriptors beneath {}; set PF_DESCRIPTOR",
+            installed_devices.display()
+        )),
     }
 }
 
@@ -311,7 +408,7 @@ impl OrientationInputSource for LinuxOrientationSource {
         self.preferences(&mut inputs)?;
         inputs.app_orientations = self.app_orientations(active_app)?;
         self.accelerometer(&mut inputs);
-        self.switches(&mut inputs);
+        self.switches(&mut inputs)?;
         Ok(inputs)
     }
 }
@@ -324,16 +421,6 @@ fn parse_rotation(value: &str) -> Option<QuarterTurn> {
             Some(QuarterTurn::UpsideDown)
         }
         "right" | "right side up" | "right-side-up" | "cw90" | "90" => Some(QuarterTurn::Right),
-        _ => None,
-    }
-}
-
-fn parse_logical_orientation(value: &str) -> Option<LogicalOrientation> {
-    match value {
-        "landscape" => Some(LogicalOrientation::Landscape),
-        "landscape_flipped" => Some(LogicalOrientation::LandscapeFlipped),
-        "portrait" => Some(LogicalOrientation::Portrait),
-        "portrait_flipped" => Some(LogicalOrientation::PortraitFlipped),
         _ => None,
     }
 }
@@ -492,20 +579,25 @@ impl SwitchDevice {
     }
 }
 
-fn discover_switch_devices(class_root: &Path, devices_root: &Path) -> Vec<SwitchDevice> {
-    let Ok(entries) = fs::read_dir(class_root) else {
-        return Vec::new();
-    };
-    entries
-        .flatten()
+fn discover_switch_devices(
+    class_root: &Path,
+    devices_root: &Path,
+) -> io::Result<Vec<SwitchDevice>> {
+    fs::read_dir(class_root)?
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
         .filter(|entry| entry.file_name().to_string_lossy().starts_with("event"))
-        .filter_map(|entry| {
-            let name = fs::read_to_string(entry.path().join("device/name")).ok()?;
+        .map(|entry| {
+            let name = fs::read_to_string(entry.path().join("device/name"))?;
             let path = devices_root.join(entry.file_name());
-            let cpath = CString::new(path.as_os_str().as_bytes()).ok()?;
+            let cpath = CString::new(path.as_os_str().as_bytes())
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "evdev path has NUL"))?;
             // SAFETY: cpath is NUL-terminated; a successful fd is immediately owned.
             let raw = unsafe { libc::open(cpath.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
-            (raw >= 0).then(|| SwitchDevice {
+            if raw < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(SwitchDevice {
                 name: name.trim().to_owned(),
                 // SAFETY: raw is a fresh successful open and has one owner.
                 fd: unsafe { OwnedFd::from_raw_fd(raw) },
@@ -564,6 +656,43 @@ mod tests {
         fs::write(panel.join("rotation"), 270_u32.to_be_bytes()).unwrap();
 
         assert_eq!(read_dt_rotation(&root), Some(QuarterTurn::Left));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn descriptor_resolution_selects_one_device_and_refuses_aggregate_or_ambiguity() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("pf-orientation-caps-{unique}"));
+        let installed = root.join("devices");
+        let only = installed.join("a133/capabilities.toml");
+        fs::create_dir_all(only.parent().unwrap()).unwrap();
+        fs::write(&only, "[[screens]]\nrole='primary'\nrotation='cw90'\n").unwrap();
+        assert_eq!(
+            resolve_descriptor_path(None, None, None, &installed).unwrap(),
+            only
+        );
+
+        let other = installed.join("a523/capabilities.toml");
+        fs::create_dir_all(other.parent().unwrap()).unwrap();
+        fs::write(&other, "[[screens]]\nrole='primary'\nrotation='cw90'\n").unwrap();
+        assert!(resolve_descriptor_path(None, None, None, &installed)
+            .unwrap_err()
+            .contains("multiple installed"));
+
+        let aggregate = root.join("platform-capabilities.toml");
+        fs::write(&aggregate, "schema_version=1\nruntime_abi='1'\n").unwrap();
+        let paths = LinuxOrientationPaths {
+            descriptor: aggregate,
+            ..LinuxOrientationPaths::default()
+        };
+        assert!(LinuxOrientationSource::open(paths)
+            .err()
+            .unwrap()
+            .contains("screens"));
 
         fs::remove_dir_all(root).unwrap();
     }
