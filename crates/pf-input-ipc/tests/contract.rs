@@ -631,6 +631,14 @@ struct RefusalFixture {
     #[serde(default)]
     sequence: u64,
     #[serde(default)]
+    state: Option<PowerState>,
+    #[serde(default)]
+    snapshot_pressed: Option<bool>,
+    #[serde(default)]
+    snapshot_last_sequence: Option<u64>,
+    #[serde(default)]
+    expected_last_sequence: Option<u64>,
+    #[serde(default)]
     role: Option<pf_input_ipc::OverlayRole>,
 }
 
@@ -655,6 +663,10 @@ fn every_stateful_refusal_has_a_named_fixture_and_positive_control() {
         "refused-multiple-fds",
         "refused-old-epoch",
         "refused-power-before-snapshot",
+        "refused-power-duplicate-pressed-after-delta",
+        "refused-power-duplicate-pressed-from-snapshot",
+        "refused-power-duplicate-released-after-delta",
+        "refused-power-duplicate-released-from-snapshot",
         "refused-power-old-epoch",
         "refused-power-replayed-sequence",
         "refused-role-already-bound",
@@ -705,6 +717,33 @@ fn every_stateful_refusal_has_a_named_fixture_and_positive_control() {
                     .unwrap();
                 session
                     .protected_power(fixture.message_epoch, fixture.sequence, PowerState::Pressed)
+                    .unwrap_err()
+            }
+            "power_duplicate_from_snapshot" => {
+                let state = fixture.state.expect("duplicate state");
+                let mut snapshot = snapshot_for_epoch(fixture.current_epoch);
+                snapshot.power.pressed = fixture.snapshot_pressed.expect("snapshot level");
+                snapshot.power.last_sequence = fixture
+                    .snapshot_last_sequence
+                    .expect("snapshot sequence watermark");
+                session.apply_snapshot(snapshot).unwrap();
+                session
+                    .protected_power(fixture.message_epoch, fixture.sequence, state)
+                    .unwrap_err()
+            }
+            "power_duplicate_after_delta" => {
+                let state = fixture.state.expect("duplicate state");
+                let mut snapshot = snapshot_for_epoch(fixture.current_epoch);
+                snapshot.power.pressed = fixture.snapshot_pressed.expect("snapshot level");
+                snapshot.power.last_sequence = fixture
+                    .snapshot_last_sequence
+                    .expect("snapshot sequence watermark");
+                session.apply_snapshot(snapshot).unwrap();
+                session
+                    .protected_power(fixture.message_epoch, fixture.sequence, state)
+                    .unwrap();
+                session
+                    .protected_power(fixture.message_epoch, fixture.sequence + 1, state)
                     .unwrap_err()
             }
             "power_replayed_sequence" | "replayed_power_sequence" => {
@@ -793,6 +832,11 @@ fn every_stateful_refusal_has_a_named_fixture_and_positive_control() {
                 got: fixture.message_epoch,
                 current: fixture.current_epoch,
             },
+            "power_duplicate_from_snapshot" | "power_duplicate_after_delta" => {
+                CompositorStateError::DuplicatePowerState {
+                    state: fixture.state.expect("duplicate state"),
+                }
+            }
             "power_replayed_sequence" | "replayed_power_sequence" => {
                 CompositorStateError::NonMonotonicPowerSequence {
                     got: fixture.sequence,
@@ -812,6 +856,13 @@ fn every_stateful_refusal_has_a_named_fixture_and_positive_control() {
             other => panic!("unknown refusal scenario {other}"),
         };
         assert_eq!(error, expected_error, "{stem} exercised the wrong refusal");
+        if fixture.scenario.starts_with("power_duplicate_") {
+            assert_eq!(
+                session.snapshot().unwrap().power.last_sequence,
+                fixture.expected_last_sequence.expect("retained watermark"),
+                "{stem} advanced the watermark for a non-transition"
+            );
+        }
     }
     assert_eq!(seen, expected);
 
@@ -821,6 +872,14 @@ fn every_stateful_refusal_has_a_named_fixture_and_positive_control() {
     good.apply_snapshot(snapshot_for_epoch(42)).unwrap();
     assert_eq!(
         good.protected_power(42, 93, PowerState::Pressed),
+        Ok(PowerStep::Accepted)
+    );
+    assert_eq!(
+        good.protected_power(42, 94, PowerState::Released),
+        Ok(PowerStep::Accepted)
+    );
+    assert_eq!(
+        good.protected_power(42, 95, PowerState::Pressed),
         Ok(PowerStep::Accepted)
     );
     good.begin_trusted_connection(42, 8001, pf_input_ipc::OverlayRole::Menu)

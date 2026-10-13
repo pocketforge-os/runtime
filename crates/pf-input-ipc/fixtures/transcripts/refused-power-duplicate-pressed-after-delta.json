@@ -1,0 +1,1 @@
+{"scenario":"power_duplicate_after_delta","current_epoch":42,"message_epoch":42,"sequence":93,"state":"pressed","snapshot_pressed":false,"snapshot_last_sequence":92,"expected_last_sequence":93}

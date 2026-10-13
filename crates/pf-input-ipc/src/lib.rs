@@ -710,6 +710,7 @@ pub mod compositor {
         SnapshotAlreadyApplied,
         IncompleteSnapshot,
         NonMonotonicPowerSequence { got: u64, last: u64 },
+        DuplicatePowerState { state: PowerState },
         UnexpectedRequestId(u64),
         MissingFileDescriptor(u64),
         UnexpectedFileDescriptorCount { request_id: u64, got: usize },
@@ -904,9 +905,17 @@ pub mod compositor {
                     last: self.last_power_sequence,
                 });
             }
+            let pressed = state == PowerState::Pressed;
+            if self
+                .snapshot
+                .as_ref()
+                .is_some_and(|snapshot| snapshot.power.pressed == pressed)
+            {
+                return Err(CompositorStateError::DuplicatePowerState { state });
+            }
             self.last_power_sequence = sequence;
             if let Some(snapshot) = &mut self.snapshot {
-                snapshot.power.pressed = state == PowerState::Pressed;
+                snapshot.power.pressed = pressed;
                 snapshot.power.last_sequence = sequence;
             }
             Ok(PowerStep::Accepted)

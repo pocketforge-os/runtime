@@ -189,7 +189,7 @@ gamescope → router:
 | `focus` | `epoch, surface: {kind: none \| app{app_id} \| trusted{role}}, text_input{active, purpose}, secure_entry` | sent on the frame the focus, the text-input state or `secure_entry` changes |
 | `overlay` | `epoch, role: keyboard \| menu \| toast, state: mapped \| unmapped, rect?` | a trusted overlay was mapped or unmapped |
 | `physical_input` | `epoch, class: keyboard \| mouse \| touch` | first event of a class and every class change, never per event; the router owns modality and answers a real keypress with `hide{physical_keyboard}` |
-| `protected_power` | `epoch, sequence, state: pressed \| released` | `KEY_POWER`/AXP PEK transition consumed before seat delivery; sequence strictly increases within the authoritative stream |
+| `protected_power` | `epoch, sequence, state: pressed \| released` | `KEY_POWER`/AXP PEK transition consumed before seat delivery; sequence strictly increases and `state` must differ from the authoritative current level |
 | `trusted_connection_result` | `epoch, request_id, result: {status: ok} (+ fd) \| {status: refused, reason}` | answer to a pending request in this epoch only |
 | `pong` | `epoch, seq` | |
 
@@ -256,8 +256,9 @@ router publishes a secure_entry signal" (adjudication item 14).
 * **(a2) Protected Power before the seat.** gamescope consumes every `KEY_POWER`/AXP-PEK
   transition before `wlr_seat_keyboard_notify_key`, root-server hotkeys, or app delivery, assigns
   a strictly increasing sequence, and sends `protected_power`. The router feeds accepted
-  transitions to the power policy. Neither gamescope nor the router replays a press as an action
-  from the snapshot watermark.
+  transitions to the power policy. A fresh sequence with the same level is refused without
+  advancing the level or watermark: only a genuine pressed↔released edge can become an action.
+  Neither gamescope nor the router replays a press as an action from the snapshot watermark.
 * **(b) Releases before a switch.** Before the pad is re-pointed, the router synthesises releases
   for every held button and centred axes on the device it is leaving. No reader ever sees a
   press without its release, and no two readers ever share a stream.
@@ -303,8 +304,9 @@ The snapshot's Power level and watermark establish continuity but do not synthes
 action.
 
 `CompositorSession` is the executable receiver model: it refuses the wrong epoch, pre-snapshot
-deltas, incomplete/duplicate snapshots, nonmonotonic Power sequences, unexpected request ids and
-successful trust results without an fd. Its disconnect result describes the fail-closed actions.
+deltas, incomplete/duplicate snapshots, nonmonotonic Power sequences, fresh-sequence Power states
+that repeat the current level, unexpected request ids and successful trust results without an fd.
+Its disconnect result describes the fail-closed actions.
 
 ## 10. What is deliberately not here
 
@@ -337,7 +339,8 @@ Every stateful refusal also has a separately named fixture, rather than living o
 a successful transcript: `refused-delta-before-snapshot.json`, `refused-old-epoch.json`,
 `refused-duplicate-snapshot.json`, `refused-incomplete-snapshot.json`,
 `refused-power-before-snapshot.json`, `refused-power-old-epoch.json`,
-`refused-power-replayed-sequence.json`, `refused-stale-request-id.json`,
+`refused-power-replayed-sequence.json`, the four snapshot/delta × pressed/released
+`refused-power-duplicate-*.json` fixtures, `refused-stale-request-id.json`,
 `refused-missing-fd.json`, `refused-multiple-fds.json`, `refused-fd-on-refusal.json`,
 `refused-role-already-bound.json` and `refused-role-not-bound.json`. The inventory test fails if
 one disappears and drives each to its exact typed error alongside a complete-snapshot/current-
