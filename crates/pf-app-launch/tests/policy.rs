@@ -242,6 +242,16 @@ fn networked_policy_derives_dns_without_manifest_capability() {
     assert!(!offline.network.dns);
     assert!(offline.landlock.tcp_connect_ports.is_empty());
     assert!(offline.landlock.udp_connect_ports.is_empty());
+
+    // Negative compatibility control: the manifest parser preserves legacy
+    // schema-1 host-only egress, but the one policy compiler cannot turn it
+    // into a protocol/port Landlock decision and therefore fails closed.
+    let error = derive_policy(
+        &resolved(&root, &["egress:scores.example.com"], true, true),
+        &inputs(&root),
+    )
+    .unwrap_err();
+    assert_eq!(error.to_string(), "egress authority is invalid");
 }
 
 #[test]

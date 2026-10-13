@@ -297,6 +297,11 @@ fn egress_authority_and_landlock_contract_controls_share_one_invocation() {
     ]))
     .unwrap();
     assert_eq!(manifest.app.capabilities.len(), 2);
+    // Compatibility control: host-only egress was valid in schema 1. Parsing
+    // remains compatible, while the policy compiler requires the canonical
+    // protocol/port form before it can grant network access.
+    let legacy = parse_manifest(&capability_manifest(&["egress:scores.example.com"])).unwrap();
+    assert_eq!(legacy.app.capabilities, ["egress:scores.example.com"]);
     for invalid in [
         "egress:443@example.com",
         "egress:sctp/443@example.com",

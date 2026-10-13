@@ -571,8 +571,17 @@ fn validate_requirement(requirement: &CapabilityRequirement) -> Result<(), ()> {
             .modifier
             .as_deref()
             .ok_or(())
-            .and_then(|modifier| parse_egress_authority(modifier).map_err(|_| ()))
-            .map(|_| ());
+            .and_then(|modifier| {
+                // Schema-1 manifests historically carried a host-only egress
+                // modifier. Keep those descriptors parseable; the policy
+                // compiler still refuses to launch them until they declare a
+                // canonical protocol/port authority.
+                if parse_egress_authority(modifier).is_ok() || valid_egress_host(modifier) {
+                    Ok(())
+                } else {
+                    Err(())
+                }
+            });
     }
     if let Some(modifier) = requirement.modifier.as_deref() {
         if !matches!(
