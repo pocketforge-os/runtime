@@ -608,6 +608,40 @@ fn manifest_with(table: &str) -> String {
     )
 }
 
+#[test]
+fn display_orientations_are_typed_for_absent_singletons_and_multiple_values() {
+    assert_eq!(parse_manifest(&manifest_with("")).unwrap().display, None);
+
+    for (token, expected) in [
+        ("landscape", DisplayOrientation::Landscape),
+        ("landscape_flipped", DisplayOrientation::LandscapeFlipped),
+        ("portrait", DisplayOrientation::Portrait),
+        ("portrait_flipped", DisplayOrientation::PortraitFlipped),
+    ] {
+        let manifest = parse_manifest(&manifest_with(&format!(
+            "[display]\norientations = [{token:?}]\n"
+        )))
+        .unwrap();
+        assert_eq!(manifest.display.unwrap().orientations, [expected]);
+    }
+
+    let manifest = parse_manifest(&manifest_with(
+        "[display]\norientations = [\"portrait\", \"landscape_flipped\"]\n",
+    ))
+    .unwrap();
+    assert_eq!(
+        manifest.display.unwrap().orientations,
+        [
+            DisplayOrientation::Portrait,
+            DisplayOrientation::LandscapeFlipped,
+        ]
+    );
+    assert!(parse_manifest(&manifest_with(
+        "[display]\norientations = [\"landscape\", \"diagonal\"]\n",
+    ))
+    .is_err());
+}
+
 fn check(table: &str, contract: &PlatformContract) -> Result<(), ResolveError> {
     let manifest = parse_manifest(&manifest_with(table)).unwrap();
     check_compatibility(&manifest, contract)
@@ -757,7 +791,7 @@ fn display_min_refuses_only_when_no_allowed_orientation_meets_it() {
 }
 
 #[test]
-fn schema_version_gates_the_display_table_and_old_manifests_keep_parsing() {
+fn schema_version_validates_and_old_manifests_keep_parsing() {
     // Positive control: an absent schema_version means the old version 1 — it
     // parses unchanged and gets the default orientations.
     let manifest = parse_manifest(&manifest_with("")).unwrap();
@@ -769,23 +803,25 @@ fn schema_version_gates_the_display_table_and_old_manifests_keep_parsing() {
     let manifest = parse_manifest(&manifest_schema2_with("")).unwrap();
     assert_eq!(manifest.schema_version, 2);
     assert_eq!(manifest.display_orientations(), DEFAULT_ORIENTATIONS);
-    // Positive control: schema_version 2 admits the new [display] table.
+    // Positive control: schema_version 2 admits the [display] table, typed.
     let manifest = parse_manifest(&manifest_schema2_with(
         "[display]\norientations = [\"portrait\"]\n",
     ))
     .unwrap();
-    assert_eq!(manifest.display_orientations(), ["portrait"]);
-    // Negative control: an explicit schema_version 1 must not declare the
-    // schema-2 table (the same gate the platform contract applies).
-    let error = parse_manifest(&format!(
-        "schema_version = 1\n{}",
-        manifest_with("[display]\norientations = [\"portrait\"]\n")
-    ))
-    .unwrap_err();
-    assert_eq!(error.kind, ManifestErrorKind::Invalid);
     assert_eq!(
-        error.message,
-        "schema_version 1 must not declare schema 2 fields"
+        manifest.display_orientations(),
+        [DisplayOrientation::Portrait]
+    );
+    // Compatibility control: a manifest that declares [display] WITHOUT a
+    // schema_version keeps parsing (the table is accepted at the default
+    // version too — merged main behaviour, consumed by the session
+    // orientation policy), and gets the declared orientations.
+    let manifest =
+        parse_manifest(&manifest_with("[display]\norientations = [\"portrait\"]\n")).unwrap();
+    assert_eq!(manifest.schema_version, 1);
+    assert_eq!(
+        manifest.display_orientations(),
+        [DisplayOrientation::Portrait]
     );
     // Negative control: a version outside the accepted set is refused by name.
     for version in [0u32, 3, 99] {
@@ -802,24 +838,42 @@ fn schema_version_gates_the_display_table_and_old_manifests_keep_parsing() {
 #[test]
 fn display_orientations_validate_against_the_sdl_vocabulary() {
     // Positive controls: every SDL display-orientation name parses alone…
-    for orientation in KNOWN_ORIENTATIONS {
-        parse_manifest(&manifest_schema2_with(&format!(
-            "[display]\norientations = [\"{orientation}\"]\n"
+    for orientation in [
+        DisplayOrientation::Landscape,
+        DisplayOrientation::LandscapeFlipped,
+        DisplayOrientation::Portrait,
+        DisplayOrientation::PortraitFlipped,
+    ] {
+        let manifest = parse_manifest(&manifest_schema2_with(&format!(
+            "[display]\norientations = [\"{}\"]\n",
+            orientation.as_str()
         )))
-        .unwrap_or_else(|error| panic!("{orientation}: {}", error.message));
+        .unwrap_or_else(|error| panic!("{}: {}", orientation.as_str(), error.message));
+        assert_eq!(manifest.display_orientations(), [orientation]);
     }
     // …and all four together parse.
     parse_manifest(&manifest_schema2_with(
         "[display]\norientations = [\"landscape\", \"landscape_flipped\", \"portrait\", \"portrait_flipped\"]\n",
     ))
     .unwrap();
-    // Negative control: an unknown value is refused with a named error.
+    // Negative control: an unknown value is refused with a named error that
+    // says the bad spelling and the vocabulary (serde unknown variant,
+    // classified Invalid like the other content refusals).
     let error = parse_manifest(&manifest_schema2_with(
         "[display]\norientations = [\"upside_down\"]\n",
     ))
     .unwrap_err();
     assert_eq!(error.kind, ManifestErrorKind::Invalid);
-    assert_eq!(error.message, "invalid display orientation");
+    assert!(
+        error.message.contains("unknown variant `upside_down`"),
+        "unexpected message: {}",
+        error.message
+    );
+    assert!(
+        error.message.contains("landscape_flipped") && error.message.contains("portrait_flipped"),
+        "the refusal must name the vocabulary: {}",
+        error.message
+    );
     // Negative control: a duplicate is refused with a named error.
     let error = parse_manifest(&manifest_schema2_with(
         "[display]\norientations = [\"portrait\", \"portrait\"]\n",

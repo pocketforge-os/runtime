@@ -169,6 +169,13 @@ pub enum PreferenceWriter {
     Shell,
 }
 
+/// Kernel-authenticated access to the preference service. Readers never acquire write authority.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PreferenceAccess {
+    ReadOnly,
+    Writer(PreferenceWriter),
+}
+
 /// One explicit row in the default-deny write policy.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct WritePolicyRow {
@@ -215,6 +222,14 @@ pub const WRITE_POLICY: &[WritePolicyRow] = &[
     },
     WritePolicyRow {
         key: "brightness",
+        writers: SETTINGS_AND_SHELL,
+    },
+    WritePolicyRow {
+        key: "auto_rotate",
+        writers: SETTINGS_AND_SHELL,
+    },
+    WritePolicyRow {
+        key: "user_rotation",
         writers: SETTINGS_AND_SHELL,
     },
 ];
@@ -266,6 +281,33 @@ pub fn peer_writer(stream: &UnixStream, writer_gid: u32) -> io::Result<Option<Pr
     peer_writer_with_source(stream, writer_gid, &KernelPeerProcessSource)
 }
 
+fn peer_access_with_source<S: PeerProcessSource>(
+    stream: &UnixStream,
+    owner_uid: u32,
+    writer_gid: u32,
+    reader_uid: u32,
+    reader_unit: &str,
+    source: &S,
+) -> io::Result<Option<PreferenceAccess>> {
+    let cred = peer_cred(stream)?;
+    if cred.uid == owner_uid {
+        return Ok(Some(
+            match peer_writer_with_source(stream, writer_gid, source)? {
+                Some(writer) => PreferenceAccess::Writer(writer),
+                None => PreferenceAccess::ReadOnly,
+            },
+        ));
+    }
+    if cred.uid != reader_uid {
+        return Ok(None);
+    }
+    let cgroup = peer_cgroup_with_source(stream, cred.pid, source)?;
+    Ok(
+        (service_unit_from_cgroup(&cgroup).as_deref() == Some(reader_unit))
+            .then_some(PreferenceAccess::ReadOnly),
+    )
+}
+
 /// Serve exactly one request and response on a connection.
 pub fn serve_connection(store: &PrefsStore, stream: &mut UnixStream) -> io::Result<()> {
     serve_connection_as(store, stream, None)
@@ -313,15 +355,25 @@ pub fn serve_until(
     store: &PrefsStore,
     allowed_uid: u32,
     writer_gid: u32,
+    reader_uid: u32,
+    reader_unit: &str,
     stop: &AtomicBool,
 ) -> io::Result<()> {
-    serve_until_with_timeout(
+    serve_until_with_timeout_and_access_resolver(
         listener,
         store,
-        allowed_uid,
-        writer_gid,
         stop,
         CONNECTION_TIMEOUT,
+        |stream| {
+            peer_access_with_source(
+                stream,
+                allowed_uid,
+                writer_gid,
+                reader_uid,
+                reader_unit,
+                &KernelPeerProcessSource,
+            )
+        },
     )
 }
 
@@ -359,6 +411,32 @@ pub fn serve_until_with_timeout_and_resolver<F>(
 where
     F: Fn(&UnixStream) -> io::Result<Option<PreferenceWriter>>,
 {
+    serve_until_with_timeout_and_access_resolver(
+        listener,
+        store,
+        stop,
+        connection_timeout,
+        move |stream| {
+            let cred = peer_cred(stream)?;
+            verify_peer_uid(cred, allowed_uid)?;
+            Ok(Some(match resolve_writer(stream)? {
+                Some(writer) => PreferenceAccess::Writer(writer),
+                None => PreferenceAccess::ReadOnly,
+            }))
+        },
+    )
+}
+
+fn serve_until_with_timeout_and_access_resolver<F>(
+    listener: UnixListener,
+    store: &PrefsStore,
+    stop: &AtomicBool,
+    connection_timeout: Duration,
+    resolve_access: F,
+) -> io::Result<()>
+where
+    F: Fn(&UnixStream) -> io::Result<Option<PreferenceAccess>>,
+{
     listener.set_nonblocking(true)?;
     while !stop.load(Ordering::Acquire) {
         match listener.accept() {
@@ -370,18 +448,16 @@ where
                         continue;
                     }
                 };
-                if let Err(error) = verify_peer_uid(cred, allowed_uid) {
-                    eprintln!("pf-prefsd: peer refused: {error}");
-                    continue;
-                }
-                let writer = match resolve_writer(&stream) {
-                    Ok(writer) => writer,
+                let writer = match resolve_access(&stream) {
+                    Ok(Some(PreferenceAccess::ReadOnly)) => None,
+                    Ok(Some(PreferenceAccess::Writer(writer))) => Some(writer),
+                    Ok(None) => {
+                        eprintln!("pf-prefsd: peer uid={} is not authorized", cred.uid);
+                        continue;
+                    }
                     Err(error) => {
-                        eprintln!(
-                            "pf-prefsd: peer pid={} has no write identity: {error}",
-                            cred.pid
-                        );
-                        None
+                        eprintln!("pf-prefsd: peer pid={} identity failed: {error}", cred.pid);
+                        continue;
                     }
                 };
                 if let Err(error) = stream
@@ -652,6 +728,67 @@ mod tests {
                 None
             );
         }
+    }
+
+    #[test]
+    fn root_authority_unit_is_read_only_and_every_other_root_unit_is_denied() {
+        let (peer, _other) = UnixStream::pair().unwrap();
+        let peer_uid = peer_cred(&peer).unwrap().uid;
+        for kernel in [ShippingKernel::A133Linux49, ShippingKernel::A523Linux515] {
+            let source = ShippingKernelSource {
+                kernel,
+                cgroup: "0::/system.slice/pf-session-authorityd.service\n",
+                writer_group: true,
+            };
+            assert_eq!(
+                peer_access_with_source(
+                    &peer,
+                    peer_uid.wrapping_add(1),
+                    TEST_WRITER_GID,
+                    peer_uid,
+                    "pf-session-authorityd.service",
+                    &source,
+                )
+                .unwrap(),
+                Some(PreferenceAccess::ReadOnly)
+            );
+
+            let denied = ShippingKernelSource {
+                cgroup: "0::/system.slice/unrelated-root.service\n",
+                ..source
+            };
+            assert_eq!(
+                peer_access_with_source(
+                    &peer,
+                    peer_uid.wrapping_add(1),
+                    TEST_WRITER_GID,
+                    peer_uid,
+                    "pf-session-authorityd.service",
+                    &denied,
+                )
+                .unwrap(),
+                None
+            );
+        }
+
+        let store = PrefsStore::at(
+            std::env::temp_dir().join(format!("pf-prefsd-read-only-{}", std::process::id())),
+        );
+        let denied = handle_rpc(
+            &store,
+            RpcRequest::Set {
+                key: "auto_rotate".into(),
+                value: false.into(),
+            },
+            None,
+        );
+        assert!(matches!(
+            denied,
+            RpcResponse::Error {
+                kind: Some(ErrorKind::PermissionDenied),
+                ..
+            }
+        ));
     }
 
     #[test]

@@ -12,9 +12,12 @@ libc.workspace = true
 pf-app-manifest.workspace = true
 pf-peer-identity.workspace = true
 pf-ports.workspace = true
+pf-prefs.workspace = true
+pf-prefsd.workspace = true
 pf-wire.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+toml.workspace = true
 
 [dev-dependencies]
 pf-app-launch = { path = "../pf-app-launch" }

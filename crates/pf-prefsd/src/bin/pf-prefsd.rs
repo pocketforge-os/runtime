@@ -54,6 +54,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &PrefsStore::at(args.state_dir).with_seed(args.seed_file),
         allowed_uid,
         writer_gid,
+        0,
+        "pf-session-authorityd.service",
         &STOP,
     )?;
     Ok(())

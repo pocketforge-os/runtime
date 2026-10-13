@@ -183,6 +183,14 @@ impl Prefs {
         self.get_scalar("brightness").unwrap_or(100)
     }
 
+    pub fn auto_rotate(&self) -> bool {
+        self.get_bool("auto_rotate").unwrap_or(true)
+    }
+
+    pub fn user_rotation(&self) -> &'static str {
+        self.get_enum("user_rotation").unwrap_or("normal")
+    }
+
     /// Validate-and-set a preference in memory. Rejects unknown keys, type mismatches, and
     /// out-of-range scalars ([`PrefError`]). The explicit set is always recorded (so its
     /// [`Source`] becomes [`Source::Stored`]); the returned [`PrefChange`] is `Some` **iff the
@@ -222,6 +230,8 @@ mod tests {
         assert!(p.haptics_enabled());
         assert!(!p.mono_audio());
         assert_eq!(p.brightness(), 100);
+        assert!(p.auto_rotate());
+        assert_eq!(p.user_rotation(), "normal");
         assert_eq!(p.source("hapticsEnabled"), Source::Default);
         assert!(!p.is_explicit("hapticsEnabled"));
     }

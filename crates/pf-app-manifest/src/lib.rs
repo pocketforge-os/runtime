@@ -58,23 +58,16 @@ pub const KNOWN_INPUTS: &[&str] = &[
     "pointer",
 ];
 
-/// `[display] orientations` vocabulary — SDL's `SDL_DisplayOrientation` names,
-/// lower-cased. The compositor presents the app in any of its declared
-/// orientations and keeps fixed-orientation apps upright and letterboxed.
-pub const KNOWN_ORIENTATIONS: &[&str] = &[
-    "landscape",
-    "landscape_flipped",
-    "portrait",
-    "portrait_flipped",
-];
-
-/// The orientations when the `[display]` table is absent (every schema-1
-/// manifest, and any schema-2 manifest that does not declare one).
-pub const DEFAULT_ORIENTATIONS: &[&str] = &["landscape"];
+/// The orientations when the `[display]` table is absent: the compositor
+/// presents the app landscape, upright, and letterboxes nothing.
+pub const DEFAULT_ORIENTATIONS: &[DisplayOrientation] = &[DisplayOrientation::Landscape];
 
 /// The orientations whose logical canvas swaps the panel's logical landscape
 /// size: width and height trade places relative to `landscape`.
-pub const PORTRAIT_ORIENTATIONS: &[&str] = &["portrait", "portrait_flipped"];
+pub const PORTRAIT_ORIENTATIONS: &[DisplayOrientation] = &[
+    DisplayOrientation::Portrait,
+    DisplayOrientation::PortraitFlipped,
+];
 
 /// Inputs the system input layer provides on every device, so declaring them
 /// in a minimum-spec table is redundant and only earns a warning.
@@ -117,9 +110,10 @@ pub fn parse_capability_requirement(token: &str) -> CapabilityRequirement {
 #[serde(deny_unknown_fields)]
 pub struct Manifest {
     /// The app.toml schema version. Absent means 1 — the schema before
-    /// `[display]` existed; every manifest that was valid at 1 still parses
-    /// unchanged. Version 2 admits the `[display]` table. Any other version is
-    /// refused, mirroring the platform contract's own version gate.
+    /// `[display] orientations` existed; every manifest that was valid at 1
+    /// still parses unchanged and gets the defaults. The current version is
+    /// 2. Any other version is refused, mirroring the platform contract's
+    /// own version gate.
     #[serde(default = "default_schema_version")]
     pub schema_version: u32,
     pub app: App,
@@ -134,7 +128,8 @@ pub struct Manifest {
     pub requirements: Option<Requirements>,
     #[serde(default)]
     pub recommended: Option<Requirements>,
-    /// How the compositor may present the app (schema_version 2 only).
+    /// How the compositor may present the app (`[display]`). Absent means
+    /// [`DEFAULT_ORIENTATIONS`].
     #[serde(default)]
     pub display: Option<Display>,
 }
@@ -145,12 +140,44 @@ fn default_schema_version() -> u32 {
 
 impl Manifest {
     /// The orientations the app allows: its declared `[display] orientations`,
-    /// or [`DEFAULT_ORIENTATIONS`] when the table is absent (which is every
-    /// schema-1 manifest). Never empty — parse-time validation refuses that.
-    pub fn display_orientations(&self) -> Vec<&str> {
+    /// or [`DEFAULT_ORIENTATIONS`] when the table is absent. Never empty —
+    /// parse-time validation refuses that.
+    pub fn display_orientations(&self) -> Vec<DisplayOrientation> {
         match &self.display {
-            Some(display) => display.orientations.iter().map(String::as_str).collect(),
+            Some(display) => display.orientations.clone(),
             None => DEFAULT_ORIENTATIONS.to_vec(),
+        }
+    }
+}
+
+/// Orientations in which an app can render without compatibility letterboxing.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Display {
+    /// A NON-EMPTY subset of the [`DisplayOrientation`] vocabulary (SDL's
+    /// `SDL_DisplayOrientation` names, lower-cased). Unknown values are
+    /// refused by the parser; duplicates and the empty list are refused by
+    /// validation.
+    pub orientations: Vec<DisplayOrientation>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DisplayOrientation {
+    Landscape,
+    LandscapeFlipped,
+    Portrait,
+    PortraitFlipped,
+}
+
+impl DisplayOrientation {
+    /// The lower-cased `SDL_DisplayOrientation` name (the TOML spelling).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            DisplayOrientation::Landscape => "landscape",
+            DisplayOrientation::LandscapeFlipped => "landscape_flipped",
+            DisplayOrientation::Portrait => "portrait",
+            DisplayOrientation::PortraitFlipped => "portrait_flipped",
         }
     }
 }
@@ -191,17 +218,6 @@ pub struct Requirements {
 pub struct DisplaySize {
     pub width: u32,
     pub height: u32,
-}
-
-/// The `[display]` table (schema_version 2): how the compositor may present the
-/// app. Absent means [`DEFAULT_ORIENTATIONS`].
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Display {
-    /// A NON-EMPTY subset of [`KNOWN_ORIENTATIONS`] (SDL's
-    /// `SDL_DisplayOrientation` names, lower-cased). Unknown values and
-    /// duplicates are refused; an empty list is refused.
-    pub orientations: Vec<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -318,7 +334,10 @@ pub fn parse_manifest(source: &str) -> Result<Manifest, ManifestError> {
     let manifest: Manifest = toml::from_str(source).map_err(|error| {
         let message = error.to_string();
         ManifestError {
-            kind: if message.contains("unknown field") || message.contains("missing field") {
+            kind: if message.contains("unknown field")
+                || message.contains("missing field")
+                || message.contains("unknown variant")
+            {
                 ManifestErrorKind::Invalid
             } else {
                 ManifestErrorKind::Parse
@@ -336,9 +355,6 @@ pub fn parse_manifest(source: &str) -> Result<Manifest, ManifestError> {
 fn validate_manifest(manifest: &Manifest) -> Result<(), ManifestError> {
     if !matches!(manifest.schema_version, 1 | 2) {
         return invalid_manifest("schema_version must be 1 or 2");
-    }
-    if manifest.schema_version == 1 && manifest.display.is_some() {
-        return invalid_manifest("schema_version 1 must not declare schema 2 fields");
     }
     if let Some(display) = &manifest.display {
         validate_display(display)?;
@@ -406,21 +422,19 @@ fn validate_manifest(manifest: &Manifest) -> Result<(), ManifestError> {
     Ok(())
 }
 
-/// Validate the schema-2 `[display]` table: a NON-EMPTY subset of
-/// [`KNOWN_ORIENTATIONS`] with no duplicates (the same idiom as the
-/// `[requirements]` input vocabulary).
+/// Validate the `[display]` table: a NON-EMPTY list of the typed
+/// [`DisplayOrientation`] vocabulary with no duplicates (an unknown TOML
+/// spelling is refused earlier, by serde, as an unknown variant).
 fn validate_display(display: &Display) -> Result<(), ManifestError> {
     if display.orientations.is_empty() {
         return invalid_manifest("empty display orientations");
     }
-    let mut seen = BTreeSet::new();
+    let mut seen: Vec<DisplayOrientation> = Vec::new();
     for orientation in &display.orientations {
-        if !KNOWN_ORIENTATIONS.contains(&orientation.as_str()) {
-            return invalid_manifest("invalid display orientation");
-        }
-        if !seen.insert(orientation.as_str()) {
+        if seen.contains(orientation) {
             return invalid_manifest("duplicate display orientation");
         }
+        seen.push(*orientation);
     }
     Ok(())
 }
@@ -1205,7 +1219,7 @@ fn check_compatibility(
 fn check_requirements(
     requirements: &Requirements,
     platform: &PlatformContract,
-    orientations: &[&str],
+    orientations: &[DisplayOrientation],
 ) -> Result<(), ResolveError> {
     if let Some(required) = requirements.memory_mib {
         match platform.app_memory_budget_mib {
@@ -1292,7 +1306,11 @@ fn check_requirements(
                     required.height,
                     display.width,
                     display.height,
-                    orientations.join(", ")
+                    orientations
+                        .iter()
+                        .map(DisplayOrientation::as_str)
+                        .collect::<Vec<_>>()
+                        .join(", ")
                 ),
             ));
         }
