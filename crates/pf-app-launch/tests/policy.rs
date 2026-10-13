@@ -70,6 +70,11 @@ fn inputs(root: &Path) -> PolicyInputs {
             vec![PathBuf::from("/dev/input/event0")],
         ),
         (
+            "video-decode-devices".into(),
+            vec![PathBuf::from("/dev/video0")],
+        ),
+        ("media-devices".into(), vec![PathBuf::from("/dev/media0")]),
+        (
             "session-environment".into(),
             vec![PathBuf::from("/run/pocketforge/session/environment")],
         ),
@@ -145,6 +150,30 @@ fn input_and_bluetooth_capabilities_are_mediated_not_raw() {
         .unit
         .inaccessible_paths
         .contains(&PathBuf::from("/run/dbus/system_bus_socket")));
+}
+
+#[test]
+fn headless_video_decode_gets_the_device_owning_group() {
+    let root = PathBuf::from("/fixture");
+    let app = resolved(&root, &["video-decode"], false, true);
+    assert!(!app.manifest.launch.as_ref().unwrap().takes_display);
+    let policy = derive_policy(&app, &inputs(&root)).unwrap();
+
+    assert!(policy
+        .unit
+        .supplementary_groups
+        .iter()
+        .any(|group| group == "video"));
+    assert!(policy
+        .unit
+        .device_allow
+        .iter()
+        .any(|grant| grant.path == Path::new("/dev/video0") && grant.mode == "rw"));
+    assert!(policy
+        .unit
+        .device_allow
+        .iter()
+        .any(|grant| grant.path == Path::new("/dev/media0") && grant.mode == "rw"));
 }
 
 #[test]

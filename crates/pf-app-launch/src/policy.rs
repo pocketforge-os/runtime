@@ -302,6 +302,17 @@ pub fn derive_policy(
         let optional = capability_optional.get("video-decode") == Some(&true);
         add_devices("video-decode-devices", "rw", optional)?;
         add_devices("media-devices", "rw", optional)?;
+        if ["video-decode-devices", "media-devices"]
+            .into_iter()
+            .any(|name| {
+                inputs
+                    .resources
+                    .get(name)
+                    .is_some_and(|paths| !paths.is_empty())
+            })
+        {
+            groups.insert("video".to_owned());
+        }
     }
     let brokered = [
         "accelerometer",
