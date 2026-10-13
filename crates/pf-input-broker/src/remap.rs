@@ -113,6 +113,75 @@ fn lookup(table: &[(&str, u16)], name: &str) -> Option<u16> {
     table.iter().find(|(n, _)| *n == name).map(|(_, v)| *v)
 }
 
+// --- the posture axis remap (tsp-mc9m.41.1026.1) ------------------------------------------------
+
+/// Where the device BODY points relative to the logical screen — the pure input
+/// to [`Remap::remap_axis_event`]. The contract (tsp-mc9m.41.996.18): the
+/// gamepad lives in the CONTROL-DECK frame, the compositor is the only
+/// physical→logical rotator of the picture, and touch follows the display. So a
+/// screen-only swivel never touches input; only when the whole body rotates
+/// (tate) does the deck move relative to the user and the broker must
+/// re-express body-frame vectors in the logical frame.
+///
+/// Where this value comes from at runtime is designed by tsp-mc9m.41.1026.6
+/// (the session orientation policy); until that lands, the broker wires
+/// [`Posture::Normal`] and nothing else.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Posture {
+    /// The body is in its normal operating pose; deck frame and logical frame
+    /// coincide.
+    Normal,
+    /// Only the SCREEN IMAGE is rotated (a swivel on a fixed body). Input is
+    /// never remapped, at any angle.
+    ScreenOnlyRotated(Rotation),
+    /// The WHOLE BODY is rotated (tate): the logical display stays user-upright,
+    /// so spatial gamepad axes must rotate with it.
+    WholeBodyRotated(Rotation),
+}
+
+/// A closed set of quarter-turn angles. `CwN` is the device body rotated N
+/// degrees CLOCKWISE as seen by the user facing the screen.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Rotation {
+    Cw0,
+    Cw90,
+    Cw180,
+    Cw270,
+}
+
+/// The spatial axis pairs a posture rotates: each stick's X/Y and the d-pad
+/// hat. Analog triggers (ABS_Z/ABS_RZ) are DEPTH, not direction — never rotated
+/// (they ride the binary-trigger classification instead); every other code
+/// passes through untouched.
+const SPATIAL_AXIS_PAIRS: &[(u16, u16)] = &[
+    (0x00, 0x01), // ABS_X    / ABS_Y     (left stick)
+    (0x03, 0x04), // ABS_RX   / ABS_RY    (right stick)
+    (0x10, 0x11), // ABS_HAT0X / ABS_HAT0Y (d-pad)
+];
+
+/// The value math of [`Remap::remap_axis_event`]: map `value` from the SOURCE
+/// axis's advertised calibration into the DESTINATION axis's, mirroring it
+/// about the source range when `negate` (the rotation's negating branches).
+/// Endpoints map to endpoints exactly and the neutral maps to the neutral (±1
+/// count of integer rounding), for ANY ranges — including the a133's UNSIGNED
+/// 0..4095 sticks, where negating the raw integer around zero would leave the
+/// advertised calibration (review round 1, pocketforge-os/runtime#126).
+/// `None` when either span is degenerate (no usable calibration).
+fn rotate_axis_value(src: &AbsInfo, dst: &AbsInfo, negate: bool, value: i32) -> Option<i32> {
+    let src_span = i128::from(src.max) - i128::from(src.min);
+    let dst_span = i128::from(dst.max) - i128::from(dst.min);
+    if src_span <= 0 || dst_span <= 0 {
+        return None;
+    }
+    let offset = if negate {
+        i128::from(src.max) - i128::from(value)
+    } else {
+        i128::from(value) - i128::from(src.min)
+    };
+    let mapped = i128::from(dst.min) + offset * dst_span / src_span;
+    i32::try_from(mapped).ok()
+}
+
 /// Failure building a remap from a descriptor (an unknown evdev code name in a row).
 #[derive(Debug)]
 pub struct RemapError(pub String);
@@ -332,6 +401,67 @@ impl Remap {
     /// The virtual-device spec the broker instantiates.
     pub fn spec(&self) -> &UinputSpec {
         &self.spec
+    }
+
+    /// Re-express one passthrough EV_ABS `(code, value)` event in the logical
+    /// frame for `posture` — a pure function of the descriptor-derived
+    /// calibration and the event; the broker applies it on both the live path
+    /// and the SYN_DROPPED resync path.
+    ///
+    /// THE NAMED CONVENTION: the session policy keeps the logical display
+    /// user-upright, so with the body rotated N° clockwise the logical frame is
+    /// the body frame rotated clockwise by N in evdev screen coordinates
+    /// (+x right, +y DOWN): logical = R_cw(N) · body — 90° maps (x, y) →
+    /// (−y, x), 180° maps (x, y) → (−x, −y), 270° maps (x, y) → (y, −x).
+    /// Anchor from the spec: after a 90° cw body rotation, the d-pad push that
+    /// is "up" in the user's world is the body's LEFT (HAT0X = −1), and it
+    /// emits logical up (HAT0Y = −1). [`Posture::Normal`] and
+    /// [`Posture::ScreenOnlyRotated`] are the identity at every angle.
+    ///
+    /// The value mapping is CALIBRATION-AWARE ([`rotate_axis_value`]): the
+    /// a133 sticks are unsigned 0..4095, so the raw integer is never negated
+    /// around zero — the value's offset in the source axis's advertised range
+    /// (mirrored about that range for the negating branches) is rescaled into
+    /// the destination axis's advertised range. A spatial code whose pair axis
+    /// the spec does not advertise (or whose calibration is degenerate) passes
+    /// through untouched: the broker never emits a code the virtual device
+    /// does not advertise.
+    pub fn remap_axis_event(&self, posture: Posture, code: u16, value: i32) -> (u16, i32) {
+        let angle = match posture {
+            Posture::WholeBodyRotated(angle) => angle,
+            Posture::Normal | Posture::ScreenOnlyRotated(_) => return (code, value),
+        };
+        let Some(&(x, y)) = SPATIAL_AXIS_PAIRS
+            .iter()
+            .find(|&&(pair_x, pair_y)| code == pair_x || code == pair_y)
+        else {
+            return (code, value);
+        };
+        let (dst_code, negate) = match (code == x, angle) {
+            (_, Rotation::Cw0) => return (code, value),
+            (true, Rotation::Cw90) => (y, false), // logical +y = body +x
+            (false, Rotation::Cw90) => (x, true), // logical +x = body −y
+            (true, Rotation::Cw180) => (x, true), // same axis, mirrored
+            (false, Rotation::Cw180) => (y, true), // same axis, mirrored
+            (true, Rotation::Cw270) => (y, true), // logical +y = body −x
+            (false, Rotation::Cw270) => (x, false), // logical +x = body +y
+        };
+        match (self.abs_calibration(code), self.abs_calibration(dst_code)) {
+            (Some(src), Some(dst)) => match rotate_axis_value(src, dst, negate, value) {
+                Some(mapped) => (dst_code, mapped),
+                None => (code, value),
+            },
+            _ => (code, value),
+        }
+    }
+
+    /// The calibration the spec advertises for `code`, when it advertises it.
+    fn abs_calibration(&self, code: u16) -> Option<&AbsInfo> {
+        self.spec
+            .abs
+            .iter()
+            .find(|(advertised, _)| *advertised == code)
+            .map(|(_, info)| info)
     }
 
     /// The `EV_KEY` codes the SOURCE must advertise: each non-system `EV_KEY` row's wire code.
@@ -734,5 +864,276 @@ source = "sunxi-keyboard"
         );
         // A system code is never remapped into the pad (identity fallthrough, never a mapping entry).
         assert_eq!(r.remap_key(0x73), 0x73, "VOL+ has no gamepad remap entry");
+    }
+
+    // --- the posture remap (tsp-mc9m.41.1026.1) -------------------------------------------------
+    //
+    // THE NAMED CONVENTION: `Rotation::CwN` is the device BODY rotated N degrees CLOCKWISE as
+    // seen by the user facing the screen. The session orientation policy (tsp-mc9m.41.1026.6)
+    // keeps the logical display user-upright by rotating the logical output COUNTER-clockwise
+    // by the same angle relative to the body, so the broker must express body-frame gamepad
+    // vectors in the logical frame: logical = rotate-clockwise(body vector, N) in evdev screen
+    // coordinates (+x right, +y DOWN). Anchor from the spec: after a 90° cw body rotation the
+    // d-pad direction that is "up" in the user's world is the body's LEFT (HAT0X = -1), and it
+    // must reach the app as logical up (HAT0Y = -1).
+    const ABS_X: u16 = 0x00;
+    const ABS_Y: u16 = 0x01;
+    const ABS_Z: u16 = 0x02;
+    const ABS_RX: u16 = 0x03;
+    const ABS_RY: u16 = 0x04;
+    const ABS_RZ: u16 = 0x05;
+    const ABS_HAT0X: u16 = 0x10;
+    const ABS_HAT0Y: u16 = 0x11;
+
+    /// Synthetic rig: symmetric d-pad hat (−1..1), an UNSIGNED equal-range left stick
+    /// (0..4095, the a133's real calibration shape per tsp-ozbp.13) and a DELIBERATELY
+    /// UNEQUAL right stick (X 0..4095, Y 100..4100) so the range mapping is asserted, not
+    /// coincidental. One binary trigger keeps the non-spatial path honest.
+    fn posture_rig() -> Remap {
+        Remap::from_descriptor(
+            &Descriptor::from_toml(
+                r#"
+[identity]
+id = "synthguide"
+manufacturer = "PocketForge"
+model = "Posture Rig (synthetic test descriptor)"
+sdl_guid = "030000005e0400008e02000010010000"
+
+[[inputs]]
+id = "dpad"
+kind = "hat"
+ev_type = "EV_ABS"
+code = "ABS_HAT0X,ABS_HAT0Y"
+
+[[inputs]]
+id = "lstick"
+kind = "stick"
+ev_type = "EV_ABS"
+code = "ABS_X,ABS_Y"
+x = { min = 0, max = 4095, fuzz = 0, flat = 0 }
+y = { min = 0, max = 4095, fuzz = 0, flat = 0 }
+
+[[inputs]]
+id = "rstick"
+kind = "stick"
+ev_type = "EV_ABS"
+code = "ABS_RX,ABS_RY"
+x = { min = 0, max = 4095, fuzz = 0, flat = 0 }
+y = { min = 100, max = 4100, fuzz = 0, flat = 0 }
+
+[[inputs]]
+id = "ltrig"
+kind = "trigger"
+ev_type = "EV_ABS"
+code = "ABS_Z"
+semantics = "binary"
+range = { min = 0, max = 255, fuzz = 0, flat = 0 }
+"#,
+            )
+            .unwrap(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn whole_body_rotation_rotates_spatial_axes_at_all_four_angles() {
+        let r = posture_rig();
+        // Positive control: angle 0 is the identity on both sticks and the d-pad.
+        let tate0 = Posture::WholeBodyRotated(Rotation::Cw0);
+        for (code, value) in [
+            (ABS_X, 1000),
+            (ABS_Y, 3000),
+            (ABS_RX, 1000),
+            (ABS_RY, 2100),
+            (ABS_HAT0X, -1),
+            (ABS_HAT0Y, 1),
+        ] {
+            assert_eq!(r.remap_axis_event(tate0, code, value), (code, value));
+        }
+        // 90° cw body rotation: logical = (x, y) → (−y, x).
+        let tate90 = Posture::WholeBodyRotated(Rotation::Cw90);
+        // D-pad (symmetric −1..1): exact sign swap. The spec anchor, spelled out:
+        // body-left d-pad (world-up after the 90° cw body rotation) emits logical up,
+        // and body-up (world-right) emits logical right.
+        assert_eq!(r.remap_axis_event(tate90, ABS_HAT0X, -1), (ABS_HAT0Y, -1));
+        assert_eq!(r.remap_axis_event(tate90, ABS_HAT0Y, -1), (ABS_HAT0X, 1));
+        assert_eq!(r.remap_axis_event(tate90, ABS_HAT0X, 1), (ABS_HAT0Y, 1));
+        assert_eq!(r.remap_axis_event(tate90, ABS_HAT0Y, 1), (ABS_HAT0X, -1));
+        // Left stick (UNSIGNED 0..4095, equal X/Y calibration): the copy branch keeps the
+        // value, the negating branch reflects it INSIDE the range (never around zero).
+        assert_eq!(r.remap_axis_event(tate90, ABS_X, 0), (ABS_Y, 0));
+        assert_eq!(r.remap_axis_event(tate90, ABS_X, 2048), (ABS_Y, 2048));
+        assert_eq!(r.remap_axis_event(tate90, ABS_X, 4095), (ABS_Y, 4095));
+        assert_eq!(r.remap_axis_event(tate90, ABS_Y, 0), (ABS_X, 4095));
+        assert_eq!(r.remap_axis_event(tate90, ABS_Y, 4095), (ABS_X, 0));
+        // Right stick with UNEQUAL calibration (X 0..4095, Y 100..4100): values rescale
+        // into the destination axis's advertised range, endpoints exactly.
+        assert_eq!(r.remap_axis_event(tate90, ABS_RX, 0), (ABS_RY, 100));
+        assert_eq!(r.remap_axis_event(tate90, ABS_RX, 4095), (ABS_RY, 4100));
+        assert_eq!(r.remap_axis_event(tate90, ABS_RY, 100), (ABS_RX, 4095));
+        assert_eq!(r.remap_axis_event(tate90, ABS_RY, 4100), (ABS_RX, 0));
+        assert_eq!(r.remap_axis_event(tate90, ABS_RY, 2100), (ABS_RX, 2047));
+        // 180°: logical = (x, y) → (−x, −y), each axis reflected within its OWN range.
+        let tate180 = Posture::WholeBodyRotated(Rotation::Cw180);
+        assert_eq!(r.remap_axis_event(tate180, ABS_HAT0X, -1), (ABS_HAT0X, 1));
+        assert_eq!(r.remap_axis_event(tate180, ABS_HAT0Y, 1), (ABS_HAT0Y, -1));
+        assert_eq!(r.remap_axis_event(tate180, ABS_X, 0), (ABS_X, 4095));
+        assert_eq!(r.remap_axis_event(tate180, ABS_X, 2048), (ABS_X, 2047));
+        assert_eq!(r.remap_axis_event(tate180, ABS_X, 4095), (ABS_X, 0));
+        assert_eq!(r.remap_axis_event(tate180, ABS_Y, 1000), (ABS_Y, 3095));
+        assert_eq!(r.remap_axis_event(tate180, ABS_RY, 100), (ABS_RY, 4100));
+        assert_eq!(r.remap_axis_event(tate180, ABS_RY, 2100), (ABS_RY, 2100));
+        // 270° cw (= 90° ccw): logical = (x, y) → (y, −x).
+        let tate270 = Posture::WholeBodyRotated(Rotation::Cw270);
+        assert_eq!(r.remap_axis_event(tate270, ABS_HAT0X, -1), (ABS_HAT0Y, 1));
+        assert_eq!(r.remap_axis_event(tate270, ABS_HAT0Y, -1), (ABS_HAT0X, -1));
+        assert_eq!(r.remap_axis_event(tate270, ABS_X, 0), (ABS_Y, 4095));
+        assert_eq!(r.remap_axis_event(tate270, ABS_X, 4095), (ABS_Y, 0));
+        assert_eq!(r.remap_axis_event(tate270, ABS_Y, 0), (ABS_X, 0));
+        assert_eq!(r.remap_axis_event(tate270, ABS_Y, 4095), (ABS_X, 4095));
+        assert_eq!(r.remap_axis_event(tate270, ABS_RX, 0), (ABS_RY, 4100));
+        assert_eq!(r.remap_axis_event(tate270, ABS_RY, 100), (ABS_RX, 0));
+        assert_eq!(r.remap_axis_event(tate270, ABS_RY, 4100), (ABS_RX, 4095));
+    }
+
+    #[test]
+    fn screen_only_swivel_and_normal_posture_never_touch_input() {
+        // Negative control for the tate test above: a screen-only swivel rotates the PICTURE
+        // but not the control deck, so the gamepad stays in the control-deck frame at every
+        // angle — and the Normal posture is the identity by definition.
+        let r = posture_rig();
+        for angle in [
+            Rotation::Cw0,
+            Rotation::Cw90,
+            Rotation::Cw180,
+            Rotation::Cw270,
+        ] {
+            for posture in [Posture::Normal, Posture::ScreenOnlyRotated(angle)] {
+                for (code, value) in [
+                    (ABS_X, 1000),
+                    (ABS_Y, 3000),
+                    (ABS_RX, 2048),
+                    (ABS_RY, 2100),
+                    (ABS_HAT0X, -1),
+                    (ABS_HAT0Y, 1),
+                ] {
+                    assert_eq!(
+                        r.remap_axis_event(posture, code, value),
+                        (code, value),
+                        "{posture:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn whole_body_rotation_leaves_non_spatial_axes_untouched() {
+        // Analog triggers are DEPTH, not direction: rotating the body never swaps or
+        // rescales them (they ride the binary-trigger classification instead).
+        let r = posture_rig();
+        let tate = Posture::WholeBodyRotated(Rotation::Cw90);
+        assert_eq!(r.remap_axis_event(tate, ABS_Z, 255), (ABS_Z, 255));
+        assert_eq!(r.remap_axis_event(tate, ABS_RZ, 0), (ABS_RZ, 0));
+        assert_eq!(r.remap_axis_event(tate, ABS_Z, 0), (ABS_Z, 0));
+        // A code outside the spatial pair table entirely passes through as-is.
+        assert_eq!(r.remap_axis_event(tate, 0x08 /* ABS_WHEEL */, 7), (0x08, 7));
+    }
+
+    #[test]
+    fn rotation_never_emits_an_unadvertised_pair_axis() {
+        // A rig whose left stick advertises ONLY ABS_X: the cross-axis branches must fall
+        // back to identity rather than emit a code the virtual device does not advertise,
+        // while the same-axis Cw180 reflection (destination advertised) still applies.
+        let r = Remap::from_descriptor(
+            &Descriptor::from_toml(
+                r#"
+[identity]
+id = "synthguide"
+manufacturer = "PocketForge"
+model = "Half Stick Rig (synthetic test descriptor)"
+sdl_guid = "030000005e0400008e02000010010000"
+
+[[inputs]]
+id = "lstick"
+kind = "stick"
+ev_type = "EV_ABS"
+code = "ABS_X"
+x = { min = 0, max = 4095, fuzz = 0, flat = 0 }
+"#,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        for angle in [Rotation::Cw90, Rotation::Cw270] {
+            let posture = Posture::WholeBodyRotated(angle);
+            assert_eq!(
+                r.remap_axis_event(posture, ABS_X, 2048),
+                (ABS_X, 2048),
+                "{posture:?}: ABS_Y is not advertised"
+            );
+            assert_eq!(
+                r.remap_axis_event(posture, ABS_Y, 2048),
+                (ABS_Y, 2048),
+                "{posture:?}: the source axis is not advertised"
+            );
+        }
+        let tate180 = Posture::WholeBodyRotated(Rotation::Cw180);
+        assert_eq!(r.remap_axis_event(tate180, ABS_X, 2048), (ABS_X, 2047));
+    }
+
+    #[test]
+    fn rotation_of_unsigned_stick_ranges_preserves_calibration() {
+        // PROPERTY (review round 1, pocketforge-os/runtime#126): the a133 sticks are
+        // UNSIGNED 0..4095 (tsp-ozbp.13) — not symmetric about zero. A rotated value must
+        // stay inside the DESTINATION axis's advertised calibration at every angle and
+        // branch (the raw-negating transform sent the centered value 2048 to -2048), and
+        // a centered stick must stay centered.
+        let r = posture_rig();
+        for posture in [
+            Posture::WholeBodyRotated(Rotation::Cw90),
+            Posture::WholeBodyRotated(Rotation::Cw180),
+            Posture::WholeBodyRotated(Rotation::Cw270),
+        ] {
+            for (code, value) in [
+                (ABS_X, 0),
+                (ABS_X, 2048),
+                (ABS_X, 4095),
+                (ABS_Y, 0),
+                (ABS_Y, 2048),
+                (ABS_Y, 4095),
+                (ABS_RX, 0),
+                (ABS_RX, 2048),
+                (ABS_RX, 4095),
+                (ABS_RY, 100),
+                (ABS_RY, 2100),
+                (ABS_RY, 4100),
+            ] {
+                let (dst, rotated) = r.remap_axis_event(posture, code, value);
+                let (min, max) = if dst == ABS_RY {
+                    (100, 4100)
+                } else {
+                    (0, 4095)
+                };
+                assert!(
+                    (min..=max).contains(&rotated),
+                    "{posture:?}: stick {code} value {value} left the {dst} calibration \
+                     {min}..{max}: {rotated}"
+                );
+            }
+            // Neutrals stay neutral (±1 count of integer rounding) on the destination axis.
+            for (code, neutral) in [(ABS_X, 2048), (ABS_Y, 2048), (ABS_RX, 2047), (ABS_RY, 2100)] {
+                let (dst, rotated) = r.remap_axis_event(posture, code, neutral);
+                let ok = if dst == ABS_RY {
+                    (2099..=2100).contains(&rotated)
+                } else {
+                    (2047..=2048).contains(&rotated)
+                };
+                assert!(
+                    ok,
+                    "{posture:?}: {code} neutral {neutral} -> {dst} {rotated}"
+                );
+            }
+        }
     }
 }

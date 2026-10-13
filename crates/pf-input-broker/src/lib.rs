@@ -47,7 +47,7 @@ pub use broker::{
     serve_client, InputBroker, MissingCapabilities, SourceCapabilities, SourceIdentity,
 };
 pub use policy::TokenBucket;
-pub use remap::{Remap, RemapError};
+pub use remap::{Posture, Remap, RemapError, Rotation};
 pub use safe_return::{
     serve_system_menu_provider, SafeReturnIntake, SystemMenuGate, SystemMenuRouter,
 };
