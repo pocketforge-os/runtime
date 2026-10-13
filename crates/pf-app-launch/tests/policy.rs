@@ -78,7 +78,7 @@ fn inputs(root: &Path) -> PolicyInputs {
         xdg_config: root.join("xdg/config/org.example.app"),
         xdg_state: root.join("xdg/state/org.example.app"),
         xdg_cache: root.join("xdg/cache/org.example.app"),
-        resource_paths: Vec::new(),
+        resource_paths: vec![root.join("platform-dependencies")],
         resources,
     }
 }
@@ -161,6 +161,10 @@ fn rendered_unit_and_runtime_policy_share_one_decision() {
     let rendered = render_systemd_dropin(&policy);
 
     assert!(policy.landlock.tcp_connect_ports.contains(&443));
+    assert!(policy.landlock.filesystem.iter().any(|rule| {
+        rule.path == root.join("platform-dependencies")
+            && rule.access == pf_app_launch::policy::FsAccess::ReadExecute
+    }));
     assert!(policy
         .network
         .authorities

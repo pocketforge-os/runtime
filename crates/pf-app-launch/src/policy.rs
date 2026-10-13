@@ -235,7 +235,7 @@ pub fn derive_policy(
         for path in &inputs.resource_paths {
             filesystem.push(FsRule {
                 path: path.clone(),
-                access: FsAccess::ReadOnly,
+                access: FsAccess::ReadExecute,
             });
         }
     }
