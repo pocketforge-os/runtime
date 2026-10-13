@@ -1,4 +1,8 @@
 use pf_ports::{Clock, MonotonicTime};
+use pf_session_authority::orientation::{
+    refresh_from_source, spawn_input_driver, OrientationInputs,
+};
+use pf_session_authority::orientation_source::{LinuxOrientationPaths, LinuxOrientationSource};
 use pf_session_authority::{
     run_service_loop, spawn_front_acceptor, spawn_rpc_acceptor_with_orientation, Authority,
     CommandSystem, CommandTemplates, FileStore, FixedUrlHandler, FrontPolicy, PendingRpc,
@@ -29,6 +33,9 @@ struct Args {
     shell_unit: String,
     broker_unit: String,
     compositor_unit: String,
+    descriptor: PathBuf,
+    prefs_socket: PathBuf,
+    orientation_live: bool,
     templates: CommandTemplates,
     /// The private SDK-front socket (tsp-ght0z); absent until the front's unit exists.
     front: Option<FrontArgs>,
@@ -80,6 +87,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         authority = authority.with_url_handler(FixedUrlHandler(handler));
     }
     authority.reconcile()?;
+    let _orientation_driver = if args.orientation_live {
+        let orientation_paths = LinuxOrientationPaths {
+            descriptor: args.descriptor,
+            prefs_socket: args.prefs_socket,
+            ..LinuxOrientationPaths::default()
+        };
+        let mut orientation_source = LinuxOrientationSource::open(orientation_paths)?;
+        // Do not expose a compositor snapshot until every required source produced one complete
+        // reducer input. systemd restarts us while an ordered dependency (such as prefsd) settles.
+        let orientation_controller = authority.orientation_controller();
+        let orientation_active_app = authority.orientation_active_app();
+        let mut orientation_inputs = OrientationInputs::default();
+        refresh_from_source(
+            &mut orientation_source,
+            &orientation_controller,
+            &orientation_active_app,
+            &mut orientation_inputs,
+        )?;
+        Some(spawn_input_driver(
+            orientation_source,
+            orientation_controller,
+            orientation_active_app,
+            orientation_inputs,
+            DEFAULT_TICK_INTERVAL,
+        ))
+    } else {
+        None
+    };
     // The socket is the daemon's readiness boundary. Publish or reconcile the
     // complete durable state before clients can observe that boundary.
     let listener = UnixListener::bind(&args.socket)?;
@@ -183,6 +218,9 @@ Options:
   --shell-unit UNIT                Full-access shell unit (default pf-shell-selected.service)
   --broker-unit UNIT               Root SafeReturn-only unit (default pf-input-broker.service)
   --compositor-unit UNIT           Read-only orientation consumer (default gamescope-session.service)
+  --descriptor PATH               Device capabilities descriptor (default $PF_DESCRIPTOR or installed platform contract)
+  --prefsd-socket PATH             User rotation preferences (default /run/pocketforge/prefsd.sock)
+  --orientation-mode MODE          live (default); static only with desktop-sim test preset
   --front-socket PATH              Private socket for the SDK front (OpenUrl/ReturnToCaller);
                                    requires --front-user and --front-unit
   --front-user NAME                The SDK front's user (socket-bound peer uid)
@@ -197,6 +235,10 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
     let mut shell_unit = "pf-shell-selected.service".to_owned();
     let mut broker_unit = "pf-input-broker.service".to_owned();
     let mut compositor_unit = "gamescope-session.service".to_owned();
+    let defaults = LinuxOrientationPaths::default();
+    let mut descriptor = defaults.descriptor;
+    let mut prefs_socket = defaults.prefs_socket;
+    let mut orientation_live = true;
     let mut preset = "device".to_owned();
     let mut grace = DEFAULT_GRACE_PERIOD;
     let mut start = None;
@@ -218,6 +260,13 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
             "--shell-unit" => shell_unit = value,
             "--broker-unit" => broker_unit = value,
             "--compositor-unit" => compositor_unit = value,
+            "--descriptor" => descriptor = value.into(),
+            "--prefsd-socket" => prefs_socket = value.into(),
+            "--orientation-mode" => match value.as_str() {
+                "live" => orientation_live = true,
+                "static" => orientation_live = false,
+                _ => return Err(format!("unknown orientation mode: {value}")),
+            },
             "--command-preset" => preset = value,
             "--grace-period-ms" => {
                 grace =
@@ -242,6 +291,9 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
         "desktop-sim" => CommandTemplates::desktop_sim(&state_dir),
         _ => return Err(format!("unknown command preset: {preset}")),
     };
+    if !orientation_live && preset != "desktop-sim" {
+        return Err("static orientation mode requires --command-preset desktop-sim".into());
+    }
     if let Some(command) = start {
         templates.start_foreground = command.split_whitespace().map(str::to_owned).collect();
     }
@@ -270,6 +322,9 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
         shell_unit,
         broker_unit,
         compositor_unit,
+        descriptor,
+        prefs_socket,
+        orientation_live,
         templates,
         front,
         url_handler,
@@ -307,6 +362,24 @@ mod tests {
         assert_eq!(args.shell_user, "gamer");
         assert_eq!(args.shell_unit, "pf-shell-selected.service");
         assert_eq!(args.broker_unit, "pf-input-broker.service");
+        assert!(args.orientation_live);
+    }
+
+    #[test]
+    fn static_orientation_is_confined_to_the_desktop_sim_preset() {
+        let base = ["--state-dir", "/tmp/pf", "--socket", "/tmp/pf.sock"];
+        let parse = |extra: &[&str]| parse_args(base.iter().chain(extra).map(|s| (*s).to_owned()));
+        assert!(parse(&["--orientation-mode", "static"]).is_err());
+        assert!(
+            !parse(&[
+                "--command-preset",
+                "desktop-sim",
+                "--orientation-mode",
+                "static",
+            ])
+            .unwrap()
+            .orientation_live
+        );
     }
 
     #[test]

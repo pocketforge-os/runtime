@@ -44,6 +44,8 @@ impl Daemon {
                 root.join("authority.sock").to_str().unwrap(),
                 "--command-preset",
                 "desktop-sim",
+                "--orientation-mode",
+                "static",
                 "--shell-user",
                 "root",
             ])

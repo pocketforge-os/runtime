@@ -66,11 +66,12 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc};
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
 pub mod orientation;
+pub mod orientation_source;
 
 /// Default deadline for the restored shell to acknowledge its first presentation.
 pub const DEFAULT_PRESENTATION_TIMEOUT: Duration = Duration::from_secs(10);
@@ -1813,7 +1814,7 @@ fn handle_rpc_from<S: StateStore, B: SessionSystem, C: Clock>(
             } else {
                 RpcResponse::Orientation {
                     version: 1,
-                    state: authority.orientation.snapshot(),
+                    state: authority.orientation.watch().snapshot(),
                 }
             }
         }
@@ -1872,7 +1873,8 @@ pub struct Authority<S, B, C> {
     url_handler: Box<dyn UrlHandlerResolver + Send>,
     /// Monotonic `OpenUrl` timestamps per caller, oldest first (memory only).
     url_rate: BTreeMap<String, VecDeque<MonotonicTime>>,
-    orientation: Arc<orientation::OrientationWatch>,
+    orientation: Arc<orientation::OrientationController>,
+    orientation_active_app: orientation::ActiveApp,
 }
 
 /// The verified caller of an `OpenUrl`.
@@ -2093,6 +2095,16 @@ impl<S: StateStore, B: SessionSystem, C: Clock> Authority<S, B, C> {
                 state
             }
         };
+        let orientation_active_app = Arc::new(Mutex::new(match &state.phase {
+            Phase::Idle => None,
+            Phase::Starting { item_id, .. }
+            | Phase::Running { item_id, .. }
+            | Phase::StoppingGracefully { item_id, .. }
+            | Phase::ForceStopping { item_id, .. }
+            | Phase::Restoring { item_id, .. }
+            | Phase::RecoveryRequired { item_id, .. }
+            | Phase::StopFailed { item_id, .. } => Some(item_id.clone()),
+        }));
         Ok(Self {
             store,
             system,
@@ -2109,10 +2121,11 @@ impl<S: StateStore, B: SessionSystem, C: Clock> Authority<S, B, C> {
             now_fn,
             url_handler: Box::new(NoUrlHandler),
             url_rate: BTreeMap::new(),
-            orientation: Arc::new(orientation::OrientationWatch::new(
-                orientation::OrientationState::default(),
+            orientation: Arc::new(orientation::OrientationController::new(
+                orientation::OrientationInputs::default(),
                 DEFAULT_CONNECTION_LIMITS.max_connections,
             )),
+            orientation_active_app,
         })
     }
     /// Replaces the default [`NoUrlHandler`] resolver.
@@ -2146,16 +2159,28 @@ impl<S: StateStore, B: SessionSystem, C: Clock> Authority<S, B, C> {
         &self.state
     }
     pub fn orientation_watch(&self) -> Arc<orientation::OrientationWatch> {
+        self.orientation.watch()
+    }
+    pub fn orientation_controller(&self) -> Arc<orientation::OrientationController> {
         Arc::clone(&self.orientation)
     }
-    pub fn publish_orientation(&self, state: orientation::OrientationState) {
-        self.orientation.publish(state);
+    pub fn orientation_active_app(&self) -> orientation::ActiveApp {
+        Arc::clone(&self.orientation_active_app)
+    }
+    pub fn update_orientation(&self, inputs: orientation::OrientationInputs) {
+        self.orientation.update(inputs);
     }
     pub fn into_parts(self) -> (S, B, C) {
         (self.store, self.system, self.clock)
     }
     fn persist(&mut self) -> Result<(), AuthorityError> {
-        self.store.save(&self.state)
+        self.store.save(&self.state)?;
+        let active_app = self.item_id();
+        *self
+            .orientation_active_app
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = active_app;
+        Ok(())
     }
     fn session_id(&self) -> Option<String> {
         match &self.state.phase {

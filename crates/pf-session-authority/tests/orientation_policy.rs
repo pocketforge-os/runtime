@@ -1,6 +1,6 @@
 use pf_session_authority::orientation::{
-    HallDebouncer, LogicalOrientation, MountMatrix, OrientationInputs, OrientationPolicy,
-    OrientationWatch, Presentation, QuarterTurn, SensorObservation,
+    HallDebouncer, LogicalOrientation, MountMatrix, OrientationController, OrientationInputs,
+    OrientationPolicy, OrientationWatch, Presentation, QuarterTurn, SensorObservation,
 };
 use std::sync::Arc;
 use std::thread;
@@ -8,6 +8,23 @@ use std::time::{Duration, Instant};
 
 fn inputs() -> OrientationInputs {
     OrientationInputs::default()
+}
+
+#[test]
+fn daemon_controller_reduces_complete_snapshots_before_publishing() {
+    let controller = OrientationController::new(inputs(), 2);
+    let watch = controller.watch();
+    let initial = watch.snapshot();
+
+    let mut changed = inputs();
+    changed.user_rotation = QuarterTurn::Left;
+    let published = controller.update(changed.clone());
+    assert_eq!(published.whole_body, QuarterTurn::Left);
+    assert_eq!(watch.snapshot(), published);
+    assert_eq!(published.serial, initial.serial + 1);
+
+    // A repeated complete snapshot is the negative control: no semantic serial bump.
+    assert_eq!(controller.update(changed).serial, published.serial);
 }
 
 #[test]

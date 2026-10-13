@@ -1835,6 +1835,91 @@ fn orientation_rpc_is_versioned_and_compositor_is_read_only() {
 }
 
 #[test]
+fn authority_refreshes_daemon_owned_orientation_source_before_serving_snapshots() {
+    struct Source(VecDeque<orientation::OrientationInputs>);
+    impl orientation::OrientationInputSource for Source {
+        fn snapshot(
+            &mut self,
+            _active_app: Option<&str>,
+            _previous: &orientation::OrientationInputs,
+        ) -> Result<orientation::OrientationInputs, String> {
+            self.0
+                .pop_front()
+                .ok_or_else(|| "no test snapshot".to_owned())
+        }
+    }
+
+    let left = orientation::OrientationInputs {
+        user_rotation: orientation::QuarterTurn::Left,
+        ..orientation::OrientationInputs::default()
+    };
+    let mut locked = left.clone();
+    locked.accelerometer_present = true;
+    locked.accelerometer = Some(orientation::SensorObservation::Right);
+    locked.auto_rotate = false;
+
+    let (authority, _) = logged_authority(None);
+    let controller = authority.orientation_controller();
+    let active_app = authority.orientation_active_app();
+    let mut inputs = orientation::OrientationInputs::default();
+    let mut source = Source(VecDeque::from([left, locked]));
+    orientation::refresh_from_source(&mut source, &controller, &active_app, &mut inputs).unwrap();
+    assert_eq!(
+        authority.orientation_watch().snapshot().whole_body,
+        orientation::QuarterTurn::Left
+    );
+    let first_serial = authority.orientation_watch().snapshot().serial;
+
+    orientation::refresh_from_source(&mut source, &controller, &active_app, &mut inputs).unwrap();
+    let state = authority.orientation_watch().snapshot();
+    assert!(state.locked);
+    assert_eq!(state.whole_body, orientation::QuarterTurn::Left);
+    assert_eq!(state.serial, first_serial + 1);
+}
+
+#[test]
+fn blocking_orientation_probe_never_delays_broker_safe_return() {
+    struct SlowSource(mpsc::Sender<()>);
+    impl orientation::OrientationInputSource for SlowSource {
+        fn snapshot(
+            &mut self,
+            _active_app: Option<&str>,
+            previous: &orientation::OrientationInputs,
+        ) -> Result<orientation::OrientationInputs, String> {
+            let _ = self.0.send(());
+            std::thread::sleep(Duration::from_millis(250));
+            Ok(previous.clone())
+        }
+    }
+
+    let (mut authority, _) = logged_authority(None);
+    launch_running(&mut authority);
+    let controller = authority.orientation_controller();
+    let active_app = authority.orientation_active_app();
+    let (started, running) = mpsc::channel();
+    let driver = orientation::spawn_input_driver(
+        SlowSource(started),
+        controller,
+        active_app,
+        orientation::OrientationInputs::default(),
+        Duration::from_millis(10),
+    );
+    running.recv_timeout(Duration::from_secs(1)).unwrap();
+
+    let before = Instant::now();
+    assert!(matches!(
+        dispatch_rpc_from(&mut authority, RpcOrigin::Broker, RpcRequest::SafeReturn),
+        RpcResponse::Ok
+    ));
+    assert!(
+        before.elapsed() < Duration::from_millis(100),
+        "blocking orientation probe delayed SafeReturn by {:?}",
+        before.elapsed()
+    );
+    drop(driver);
+}
+
+#[test]
 fn overlapping_shell_and_broker_identity_never_gets_shell_authority() {
     let overlapping =
         ShellPolicy::custom(0, TEST_BROKER_UNIT.into(), TEST_BROKER_UNIT.into(), |_| {

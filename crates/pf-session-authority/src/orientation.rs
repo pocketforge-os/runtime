@@ -14,8 +14,9 @@
 
 use pf_prefs::Prefs;
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Condvar, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread;
 use std::time::Duration;
 
 pub const AUTO_ROTATE_KEY: &str = "auto_rotate";
@@ -214,6 +215,118 @@ pub struct OrientationPolicy {
     state: OrientationState,
     last_sensor: Option<QuarterTurn>,
     prior_app: Option<LogicalOrientation>,
+}
+
+/// Daemon-owned bridge from changing input snapshots to the compositor-facing watch.
+///
+/// Keeping the reducer and watch behind one lock prevents an adapter from publishing a state
+/// that was computed from an older input snapshot after a newer one. Adapters submit complete
+/// snapshots; the reducer's serial changes only when the semantic output changes.
+pub struct OrientationController {
+    policy: Mutex<OrientationPolicy>,
+    watch: Arc<OrientationWatch>,
+}
+
+/// One complete observation pass over the production orientation inputs.
+///
+/// Implementations retain the prior value for transiently undefined inputs (for example an
+/// iio-sensor-proxy `undefined` observation) and return an error only when a trustworthy complete
+/// snapshot cannot be formed. The authority invokes this before publishing its socket and on
+/// every lifecycle tick.
+pub trait OrientationInputSource: Send {
+    fn snapshot(
+        &mut self,
+        active_app: Option<&str>,
+        previous: &OrientationInputs,
+    ) -> Result<OrientationInputs, String>;
+}
+
+pub type ActiveApp = Arc<Mutex<Option<String>>>;
+
+/// Sample a source and atomically publish its reduced result. This function is also the daemon's
+/// startup gate: it completes once before the authority socket is bound.
+pub fn refresh_from_source(
+    source: &mut dyn OrientationInputSource,
+    controller: &OrientationController,
+    active_app: &ActiveApp,
+    inputs: &mut OrientationInputs,
+) -> Result<OrientationState, String> {
+    let active_app = active_app
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    let next = source.snapshot(active_app.as_deref(), inputs)?;
+    *inputs = next.clone();
+    Ok(controller.update(next))
+}
+
+/// Run potentially blocking DRM/evdev/D-Bus/preference probes outside the lifecycle authority.
+/// A slow source can delay only the next orientation observation, never SafeReturn or a deadline.
+pub struct OrientationDriver {
+    stop: Arc<AtomicBool>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl Drop for OrientationDriver {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+pub fn spawn_input_driver(
+    mut source: impl OrientationInputSource + 'static,
+    controller: Arc<OrientationController>,
+    active_app: ActiveApp,
+    mut inputs: OrientationInputs,
+    interval: Duration,
+) -> OrientationDriver {
+    let stop = Arc::new(AtomicBool::new(false));
+    let thread_stop = Arc::clone(&stop);
+    let thread = thread::spawn(move || loop {
+        thread::sleep(interval.max(Duration::from_millis(10)));
+        if thread_stop.load(Ordering::Acquire) {
+            break;
+        }
+        if let Err(error) = refresh_from_source(&mut source, &controller, &active_app, &mut inputs)
+        {
+            eprintln!("pf-session-authorityd: orientation_source_error detail={error:?}");
+        }
+    });
+    OrientationDriver {
+        stop,
+        thread: Some(thread),
+    }
+}
+
+impl OrientationController {
+    pub fn new(inputs: OrientationInputs, max_waiters: usize) -> Self {
+        let policy = OrientationPolicy::new(inputs);
+        let watch = Arc::new(OrientationWatch::new(policy.state().clone(), max_waiters));
+        Self {
+            policy: Mutex::new(policy),
+            watch,
+        }
+    }
+
+    pub fn watch(&self) -> Arc<OrientationWatch> {
+        Arc::clone(&self.watch)
+    }
+
+    pub fn update(&self, inputs: OrientationInputs) -> OrientationState {
+        let state = self
+            .policy
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .update(inputs)
+            .clone();
+        if self.watch.snapshot() != state {
+            self.watch.publish(state.clone());
+        }
+        state
+    }
 }
 
 impl OrientationPolicy {
