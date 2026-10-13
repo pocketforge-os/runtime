@@ -912,4 +912,42 @@ source = "sunxi-keyboard"
         assert_eq!(remap_axis_event(tate, ABS_RZ, 0), (ABS_RZ, 0));
         assert_eq!(remap_axis_event(tate, ABS_Z, 0), (ABS_Z, 0));
     }
+
+    #[test]
+    fn rotation_of_unsigned_stick_ranges_preserves_calibration() {
+        // PROPERTY (review round 1, pocketforge-os/runtime#126): the a133 sticks are
+        // UNSIGNED 0..4095 (tsp-ozbp.13) — not symmetric about zero. A rotated value must
+        // stay inside the destination axis's advertised calibration at every angle: the
+        // raw-negating transform sends the centered value 2048 to -2048, outside the range
+        // the uinput device advertises.
+        for posture in [
+            Posture::WholeBodyRotated(Rotation::Cw90),
+            Posture::WholeBodyRotated(Rotation::Cw180),
+            Posture::WholeBodyRotated(Rotation::Cw270),
+        ] {
+            for (code, value) in [
+                (ABS_X, 2048),
+                (ABS_Y, 2048),
+                (ABS_X, 0),
+                (ABS_X, 4095),
+                (ABS_Y, 0),
+                (ABS_Y, 4095),
+                (ABS_RX, 2048),
+                (ABS_RY, 2048),
+            ] {
+                let (_, rotated) = remap_axis_event(posture, code, value);
+                assert!(
+                    (0..=4095).contains(&rotated),
+                    "{posture:?}: stick {code} value {value} left the advertised 0..4095 \
+                     calibration: {rotated}"
+                );
+            }
+            // The centered value must stay centered, not cross to the far side of zero.
+            let (_, rotated) = remap_axis_event(posture, ABS_X, 2048);
+            assert!(
+                (2047..=2048).contains(&rotated),
+                "{posture:?}: centered stick must stay centered, got {rotated}"
+            );
+        }
+    }
 }
