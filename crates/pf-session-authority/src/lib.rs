@@ -1228,6 +1228,18 @@ impl ShellPolicy {
                 format!("shell uid=0 unit={shell_unit} overlaps the root broker identity"),
             ));
         }
+        if compositor_unit.as_deref() == Some(shell_unit.as_str()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("compositor unit={shell_unit} overlaps the full-authority shell identity"),
+            ));
+        }
+        if shell_uid == 0 && compositor_unit.as_deref() == Some(broker_unit.as_str()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("compositor unit={broker_unit} overlaps the root broker identity"),
+            ));
+        }
         Ok(Self {
             shell_uid,
             shell_unit,

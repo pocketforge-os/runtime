@@ -1854,6 +1854,46 @@ fn overlapping_shell_and_broker_identity_never_gets_shell_authority() {
 }
 
 #[test]
+fn compositor_identity_never_overlaps_a_more_privileged_identity() {
+    for (shell_uid, shell_unit, broker_unit, compositor_unit, expected) in [
+        (
+            TEST_GAMER_UID,
+            TEST_SHELL_UNIT,
+            TEST_BROKER_UNIT,
+            TEST_SHELL_UNIT,
+            "shell",
+        ),
+        (
+            0,
+            TEST_SHELL_UNIT,
+            TEST_BROKER_UNIT,
+            TEST_BROKER_UNIT,
+            "broker",
+        ),
+    ] {
+        let policy = ShellPolicy::custom_with_compositor(
+            shell_uid,
+            shell_unit.into(),
+            broker_unit.into(),
+            Some(compositor_unit.into()),
+            |_| unreachable!("overlapping policy must fail before identity resolution"),
+        );
+        let error = policy.err().expect("compositor overlap was accepted");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains(expected), "{error}");
+    }
+
+    assert!(ShellPolicy::custom_with_compositor(
+        TEST_GAMER_UID,
+        TEST_SHELL_UNIT.into(),
+        TEST_BROKER_UNIT.into(),
+        Some("gamescope-session.service".into()),
+        |_| unreachable!("construction does not resolve a peer"),
+    )
+    .is_ok());
+}
+
+#[test]
 fn stalled_clients_never_block_the_service_loop_tick() {
     use std::io::Write as _;
     let dir = short_socket_dir("stall");
