@@ -330,11 +330,14 @@ install trust. `protected-power-before-seat.json` admits only consume → relay 
 seat-delivery ordering. `menu-before-every-destination.json` proves Menu is consumed before app,
 keyboard, pointer, shell, menu and quarantined destinations while ordinary input still routes.
 `role-release-remint.json` proves destroy-time release precedes a fresh request/fd.
+`refused-power-seat-first.json` separately proves that seat delivery, relay-before-consume, and
+consume-seat-relay orderings are all rejected.
 
 Every stateful refusal also has a separately named fixture, rather than living only as a label in
 a successful transcript: `refused-delta-before-snapshot.json`, `refused-old-epoch.json`,
 `refused-duplicate-snapshot.json`, `refused-incomplete-snapshot.json`,
-`refused-replayed-power-sequence.json`, `refused-stale-request-id.json`,
+`refused-power-before-snapshot.json`, `refused-power-old-epoch.json`,
+`refused-power-replayed-sequence.json`, `refused-stale-request-id.json`,
 `refused-missing-fd.json`, `refused-multiple-fds.json`, `refused-fd-on-refusal.json`,
 `refused-role-already-bound.json` and `refused-role-not-bound.json`. The inventory test fails if
 one disappears and drives each to its exact typed error alongside a complete-snapshot/current-

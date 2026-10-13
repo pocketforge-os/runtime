@@ -1,8 +1,3 @@
 {
-  "accepted": ["consume", "relay_to_router"],
-  "refused": [
-    ["relay_to_router", "consume"],
-    ["seat_delivery", "relay_to_router"],
-    ["consume", "seat_delivery", "relay_to_router"]
-  ]
+  "accepted": ["consume", "relay_to_router"]
 }

@@ -570,6 +570,10 @@ fn recovery_transcript(name: &str) -> RecoveryTranscript {
 #[derive(Debug, Deserialize)]
 struct ProtectedPowerOrderFixture {
     accepted: Vec<GamescopeInputStep>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RefusedPowerOrderFixture {
     refused: Vec<Vec<GamescopeInputStep>>,
 }
 
@@ -579,7 +583,10 @@ fn protected_power_is_consumed_before_seat_delivery() {
     let fixture: ProtectedPowerOrderFixture =
         serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
     assert_eq!(validate_protected_power_order(&fixture.accepted), Ok(()));
-    for refused in fixture.refused {
+    let refused_path = fixture_dir("transcripts").join("refused-power-seat-first.json");
+    let refused_fixture: RefusedPowerOrderFixture =
+        serde_json::from_slice(&fs::read(refused_path).unwrap()).unwrap();
+    for refused in refused_fixture.refused {
         assert!(
             validate_protected_power_order(&refused).is_err(),
             "negative fixture unexpectedly accepted: {refused:?}"
@@ -647,7 +654,9 @@ fn every_stateful_refusal_has_a_named_fixture_and_positive_control() {
         "refused-missing-fd",
         "refused-multiple-fds",
         "refused-old-epoch",
-        "refused-replayed-power-sequence",
+        "refused-power-before-snapshot",
+        "refused-power-old-epoch",
+        "refused-power-replayed-sequence",
         "refused-role-already-bound",
         "refused-role-not-bound",
         "refused-stale-request-id",
@@ -663,6 +672,11 @@ fn every_stateful_refusal_has_a_named_fixture_and_positive_control() {
             continue;
         };
         if !stem.starts_with("refused-") {
+            continue;
+        }
+        // Ordering refusals use a different fixture shape and are driven by their dedicated
+        // positive/negative contract test above.
+        if stem == "refused-power-seat-first" {
             continue;
         }
         seen.insert(stem.to_owned());
@@ -682,7 +696,18 @@ fn every_stateful_refusal_has_a_named_fixture_and_positive_control() {
                 snapshot.overlays.pop();
                 session.apply_snapshot(snapshot).unwrap_err()
             }
-            "replayed_power_sequence" => {
+            "power_before_snapshot" => session
+                .protected_power(fixture.message_epoch, fixture.sequence, PowerState::Pressed)
+                .unwrap_err(),
+            "power_old_epoch" => {
+                session
+                    .apply_snapshot(snapshot_for_epoch(fixture.current_epoch))
+                    .unwrap();
+                session
+                    .protected_power(fixture.message_epoch, fixture.sequence, PowerState::Pressed)
+                    .unwrap_err()
+            }
+            "power_replayed_sequence" | "replayed_power_sequence" => {
                 session
                     .apply_snapshot(snapshot_for_epoch(fixture.current_epoch))
                     .unwrap();
@@ -763,10 +788,17 @@ fn every_stateful_refusal_has_a_named_fixture_and_positive_control() {
             },
             "duplicate_snapshot" => CompositorStateError::SnapshotAlreadyApplied,
             "incomplete_snapshot" => CompositorStateError::IncompleteSnapshot,
-            "replayed_power_sequence" => CompositorStateError::NonMonotonicPowerSequence {
-                got: fixture.sequence,
-                last: fixture.sequence,
+            "power_before_snapshot" => CompositorStateError::SnapshotRequired,
+            "power_old_epoch" => CompositorStateError::OldEpoch {
+                got: fixture.message_epoch,
+                current: fixture.current_epoch,
             },
+            "power_replayed_sequence" | "replayed_power_sequence" => {
+                CompositorStateError::NonMonotonicPowerSequence {
+                    got: fixture.sequence,
+                    last: fixture.sequence,
+                }
+            }
             "stale_request_id" => CompositorStateError::UnexpectedRequestId(fixture.request_id),
             "missing_fd" => CompositorStateError::MissingFileDescriptor(fixture.request_id),
             "multiple_fds" | "fd_on_refusal" => {
