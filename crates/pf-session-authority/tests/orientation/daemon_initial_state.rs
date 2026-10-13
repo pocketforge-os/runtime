@@ -1,3 +1,5 @@
+//! Daemon initial-state coverage in the consolidated orientation integration target.
+
 use pf_session_authority::PersistedState;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -44,6 +46,8 @@ impl Daemon {
                 root.join("authority.sock").to_str().unwrap(),
                 "--command-preset",
                 "desktop-sim",
+                "--orientation-mode",
+                "static",
                 "--shell-user",
                 "root",
             ])

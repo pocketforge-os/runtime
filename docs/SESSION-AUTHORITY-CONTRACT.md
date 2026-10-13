@@ -42,6 +42,27 @@ All requests are `{"method": "<name>", ...}`:
 | `history` | — | `history {entries: [HistoryEntry...]}` |
 | `observe` | `{observation: {kind, ...}}` | `ok` |
 | `tick` | — | `ok` |
+| `orientation` | `{version: 1, after_serial?, wait_ms?}` | `orientation {version: 1, state}`. Returns the complete current snapshot; when `after_serial` equals the current serial it waits for a semantic change or at most 30 seconds. |
+
+Orientation waits run on an independently bounded watch lane and never enter the lifecycle
+request channel. Filling all orientation waiter permits therefore does not consume or delay the
+existing `safe_return` capacity. Gamescope is authenticated as a read-only compositor peer;
+the broker may read orientation and call `safe_return`, while application/front peers cannot
+read it.
+
+The state reports the final `output` quarter turn and its `whole_body` and `screen_only`
+components. Only `whole_body` drives gamepad remapping. User preferences are the pf-prefs keys
+`auto_rotate` (boolean, default `true`) and `user_rotation`
+(`normal|left|upsidedown|right`, default `normal`). Any active `SW_ROTATE_LOCK` or
+`auto_rotate=false` locks whole-body rotation to `user_rotation`; sensorless devices also use
+`user_rotation`. An eligible accelerometer wins only while unlocked.
+
+App declarations constrain compatible presentation rather than rotating physical output. A
+180-degree difference within the same aspect class is `fill`: an app declaring only `landscape`
+stays in the device's native-landscape orientation when the user holds the device flipped, so it
+appears upside-down to that user by design. This matches Android
+`SCREEN_ORIENTATION_LANDSCAPE`, not `sensorLandscape`; apps that want both directions declare
+`landscape_flipped` too. Portrait/landscape aspect mismatches use `letterbox`.
 
 Events are delivered per `client_id` from a durable cursor: each event carries a monotonic
 `sequence`, clients acknowledge the last sequence they processed, and acknowledged prefixes are

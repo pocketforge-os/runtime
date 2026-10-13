@@ -117,6 +117,24 @@ pub struct Manifest {
     pub requirements: Option<Requirements>,
     #[serde(default)]
     pub recommended: Option<Requirements>,
+    #[serde(default)]
+    pub display: Option<Display>,
+}
+
+/// Orientations in which an app can render without compatibility letterboxing.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Display {
+    pub orientations: Vec<DisplayOrientation>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DisplayOrientation {
+    Landscape,
+    LandscapeFlipped,
+    Portrait,
+    PortraitFlipped,
 }
 
 /// An app's declared minimum spec (`[requirements]`, enforced at launch) or

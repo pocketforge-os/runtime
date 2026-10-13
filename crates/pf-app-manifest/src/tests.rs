@@ -659,6 +659,40 @@ fn manifest_with(table: &str) -> String {
     )
 }
 
+#[test]
+fn display_orientations_are_typed_for_absent_singletons_and_multiple_values() {
+    assert_eq!(parse_manifest(&manifest_with("")).unwrap().display, None);
+
+    for (token, expected) in [
+        ("landscape", DisplayOrientation::Landscape),
+        ("landscape_flipped", DisplayOrientation::LandscapeFlipped),
+        ("portrait", DisplayOrientation::Portrait),
+        ("portrait_flipped", DisplayOrientation::PortraitFlipped),
+    ] {
+        let manifest = parse_manifest(&manifest_with(&format!(
+            "[display]\norientations = [{token:?}]\n"
+        )))
+        .unwrap();
+        assert_eq!(manifest.display.unwrap().orientations, [expected]);
+    }
+
+    let manifest = parse_manifest(&manifest_with(
+        "[display]\norientations = [\"portrait\", \"landscape_flipped\"]\n",
+    ))
+    .unwrap();
+    assert_eq!(
+        manifest.display.unwrap().orientations,
+        [
+            DisplayOrientation::Portrait,
+            DisplayOrientation::LandscapeFlipped,
+        ]
+    );
+    assert!(parse_manifest(&manifest_with(
+        "[display]\norientations = [\"landscape\", \"diagonal\"]\n",
+    ))
+    .is_err());
+}
+
 fn check(table: &str, contract: &PlatformContract) -> Result<(), ResolveError> {
     let manifest = parse_manifest(&manifest_with(table)).unwrap();
     check_compatibility(&manifest, contract)
