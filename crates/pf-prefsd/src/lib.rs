@@ -190,6 +190,10 @@ pub const WRITE_POLICY: &[WritePolicyRow] = &[
         writers: SETTINGS_AND_SHELL,
     },
     WritePolicyRow {
+        key: "keyboardLayout",
+        writers: SETTINGS_AND_SHELL,
+    },
+    WritePolicyRow {
         key: "highContrast",
         writers: SETTINGS_AND_SHELL,
     },

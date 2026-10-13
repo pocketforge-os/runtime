@@ -50,9 +50,18 @@ pub struct PrefChange {
 /// through to its schema default. `extra` preserves unknown keys encountered on load
 /// (forward-compat: a newer writer's key survives an older reader's round-trip instead of being
 /// silently dropped).
+///
+/// `seeded` holds first-boot seed values (e.g. the `keyboardLayout` rendered by
+/// cloud-init into `/etc/pocketforge/prefs.seed.json` and merged by
+/// [`crate::store::PrefsStore::load`]). A seeded value is the effective value for
+/// a key with no stored value, but it is deliberately NOT explicit:
+/// [`Prefs::is_explicit`] stays false and [`Source`] stays [`Source::Default`],
+/// so the settings UI can tell "First-boot setup" from "You". Seeds are never
+/// persisted into the store document and never re-read once the user sets a key.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Prefs {
     pub(crate) stored: BTreeMap<String, PrefValue>,
+    pub(crate) seeded: BTreeMap<String, PrefValue>,
     pub(crate) extra: BTreeMap<String, serde_json::Value>,
 }
 
@@ -62,16 +71,31 @@ impl Prefs {
         Prefs::default()
     }
 
-    /// The effective value of a known key: its stored value, else the schema default.
+    /// The effective value of a known key: its stored value, else its first-boot
+    /// seed value, else the schema default.
     ///
     /// Returns [`PrefError::UnknownKey`] for a key not in the schema — callers that want a raw
     /// preserved value should read [`Prefs::extra`] directly.
     pub fn value(&self, key: &str) -> Result<PrefValue, PrefError> {
         let spec = schema::spec(key).ok_or_else(|| PrefError::UnknownKey(key.to_string()))?;
-        Ok(self.stored.get(key).copied().unwrap_or(spec.default))
+        if let Some(value) = self.stored.get(key) {
+            return Ok(*value);
+        }
+        if let Some(value) = self.seeded.get(key) {
+            return Ok(*value);
+        }
+        Ok(spec.default)
     }
 
-    /// Where a known key's effective value comes from (default vs stored).
+    /// Whether the effective value of a known key comes from the first-boot seed
+    /// (rather than an explicit store write or the schema default).
+    pub fn is_seeded(&self, key: &str) -> bool {
+        !self.stored.contains_key(key) && self.seeded.contains_key(key)
+    }
+
+    /// Where a known key's effective value comes from (default vs stored). A
+    /// first-boot seed value reports [`Source::Default`]: only an explicit user
+    /// write makes a key stored (see [`Prefs::is_explicit`] / [`Prefs::is_seeded`]).
     pub fn source(&self, key: &str) -> Source {
         if self.stored.contains_key(key) {
             Source::Stored

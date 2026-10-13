@@ -10,6 +10,11 @@
 
 use crate::error::PrefError;
 
+// Build-generated from crates/pf-prefs/keyboard-layouts.txt (see build.rs):
+// `KEYBOARD_LAYOUTS` (every xkb `layout(variant)` token the image ships, sorted)
+// and `KEYBOARD_LAYOUTS_PROVENANCE` (the data file's first header line).
+include!(concat!(env!("OUT_DIR"), "/keyboard_layouts.rs"));
+
 /// The runtime type of a preference value.
 ///
 /// The schema supports booleans, bounded scalars, and closed string enums.
@@ -144,6 +149,16 @@ pub const SCHEMA: &[PrefSpec] = &[
         },
         default: PrefValue::Enum("100%"),
         doc: "Scale shell text using a supported step (100%, 125%, 150%, 175%, or 200%).",
+    },
+    PrefSpec {
+        key: "keyboardLayout",
+        kind: PrefKind::Enum {
+            variants: KEYBOARD_LAYOUTS,
+        },
+        default: PrefValue::Enum("us"),
+        doc: "System keyboard layout for gamescope, fcitx5, the OSK and USB/Bluetooth \
+keyboards, as an xkb `layout(variant)` token (first boot may seed it from \
+/etc/default/keyboard; an explicit user set always wins).",
     },
     PrefSpec {
         key: "highContrast",
@@ -336,6 +351,59 @@ mod tests {
             );
         }
         assert!(parse_value("appearance", "high-contrast").is_err());
+    }
+
+    #[test]
+    fn keyboard_layout_defaults_to_us_over_the_generated_xkb_enum() {
+        let spec = spec("keyboardLayout").expect("keyboardLayout must be in the schema");
+        assert_eq!(spec.default, PrefValue::Enum("us"));
+        // Positive controls: real tokens from the build-generated xkb list.
+        for token in [
+            "us",
+            "de",
+            "de(nodeadkeys)",
+            "us(intl)",
+            "gb(extd)",
+            "latam",
+        ] {
+            assert_eq!(
+                parse_value("keyboardLayout", token).unwrap(),
+                PrefValue::Enum(token)
+            );
+        }
+        // Negative controls: tokens the session wiring cannot split back into
+        // XKB_DEFAULT_LAYOUT / XKB_DEFAULT_VARIANT must be rejected.
+        for bad in [
+            "klingon",
+            "us(bogusvariant)",
+            "de(",
+            "de)",
+            "",
+            "US",
+            "de,nodeadkeys",
+            "de (nodeadkeys)",
+        ] {
+            assert!(
+                parse_value("keyboardLayout", bad).is_err(),
+                "{bad:?} must not validate as a keyboardLayout"
+            );
+        }
+    }
+
+    #[test]
+    fn keyboard_layout_variants_are_the_build_generated_xkb_list() {
+        let spec = spec("keyboardLayout").expect("keyboardLayout must be in the schema");
+        let PrefKind::Enum { variants } = spec.kind else {
+            panic!("keyboardLayout must be a closed enum");
+        };
+        assert_eq!(variants, KEYBOARD_LAYOUTS);
+        // The generated list is a sorted, deduplicated, non-trivial xkb inventory.
+        assert!(KEYBOARD_LAYOUTS.len() > 100);
+        assert!(KEYBOARD_LAYOUTS.contains(&"us"));
+        let mut sorted = KEYBOARD_LAYOUTS.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.as_slice(), KEYBOARD_LAYOUTS);
     }
 
     #[test]
