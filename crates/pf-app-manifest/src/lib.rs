@@ -65,6 +65,17 @@ pub const KNOWN_INPUTS: &[&str] = &[
     "pointer",
 ];
 
+/// The orientations when the `[display]` table is absent: the compositor
+/// presents the app landscape, upright, and letterboxes nothing.
+pub const DEFAULT_ORIENTATIONS: &[DisplayOrientation] = &[DisplayOrientation::Landscape];
+
+/// The orientations whose logical canvas swaps the panel's logical landscape
+/// size: width and height trade places relative to `landscape`.
+pub const PORTRAIT_ORIENTATIONS: &[DisplayOrientation] = &[
+    DisplayOrientation::Portrait,
+    DisplayOrientation::PortraitFlipped,
+];
+
 /// Inputs the system input layer provides on every device, so declaring them
 /// in a minimum-spec table is redundant and only earns a warning.
 pub const SYSTEM_INPUTS: &[&str] = &["keyboard", "pointer"];
@@ -105,6 +116,13 @@ pub fn parse_capability_requirement(token: &str) -> CapabilityRequirement {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Manifest {
+    /// The app.toml schema version. Absent means 1 — the schema before
+    /// `[display] orientations` existed; every manifest that was valid at 1
+    /// still parses unchanged and gets the defaults. The current version is
+    /// 2. Any other version is refused, mirroring the platform contract's
+    /// own version gate.
+    #[serde(default = "default_schema_version")]
+    pub schema_version: u32,
     pub app: App,
     pub runtime: Runtime,
     #[serde(default)]
@@ -117,14 +135,36 @@ pub struct Manifest {
     pub requirements: Option<Requirements>,
     #[serde(default)]
     pub recommended: Option<Requirements>,
+    /// How the compositor may present the app (`[display]`). Absent means
+    /// [`DEFAULT_ORIENTATIONS`].
     #[serde(default)]
     pub display: Option<Display>,
+}
+
+fn default_schema_version() -> u32 {
+    1
+}
+
+impl Manifest {
+    /// The orientations the app allows: its declared `[display] orientations`,
+    /// or [`DEFAULT_ORIENTATIONS`] when the table is absent. Never empty —
+    /// parse-time validation refuses that.
+    pub fn display_orientations(&self) -> Vec<DisplayOrientation> {
+        match &self.display {
+            Some(display) => display.orientations.clone(),
+            None => DEFAULT_ORIENTATIONS.to_vec(),
+        }
+    }
 }
 
 /// Orientations in which an app can render without compatibility letterboxing.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Display {
+    /// A NON-EMPTY subset of the [`DisplayOrientation`] vocabulary (SDL's
+    /// `SDL_DisplayOrientation` names, lower-cased). Unknown values are
+    /// refused by the parser; duplicates and the empty list are refused by
+    /// validation.
     pub orientations: Vec<DisplayOrientation>,
 }
 
@@ -135,6 +175,18 @@ pub enum DisplayOrientation {
     LandscapeFlipped,
     Portrait,
     PortraitFlipped,
+}
+
+impl DisplayOrientation {
+    /// The lower-cased `SDL_DisplayOrientation` name (the TOML spelling).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            DisplayOrientation::Landscape => "landscape",
+            DisplayOrientation::LandscapeFlipped => "landscape_flipped",
+            DisplayOrientation::Portrait => "portrait",
+            DisplayOrientation::PortraitFlipped => "portrait_flipped",
+        }
+    }
 }
 
 /// An app's declared minimum spec (`[requirements]`, enforced at launch) or
@@ -155,7 +207,10 @@ pub struct Requirements {
     /// Controls the app cannot work without, from [`KNOWN_INPUTS`].
     #[serde(default)]
     pub inputs: Vec<String>,
-    /// Minimum display size in physical pixels, compared orientation-independently.
+    /// Minimum logical display size in pixels. The app is refused only when
+    /// this cannot be met in ANY allowed orientation (`[display]
+    /// orientations`, default [`DEFAULT_ORIENTATIONS`]); the portrait
+    /// orientations swap the panel's logical landscape width and height.
     #[serde(default)]
     pub display_min: Option<DisplaySize>,
     /// Install size plus working space. Carried and validated, not checked at
@@ -286,7 +341,10 @@ pub fn parse_manifest(source: &str) -> Result<Manifest, ManifestError> {
     let manifest: Manifest = toml::from_str(source).map_err(|error| {
         let message = error.to_string();
         ManifestError {
-            kind: if message.contains("unknown field") || message.contains("missing field") {
+            kind: if message.contains("unknown field")
+                || message.contains("missing field")
+                || message.contains("unknown variant")
+            {
                 ManifestErrorKind::Invalid
             } else {
                 ManifestErrorKind::Parse
@@ -302,6 +360,12 @@ pub fn parse_manifest(source: &str) -> Result<Manifest, ManifestError> {
 }
 
 fn validate_manifest(manifest: &Manifest) -> Result<(), ManifestError> {
+    if !matches!(manifest.schema_version, 1 | 2) {
+        return invalid_manifest("schema_version must be 1 or 2");
+    }
+    if let Some(display) = &manifest.display {
+        validate_display(display)?;
+    }
     if validate_app_id(&manifest.app.id).is_err() {
         return invalid_manifest("invalid app.id");
     }
@@ -369,6 +433,23 @@ fn validate_manifest(manifest: &Manifest) -> Result<(), ManifestError> {
                 return invalid_manifest("invalid fetch sha256");
             }
         }
+    }
+    Ok(())
+}
+
+/// Validate the `[display]` table: a NON-EMPTY list of the typed
+/// [`DisplayOrientation`] vocabulary with no duplicates (an unknown TOML
+/// spelling is refused earlier, by serde, as an unknown variant).
+fn validate_display(display: &Display) -> Result<(), ManifestError> {
+    if display.orientations.is_empty() {
+        return invalid_manifest("empty display orientations");
+    }
+    let mut seen: Vec<DisplayOrientation> = Vec::new();
+    for orientation in &display.orientations {
+        if seen.contains(orientation) {
+            return invalid_manifest("duplicate display orientation");
+        }
+        seen.push(*orientation);
     }
     Ok(())
 }
@@ -1256,19 +1337,22 @@ pub fn check_compatibility(
         }
     }
     if let Some(requirements) = &manifest.requirements {
-        check_requirements(requirements, platform)?;
+        check_requirements(requirements, platform, &manifest.display_orientations())?;
     }
     Ok(())
 }
 
 /// Enforce the `[requirements]` minimum spec against the platform contract's
-/// device facts. A contract that lacks the fact for a declared requirement
-/// fails closed with [`ReasonCode::RequirementUnverifiable`]; under schema 1
-/// every fact is absent, so any requirement is unverifiable there. The
-/// `[recommended]` table is informational and is never consulted here.
+/// device facts, with the app's allowed `orientations` (`[display]`, default
+/// [`DEFAULT_ORIENTATIONS`]) feeding the display_min rule. A contract that
+/// lacks the fact for a declared requirement fails closed with
+/// [`ReasonCode::RequirementUnverifiable`]; under schema 1 every fact is
+/// absent, so any requirement is unverifiable there. The `[recommended]` table
+/// is informational and is never consulted here.
 fn check_requirements(
     requirements: &Requirements,
     platform: &PlatformContract,
+    orientations: &[DisplayOrientation],
 ) -> Result<(), ResolveError> {
     if let Some(required) = requirements.memory_mib {
         match platform.app_memory_budget_mib {
@@ -1330,15 +1414,36 @@ fn check_requirements(
                 required.width, required.height
             )));
         };
-        let (required_small, required_large) = sorted_sides(required);
-        let (display_small, display_large) = sorted_sides(display);
-        if required_small > display_small || required_large > display_large {
+        // The compositor presents the app in ANY allowed orientation, so the
+        // minimum only has to fit the logical canvas of ONE of them. The panel's
+        // logical landscape size comes from the contract's display fact; the
+        // portrait orientations swap its width and height.
+        let met = orientations.iter().any(|orientation| {
+            let logical = if PORTRAIT_ORIENTATIONS.contains(orientation) {
+                DisplaySize {
+                    width: display.height,
+                    height: display.width,
+                }
+            } else {
+                display
+            };
+            required.width <= logical.width && required.height <= logical.height
+        });
+        if !met {
             return Err(resolve_error(
                 ReasonCode::DisplayTooSmall,
                 65,
                 format!(
-                    "display_min {}x{} exceeds display {}x{}",
-                    required.width, required.height, display.width, display.height
+                    "display_min {}x{} exceeds display {}x{} in allowed orientations {}",
+                    required.width,
+                    required.height,
+                    display.width,
+                    display.height,
+                    orientations
+                        .iter()
+                        .map(DisplayOrientation::as_str)
+                        .collect::<Vec<_>>()
+                        .join(", ")
                 ),
             ));
         }
@@ -1378,15 +1483,6 @@ fn input_satisfied(required: &str, device_inputs: &[String]) -> bool {
     device_inputs
         .iter()
         .any(|input| input == required || (required == "stick" && input == "two_sticks"))
-}
-
-/// The smaller side first, so display comparisons are orientation-independent.
-fn sorted_sides(display: DisplaySize) -> (u32, u32) {
-    if display.width <= display.height {
-        (display.width, display.height)
-    } else {
-        (display.height, display.width)
-    }
 }
 
 fn unverifiable(detail: String) -> ResolveError {

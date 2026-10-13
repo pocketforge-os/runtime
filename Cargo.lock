@@ -383,6 +383,7 @@ dependencies = [
 name = "pf-app-manifest"
 version = "0.0.1"
 dependencies = [
+ "pocketforge",
  "serde",
  "sha2",
  "toml",
