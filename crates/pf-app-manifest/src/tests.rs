@@ -695,7 +695,11 @@ fn display_min_refuses_only_when_no_allowed_orientation_meets_it() {
     // Positive controls: with the default orientations = ["landscape"] the exact
     // landscape minimum and a smaller minimum fit the 1280x720 logical canvas.
     assert!(check(landscape_exact, &contract).is_ok());
-    assert!(check("[requirements.display_min]\nwidth = 480\nheight = 640\n", &contract).is_ok());
+    assert!(check(
+        "[requirements.display_min]\nwidth = 480\nheight = 640\n",
+        &contract
+    )
+    .is_ok());
     // Negative control for the orientation-aware rule: a portrait-shaped minimum
     // refuses under the default landscape-only orientations. The old
     // orientation-independent sorted-sides comparison passed this manifest.
@@ -766,9 +770,10 @@ fn schema_version_gates_the_display_table_and_old_manifests_keep_parsing() {
     assert_eq!(manifest.schema_version, 2);
     assert_eq!(manifest.display_orientations(), DEFAULT_ORIENTATIONS);
     // Positive control: schema_version 2 admits the new [display] table.
-    let manifest =
-        parse_manifest(&manifest_schema2_with("[display]\norientations = [\"portrait\"]\n"))
-            .unwrap();
+    let manifest = parse_manifest(&manifest_schema2_with(
+        "[display]\norientations = [\"portrait\"]\n",
+    ))
+    .unwrap();
     assert_eq!(manifest.display_orientations(), ["portrait"]);
     // Negative control: an explicit schema_version 1 must not declare the
     // schema-2 table (the same gate the platform contract applies).
@@ -784,9 +789,11 @@ fn schema_version_gates_the_display_table_and_old_manifests_keep_parsing() {
     );
     // Negative control: a version outside the accepted set is refused by name.
     for version in [0u32, 3, 99] {
-        let error =
-            parse_manifest(&format!("schema_version = {version}\n{}", manifest_with("")))
-                .unwrap_err();
+        let error = parse_manifest(&format!(
+            "schema_version = {version}\n{}",
+            manifest_with("")
+        ))
+        .unwrap_err();
         assert_eq!(error.kind, ManifestErrorKind::Invalid);
         assert_eq!(error.message, "schema_version must be 1 or 2");
     }
@@ -807,9 +814,10 @@ fn display_orientations_validate_against_the_sdl_vocabulary() {
     ))
     .unwrap();
     // Negative control: an unknown value is refused with a named error.
-    let error =
-        parse_manifest(&manifest_schema2_with("[display]\norientations = [\"upside_down\"]\n"))
-            .unwrap_err();
+    let error = parse_manifest(&manifest_schema2_with(
+        "[display]\norientations = [\"upside_down\"]\n",
+    ))
+    .unwrap_err();
     assert_eq!(error.kind, ManifestErrorKind::Invalid);
     assert_eq!(error.message, "invalid display orientation");
     // Negative control: a duplicate is refused with a named error.
@@ -840,9 +848,8 @@ fn real_old_schema_manifests_from_the_platform_checkout_parse_with_default_orien
     // schema_version key, no [display] table) must keep parsing and get the
     // default orientations. Read through the one platform-root resolver — never
     // from a vendored copy, so the fixtures cannot drift.
-    let root = pocketforge::test_support::platform_root().expect(
-        "PF_PLATFORM_DIR (or a sibling platform checkout) must point at the platform repo",
-    );
+    let root = pocketforge::test_support::platform_root()
+        .expect("PF_PLATFORM_DIR (or a sibling platform checkout) must point at the platform repo");
     for example in [
         "abi/examples/app-a133-powervr.toml",
         "abi/examples/app-a523-mali.toml",

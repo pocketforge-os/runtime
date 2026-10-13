@@ -113,6 +113,86 @@ fn lookup(table: &[(&str, u16)], name: &str) -> Option<u16> {
     table.iter().find(|(n, _)| *n == name).map(|(_, v)| *v)
 }
 
+// --- the posture axis remap (tsp-mc9m.41.1026.1) ------------------------------------------------
+
+/// Where the device BODY points relative to the logical screen — the pure input
+/// to [`remap_axis_event`]. The contract (tsp-mc9m.41.996.18): the gamepad
+/// lives in the CONTROL-DECK frame, the compositor is the only physical→logical
+/// rotator of the picture, and touch follows the display. So a screen-only
+/// swivel never touches input; only when the whole body rotates (tate) does the
+/// deck move relative to the user and the broker must re-express body-frame
+/// vectors in the logical frame.
+///
+/// Where this value comes from at runtime is designed by tsp-mc9m.41.1026.6
+/// (the session orientation policy); until that lands, the broker wires
+/// [`Posture::Normal`] and nothing else.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Posture {
+    /// The body is in its normal operating pose; deck frame and logical frame
+    /// coincide.
+    Normal,
+    /// Only the SCREEN IMAGE is rotated (a swivel on a fixed body). Input is
+    /// never remapped, at any angle.
+    ScreenOnlyRotated(Rotation),
+    /// The WHOLE BODY is rotated (tate): the logical display stays user-upright,
+    /// so spatial gamepad axes must rotate with it.
+    WholeBodyRotated(Rotation),
+}
+
+/// A closed set of quarter-turn angles. `CwN` is the device body rotated N
+/// degrees CLOCKWISE as seen by the user facing the screen.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Rotation {
+    Cw0,
+    Cw90,
+    Cw180,
+    Cw270,
+}
+
+/// The spatial axis pairs a posture rotates: each stick's X/Y and the d-pad
+/// hat. Analog triggers (ABS_Z/ABS_RZ) are DEPTH, not direction — never rotated
+/// (they ride the binary-trigger classification instead); every other code
+/// passes through untouched.
+const SPATIAL_AXIS_PAIRS: &[(u16, u16)] = &[
+    (0x00, 0x01), // ABS_X    / ABS_Y     (left stick)
+    (0x03, 0x04), // ABS_RX   / ABS_RY    (right stick)
+    (0x10, 0x11), // ABS_HAT0X / ABS_HAT0Y (d-pad)
+];
+
+/// Re-express one EV_ABS `(code, value)` event in the logical frame for
+/// `posture` — a pure function; the broker applies it to every passthrough axis
+/// event on both the live path and the SYN_DROPPED resync path.
+///
+/// THE NAMED CONVENTION: the session policy keeps the logical display
+/// user-upright, so with the body rotated N° clockwise the logical frame is the
+/// body frame rotated clockwise by N in evdev screen coordinates (+x right, +y
+/// DOWN): logical = R_cw(N) · body — 90° maps (x, y) → (−y, x), 180° maps
+/// (x, y) → (−x, −y), 270° maps (x, y) → (y, −x). Anchor from the spec: after a
+/// 90° cw body rotation, the d-pad push that is "up" in the user's world is the
+/// body's LEFT (HAT0X = −1), and it emits logical up (HAT0Y = −1).
+/// [`Posture::Normal`] and [`Posture::ScreenOnlyRotated`] are the identity at
+/// every angle.
+pub fn remap_axis_event(posture: Posture, code: u16, value: i32) -> (u16, i32) {
+    let angle = match posture {
+        Posture::WholeBodyRotated(angle) => angle,
+        Posture::Normal | Posture::ScreenOnlyRotated(_) => return (code, value),
+    };
+    let Some(&(x, y)) = SPATIAL_AXIS_PAIRS
+        .iter()
+        .find(|&&(pair_x, pair_y)| code == pair_x || code == pair_y)
+    else {
+        return (code, value);
+    };
+    match (code == x, angle) {
+        (_, Rotation::Cw0) => (code, value),
+        (true, Rotation::Cw90) => (y, value),
+        (false, Rotation::Cw90) => (x, -value),
+        (_, Rotation::Cw180) => (code, -value),
+        (true, Rotation::Cw270) => (y, -value),
+        (false, Rotation::Cw270) => (x, value),
+    }
+}
+
 /// Failure building a remap from a descriptor (an unknown evdev code name in a row).
 #[derive(Debug)]
 pub struct RemapError(pub String);

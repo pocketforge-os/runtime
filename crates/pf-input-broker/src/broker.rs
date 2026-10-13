@@ -19,7 +19,7 @@ use pocketforge::Backend;
 use crate::evdev::Evdev;
 use crate::ioc;
 use crate::policy::TokenBucket;
-use crate::remap::{AbsAction, Remap};
+use crate::remap::{remap_axis_event, AbsAction, Posture, Remap};
 use crate::safe_return::{SystemMenuGate, SystemMenuRouter, GUIDE_CODE};
 use crate::scm;
 use crate::uinput::Uinput;
@@ -198,6 +198,11 @@ impl SourceState for Evdev {
 /// `SYN_DROPPED` resync and (with `--safe-return-sock`) the protected System Menu gate.
 pub(crate) struct ReportPump {
     remap: Remap,
+    /// The posture [`remap_axis_event`] re-expresses spatial axis events for.
+    /// Production wiring is [`Posture::Normal`]: TODO(tsp-mc9m.41.1026.6) — the
+    /// session orientation policy designs where the runtime posture comes from;
+    /// do not invent a source here.
+    posture: Posture,
     bucket: TokenBucket,
     pending_report: Vec<(u16, u16, i32)>,
     pending_report_oversized: bool,
@@ -515,6 +520,10 @@ impl ReportPump {
             .collect();
         ReportPump {
             remap,
+            // TODO(tsp-mc9m.41.1026.6): the runtime posture source is designed
+            // by the session orientation policy; Normal is the only value wired
+            // until that lands.
+            posture: Posture::Normal,
             bucket: TokenBucket::default_broker(),
             pending_report: Vec::new(),
             pending_report_oversized: false,
@@ -588,10 +597,13 @@ impl ReportPump {
                 // reclassified to an EV_KEY press/release on its canonical button (descriptor-driven).
                 match self.remap.classify_abs(ev.code, ev.value) {
                     AbsAction::Passthrough => {
+                        // Spatial axes are re-expressed in the logical frame for the
+                        // current posture (identity for Normal / a screen-only swivel).
+                        let (code, value) = remap_axis_event(self.posture, ev.code, ev.value);
                         push_report_event(
                             &mut self.pending_report,
                             &mut self.pending_report_oversized,
-                            (t, ev.code, ev.value),
+                            (t, code, value),
                         );
                     }
                     AbsAction::Button { code, value } => {
@@ -631,7 +643,12 @@ impl ReportPump {
         let mut actual_binary = Vec::new();
         for (code, value) in abs_values {
             match self.remap.resync_abs(code, value) {
-                AbsAction::Passthrough => actual_abs.push((code, value)),
+                // The held state is diffed in the LOGICAL frame (abs_state is keyed by
+                // emitted codes), so the authoritative body-frame value is re-expressed
+                // for the current posture exactly like the live path.
+                AbsAction::Passthrough => {
+                    actual_abs.push(remap_axis_event(self.posture, code, value))
+                }
                 AbsAction::Button { code, value } => actual_binary.push((code, value != 0)),
                 AbsAction::None => unreachable!("resync_abs always yields authoritative state"),
             }
@@ -1387,6 +1404,7 @@ id = "ltrig"
 kind = "trigger"
 ev_type = "EV_ABS"
 code = "ABS_Z"
+semantics = "binary"
 range = { min = 0, max = 255, fuzz = 0, flat = 0 }
 "#,
         )
@@ -1425,7 +1443,11 @@ range = { min = 0, max = 255, fuzz = 0, flat = 0 }
             out.contains(&(ioc::EV_ABS, 0x11 /* ABS_HAT0Y */, -1)),
             "{out:?}"
         );
-        assert!(!out.iter().any(|&(_, code, _)| code == 0x10), "{out:?}");
+        assert!(
+            !out.iter()
+                .any(|&(t, code, _)| t == ioc::EV_ABS && code == 0x10),
+            "{out:?}"
+        );
         // Stick axes ride the same rotation, while the binary trigger (DEPTH, not
         // direction) emits its identical button under any posture.
         let out = run(
@@ -1440,7 +1462,11 @@ range = { min = 0, max = 255, fuzz = 0, flat = 0 }
             out.contains(&(ioc::EV_ABS, 0x01 /* ABS_Y */, 4095)),
             "{out:?}"
         );
-        assert!(!out.iter().any(|&(_, code, _)| code == 0x00), "{out:?}");
+        assert!(
+            !out.iter()
+                .any(|&(t, code, _)| t == ioc::EV_ABS && code == 0x00),
+            "{out:?}"
+        );
         assert!(
             out.contains(&(ioc::EV_KEY, 0x138 /* BTN_TL2 */, 1)),
             "{out:?}"
@@ -1472,7 +1498,8 @@ range = { min = 0, max = 255, fuzz = 0, flat = 0 }
         assert!(out.contains(&(ioc::EV_ABS, 0x10, 0)), "{out:?}");
         assert!(out.contains(&(ioc::EV_ABS, 0x11, 1)), "{out:?}");
         assert!(
-            !out.iter().any(|&(t, c, v)| t == ioc::EV_ABS && c == 0x10 && v == 1),
+            !out.iter()
+                .any(|&(t, c, v)| t == ioc::EV_ABS && c == 0x10 && v == 1),
             "{out:?}"
         );
     }
