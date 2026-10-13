@@ -1,5 +1,12 @@
 //! Library seam for the `pf-app-launch <app-id>` helper.
 
+pub mod landlock;
+pub mod policy;
+
+use crate::landlock::{apply_landlock, AppliedPolicy, LandlockError, LandlockKernel};
+use crate::policy::{
+    derive_policy, PolicyDecision, PolicyError, PolicyInputs, PolicyResourceInventory,
+};
 use pf_app_manifest::{ReasonCode, ResolveError, Resolver};
 use std::fmt;
 use std::fs;
@@ -29,6 +36,8 @@ impl Exec for ProcessExec {
 pub enum LaunchError {
     Resolve(ResolveError),
     Xdg(io::Error),
+    Policy(PolicyError),
+    Landlock(LandlockError),
     Exec(io::Error),
 }
 
@@ -37,6 +46,10 @@ impl LaunchError {
         match self {
             Self::Resolve(error) => error.reason,
             Self::Xdg(_) | Self::Exec(_) => ReasonCode::ExecIo,
+            Self::Policy(_) => ReasonCode::PolicyInvalid,
+            Self::Landlock(LandlockError::Unavailable(_)) => ReasonCode::LandlockUnavailable,
+            Self::Landlock(LandlockError::AbiTooOld { .. }) => ReasonCode::LandlockAbiTooOld,
+            Self::Landlock(LandlockError::Apply(_)) => ReasonCode::PolicyApplyFailed,
         }
     }
 
@@ -44,6 +57,8 @@ impl LaunchError {
         match self {
             Self::Resolve(error) => error.helper_exit_code(),
             Self::Xdg(_) => 74,
+            Self::Policy(_) => 65,
+            Self::Landlock(_) => 77,
             Self::Exec(_) => 126,
         }
     }
@@ -54,6 +69,8 @@ impl fmt::Display for LaunchError {
         match self {
             Self::Resolve(error) => error.fmt(f),
             Self::Xdg(error) => write!(f, "XDG directory: {error}"),
+            Self::Policy(error) => write!(f, "policy: {error}"),
+            Self::Landlock(error) => error.fmt(f),
             Self::Exec(error) => write!(f, "execve: {error}"),
         }
     }
@@ -61,34 +78,100 @@ impl fmt::Display for LaunchError {
 
 impl std::error::Error for LaunchError {}
 
-/// Resolve, prepare the authorized XDG directories, and execute an installed application.
-///
-/// Production uses [`Resolver::fixed`]; explicit roots and an executor are accepted here solely
-/// for hermetic tests.
-pub fn launch_with<E: Exec>(
+pub trait PolicyEnforcer {
+    fn enforce_policy(&mut self, policy: &PolicyDecision) -> Result<AppliedPolicy, LandlockError>;
+}
+
+impl<T: LandlockKernel> PolicyEnforcer for T {
+    fn enforce_policy(&mut self, policy: &PolicyDecision) -> Result<AppliedPolicy, LandlockError> {
+        apply_landlock(policy, self)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LaunchPaths {
+    pub xdg_config: PathBuf,
+    pub xdg_state: PathBuf,
+    pub xdg_cache: PathBuf,
+    pub platform_runtime: PathBuf,
+    pub resource_paths: Vec<PathBuf>,
+    pub resources: std::collections::BTreeMap<String, Vec<PathBuf>>,
+}
+
+/// Resolve, compile and enforce policy, then execute an installed application.
+pub fn launch_with<E: Exec, P: PolicyEnforcer>(
     resolver: &Resolver,
     app_id: &str,
-    xdg_config_home: &Path,
-    xdg_state_home: &Path,
+    paths: &LaunchPaths,
+    enforcer: &mut P,
     executor: &mut E,
 ) -> Result<(), LaunchError> {
     let resolved = resolver.resolve(app_id).map_err(LaunchError::Resolve)?;
-    for directory in [xdg_config_home, xdg_state_home] {
+    for directory in [&paths.xdg_config, &paths.xdg_state, &paths.xdg_cache] {
         fs::create_dir_all(directory).map_err(LaunchError::Xdg)?;
     }
+    let policy = derive_policy(
+        &resolved,
+        &PolicyInputs {
+            platform_runtime: paths.platform_runtime.clone(),
+            xdg_config: paths.xdg_config.clone(),
+            xdg_state: paths.xdg_state.clone(),
+            xdg_cache: paths.xdg_cache.clone(),
+            resource_paths: paths.resource_paths.clone(),
+            resources: paths.resources.clone(),
+        },
+    )
+    .map_err(LaunchError::Policy)?;
+    enforcer
+        .enforce_policy(&policy)
+        .map_err(LaunchError::Landlock)?;
     executor
         .exec(&resolved.executable, &resolved.app_dir)
         .map_err(LaunchError::Exec)
 }
 
-pub fn required_xdg_paths() -> Result<(PathBuf, PathBuf), LaunchError> {
-    let config = std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .ok_or_else(|| LaunchError::Xdg(io::Error::other("XDG_CONFIG_HOME is not set")))?;
-    let state = std::env::var_os("XDG_STATE_HOME")
-        .map(PathBuf::from)
-        .ok_or_else(|| LaunchError::Xdg(io::Error::other("XDG_STATE_HOME is not set")))?;
-    Ok((config, state))
+pub fn required_launch_paths(app_id: &str) -> Result<LaunchPaths, LaunchError> {
+    let required = |name: &str, expected: PathBuf| {
+        let actual = std::env::var_os(name)
+            .map(PathBuf::from)
+            .ok_or_else(|| LaunchError::Xdg(io::Error::other(format!("{name} is not set"))))?;
+        if actual != expected {
+            return Err(LaunchError::Xdg(io::Error::other(format!(
+                "{name} is outside the canonical app directory"
+            ))));
+        }
+        Ok(actual)
+    };
+    let state_root = PathBuf::from("/var/lib/pocketforge/apps").join(app_id);
+    let inventory_path =
+        PathBuf::from("/usr/share/pocketforge/app-policy").join(format!("{app_id}.resources.json"));
+    let inventory_source = fs::read_to_string(&inventory_path).map_err(|error| {
+        LaunchError::Policy(PolicyError(format!(
+            "read signed resource inventory {}: {error}",
+            inventory_path.display()
+        )))
+    })?;
+    let inventory: PolicyResourceInventory =
+        serde_json::from_str(&inventory_source).map_err(|error| {
+            LaunchError::Policy(PolicyError(format!(
+                "parse signed resource inventory {}: {error}",
+                inventory_path.display()
+            )))
+        })?;
+    Ok(LaunchPaths {
+        xdg_config: required("XDG_CONFIG_HOME", state_root.join("config"))?,
+        xdg_state: required("XDG_STATE_HOME", state_root.join("state"))?,
+        xdg_cache: required(
+            "XDG_CACHE_HOME",
+            PathBuf::from("/var/cache/pocketforge/apps").join(app_id),
+        )?,
+        platform_runtime: PathBuf::from("/run/pocketforge/platform-runtime"),
+        resource_paths: ["/usr", "/lib", "/lib64", "/bin", "/sbin", "/etc"]
+            .into_iter()
+            .map(PathBuf::from)
+            .collect(),
+        resources: inventory.resources,
+    })
 }
 
 #[cfg(test)]
@@ -108,6 +191,25 @@ mod tests {
             self.executable = Some(executable.to_owned());
             self.working_directory = Some(working_directory.to_owned());
             Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct FakeEnforcer {
+        policy: Option<PolicyDecision>,
+    }
+
+    impl PolicyEnforcer for FakeEnforcer {
+        fn enforce_policy(
+            &mut self,
+            policy: &PolicyDecision,
+        ) -> Result<AppliedPolicy, LandlockError> {
+            self.policy = Some(policy.clone());
+            Ok(AppliedPolicy {
+                kernel_abi: 10,
+                enforced: true,
+                ruleset: None,
+            })
         }
     }
 
@@ -141,24 +243,54 @@ mod tests {
              runtime_family = \"pocketforge/a133-powervr\"\n\
              runtime_abi = \"1\"\n\
              platform_version = \"20\"\n\
-             supported_capabilities = [\"audio\"]\n",
+             supported_capabilities = [\"audio\"]\n\
+             production = true\n\
+             landlock_mode = \"required\"\n\
+             landlock_full_min_abi = 10\n\
+             landlock_browser_min_abi = 6\n",
         )
         .unwrap();
         let config = dir.join("state/config");
         let state = dir.join("state/state");
+        let cache = dir.join("state/cache");
+        let runtime = dir.join("runtime");
+        fs::create_dir_all(&runtime).unwrap();
         let mut exec = FakeExec::default();
+        let mut enforcer = FakeEnforcer::default();
 
         launch_with(
             &Resolver::new(&root, &platform),
             "org.example.app",
-            &config,
-            &state,
+            &LaunchPaths {
+                xdg_config: config.clone(),
+                xdg_state: state.clone(),
+                xdg_cache: cache.clone(),
+                platform_runtime: runtime,
+                resource_paths: Vec::new(),
+                resources: std::collections::BTreeMap::from([
+                    (
+                        "audio-devices".to_owned(),
+                        vec![PathBuf::from("/dev/snd/controlC0")],
+                    ),
+                    (
+                        "audio-sockets".to_owned(),
+                        vec![PathBuf::from("/run/pocketforge/session/audio-0")],
+                    ),
+                    (
+                        "session-environment".to_owned(),
+                        vec![PathBuf::from("/run/pocketforge/session/environment")],
+                    ),
+                ]),
+            },
+            &mut enforcer,
             &mut exec,
         )
         .unwrap();
 
         assert!(config.is_dir());
         assert!(state.is_dir());
+        assert!(cache.is_dir());
+        assert_eq!(enforcer.policy.unwrap().app_id, "org.example.app");
         assert_eq!(exec.executable, Some(fs::canonicalize(executable).unwrap()));
         assert_eq!(exec.working_directory, Some(fs::canonicalize(app).unwrap()));
         fs::remove_dir_all(dir).unwrap();
@@ -168,11 +300,19 @@ mod tests {
     fn resolver_refusals_preserve_reason_and_exit_class() {
         let resolver = Resolver::new("/definitely/missing", "/also/missing");
         let mut exec = FakeExec::default();
+        let mut enforcer = FakeEnforcer::default();
         let error = launch_with(
             &resolver,
             "../outside",
-            Path::new("/unused/config"),
-            Path::new("/unused/state"),
+            &LaunchPaths {
+                xdg_config: PathBuf::from("/unused/config"),
+                xdg_state: PathBuf::from("/unused/state"),
+                xdg_cache: PathBuf::from("/unused/cache"),
+                platform_runtime: PathBuf::from("/unused/runtime"),
+                resource_paths: Vec::new(),
+                resources: std::collections::BTreeMap::new(),
+            },
+            &mut enforcer,
             &mut exec,
         )
         .unwrap_err();

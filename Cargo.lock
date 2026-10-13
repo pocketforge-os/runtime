@@ -370,8 +370,13 @@ checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 name = "pf-app-launch"
 version = "0.0.1"
 dependencies = [
+ "libc",
+ "linux-raw-sys",
  "pf-app-manifest",
+ "serde",
  "serde_json",
+ "sha2",
+ "toml",
 ]
 
 [[package]]
@@ -379,6 +384,7 @@ name = "pf-app-manifest"
 version = "0.0.1"
 dependencies = [
  "serde",
+ "sha2",
  "toml",
 ]
 

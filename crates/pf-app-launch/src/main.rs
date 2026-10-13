@@ -1,4 +1,5 @@
-use pf_app_launch::{launch_with, required_xdg_paths, ProcessExec};
+use pf_app_launch::landlock::SystemLandlock;
+use pf_app_launch::{launch_with, required_launch_paths, ProcessExec};
 use pf_app_manifest::{validate_app_id, ReasonCode, Resolver};
 
 fn main() {
@@ -16,15 +17,15 @@ fn main() {
     if validate_app_id(app_id).is_err() {
         refuse(ReasonCode::InvalidId, app_id, 65);
     }
-    let (config, state) = match required_xdg_paths() {
+    let paths = match required_launch_paths(app_id) {
         Ok(paths) => paths,
         Err(error) => refuse(error.reason(), app_id, error.exit_code()),
     };
     if let Err(error) = launch_with(
         &Resolver::fixed(),
         app_id,
-        &config,
-        &state,
+        &paths,
+        &mut SystemLandlock,
         &mut ProcessExec,
     ) {
         refuse(error.reason(), app_id, error.exit_code());

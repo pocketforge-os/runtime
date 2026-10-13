@@ -1,0 +1,41 @@
+name: App policy paired contract
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/app-policy-pair.yml'
+      - 'crates/pf-app-launch/**'
+      - 'crates/pf-app-manifest/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+
+permissions:
+  contents: read
+
+jobs:
+  pair:
+    if: >-
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, pf-ci]
+    timeout-minutes: 15
+    container:
+      image: 10.0.32.86:5555/pocketforge/ci-rust@sha256:801f15f7e8fd20b449e3b0d0a7a56d632e28dae825b251a19a30e6f8b32bd8e9
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          fetch-depth: 0
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          repository: pocketforge-os/image
+          ref: tsp-3gjwc
+          path: image-pair
+      - name: Build this policy compiler and run paired image contract
+        run: |
+          cargo build --offline --locked -p pf-app-launch --bin pf-app-policy-render
+          export PF_APP_POLICY_RENDER="$GITHUB_WORKSPACE/target/debug/pf-app-policy-render"
+          printf 'runtime_candidate=%s image_candidate=%s policy_renderer_sha256=%s\n' \
+            "$(git rev-parse HEAD)" \
+            "$(git -C image-pair rev-parse HEAD)" \
+            "$(sha256sum "$PF_APP_POLICY_RENDER" | cut -d' ' -f1)"
+          image-pair/tests/test-app-runtime-root.sh
+          image-pair/tests/test-default-app-platform.sh

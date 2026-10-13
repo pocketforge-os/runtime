@@ -289,6 +289,57 @@ fn normalized_capability_compatibility_and_controls_share_one_invocation() {
     fs::remove_dir_all(dir).unwrap();
 }
 
+#[test]
+fn egress_authority_and_landlock_contract_controls_share_one_invocation() {
+    let manifest = parse_manifest(&capability_manifest(&[
+        "egress:tcp/443@example.com",
+        "egress:udp/53@1.1.1.1",
+    ]))
+    .unwrap();
+    assert_eq!(manifest.app.capabilities.len(), 2);
+    for invalid in [
+        "egress:443@example.com",
+        "egress:sctp/443@example.com",
+        "egress:tcp/0@example.com",
+        "egress:tcp/443@",
+        "egress:tcp/443@example..com",
+        "egress:tcp/443@-example.com",
+    ] {
+        let error = parse_manifest(&capability_manifest(&[invalid])).unwrap_err();
+        assert_eq!(error.kind, ManifestErrorKind::Invalid, "{invalid}");
+        assert_eq!(
+            error.message, "invalid or duplicate capability",
+            "{invalid}"
+        );
+    }
+
+    let required = "schema_version = 1\n\
+        runtime_family = \"pocketforge/a133-powervr\"\n\
+        runtime_abi = \"1\"\nplatform_version = \"20\"\n\
+        supported_capabilities = []\nproduction = true\n\
+        landlock_mode = \"required\"\nlandlock_full_min_abi = 10\n\
+        landlock_browser_min_abi = 6\n";
+    assert!(parse_platform_contract(required).is_ok());
+    for invalid in [
+        required.replace("landlock_full_min_abi = 10\n", ""),
+        required.replace("landlock_full_min_abi = 10", "landlock_full_min_abi = 9"),
+        required.replace(
+            "landlock_mode = \"required\"",
+            "landlock_mode = \"best_effort\"",
+        ),
+    ] {
+        let error = parse_platform_contract(&invalid).unwrap_err();
+        assert_eq!(error.reason, PlatformContractErrorReason::Schema);
+    }
+    let non_production = required
+        .replace("production = true", "production = false")
+        .replace(
+            "landlock_mode = \"required\"",
+            "landlock_mode = \"best_effort\"",
+        );
+    assert!(parse_platform_contract(&non_production).is_ok());
+}
+
 /// A whole-manifest source declaring exactly `caps`, pinned to the a133 family.
 fn capability_manifest(caps: &[&str]) -> String {
     let caps = caps

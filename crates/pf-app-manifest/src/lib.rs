@@ -4,9 +4,11 @@
 //! descriptor or executable path, and every filesystem object is checked before launch.
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs;
+use std::net::IpAddr;
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 
@@ -15,8 +17,10 @@ pub const PLATFORM_CONTRACT_PATH: &str = "/usr/share/pocketforge/platform-capabi
 
 /// The runtime's canonical capability vocabulary.
 pub const KNOWN_CAPABILITIES: &[&str] = &[
+    "bluetooth",
     "input",
     "vibration",
+    "video-decode",
     "rumble",
     "imu",
     "accelerometer",
@@ -39,6 +43,9 @@ pub const KNOWN_CAPABILITIES: &[&str] = &[
     "pointer",
     "menu",
     "options",
+    // Platform-owned opt-in for launchers which must create nested user/mount/network
+    // namespaces (notably the browser's bwrap sandbox).
+    "sandbox.nested_userns",
 ];
 
 /// Minimum-spec graphics version vocabulary: OpenGL ES.
@@ -298,7 +305,15 @@ fn validate_manifest(manifest: &Manifest) -> Result<(), ManifestError> {
     let mut capabilities = BTreeSet::new();
     for capability in &manifest.app.capabilities {
         let requirement = parse_capability_requirement(capability);
-        if requirement.base.is_empty() || !capabilities.insert(requirement.base.clone()) {
+        let uniqueness_key = if requirement.base == "egress" {
+            format!(
+                "egress:{}",
+                requirement.modifier.as_deref().unwrap_or_default()
+            )
+        } else {
+            requirement.base.clone()
+        };
+        if requirement.base.is_empty() || !capabilities.insert(uniqueness_key) {
             return invalid_manifest("invalid or duplicate capability");
         }
         if validate_requirement(&requirement).is_err() {
@@ -453,15 +468,12 @@ fn decimal_version(value: &str) -> bool {
 
 fn validate_requirement(requirement: &CapabilityRequirement) -> Result<(), ()> {
     if requirement.base == "egress" {
-        return if requirement
+        return requirement
             .modifier
             .as_deref()
-            .is_some_and(|modifier| !modifier.is_empty())
-        {
-            Ok(())
-        } else {
-            Err(())
-        };
+            .ok_or(())
+            .and_then(parse_egress_authority)
+            .map(|_| ());
     }
     if let Some(modifier) = requirement.modifier.as_deref() {
         if !matches!(
@@ -476,6 +488,63 @@ fn validate_requirement(requirement: &CapabilityRequirement) -> Result<(), ()> {
     } else {
         Err(())
     }
+}
+
+/// A normalized network authority shared by the launcher policy and network-namespace renderer.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+pub struct EgressAuthority {
+    pub protocol: EgressProtocol,
+    pub port: u16,
+    pub host: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EgressProtocol {
+    Tcp,
+    Udp,
+}
+
+/// Parse the canonical `egress:<protocol>/<destination-port>@<host>` modifier.
+pub fn parse_egress_authority(modifier: &str) -> Result<EgressAuthority, ()> {
+    let (protocol_port, host) = modifier.split_once('@').ok_or(())?;
+    let (protocol, port) = protocol_port.split_once('/').ok_or(())?;
+    let protocol = match protocol {
+        "tcp" => EgressProtocol::Tcp,
+        "udp" => EgressProtocol::Udp,
+        _ => return Err(()),
+    };
+    let port = port.parse::<u16>().map_err(|_| ())?;
+    if port == 0 || !valid_egress_host(host) {
+        return Err(());
+    }
+    Ok(EgressAuthority {
+        protocol,
+        port,
+        host: host.to_ascii_lowercase(),
+    })
+}
+
+fn valid_egress_host(host: &str) -> bool {
+    if host == "*" {
+        return true;
+    }
+    if host.is_empty() || host.len() > 253 || !host.is_ascii() {
+        return false;
+    }
+    if host.parse::<IpAddr>().is_ok() {
+        return true;
+    }
+    host.split('.').all(|label| {
+        let bytes = label.as_bytes();
+        !bytes.is_empty()
+            && bytes.len() <= 63
+            && bytes[0].is_ascii_alphanumeric()
+            && bytes[bytes.len() - 1].is_ascii_alphanumeric()
+            && bytes
+                .iter()
+                .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'-')
+    })
 }
 
 fn validate_exec_path(value: &str) -> Result<PathBuf, String> {
@@ -552,6 +621,27 @@ pub struct PlatformContract {
     /// Schema 2: physical display size in pixels.
     #[serde(default)]
     pub display: Option<DisplaySize>,
+    /// Production contracts are fail closed. Only an explicitly non-production
+    /// signed contract may request best-effort ABI masking.
+    #[serde(default = "default_production")]
+    pub production: bool,
+    #[serde(default)]
+    pub landlock_mode: Option<LandlockMode>,
+    #[serde(default)]
+    pub landlock_full_min_abi: Option<u32>,
+    #[serde(default)]
+    pub landlock_browser_min_abi: Option<u32>,
+}
+
+const fn default_production() -> bool {
+    true
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LandlockMode {
+    Required,
+    BestEffort,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -695,6 +785,27 @@ pub fn parse_platform_contract(source: &str) -> Result<PlatformContract, Platfor
             "invalid platform_version",
         );
     }
+    match (
+        contract.landlock_mode,
+        contract.landlock_full_min_abi,
+        contract.landlock_browser_min_abi,
+    ) {
+        (None, None, None) => {}
+        (Some(mode), Some(10), Some(6)) => {
+            if contract.production && mode == LandlockMode::BestEffort {
+                return invalid_contract(
+                    PlatformContractErrorReason::Schema,
+                    "production contract cannot use best_effort Landlock",
+                );
+            }
+        }
+        _ => {
+            return invalid_contract(
+                PlatformContractErrorReason::Schema,
+                "Landlock contract requires mode, full ABI 10 and browser ABI 6",
+            );
+        }
+    }
     let mut previous: Option<&str> = None;
     let mut seen = BTreeSet::new();
     for capability in &contract.supported_capabilities {
@@ -757,6 +868,10 @@ pub enum ReasonCode {
     ExecEscape,
     ExecNotExecutable,
     ExecIo,
+    LandlockUnavailable,
+    LandlockAbiTooOld,
+    PolicyInvalid,
+    PolicyApplyFailed,
     RuntimeFamilyMismatch,
     RuntimeAbiMismatch,
     PlatformVersionMismatch,
@@ -800,6 +915,10 @@ impl ReasonCode {
             Self::ExecEscape => "exec_escape",
             Self::ExecNotExecutable => "exec_not_executable",
             Self::ExecIo => "exec_io",
+            Self::LandlockUnavailable => "landlock_unavailable",
+            Self::LandlockAbiTooOld => "landlock_abi_too_old",
+            Self::PolicyInvalid => "policy_invalid",
+            Self::PolicyApplyFailed => "policy_apply_failed",
             Self::RuntimeFamilyMismatch => "runtime_family_mismatch",
             Self::RuntimeAbiMismatch => "runtime_abi_mismatch",
             Self::PlatformVersionMismatch => "platform_version_mismatch",
@@ -848,6 +967,7 @@ pub struct ResolvedApp {
     pub app_dir: PathBuf,
     pub executable: PathBuf,
     pub manifest: Manifest,
+    pub manifest_sha256: String,
     pub platform: PlatformContract,
 }
 
@@ -961,6 +1081,7 @@ impl Resolver {
             detail: format!("read descriptor: {error}"),
             exit_code: 74,
         })?;
+        let manifest_sha256 = format!("{:x}", Sha256::digest(source.as_bytes()));
         let manifest = parse_manifest(&source).map_err(|error| match error.kind {
             ManifestErrorKind::Parse => {
                 resolve_error(ReasonCode::DescriptorParse, 65, error.message)
@@ -1053,12 +1174,13 @@ impl Resolver {
             app_dir: canonical_app,
             executable: canonical_exec,
             manifest,
+            manifest_sha256,
             platform,
         })
     }
 }
 
-fn check_compatibility(
+pub fn check_compatibility(
     manifest: &Manifest,
     platform: &PlatformContract,
 ) -> Result<(), ResolveError> {
