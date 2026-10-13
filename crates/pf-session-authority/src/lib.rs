@@ -870,6 +870,14 @@ pub enum RpcRequest {
         observation: RpcObservation,
     },
     Tick,
+    /// Read or long-poll the complete compositor orientation snapshot.
+    Orientation {
+        version: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        after_serial: Option<u64>,
+        #[serde(default)]
+        wait_ms: u64,
+    },
     /// Open `url` in the default handler. On the front socket `app_id` is the front's claim,
     /// re-verified against the forwarded process handle; on the shell socket it must be absent.
     OpenUrl {
@@ -904,6 +912,8 @@ pub enum RpcOrigin {
     Shell,
     /// The root input broker on the shell socket. Its role is restricted to `SafeReturn`.
     Broker,
+    /// The compositor has read-only access to the orientation method.
+    Compositor,
     /// The SDK front's private socket, with the app id re-derived from the forwarded process
     /// handle, or the reason no app id could be derived.
     Front { caller: Result<String, String> },
@@ -955,6 +965,10 @@ pub enum RpcResponse {
     },
     History {
         entries: Vec<HistoryEntry>,
+    },
+    Orientation {
+        version: u32,
+        state: orientation::OrientationState,
     },
     Ok,
     Error {
@@ -1147,6 +1161,7 @@ pub struct ShellPolicy {
     shell_uid: u32,
     shell_unit: String,
     broker_unit: String,
+    compositor_unit: Option<String>,
     resolve_peer: Arc<ShellPeerResolver>,
 }
 
@@ -1157,6 +1172,7 @@ type ShellPeerResolver =
 enum ShellPeerRole {
     Shell,
     Broker,
+    Compositor,
 }
 
 impl ShellPolicy {
@@ -1169,10 +1185,38 @@ impl ShellPolicy {
         )
     }
 
+    pub fn kernel_with_compositor(
+        shell_uid: u32,
+        shell_unit: String,
+        broker_unit: String,
+        compositor_unit: String,
+    ) -> io::Result<Self> {
+        Self::custom_with_compositor(
+            shell_uid,
+            shell_unit,
+            broker_unit,
+            Some(compositor_unit),
+            pf_peer_identity::peer_service_identity,
+        )
+    }
+
     pub fn custom(
         shell_uid: u32,
         shell_unit: String,
         broker_unit: String,
+        resolve_peer: impl Fn(&UnixStream) -> io::Result<pf_peer_identity::PeerServiceIdentity>
+            + Send
+            + Sync
+            + 'static,
+    ) -> io::Result<Self> {
+        Self::custom_with_compositor(shell_uid, shell_unit, broker_unit, None, resolve_peer)
+    }
+
+    pub fn custom_with_compositor(
+        shell_uid: u32,
+        shell_unit: String,
+        broker_unit: String,
+        compositor_unit: Option<String>,
         resolve_peer: impl Fn(&UnixStream) -> io::Result<pf_peer_identity::PeerServiceIdentity>
             + Send
             + Sync
@@ -1188,6 +1232,7 @@ impl ShellPolicy {
             shell_uid,
             shell_unit,
             broker_unit,
+            compositor_unit,
             resolve_peer: Arc::new(resolve_peer),
         })
     }
@@ -1199,6 +1244,11 @@ impl ShellPolicy {
         }
         if identity.cred.uid == 0 && identity.unit == self.broker_unit {
             return Ok(ShellPeerRole::Broker);
+        }
+        if identity.cred.uid == self.shell_uid
+            && self.compositor_unit.as_deref() == Some(identity.unit.as_str())
+        {
+            return Ok(ShellPeerRole::Compositor);
         }
         Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
@@ -1431,6 +1481,139 @@ pub fn spawn_rpc_acceptor(
     })
 }
 
+/// Orientation-aware acceptor. Orientation waits use [`orientation::OrientationWatch`]'s
+/// independent permit bound and never enter the lifecycle request channel; lifecycle RPCs retain
+/// the existing `max_connections` bound even when all orientation permits are occupied.
+pub fn spawn_rpc_acceptor_with_orientation(
+    listener: UnixListener,
+    requests: mpsc::Sender<io::Result<PendingRpc>>,
+    limits: ConnectionLimits,
+    policy: ShellPolicy,
+    watch: Arc<orientation::OrientationWatch>,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        let lifecycle_active = Arc::new(AtomicUsize::new(0));
+        for connection in listener.incoming() {
+            let stream = match connection {
+                Ok(stream) => stream,
+                Err(error) => {
+                    let _ = requests.send(Err(error));
+                    return;
+                }
+            };
+            let (requests, lifecycle_active, policy, watch) = (
+                requests.clone(),
+                Arc::clone(&lifecycle_active),
+                policy.clone(),
+                Arc::clone(&watch),
+            );
+            thread::spawn(move || {
+                if let Err(error) = serve_orientation_aware_connection(
+                    stream,
+                    &requests,
+                    limits,
+                    &policy,
+                    &watch,
+                    &lifecycle_active,
+                ) {
+                    eprintln!("pf-session-authorityd: connection error: {error:?}");
+                }
+            });
+        }
+    })
+}
+
+fn serve_orientation_aware_connection(
+    mut stream: UnixStream,
+    requests: &mpsc::Sender<io::Result<PendingRpc>>,
+    limits: ConnectionLimits,
+    policy: &ShellPolicy,
+    watch: &orientation::OrientationWatch,
+    lifecycle_active: &AtomicUsize,
+) -> Result<(), AuthorityError> {
+    let backend = |error: &dyn std::fmt::Display| AuthorityError::Backend(error.to_string());
+    let origin = match policy.authenticate_peer(&stream) {
+        Ok(ShellPeerRole::Shell) => RpcOrigin::Shell,
+        Ok(ShellPeerRole::Broker) => RpcOrigin::Broker,
+        Ok(ShellPeerRole::Compositor) => RpcOrigin::Compositor,
+        Err(error) => {
+            eprintln!(
+                "pf-session-authorityd: shell_refused reason=peer_identity detail={}",
+                json_string(&error.to_string())
+            );
+            return Ok(());
+        }
+    };
+    stream
+        .set_read_timeout(Some(limits.io_timeout))
+        .and_then(|()| stream.set_write_timeout(Some(limits.io_timeout)))
+        .map_err(|e| backend(&e))?;
+    let body = pf_wire::read_frame(&mut stream).map_err(|e| backend(&e))?;
+    let request: RpcRequest = serde_json::from_slice(&body).map_err(|e| backend(&e))?;
+    let response = if let RpcRequest::Orientation {
+        version,
+        after_serial,
+        wait_ms,
+    } = request
+    {
+        if version != 1 {
+            RpcResponse::Error {
+                message: format!("unsupported orientation rpc version {version}"),
+            }
+        } else {
+            let current = watch.snapshot();
+            let state = if after_serial == Some(current.serial) && wait_ms > 0 {
+                match watch.wait_after(current.serial, Duration::from_millis(wait_ms)) {
+                    Ok(state) => state,
+                    Err(orientation::WaitError::TooManyWaiters) => {
+                        let response = RpcResponse::Error {
+                            message: "too many orientation waiters".into(),
+                        };
+                        let body = serde_json::to_vec(&response).map_err(|e| backend(&e))?;
+                        return pf_wire::write_frame(&mut stream, &body).map_err(|e| backend(&e));
+                    }
+                    Err(orientation::WaitError::Poisoned) => {
+                        return Err(AuthorityError::Backend("orientation watch poisoned".into()))
+                    }
+                }
+            } else {
+                current
+            };
+            RpcResponse::Orientation { version: 1, state }
+        }
+    } else {
+        if origin == RpcOrigin::Compositor {
+            RpcResponse::Denied
+        } else {
+            if lifecycle_active.fetch_add(1, Ordering::AcqRel) >= limits.max_connections {
+                lifecycle_active.fetch_sub(1, Ordering::AcqRel);
+                return Ok(());
+            }
+            let _permit = LifecyclePermit(lifecycle_active);
+            let (reply, response) = mpsc::channel();
+            requests
+                .send(Ok(PendingRpc {
+                    request,
+                    reply,
+                    origin,
+                }))
+                .map_err(|_| AuthorityError::Backend("authority loop stopped".into()))?;
+            response
+                .recv_timeout(limits.response_timeout)
+                .map_err(|e| backend(&e))?
+        }
+    };
+    let body = serde_json::to_vec(&response).map_err(|e| backend(&e))?;
+    pf_wire::write_frame(&mut stream, &body).map_err(|e| backend(&e))
+}
+
+struct LifecyclePermit<'a>(&'a AtomicUsize);
+impl Drop for LifecyclePermit<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 fn serve_rpc_connection(
     mut stream: UnixStream,
     requests: &mpsc::Sender<io::Result<PendingRpc>>,
@@ -1441,6 +1624,7 @@ fn serve_rpc_connection(
     let origin = match policy.authenticate_peer(&stream) {
         Ok(ShellPeerRole::Shell) => RpcOrigin::Shell,
         Ok(ShellPeerRole::Broker) => RpcOrigin::Broker,
+        Ok(ShellPeerRole::Compositor) => RpcOrigin::Compositor,
         Err(error) => {
             eprintln!(
                 "pf-session-authorityd: shell_refused reason=peer_identity detail={}",
@@ -1489,9 +1673,21 @@ fn handle_rpc_from<S: StateStore, B: SessionSystem, C: Clock>(
     origin: RpcOrigin,
     request: RpcRequest,
 ) -> Result<RpcResponse, AuthorityError> {
-    if origin == RpcOrigin::Broker && !matches!(&request, RpcRequest::SafeReturn) {
+    if origin == RpcOrigin::Broker
+        && !matches!(
+            &request,
+            RpcRequest::SafeReturn | RpcRequest::Orientation { .. }
+        )
+    {
         authority.log(&format!(
             "pf-session-authorityd: shell_refused reason=peer_scope role=broker method={}",
+            rpc_method(&request)
+        ));
+        return Ok(RpcResponse::Denied);
+    }
+    if origin == RpcOrigin::Compositor && !matches!(&request, RpcRequest::Orientation { .. }) {
+        authority.log(&format!(
+            "pf-session-authorityd: shell_refused reason=peer_scope role=compositor method={}",
             rpc_method(&request)
         ));
         return Ok(RpcResponse::Denied);
@@ -1515,7 +1711,9 @@ fn handle_rpc_from<S: StateStore, B: SessionSystem, C: Clock>(
                         None => return Ok(RpcResponse::Denied),
                     }
                 }
-                (RpcOrigin::Broker, _) => unreachable!("broker requests are filtered above"),
+                (RpcOrigin::Broker | RpcOrigin::Compositor, _) => {
+                    unreachable!("restricted requests are filtered above")
+                }
             };
             authority.open_url(caller, &url, flags)?
         }
@@ -1535,7 +1733,9 @@ fn handle_rpc_from<S: StateStore, B: SessionSystem, C: Clock>(
                     None => RpcResponse::Denied,
                 }
             }
-            RpcOrigin::Broker => unreachable!("broker requests are filtered above"),
+            RpcOrigin::Broker | RpcOrigin::Compositor => {
+                unreachable!("restricted requests are filtered above")
+            }
         },
         RpcRequest::Launch { item_id } => match authority.launch(LaunchRequest { item_id })? {
             LaunchResult::Accepted { session_id } => RpcResponse::Accepted { session_id },
@@ -1585,6 +1785,18 @@ fn handle_rpc_from<S: StateStore, B: SessionSystem, C: Clock>(
             authority.tick()?;
             RpcResponse::Ok
         }
+        RpcRequest::Orientation { version, .. } => {
+            if version != 1 {
+                RpcResponse::Error {
+                    message: format!("unsupported orientation rpc version {version}"),
+                }
+            } else {
+                RpcResponse::Orientation {
+                    version: 1,
+                    state: authority.orientation.snapshot(),
+                }
+            }
+        }
     })
 }
 
@@ -1597,6 +1809,7 @@ fn rpc_method(request: &RpcRequest) -> &'static str {
         RpcRequest::History => "history",
         RpcRequest::Observe { .. } => "observe",
         RpcRequest::Tick => "tick",
+        RpcRequest::Orientation { .. } => "orientation",
         RpcRequest::OpenUrl { .. } => "open_url",
         RpcRequest::ReturnToCaller { .. } => "return_to_caller",
     }
@@ -1639,6 +1852,7 @@ pub struct Authority<S, B, C> {
     url_handler: Box<dyn UrlHandlerResolver + Send>,
     /// Monotonic `OpenUrl` timestamps per caller, oldest first (memory only).
     url_rate: BTreeMap<String, VecDeque<MonotonicTime>>,
+    orientation: Arc<orientation::OrientationWatch>,
 }
 
 /// The verified caller of an `OpenUrl`.
@@ -1875,6 +2089,10 @@ impl<S: StateStore, B: SessionSystem, C: Clock> Authority<S, B, C> {
             now_fn,
             url_handler: Box::new(NoUrlHandler),
             url_rate: BTreeMap::new(),
+            orientation: Arc::new(orientation::OrientationWatch::new(
+                orientation::OrientationState::default(),
+                DEFAULT_CONNECTION_LIMITS.max_connections,
+            )),
         })
     }
     /// Replaces the default [`NoUrlHandler`] resolver.
@@ -1906,6 +2124,12 @@ impl<S: StateStore, B: SessionSystem, C: Clock> Authority<S, B, C> {
     }
     pub fn state(&self) -> &PersistedState {
         &self.state
+    }
+    pub fn orientation_watch(&self) -> Arc<orientation::OrientationWatch> {
+        Arc::clone(&self.orientation)
+    }
+    pub fn publish_orientation(&self, state: orientation::OrientationState) {
+        self.orientation.publish(state);
     }
     pub fn into_parts(self) -> (S, B, C) {
         (self.store, self.system, self.clock)

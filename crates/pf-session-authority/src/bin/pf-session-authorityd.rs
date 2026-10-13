@@ -1,8 +1,8 @@
 use pf_ports::{Clock, MonotonicTime};
 use pf_session_authority::{
-    run_service_loop, spawn_front_acceptor, spawn_rpc_acceptor, Authority, CommandSystem,
-    CommandTemplates, FileStore, FixedUrlHandler, FrontPolicy, PendingRpc, ShellPolicy,
-    DEFAULT_CONNECTION_LIMITS, DEFAULT_GRACE_PERIOD, DEFAULT_PRESENTATION_TIMEOUT,
+    run_service_loop, spawn_front_acceptor, spawn_rpc_acceptor_with_orientation, Authority,
+    CommandSystem, CommandTemplates, FileStore, FixedUrlHandler, FrontPolicy, PendingRpc,
+    ShellPolicy, DEFAULT_CONNECTION_LIMITS, DEFAULT_GRACE_PERIOD, DEFAULT_PRESENTATION_TIMEOUT,
     DEFAULT_TICK_INTERVAL,
 };
 use std::env;
@@ -28,6 +28,7 @@ struct Args {
     shell_user: String,
     shell_unit: String,
     broker_unit: String,
+    compositor_unit: String,
     templates: CommandTemplates,
     /// The private SDK-front socket (tsp-ght0z); absent until the front's unit exists.
     front: Option<FrontArgs>,
@@ -61,8 +62,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         None => None,
     };
     let shell_uid = resolve_uid(&args.shell_user)?;
-    let shell_policy =
-        ShellPolicy::kernel(shell_uid, args.shell_unit.clone(), args.broker_unit.clone())?;
+    let shell_policy = ShellPolicy::kernel_with_compositor(
+        shell_uid,
+        args.shell_unit.clone(),
+        args.broker_unit.clone(),
+        args.compositor_unit.clone(),
+    )?;
     let mut authority = Authority::open(
         FileStore::new(args.state_dir.join("authority.json")),
         CommandSystem::new(args.templates),
@@ -83,11 +88,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // only complete requests, so the single-threaded authority blocks only in the loop's channel
     // wait and its self-driven tick keeps firing during a slow or silent client.
     let (requests, incoming) = mpsc::channel();
-    spawn_rpc_acceptor(
+    let orientation = authority.orientation_watch();
+    spawn_rpc_acceptor_with_orientation(
         listener,
         requests.clone(),
         DEFAULT_CONNECTION_LIMITS,
         shell_policy,
+        orientation,
     );
     let _front_guard = match (&args.front, front_policy) {
         (Some(front), Some(policy)) => {
@@ -175,6 +182,7 @@ Options:
   --shell-user NAME                Shell socket user (default gamer)
   --shell-unit UNIT                Full-access shell unit (default pf-shell-selected.service)
   --broker-unit UNIT               Root SafeReturn-only unit (default pf-input-broker.service)
+  --compositor-unit UNIT           Read-only orientation consumer (default gamescope-session.service)
   --front-socket PATH              Private socket for the SDK front (OpenUrl/ReturnToCaller);
                                    requires --front-user and --front-unit
   --front-user NAME                The SDK front's user (socket-bound peer uid)
@@ -188,6 +196,7 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
     let mut shell_user = "gamer".to_owned();
     let mut shell_unit = "pf-shell-selected.service".to_owned();
     let mut broker_unit = "pf-input-broker.service".to_owned();
+    let mut compositor_unit = "gamescope-session.service".to_owned();
     let mut preset = "device".to_owned();
     let mut grace = DEFAULT_GRACE_PERIOD;
     let mut start = None;
@@ -208,6 +217,7 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
             "--shell-user" => shell_user = value,
             "--shell-unit" => shell_unit = value,
             "--broker-unit" => broker_unit = value,
+            "--compositor-unit" => compositor_unit = value,
             "--command-preset" => preset = value,
             "--grace-period-ms" => {
                 grace =
@@ -259,6 +269,7 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
         shell_user,
         shell_unit,
         broker_unit,
+        compositor_unit,
         templates,
         front,
         url_handler,

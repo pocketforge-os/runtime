@@ -592,6 +592,7 @@ dependencies = [
  "pf-app-manifest",
  "pf-peer-identity",
  "pf-ports",
+ "pf-prefs",
  "pf-wire",
  "serde",
  "serde_json",

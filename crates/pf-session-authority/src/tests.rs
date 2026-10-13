@@ -1793,6 +1793,48 @@ fn broker_identity_is_limited_to_safe_return() {
 }
 
 #[test]
+fn orientation_rpc_is_versioned_and_compositor_is_read_only() {
+    let (mut authority, _) = logged_authority(None);
+    for origin in [RpcOrigin::Shell, RpcOrigin::Broker, RpcOrigin::Compositor] {
+        assert!(matches!(
+            dispatch_rpc_from(
+                &mut authority,
+                origin,
+                RpcRequest::Orientation {
+                    version: 1,
+                    after_serial: None,
+                    wait_ms: 0,
+                }
+            ),
+            RpcResponse::Orientation {
+                version: 1,
+                state: orientation::OrientationState { serial: 1, .. }
+            }
+        ));
+    }
+    assert!(matches!(
+        dispatch_rpc_from(
+            &mut authority,
+            RpcOrigin::Compositor,
+            RpcRequest::SafeReturn
+        ),
+        RpcResponse::Denied
+    ));
+    assert!(matches!(
+        dispatch_rpc_from(
+            &mut authority,
+            RpcOrigin::Shell,
+            RpcRequest::Orientation {
+                version: 2,
+                after_serial: None,
+                wait_ms: 0,
+            }
+        ),
+        RpcResponse::Error { .. }
+    ));
+}
+
+#[test]
 fn overlapping_shell_and_broker_identity_never_gets_shell_authority() {
     let overlapping =
         ShellPolicy::custom(0, TEST_BROKER_UNIT.into(), TEST_BROKER_UNIT.into(), |_| {
@@ -1866,6 +1908,77 @@ fn stalled_clients_never_block_the_service_loop_tick() {
     );
     assert!(log.lock().unwrap()[0].contains("presentation_not_acknowledged"));
     drop((silent, partial));
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn full_orientation_waiter_bound_does_not_delay_safe_return_lane() {
+    const N: usize = 8;
+    let dir = short_socket_dir("orientation-lane");
+    let socket = dir.join("a.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    let (requests, incoming) = std::sync::mpsc::channel();
+    let watch = Arc::new(orientation::OrientationWatch::new(
+        orientation::OrientationState::default(),
+        N,
+    ));
+    spawn_rpc_acceptor_with_orientation(
+        listener,
+        requests,
+        DEFAULT_CONNECTION_LIMITS,
+        trusted_shell_policy(),
+        Arc::clone(&watch),
+    );
+
+    let serial = watch.snapshot().serial;
+    let mut waiters = Vec::new();
+    for _ in 0..N {
+        let socket = socket.clone();
+        waiters.push(std::thread::spawn(move || {
+            raw_rpc(
+                &socket,
+                &RpcRequest::Orientation {
+                    version: 1,
+                    after_serial: Some(serial),
+                    wait_ms: 1_000,
+                },
+            )
+        }));
+    }
+    let fill_deadline = Instant::now() + Duration::from_millis(200);
+    while watch.active_waiters() != N && Instant::now() < fill_deadline {
+        std::thread::yield_now();
+    }
+    assert_eq!(watch.active_waiters(), N);
+
+    let socket_for_lifecycle = socket.clone();
+    let lifecycle = std::thread::spawn(move || {
+        let started = Instant::now();
+        let response = raw_rpc(&socket_for_lifecycle, &RpcRequest::SafeReturn);
+        (started.elapsed(), response)
+    });
+    let pending = incoming
+        .recv_timeout(Duration::from_millis(100))
+        .expect("safe_return must reach the lifecycle lane")
+        .unwrap();
+    assert!(matches!(pending.request, RpcRequest::SafeReturn));
+    pending.respond(RpcResponse::Ok);
+    let (elapsed, response) = lifecycle.join().unwrap();
+    assert!(matches!(response, RpcResponse::Ok));
+    assert!(
+        elapsed < Duration::from_millis(100),
+        "safe_return took {elapsed:?}"
+    );
+
+    let mut changed = watch.snapshot();
+    changed.serial += 1;
+    watch.publish(changed);
+    for waiter in waiters {
+        assert!(matches!(
+            waiter.join().unwrap(),
+            RpcResponse::Orientation { version: 1, .. }
+        ));
+    }
     fs::remove_dir_all(dir).unwrap();
 }
 

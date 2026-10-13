@@ -11,6 +11,24 @@ fn inputs() -> OrientationInputs {
 }
 
 #[test]
+fn canonical_pf_prefs_keys_drive_the_manual_rotation_source() {
+    let mut prefs = pf_prefs::Prefs::defaults();
+    prefs
+        .set("auto_rotate", pf_prefs::PrefValue::Bool(false))
+        .unwrap();
+    prefs
+        .set("user_rotation", pf_prefs::PrefValue::Enum("left"))
+        .unwrap();
+    let mut i = inputs();
+    i.accelerometer_present = true;
+    i.accelerometer = Some(SensorObservation::Right);
+    i.apply_preferences(&prefs);
+    let state = OrientationPolicy::new(i);
+    assert!(state.state().locked);
+    assert_eq!(state.state().whole_body, QuarterTurn::Left);
+}
+
+#[test]
 fn every_input_and_precedence_rule_has_positive_and_negative_controls() {
     let mut policy = OrientationPolicy::new(inputs());
     assert_eq!(policy.state().output, QuarterTurn::Normal);
@@ -21,12 +39,16 @@ fn every_input_and_precedence_rule_has_positive_and_negative_controls() {
     i.descriptor_panel_orientation = Some(QuarterTurn::Left);
     let state = policy.update(i.clone());
     assert_eq!(state.output, QuarterTurn::Right);
-    assert!(state.degraded.contains(&"panel_orientation_mismatch"));
+    assert!(state
+        .degraded
+        .iter()
+        .any(|reason| reason == "panel_orientation_mismatch"));
     i.descriptor_panel_orientation = Some(QuarterTurn::Right);
     assert!(!policy
         .update(i.clone())
         .degraded
-        .contains(&"panel_orientation_mismatch"));
+        .iter()
+        .any(|reason| reason == "panel_orientation_mismatch"));
 
     // A swivel is screen-only: same output as body rotation, but no gamepad remap.
     i.panel_orientation = QuarterTurn::Normal;
@@ -37,6 +59,7 @@ fn every_input_and_precedence_rule_has_positive_and_negative_controls() {
     assert_eq!(posture.whole_body, QuarterTurn::Normal);
     assert!(!posture.requires_gamepad_remap());
     i.screen_posture = QuarterTurn::Normal;
+    i.accelerometer_present = true;
     i.accelerometer = Some(SensorObservation::Left);
     let body = policy.update(i.clone()).clone();
     assert_eq!(body.output, QuarterTurn::Left);
@@ -66,7 +89,7 @@ fn every_input_and_precedence_rule_has_positive_and_negative_controls() {
     i.auto_rotate = false;
     i.panel_orientation = QuarterTurn::Right;
     i.screen_posture = QuarterTurn::Left;
-    assert_eq!(policy.update(i.clone()).output, QuarterTurn::Right);
+    assert_eq!(policy.update(i.clone()).output, QuarterTurn::Left);
 
     // Undefined sensor data retains the last valid proposal; a mismatched matrix disables it.
     i.auto_rotate = true;
@@ -79,7 +102,8 @@ fn every_input_and_precedence_rule_has_positive_and_negative_controls() {
     assert!(policy
         .state()
         .degraded
-        .contains(&"accelerometer_mount_mismatch"));
+        .iter()
+        .any(|reason| reason == "accelerometer_mount_mismatch"));
 
     // Unmapped tablet mode gates the sensor; explicitly mapped mode is posture-only.
     i.accelerometer_mount_matches = true;
@@ -136,12 +160,20 @@ fn app_selection_letterboxes_cross_aspect_and_documents_180_degree_fill() {
     assert_eq!(state.presentation, Presentation::Fill);
 
     i.app_orientations = vec![LogicalOrientation::Portrait];
-    assert_eq!(policy.update(i.clone()).presentation, Presentation::Letterbox);
+    assert_eq!(
+        policy.update(i.clone()).presentation,
+        Presentation::Letterbox
+    );
     i.app_orientations = vec![
         LogicalOrientation::PortraitFlipped,
         LogicalOrientation::Portrait,
     ];
-    assert_eq!(policy.update(i).app, LogicalOrientation::PortraitFlipped);
+    assert_eq!(policy.update(i.clone()).app, LogicalOrientation::Portrait);
+    let manifest_order = OrientationPolicy::new(i);
+    assert_eq!(
+        manifest_order.state().app,
+        LogicalOrientation::PortraitFlipped
+    );
 }
 
 #[test]
@@ -156,7 +188,9 @@ fn bounded_orientation_waiters_do_not_delay_lifecycle_work() {
     for _ in 0..N {
         let watch = Arc::clone(&watch);
         waiters.push(thread::spawn(move || {
-            watch.wait_after(serial, Duration::from_millis(200)).unwrap()
+            watch
+                .wait_after(serial, Duration::from_millis(200))
+                .unwrap()
         }));
     }
     let deadline = Instant::now() + Duration::from_millis(100);
@@ -164,9 +198,7 @@ fn bounded_orientation_waiters_do_not_delay_lifecycle_work() {
         thread::yield_now();
     }
     assert_eq!(watch.active_waiters(), N);
-    assert!(watch
-        .wait_after(serial, Duration::from_millis(1))
-        .is_err());
+    assert!(watch.wait_after(serial, Duration::from_millis(1)).is_err());
 
     // This models the authority's existing lifecycle lane: it does not share the watcher's
     // permits or condvar, so a Broker safe_return-sized action stays well inside its deadline.

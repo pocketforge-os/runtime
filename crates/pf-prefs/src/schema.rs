@@ -196,6 +196,20 @@ keyboards, as an xkb `layout(variant)` token (first boot may seed it from \
         default: PrefValue::Scalar(100),
         doc: "Display brightness 0..=100 (CONTRACT-ONLY in v1; no sysfs apply leg).",
     },
+    PrefSpec {
+        key: "auto_rotate",
+        kind: PrefKind::Bool,
+        default: PrefValue::Bool(true),
+        doc: "Use the accelerometer for whole-body display rotation when one is present.",
+    },
+    PrefSpec {
+        key: "user_rotation",
+        kind: PrefKind::Enum {
+            variants: &["normal", "left", "upsidedown", "right"],
+        },
+        default: PrefValue::Enum("normal"),
+        doc: "Whole-body rotation used while rotation is locked or no accelerometer is present.",
+    },
 ];
 
 /// Look up the spec for a key, if it is a known preference.
@@ -325,6 +339,11 @@ mod tests {
         );
         assert_eq!(spec("monoAudio").unwrap().default, PrefValue::Bool(false));
         assert_eq!(spec("brightness").unwrap().default, PrefValue::Scalar(100));
+        assert_eq!(spec("auto_rotate").unwrap().default, PrefValue::Bool(true));
+        assert_eq!(
+            spec("user_rotation").unwrap().default,
+            PrefValue::Enum("normal")
+        );
         assert_eq!(
             spec("reduceFlashing").unwrap().default,
             PrefValue::Bool(false)
