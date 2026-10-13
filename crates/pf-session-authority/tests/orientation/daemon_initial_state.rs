@@ -1,3 +1,5 @@
+//! Daemon initial-state coverage in the consolidated orientation integration target.
+
 use pf_session_authority::PersistedState;
 use std::fs;
 use std::path::{Path, PathBuf};

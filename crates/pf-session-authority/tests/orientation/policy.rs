@@ -1,3 +1,5 @@
+//! Pure policy and long-poll coverage in the consolidated orientation integration target.
+
 use pf_session_authority::orientation::{
     HallDebouncer, LogicalOrientation, MountMatrix, OrientationController, OrientationInputs,
     OrientationPolicy, OrientationWatch, Presentation, QuarterTurn, SensorObservation,

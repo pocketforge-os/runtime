@@ -1,3 +1,5 @@
+//! Linux source-adapter coverage in the consolidated orientation integration target.
+
 use pf_prefs::PrefsStore;
 use pf_prefsd::{serve_until_with_timeout_and_resolver, Client, PreferenceWriter};
 use pf_session_authority::orientation::{
