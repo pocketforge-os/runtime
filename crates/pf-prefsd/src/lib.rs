@@ -217,6 +217,14 @@ pub const WRITE_POLICY: &[WritePolicyRow] = &[
         key: "brightness",
         writers: SETTINGS_AND_SHELL,
     },
+    WritePolicyRow {
+        key: "auto_rotate",
+        writers: SETTINGS_AND_SHELL,
+    },
+    WritePolicyRow {
+        key: "user_rotation",
+        writers: SETTINGS_AND_SHELL,
+    },
 ];
 
 /// Return whether a kernel-derived writer class may change `key`.
