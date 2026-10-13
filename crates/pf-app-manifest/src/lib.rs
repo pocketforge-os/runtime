@@ -472,7 +472,7 @@ fn validate_requirement(requirement: &CapabilityRequirement) -> Result<(), ()> {
             .modifier
             .as_deref()
             .ok_or(())
-            .and_then(parse_egress_authority)
+            .and_then(|modifier| parse_egress_authority(modifier).map_err(|_| ()))
             .map(|_| ());
     }
     if let Some(modifier) = requirement.modifier.as_deref() {
@@ -505,18 +505,29 @@ pub enum EgressProtocol {
     Udp,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EgressAuthorityError;
+
+impl fmt::Display for EgressAuthorityError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("invalid egress authority")
+    }
+}
+
+impl std::error::Error for EgressAuthorityError {}
+
 /// Parse the canonical `egress:<protocol>/<destination-port>@<host>` modifier.
-pub fn parse_egress_authority(modifier: &str) -> Result<EgressAuthority, ()> {
-    let (protocol_port, host) = modifier.split_once('@').ok_or(())?;
-    let (protocol, port) = protocol_port.split_once('/').ok_or(())?;
+pub fn parse_egress_authority(modifier: &str) -> Result<EgressAuthority, EgressAuthorityError> {
+    let (protocol_port, host) = modifier.split_once('@').ok_or(EgressAuthorityError)?;
+    let (protocol, port) = protocol_port.split_once('/').ok_or(EgressAuthorityError)?;
     let protocol = match protocol {
         "tcp" => EgressProtocol::Tcp,
         "udp" => EgressProtocol::Udp,
-        _ => return Err(()),
+        _ => return Err(EgressAuthorityError),
     };
-    let port = port.parse::<u16>().map_err(|_| ())?;
+    let port = port.parse::<u16>().map_err(|_| EgressAuthorityError)?;
     if port == 0 || !valid_egress_host(host) {
-        return Err(());
+        return Err(EgressAuthorityError);
     }
     Ok(EgressAuthority {
         protocol,
