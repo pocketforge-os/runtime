@@ -1,5 +1,5 @@
 use pf_app_launch::policy::{
-    derive_policy, render_systemd_dropin, AppClass, MediatedEndpoint, PolicyInputs,
+    derive_policy, render_systemd_dropin, AppClass, MediatedEndpoint, NetAccess, PolicyInputs,
 };
 use pf_app_manifest::{parse_manifest, parse_platform_contract, ResolvedApp};
 use std::collections::BTreeMap;
@@ -101,6 +101,7 @@ fn browser_profile_has_scopes_and_no_fs_or_net_rules() {
     assert_eq!(browser.class, AppClass::NestedUserns);
     assert!(browser.landlock.filesystem.is_empty());
     assert!(browser.landlock.network.is_empty());
+    assert!(browser.network.dns);
     assert!(browser.landlock.scope_signal);
     assert!(browser.landlock.scope_abstract_unix);
     assert_eq!(browser.landlock.required_abi, 6);
@@ -184,4 +185,31 @@ fn rendered_unit_and_runtime_policy_share_one_decision() {
     assert!(error
         .to_string()
         .contains("policy input path is not a confined absolute path"));
+}
+
+#[test]
+fn networked_policy_derives_dns_without_manifest_capability() {
+    let root = PathBuf::from("/fixture");
+    let networked = derive_policy(
+        &resolved(&root, &["egress:tcp/80@*", "egress:tcp/443@*"], true, true),
+        &inputs(&root),
+    )
+    .unwrap();
+    let offline = derive_policy(&resolved(&root, &[], false, true), &inputs(&root)).unwrap();
+
+    assert!(networked.network.dns);
+    assert_eq!(networked.landlock.tcp_connect_ports, vec![53, 80, 443]);
+    assert_eq!(networked.landlock.udp_connect_ports, vec![53]);
+    assert!(networked
+        .landlock
+        .network
+        .contains(&pf_app_launch::policy::NetRule {
+            access: NetAccess::BindUdpEphemeral,
+            port: 0,
+        }));
+    assert!(render_systemd_dropin(&networked).contains("# derived dns tcp udp 53"));
+
+    assert!(!offline.network.dns);
+    assert!(offline.landlock.tcp_connect_ports.is_empty());
+    assert!(offline.landlock.udp_connect_ports.is_empty());
 }

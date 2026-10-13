@@ -10,6 +10,7 @@ use std::fmt;
 use std::path::{Component, Path, PathBuf};
 
 pub const POLICY_SCHEMA_VERSION: u32 = 1;
+const DNS_PORT: u16 = 53;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PolicyInputs {
@@ -88,6 +89,8 @@ pub struct LandlockDecision {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct NetworkDecision {
     pub authorities: Vec<EgressAuthority>,
+    /// Resolver transport derived for every networked decision, never app-declared.
+    pub dns: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -347,7 +350,20 @@ pub fn derive_policy(
     let mut network_rules = Vec::new();
     let mut tcp_connect_ports = BTreeSet::new();
     let mut udp_connect_ports = BTreeSet::new();
+    let networked = !authorities.is_empty();
     if class == AppClass::Full {
+        if networked {
+            tcp_connect_ports.insert(DNS_PORT);
+            udp_connect_ports.insert(DNS_PORT);
+            network_rules.push(NetRule {
+                access: NetAccess::ConnectTcp,
+                port: DNS_PORT,
+            });
+            network_rules.push(NetRule {
+                access: NetAccess::ConnectSendUdp,
+                port: DNS_PORT,
+            });
+        }
         for authority in &authorities {
             match authority.protocol {
                 EgressProtocol::Tcp => {
@@ -388,7 +404,6 @@ pub fn derive_policy(
     if capability_bases.contains("bluetooth") {
         endpoints.push(MediatedEndpoint::BluetoothPort);
     }
-    let networked = !authorities.is_empty();
     let mut address_families = vec!["AF_UNIX".to_owned()];
     if networked {
         address_families.extend(["AF_INET".to_owned(), "AF_INET6".to_owned()]);
@@ -415,6 +430,7 @@ pub fn derive_policy(
         },
         network: NetworkDecision {
             authorities: authorities.into_iter().collect(),
+            dns: networked,
         },
         endpoints,
         unit: UnitProperties {
@@ -496,6 +512,9 @@ pub fn render_systemd_dropin(policy: &PolicyDecision) -> String {
             "# egress {protocol} {} {}",
             authority.host, authority.port
         ));
+    }
+    if policy.network.dns {
+        lines.push(format!("# derived dns tcp udp {DNS_PORT}"));
     }
     lines.push(String::new());
     lines.join("\n")
