@@ -37,6 +37,7 @@ struct Args {
     compositor_unit: String,
     descriptor: Option<PathBuf>,
     prefs_socket: PathBuf,
+    orientation_fixture_root: Option<PathBuf>,
     orientation_live: bool,
     templates: CommandTemplates,
     /// The private SDK-front socket (tsp-ght0z); absent until the front's unit exists.
@@ -89,8 +90,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         authority = authority.with_url_handler(FixedUrlHandler(handler));
     }
     authority.reconcile()?;
-    let _orientation_driver = if args.orientation_live {
-        let orientation_paths = LinuxOrientationPaths {
+    let orientation_source = if args.orientation_live {
+        let mut orientation_paths = LinuxOrientationPaths {
             descriptor: args
                 .descriptor
                 .map(Ok)
@@ -98,9 +99,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             prefs_socket: args.prefs_socket,
             ..LinuxOrientationPaths::default()
         };
-        let mut orientation_source = LinuxOrientationSource::open(orientation_paths)?;
-        // Do not expose a compositor snapshot until every required source produced one complete
-        // reducer input. systemd restarts us while an ordered dependency (such as prefsd) settles.
+        if let Some(root) = args.orientation_fixture_root {
+            orientation_paths.app_root = root.join("apps");
+            orientation_paths.drm_class = root.join("drm");
+            orientation_paths.device_tree = root.join("dt");
+            orientation_paths.input_class = root.join("input-class");
+            orientation_paths.input_devices = root.join("input-devices");
+            orientation_paths.iio_devices = root.join("iio");
+            orientation_paths.sensor_orientation_file = Some(root.join("sensor-orientation"));
+            orientation_paths.switch_state_file = Some(root.join("switches.json"));
+        }
+        Some(LinuxOrientationSource::open(orientation_paths)?)
+    } else {
+        None
+    };
+    let _orientation_driver = if let Some(mut orientation_source) = orientation_source {
         let orientation_controller = authority.orientation_controller();
         let orientation_active_app = authority.orientation_active_app();
         let mut orientation_inputs = OrientationInputs::default();
@@ -120,8 +133,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         None
     };
-    // The socket is the daemon's readiness boundary. Publish or reconcile the
-    // complete durable state before clients can observe that boundary.
+    // The socket is the daemon readiness boundary. The first complete snapshot gates it; panel
+    // metadata cannot block that snapshot because the source supplies a typed degraded fallback.
     let listener = UnixListener::bind(&args.socket)?;
     let _socket_guard = SocketGuard(args.socket.clone());
     // Connection threads own all socket I/O (bounded by DEFAULT_CONNECTION_LIMITS) and forward
@@ -228,6 +241,7 @@ Options:
                                    or the sole installed per-device descriptor)
   --prefsd-socket PATH             User rotation preferences (default /run/pocketforge/prefsd.sock)
   --orientation-mode MODE          live (default); static only with desktop-sim test preset
+  --orientation-fixture-root PATH  Hermetic Linux-input tree; desktop-sim tests only
   --front-socket PATH              Private socket for the SDK front (OpenUrl/ReturnToCaller);
                                    requires --front-user and --front-unit
   --front-user NAME                The SDK front's user (socket-bound peer uid)
@@ -245,6 +259,7 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
     let defaults = LinuxOrientationPaths::default();
     let mut descriptor = None;
     let mut prefs_socket = defaults.prefs_socket;
+    let mut orientation_fixture_root = None;
     let mut orientation_live = true;
     let mut preset = "device".to_owned();
     let mut grace = DEFAULT_GRACE_PERIOD;
@@ -269,6 +284,7 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
             "--compositor-unit" => compositor_unit = value,
             "--descriptor" => descriptor = Some(value.into()),
             "--prefsd-socket" => prefs_socket = value.into(),
+            "--orientation-fixture-root" => orientation_fixture_root = Some(value.into()),
             "--orientation-mode" => match value.as_str() {
                 "live" => orientation_live = true,
                 "static" => orientation_live = false,
@@ -301,6 +317,9 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
     if !orientation_live && preset != "desktop-sim" {
         return Err("static orientation mode requires --command-preset desktop-sim".into());
     }
+    if orientation_fixture_root.is_some() && preset != "desktop-sim" {
+        return Err("--orientation-fixture-root requires --command-preset desktop-sim".into());
+    }
     if let Some(command) = start {
         templates.start_foreground = command.split_whitespace().map(str::to_owned).collect();
     }
@@ -331,6 +350,7 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
         compositor_unit,
         descriptor,
         prefs_socket,
+        orientation_fixture_root,
         orientation_live,
         templates,
         front,
@@ -386,6 +406,18 @@ mod tests {
             ])
             .unwrap()
             .orientation_live
+        );
+        assert!(parse(&["--orientation-fixture-root", "/tmp/fixture"]).is_err());
+        assert_eq!(
+            parse(&[
+                "--command-preset",
+                "desktop-sim",
+                "--orientation-fixture-root",
+                "/tmp/fixture",
+            ])
+            .unwrap()
+            .orientation_fixture_root,
+            Some(PathBuf::from("/tmp/fixture"))
         );
     }
 
