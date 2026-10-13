@@ -28,6 +28,9 @@ pub const KNOWN_CAPABILITIES: &[&str] = &[
     "audio",
     "settings",
     "leds",
+    // Open URLs in the default browser through the session authority (tsp-ght0z, owner
+    // decision B: only apps declaring it may open URLs).
+    "open_url",
     // System input layer (design/input-layer, every-menu-spec §10.2). `pointer` asks for the
     // system-drawn pointer, `menu` fills the app section of the system menu, and `options`
     // declares a shipped options.toml the system draws (reserved for fw-options; its schema is

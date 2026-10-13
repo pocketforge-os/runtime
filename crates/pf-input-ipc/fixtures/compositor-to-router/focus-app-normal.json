@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "type": "focus",
+  "epoch": 42,
+  "surface": {
+    "kind": "app",
+    "app_id": "org.example.browser"
+  },
+  "text_input": {
+    "active": true,
+    "purpose": "normal"
+  },
+  "secure_entry": false
+}

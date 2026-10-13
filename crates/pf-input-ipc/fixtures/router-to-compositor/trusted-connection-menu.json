@@ -1,0 +1,8 @@
+{
+  "version": 1,
+  "type": "trusted_connection",
+  "epoch": 42,
+  "request_id": 10,
+  "role": "menu",
+  "unit": "pf-system-menu.service"
+}

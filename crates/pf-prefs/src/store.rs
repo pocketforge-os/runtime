@@ -42,6 +42,7 @@ const SCHEMA_VERSION_KEY: &str = "schemaVersion";
 #[derive(Debug, Clone)]
 pub struct PrefsStore {
     path: PathBuf,
+    seed: Option<PathBuf>,
 }
 
 impl PrefsStore {
@@ -54,7 +55,21 @@ impl PrefsStore {
     pub fn at(dir: impl AsRef<Path>) -> PrefsStore {
         PrefsStore {
             path: dir.as_ref().join(PREFS_FILE),
+            seed: None,
         }
+    }
+
+    /// Attach the read-only first-boot seed document (rendered by cloud-init at
+    /// `/etc/pocketforge/prefs.seed.json`). [`PrefsStore::load`] merges every seed
+    /// value for keys the store does not explicitly hold into
+    /// [`Prefs::is_seeded`] territory: effective but not explicit, never written
+    /// back into the store document. A missing seed file is normal (no cloud-init
+    /// keyboard module => the schema default stands); a *malformed* seed file is a
+    /// typed [`PrefError`] — the seed is trusted provisioning data, so corruption
+    /// fails closed instead of silently dropping the seeded layout.
+    pub fn with_seed(mut self, path: impl Into<PathBuf>) -> PrefsStore {
+        self.seed = Some(path.into());
+        self
     }
 
     /// The full path to the JSON document.
@@ -62,8 +77,18 @@ impl PrefsStore {
         &self.path
     }
 
+    /// The attached first-boot seed document path, if any.
+    pub fn seed_path(&self) -> Option<&Path> {
+        self.seed.as_deref()
+    }
+
     /// Load the current document (tolerant — see module docs). A missing file is all-defaults.
     pub fn load(&self) -> Result<Prefs, PrefError> {
+        self.merge_seed(self.load_stored())
+    }
+
+    /// The stored document alone, without the seed layer.
+    fn load_stored(&self) -> Result<Prefs, PrefError> {
         let bytes = match std::fs::read(&self.path) {
             Ok(b) => b,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Prefs::defaults()),
@@ -81,6 +106,42 @@ impl PrefsStore {
             .as_object()
             .ok_or_else(|| PrefError::Parse("top-level JSON value is not an object".to_string()))?;
         decode(obj)
+    }
+
+    /// Fold the seed document under the stored one: a seed value applies only to
+    /// keys with no explicit stored value, and every seed entry is validated
+    /// exactly like a stored one (unknown keys and bad values are typed errors).
+    fn merge_seed(&self, prefs: Result<Prefs, PrefError>) -> Result<Prefs, PrefError> {
+        let mut prefs = prefs?;
+        let Some(seed_path) = &self.seed else {
+            return Ok(prefs);
+        };
+        let bytes = match std::fs::read(seed_path) {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(prefs),
+            Err(e) => return Err(PrefError::Io(e)),
+        };
+        let text = String::from_utf8(bytes)
+            .map_err(|e| PrefError::Parse(format!("seed file is not valid UTF-8: {e}")))?;
+        let value: Value =
+            serde_json::from_str(&text).map_err(|e| PrefError::Parse(format!("seed file: {e}")))?;
+        let obj = value.as_object().ok_or_else(|| {
+            PrefError::Parse("seed file: top-level JSON value is not an object".to_string())
+        })?;
+        for (key, raw) in obj {
+            let spec = schema::spec(key).ok_or_else(|| PrefError::UnknownKey(key.clone()))?;
+            // An explicit user value completely shadows its provisioning seed,
+            // including a stale seed whose old value is no longer valid.
+            if prefs.stored.contains_key(key) {
+                continue;
+            }
+            // Same typed conversions as the stored document: a seed value is
+            // provisioning data, so a bad token/type/range stays a typed error.
+            let value = json_to_pref(key, spec.kind, raw)?;
+            let validated = spec.validate(value)?;
+            prefs.seeded.insert(key.clone(), validated);
+        }
+        Ok(prefs)
     }
 
     /// Atomically persist a document (temp write + fsync + rename). Creates the directory if
@@ -454,5 +515,120 @@ mod tests {
         let store = PrefsStore::at(&dir);
         assert_eq!(store.load().unwrap(), Prefs::defaults());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Write a seed file for the tests below and return (store dir, seed path).
+    fn seeded_scratch(tag: &str, seed_json: &[u8]) -> (PathBuf, PathBuf) {
+        let dir = scratch(tag);
+        std::fs::create_dir_all(&dir).unwrap();
+        let seed = dir.join("prefs.seed.json");
+        std::fs::write(&seed, seed_json).unwrap();
+        (dir, seed)
+    }
+
+    #[test]
+    fn seed_supplies_keyboard_layout_without_making_it_explicit() {
+        let (dir, seed) = seeded_scratch("seed-basic", br#"{"keyboardLayout":"de"}"#);
+        let store = PrefsStore::at(&dir).with_seed(&seed);
+        let p = store.load().unwrap();
+        // Positive control: the seeded value is the effective one...
+        assert_eq!(p.value("keyboardLayout").unwrap(), PrefValue::Enum("de"));
+        // ...but it is neither explicit ("First-boot setup", not "You") nor stored.
+        assert!(!p.is_explicit("keyboardLayout"));
+        assert_eq!(p.source("keyboardLayout"), crate::prefs::Source::Default);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn explicit_store_wins_over_seed_and_seed_is_never_persisted() {
+        let (dir, seed) = seeded_scratch("seed-override", br#"{"keyboardLayout":"de"}"#);
+        let store = PrefsStore::at(&dir).with_seed(&seed);
+        // The user explicitly sets us; the seeded de must lose.
+        store
+            .apply("keyboardLayout", PrefValue::Enum("us"))
+            .unwrap();
+        let p = store.load().unwrap();
+        assert_eq!(p.value("keyboardLayout").unwrap(), PrefValue::Enum("us"));
+        assert!(p.is_explicit("keyboardLayout"));
+        assert_eq!(p.source("keyboardLayout"), crate::prefs::Source::Stored);
+        // The stored document must not carry the seed value back out.
+        let text = std::fs::read_to_string(store.path()).unwrap();
+        assert!(text.contains("\"keyboardLayout\": \"us\""));
+        assert!(!text.contains("de"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn explicit_store_shadows_an_invalid_seed_for_the_same_key() {
+        let (dir, seed) = seeded_scratch("seed-invalid-shadowed", br#"{"keyboardLayout":"de"}"#);
+        let store = PrefsStore::at(&dir).with_seed(&seed);
+        store
+            .apply("keyboardLayout", PrefValue::Enum("us"))
+            .unwrap();
+
+        // Negative control: this token is invalid when it is effective, but a
+        // stale provisioned value must be ignored after an explicit user write.
+        std::fs::write(&seed, br#"{"keyboardLayout":"klingon"}"#).unwrap();
+        let p = store.load().unwrap();
+        assert_eq!(p.value("keyboardLayout").unwrap(), PrefValue::Enum("us"));
+        assert!(p.is_explicit("keyboardLayout"));
+        assert_eq!(p.source("keyboardLayout"), crate::prefs::Source::Stored);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn seeding_another_key_does_not_touch_unrelated_defaults() {
+        let (dir, seed) = seeded_scratch("seed-other", br#"{"keyboardLayout":"gb(extd)"}"#);
+        let store = PrefsStore::at(&dir).with_seed(&seed);
+        // A stored value for a *different* key coexists with the seed.
+        store
+            .apply("hapticsEnabled", PrefValue::Bool(false))
+            .unwrap();
+        let p = store.load().unwrap();
+        assert_eq!(
+            p.value("keyboardLayout").unwrap(),
+            PrefValue::Enum("gb(extd)")
+        );
+        assert!(!p.haptics_enabled());
+        assert_eq!(p.text_scale(), "100%");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn missing_seed_file_is_not_an_error() {
+        let dir = scratch("seed-missing");
+        let store = PrefsStore::at(&dir).with_seed(dir.join("prefs.seed.json"));
+        let p = store.load().unwrap();
+        // Negative control for the seed path: no seed => the schema default.
+        assert_eq!(p.value("keyboardLayout").unwrap(), PrefValue::Enum("us"));
+        assert!(!p.is_explicit("keyboardLayout"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn malformed_seeds_fail_closed_with_typed_errors() {
+        // Each corrupt seed is a typed error, never a silent default.
+        for (tag, seed_json) in [
+            ("seed-corrupt", br#"not json"#.as_slice()),
+            ("seed-array", br#"["keyboardLayout"]"#),
+            ("seed-unknown-key", br#"{"keyboardLayoutt":"de"}"#),
+            ("seed-bad-token", br#"{"keyboardLayout":"klingon"}"#),
+            ("seed-wrong-type", br#"{"keyboardLayout":42}"#),
+            ("seed-empty", b""),
+        ] {
+            let (dir, seed) = seeded_scratch(tag, seed_json);
+            let store = PrefsStore::at(&dir).with_seed(&seed);
+            let result = store.load();
+            assert!(
+                matches!(
+                    &result,
+                    Err(PrefError::Parse(_))
+                        | Err(PrefError::Type { .. })
+                        | Err(PrefError::UnknownKey(_))
+                ),
+                "{tag}: expected a typed seed error, got {result:?}"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 }

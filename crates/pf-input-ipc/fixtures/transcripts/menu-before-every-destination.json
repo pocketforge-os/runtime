@@ -1,0 +1,5 @@
+{
+  "destinations": ["app", "keyboard", "pointer", "shell", "menu", "quarantined"],
+  "protected_control": "menu",
+  "ordinary_control": "ordinary"
+}

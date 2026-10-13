@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "type": "visibility",
+  "surface": "docked",
+  "visible": true,
+  "wants_pad": true,
+  "rect": {
+    "x": 0,
+    "y": 420,
+    "width": 1280,
+    "height": 300
+  }
+}

@@ -35,6 +35,7 @@ The schema is data (`crates/pf-prefs/src/schema.rs`); adding a preference is one
 | `reduceFlashing` | bool | `false` | **stored + observable through `PreferencePort`** | no flashing-suppression consumer exists yet; the port reports stored-not-applied |
 | `monoAudio` | bool | `false` | **routing layer** — `AudioManager::output_mix()` reports `Mono` | sim-visible semantic; real DSP down-mix is post-v0 (§4) |
 | `brightness` | scalar `0..=100` | `100` | **contract-only** — readable + observer fires; **NO sysfs apply leg** | owner ruling Q3; per-SoC hardware leg is a follow-on bead (§5) |
+| `keyboardLayout` | enum (closed xkb `layout(variant)` token list, build-generated from `xkb-data`'s evdev.xml — `crates/pf-prefs/keyboard-layouts.txt` + `build.rs`) | `us` | **session wiring** — the image's `pf-kbd-layout-env` generator turns the effective value into `XKB_DEFAULT_LAYOUT`/`XKB_DEFAULT_VARIANT` for the compositor (gamescope/Xwayland); fcitx5 and the on-screen keyboard honor the same key (input-layer epic `tsp-ihne1`) | first-boot seedable by cloud-init (§2.1); one value for the whole system — USB/Bluetooth keyboards included |
 
 Defaults match the merged in-memory seam (`hapticsEnabled` ON, as the rumble primitive reads it) and
 the accessibility-off-by-default norm (`reduceMotion`/`monoAudio` opt-in — the accessible affordance
@@ -44,6 +45,24 @@ Schema v1 stores were unversioned flat JSON objects. Schema v2 writes `schemaVer
 accepts only those two forms. An explicitly versioned document other than v2 returns a typed
 unsupported-version error before any save, so a newer schema can never be misread or downgraded.
 continues to accept an unversioned v1 document and supplies defaults for every additive v2 key.
+
+### 2.1 First-boot seed (`/etc/pocketforge/prefs.seed.json`)
+
+Some preferences have a provisioning source older than the user: cloud-init-tsp's `keyboard`
+module renders the seeded `keyboardLayout` into **both** `/etc/default/keyboard` (the classic
+console/X default) and a read-only seed document `/etc/pocketforge/prefs.seed.json`
+(`{"keyboardLayout":"de(nodeadkeys)"}`). `pf-prefsd` runs with `--seed-file` (that path by
+default) and `PrefsStore::load` folds the seed **under** the store:
+
+- A seed value is the effective value for any key the store does not explicitly hold —
+  `stored → seeded → schema default`.
+- A seeded key is **not explicit**: `is_explicit` stays `false` and `pf-settings list` reports
+  `default`, so the settings UI can show "First-boot setup" instead of "You".
+- Once the user sets the key (the single `apply()` write path), the stored value wins and the
+  seed is never re-read; seed values are never persisted into `prefs.json`.
+- A **missing** seed file is the normal no-cloud-init-keyboard case (schema defaults stand). A
+  **malformed** seed (bad JSON, unknown key, invalid value) is a typed `PrefError` — the seed is
+  trusted provisioning data, so corruption fails closed instead of silently dropping the layout.
 
 ## 3. Read-only to apps; observable; honored at the primitive
 
@@ -94,6 +113,8 @@ units; app units do not receive it. This socket-bound prerequisite closes the ol
 gap before any numeric-PID lookup, while the cgroup check prevents a trusted socket from being
 reclassified as an app after process exit.
 
+The identity implementation is the shared `pf-peer-identity` crate (tsp-ght0z), which the session
+authority also uses for the SDK front and app handles (docs/URL-HANDOFF.md); it is never forked.
 On kernels with `SO_PEERPIDFD`, the socket supplies the pidfd directly. The shipping A523/5.15
 kernel falls back to `pidfd_open`; the A133/4.9 kernel holds an opened `/proc/<pid>` directory and
 reads `stat` and `cgroup` relative to that descriptor. These compatibility handles narrow an

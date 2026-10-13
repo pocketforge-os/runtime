@@ -47,6 +47,7 @@ crates/
                    default-deny + manifest ceiling + SO_PEERCRED + per-cap quota (docs/BROKER-DESIGN.md)
 wire/WIRE-PROTOCOL.md   the byte-level, reimplementable wire spec (folds in SPIKE-1's verdict)
 docs/BROKER-DESIGN.md   the broker architecture + threat model + what v0 enforces vs. substrate-gated
+docs/input-ipc.md       the frozen router ↔ gamescope ↔ pf-osk ↔ system-menu contract (crates/pf-input-ipc)
 docs/INPUT-MAPPING.md   pf-input-map: contract v3 contexts/classes, protection rules, the
                    router-owned remap store (X16) and the X19 pointer-claim precedence
 include/pocketforge.h   the hand-maintained C header (matches libpocketforge)

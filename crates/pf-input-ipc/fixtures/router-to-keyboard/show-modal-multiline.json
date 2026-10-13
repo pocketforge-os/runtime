@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "type": "show_modal",
+  "request_id": 42,
+  "app": {
+    "app_id": "org.example.browser",
+    "name": "Browser",
+    "unit": "pf-app@org.example.browser.service"
+  },
+  "purpose": "normal",
+  "title": "Note",
+  "initial_text": "draft",
+  "max_chars": 0,
+  "multiline": true
+}

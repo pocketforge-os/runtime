@@ -1,0 +1,18 @@
+[package]
+name = "pf-input-ipc"
+description = "Frozen interface contract between the session input router (pf-input-broker), gamescope, pf-osk and the system menu (tsp-ihne1.36): socket paths, versioned JSON message types, Menu timeouts, trusted-overlay provenance and secure_entry. Types and pure state only; no I/O."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+# Byte-level compatibility with the system-menu provider frames the broker already speaks
+# (crates/pf-input-broker/src/safe_return.rs, merged as runtime#108). Test-only.
+pf-input-broker = { path = "../pf-input-broker", version = "0.0.1" }

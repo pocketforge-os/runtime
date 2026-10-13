@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "type": "register",
+  "surfaces": [
+    "docked",
+    "floating",
+    "number_pad",
+    "edit_pad",
+    "modal",
+    "strip"
+  ]
+}

@@ -1,0 +1,36 @@
+{
+  "old_epoch": 81,
+  "new_epoch": 82,
+  "request_id": 9001,
+  "next_power_sequence": 18,
+  "sequence": [
+    "snapshot",
+    "live_role_and_pending_trust",
+    "eof",
+    "reconnect",
+    "incomplete_replay",
+    "duplicate_role_replay",
+    "replay",
+    "old_epoch_result_with_fd",
+    "unexpected_result_with_fd",
+    "pending_result_without_fd",
+    "pending_result_with_two_fds",
+    "remint_roles_with_fresh_fds",
+    "refused_result_with_fd",
+    "refused_result_without_fd"
+  ],
+  "snapshot": {
+    "epoch": 81,
+    "focus": {
+      "surface": { "kind": "trusted", "role": "menu" },
+      "text_input": { "active": false, "purpose": "normal" },
+      "secure_entry": false
+    },
+    "overlays": [
+      { "role": "keyboard", "state": "unmapped" },
+      { "role": "menu", "state": "mapped", "rect": { "x": 0, "y": 0, "width": 1280, "height": 720 } },
+      { "role": "toast", "state": "unmapped" }
+    ],
+    "power": { "pressed": true, "last_sequence": 17 }
+  }
+}

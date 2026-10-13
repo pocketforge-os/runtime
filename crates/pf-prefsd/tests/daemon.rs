@@ -46,10 +46,28 @@ impl Server {
         Self::start_with_timeout_as(root, Duration::from_millis(100), writer)
     }
 
+    fn start_with_seed(root: &Path, seed: &Path) -> Self {
+        Self::start_store(
+            root,
+            Duration::from_millis(100),
+            Some(PreferenceWriter::Shell),
+            Some(seed.to_path_buf()),
+        )
+    }
+
     fn start_with_timeout_as(
         root: &Path,
         connection_timeout: Duration,
         writer: Option<PreferenceWriter>,
+    ) -> Self {
+        Self::start_store(root, connection_timeout, writer, None)
+    }
+
+    fn start_store(
+        root: &Path,
+        connection_timeout: Duration,
+        writer: Option<PreferenceWriter>,
+        seed: Option<PathBuf>,
     ) -> Self {
         let socket = root.join("prefsd.sock");
         let listener = UnixListener::bind(&socket).unwrap();
@@ -57,9 +75,13 @@ impl Server {
         let stop = Arc::new(AtomicBool::new(false));
         let thread_stop = stop.clone();
         let thread = std::thread::spawn(move || {
+            let mut store = pf_prefs::PrefsStore::at(state);
+            if let Some(seed) = seed {
+                store = store.with_seed(seed);
+            }
             serve_until_with_timeout_and_resolver(
                 listener,
-                &pf_prefs::PrefsStore::at(state),
+                &store,
                 unsafe { libc::geteuid() },
                 &thread_stop,
                 connection_timeout,
@@ -73,6 +95,96 @@ impl Server {
             thread: Some(thread),
         }
     }
+}
+
+#[test]
+fn seed_file_feeds_keyboard_layout_until_the_user_sets_it() {
+    let root = Scratch::new("seed-layout");
+    let seed = root.0.join("prefs.seed.json");
+    std::fs::write(&seed, br#"{"keyboardLayout":"de"}"#).unwrap();
+    let server = Server::start_with_seed(&root.0, &seed);
+
+    // Positive control: the seeded layout is the effective value...
+    assert_eq!(
+        rpc(
+            &server.socket,
+            serde_json::json!({"method":"get", "key":"keyboardLayout"})
+        ),
+        RpcResponse::Value {
+            value: serde_json::json!("de")
+        }
+    );
+    // ...visible through GetAll as well...
+    match rpc(&server.socket, serde_json::json!({"method":"get_all"})) {
+        RpcResponse::Values { values } => {
+            assert_eq!(values.get("keyboardLayout"), Some(&serde_json::json!("de")));
+            // Negative control: unrelated keys keep their schema defaults.
+            assert_eq!(values.get("brightness"), Some(&serde_json::json!(100)));
+        }
+        other => panic!("expected values, got {other:?}"),
+    }
+    // ...but still "First-boot setup", never "You".
+    assert_eq!(
+        rpc(
+            &server.socket,
+            serde_json::json!({"method":"is_explicit", "key":"keyboardLayout"})
+        ),
+        RpcResponse::Explicit { explicit: false }
+    );
+
+    // Once the user sets the key, the stored value wins over the seed.
+    assert_eq!(
+        rpc(
+            &server.socket,
+            serde_json::json!({"method":"set", "key":"keyboardLayout", "value":"us"})
+        ),
+        RpcResponse::Value {
+            value: serde_json::json!("us")
+        }
+    );
+    assert_eq!(
+        rpc(
+            &server.socket,
+            serde_json::json!({"method":"is_explicit", "key":"keyboardLayout"})
+        ),
+        RpcResponse::Explicit { explicit: true }
+    );
+    // The seed never leaks into the persisted store document.
+    let stored = std::fs::read_to_string(root.0.join("state").join("prefs.json")).unwrap();
+    assert!(stored.contains("\"keyboardLayout\": \"us\""));
+    assert!(!stored.contains("prefs.seed"));
+
+    // Negative control: an identical daemon WITHOUT the seed serves the default.
+    let bare = Scratch::new("seed-bare");
+    let server = Server::start_as(&bare.0, Some(PreferenceWriter::Shell));
+    assert_eq!(
+        rpc(
+            &server.socket,
+            serde_json::json!({"method":"get", "key":"keyboardLayout"})
+        ),
+        RpcResponse::Value {
+            value: serde_json::json!("us")
+        }
+    );
+}
+
+#[test]
+fn corrupt_seed_file_surfaces_a_typed_store_error() {
+    let root = Scratch::new("seed-corrupt");
+    let seed = root.0.join("prefs.seed.json");
+    std::fs::write(&seed, b"{\"keyboardLayout\":\"klingon\"}").unwrap();
+    let server = Server::start_with_seed(&root.0, &seed);
+    // An invalid seed must fail closed, not silently fall back to the default.
+    assert!(matches!(
+        rpc(
+            &server.socket,
+            serde_json::json!({"method":"get", "key":"keyboardLayout"})
+        ),
+        RpcResponse::Error {
+            kind: Some(ErrorKind::InvalidValue),
+            ..
+        }
+    ));
 }
 
 #[test]
@@ -234,7 +346,7 @@ fn defaults_set_get_all_and_persistence_use_schema_v2() {
     else {
         panic!("get_all did not return values");
     };
-    assert_eq!(values.len(), 8);
+    assert_eq!(values.len(), pf_prefs::SCHEMA.len());
     assert_eq!(values["appearance"], serde_json::json!("dark"));
     assert_eq!(values["hapticsEnabled"], serde_json::json!(true));
 
