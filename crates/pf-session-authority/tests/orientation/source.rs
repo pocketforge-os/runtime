@@ -3,18 +3,22 @@
 use pf_prefs::PrefsStore;
 use pf_prefsd::{serve_until_with_timeout_and_resolver, Client, PreferenceWriter};
 use pf_session_authority::orientation::{
-    OrientationInputSource, OrientationInputs, QuarterTurn, SensorObservation,
+    refresh_from_source, OrientationController, OrientationInputSource, OrientationInputs,
+    PanelOrientationFailure, PanelOrientationSource, QuarterTurn, SensorObservation,
 };
 use pf_session_authority::orientation_source::{LinuxOrientationPaths, LinuxOrientationSource};
 use std::fs;
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+static SCRATCH_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
 fn scratch() -> PathBuf {
-    let path = std::env::temp_dir().join(format!("pf-o-src-{}", std::process::id()));
+    let sequence = SCRATCH_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let path = std::env::temp_dir().join(format!("pf-o-src-{}-{sequence}", std::process::id()));
     if path.exists() {
         fs::remove_dir_all(&path).unwrap();
     }
@@ -192,6 +196,120 @@ screen_rotation = { screen_main="cw90" }
             .unwrap_err();
         assert!(error.contains("evdev"), "{label}: {error}");
     }
+
+    stop.store(true, Ordering::Release);
+    daemon.join().unwrap();
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn panel_orientation_absent_unreadable_and_late_uses_a_degraded_fallback_then_recovers() {
+    let root = scratch();
+    let descriptor = root.join("capabilities.toml");
+    write(
+        &descriptor,
+        "[[screens]]\nid='screen_main'\nrole='primary'\nrotation='cw90'\n",
+    );
+    write(root.join("switches.json"), "{}");
+
+    let prefs_socket = root.join("prefsd.sock");
+    let listener = UnixListener::bind(&prefs_socket).unwrap();
+    let stop = Arc::new(AtomicBool::new(false));
+    let thread_stop = Arc::clone(&stop);
+    let state = root.join("prefs");
+    let daemon = std::thread::spawn(move || {
+        serve_until_with_timeout_and_resolver(
+            listener,
+            &PrefsStore::at(state),
+            unsafe { libc::geteuid() },
+            &thread_stop,
+            Duration::from_millis(20),
+            |_| Ok(Some(PreferenceWriter::Settings)),
+        )
+        .unwrap();
+    });
+
+    let paths = LinuxOrientationPaths {
+        descriptor,
+        prefs_socket,
+        app_root: root.join("apps"),
+        drm_class: root.join("drm"),
+        device_tree: root.join("dt"),
+        input_class: root.join("input-class"),
+        input_devices: root.join("input-devices"),
+        iio_devices: root.join("iio"),
+        sensor_orientation_file: Some(root.join("sensor-orientation")),
+        switch_state_file: Some(root.join("switches.json")),
+    };
+
+    for (label, prepare, failure) in [
+        ("absent", false, PanelOrientationFailure::Missing),
+        ("unreadable", true, PanelOrientationFailure::Unreadable),
+    ] {
+        let case_root = root.join(label);
+        let mut case_paths = paths.clone();
+        case_paths.drm_class = case_root.join("drm");
+        case_paths.device_tree = case_root.join("dt");
+        if prepare {
+            write(
+                case_paths.drm_class.join("card0-DSI-1/status"),
+                "connected\n",
+            );
+            fs::create_dir_all(case_paths.drm_class.join("card0-DSI-1/panel_orientation")).unwrap();
+        }
+        let mut source = LinuxOrientationSource::open(case_paths).unwrap();
+        let snapshot = source
+            .snapshot(None, &OrientationInputs::default())
+            .unwrap();
+        assert_eq!(snapshot.panel_orientation, QuarterTurn::Right, "{label}");
+        assert_eq!(
+            snapshot.panel_orientation_source,
+            PanelOrientationSource::DescriptorFallback(failure),
+            "{label}"
+        );
+    }
+
+    let controller = OrientationController::new(OrientationInputs::default(), 1);
+    let active_app = Arc::new(Mutex::new(None));
+    let mut inputs = OrientationInputs::default();
+    let mut source = LinuxOrientationSource::open(paths.clone()).unwrap();
+    let fallback = refresh_from_source(&mut source, &controller, &active_app, &mut inputs).unwrap();
+    assert!(fallback
+        .degraded
+        .iter()
+        .any(|reason| reason == "panel_orientation_fallback"));
+
+    write(paths.drm_class.join("card0-DSI-1/status"), "connected\n");
+    write(
+        paths.drm_class.join("card0-DSI-1/panel_orientation"),
+        "left side up\n",
+    );
+    let recovered =
+        refresh_from_source(&mut source, &controller, &active_app, &mut inputs).unwrap();
+    assert!(recovered.serial > fallback.serial);
+    assert_eq!(recovered.output, QuarterTurn::Left);
+    assert!(!recovered
+        .degraded
+        .iter()
+        .any(|reason| reason == "panel_orientation_fallback"));
+
+    let unknown_descriptor = root.join("unknown-capabilities.toml");
+    write(
+        &unknown_descriptor,
+        "[[screens]]\nid='screen_main'\nrole='primary'\n",
+    );
+    let mut unknown_paths = paths;
+    unknown_paths.descriptor = unknown_descriptor;
+    unknown_paths.drm_class = root.join("unknown-drm");
+    let unknown = LinuxOrientationSource::open(unknown_paths)
+        .unwrap()
+        .snapshot(None, &OrientationInputs::default())
+        .unwrap();
+    assert_eq!(unknown.panel_orientation, QuarterTurn::Normal);
+    assert_eq!(
+        unknown.panel_orientation_source,
+        PanelOrientationSource::UnknownFallback(PanelOrientationFailure::Missing)
+    );
 
     stop.store(true, Ordering::Release);
     daemon.join().unwrap();
