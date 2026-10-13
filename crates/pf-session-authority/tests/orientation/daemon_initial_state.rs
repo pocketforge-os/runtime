@@ -257,3 +257,44 @@ fn live_daemon_binds_for_absent_unreadable_and_late_panel_orientation() {
         prefs.join().unwrap();
     }
 }
+
+#[test]
+fn live_daemon_keeps_socket_hidden_until_non_panel_snapshot_is_complete() {
+    let scratch = Scratch::new("incomplete-snapshot");
+    let descriptor = scratch.path().join("capabilities.toml");
+    fs::write(
+        &descriptor,
+        "[[screens]]\nid='screen_main'\nrole='primary'\nrotation='cw90'\n",
+    )
+    .unwrap();
+    let fixture = scratch.path().join("fixture");
+    let connector = fixture.join("drm/card0-DSI-1");
+    fs::create_dir_all(&connector).unwrap();
+    fs::write(connector.join("status"), "connected\n").unwrap();
+    fs::write(connector.join("panel_orientation"), "right side up\n").unwrap();
+    fs::write(fixture.join("switches.json"), "{}").unwrap();
+
+    let prefs_socket = scratch.path().join("prefsd.sock");
+    let listener = UnixListener::bind(&prefs_socket).unwrap();
+    let (accepted, connected) = std::sync::mpsc::sync_channel(0);
+    let prefs = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        accepted.send(()).unwrap();
+        std::thread::sleep(Duration::from_millis(500));
+        drop(stream);
+    });
+
+    let socket = scratch.path().join("authority.sock");
+    let mut daemon = Daemon::spawn_live(scratch.path(), &descriptor, &prefs_socket, &fixture);
+    connected.recv_timeout(STARTUP_TIMEOUT).unwrap();
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(
+        !socket.exists(),
+        "authority readiness must remain hidden while a required preference read is incomplete"
+    );
+
+    prefs.join().unwrap();
+    let status = daemon.wait_for_exit();
+    assert!(!status.success());
+    assert!(!socket.exists());
+}

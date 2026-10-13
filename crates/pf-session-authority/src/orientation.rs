@@ -259,8 +259,8 @@ pub struct OrientationController {
 ///
 /// Implementations retain the prior value for transiently undefined inputs (for example an
 /// iio-sensor-proxy `undefined` observation) and return an error only when a trustworthy complete
-/// snapshot cannot be formed. The authority performs its first probe after binding the socket but
-/// before starting its acceptor, then re-samples in the isolated input-driver thread.
+/// snapshot cannot be formed. The authority performs its first probe before publishing its socket,
+/// then re-samples after bind in the isolated input-driver thread.
 pub trait OrientationInputSource: Send {
     fn snapshot(
         &mut self,
@@ -271,8 +271,8 @@ pub trait OrientationInputSource: Send {
 
 pub type ActiveApp = Arc<Mutex<Option<String>>>;
 
-/// Sample a source and atomically publish its reduced result. The daemon calls this once after its
-/// socket is bound and before its acceptor starts; later calls run in the input-driver thread.
+/// Sample a source and atomically publish its reduced result. The daemon calls this once before its
+/// socket is bound; later calls run after bind in the input-driver thread.
 pub fn refresh_from_source(
     source: &mut dyn OrientationInputSource,
     controller: &OrientationController,

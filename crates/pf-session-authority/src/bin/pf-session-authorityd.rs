@@ -113,10 +113,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         None
     };
-    // Binding is the daemon readiness boundary for every lifecycle client. Panel metadata may
-    // race DRM probe, so the first source refresh must happen only after this socket exists.
-    let listener = UnixListener::bind(&args.socket)?;
-    let _socket_guard = SocketGuard(args.socket.clone());
     let _orientation_driver = if let Some(mut orientation_source) = orientation_source {
         let orientation_controller = authority.orientation_controller();
         let orientation_active_app = authority.orientation_active_app();
@@ -137,6 +133,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         None
     };
+    // The socket is the daemon readiness boundary. The first complete snapshot gates it; panel
+    // metadata cannot block that snapshot because the source supplies a typed degraded fallback.
+    let listener = UnixListener::bind(&args.socket)?;
+    let _socket_guard = SocketGuard(args.socket.clone());
     // Connection threads own all socket I/O (bounded by DEFAULT_CONNECTION_LIMITS) and forward
     // only complete requests, so the single-threaded authority blocks only in the loop's channel
     // wait and its self-driven tick keeps firing during a slow or silent client.
