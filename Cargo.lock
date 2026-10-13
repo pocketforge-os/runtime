@@ -557,6 +557,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "pf-problem-report"
+version = "0.0.1"
+dependencies = [
+ "serde_json",
+]
+
+[[package]]
 name = "pf-render"
 version = "0.0.1"
 dependencies = [
