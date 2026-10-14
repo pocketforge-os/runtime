@@ -98,6 +98,21 @@ pub struct LaunchPaths {
     pub resources: std::collections::BTreeMap<String, Vec<PathBuf>>,
 }
 
+fn platform_resource_paths() -> Vec<PathBuf> {
+    [
+        "/usr",
+        "/lib",
+        "/lib64",
+        "/bin",
+        "/sbin",
+        "/etc",
+        "/opt/pocketforge/lib",
+    ]
+    .into_iter()
+    .map(PathBuf::from)
+    .collect()
+}
+
 /// Resolve, compile and enforce policy, then execute an installed application.
 pub fn launch_with<E: Exec, P: PolicyEnforcer>(
     resolver: &Resolver,
@@ -166,10 +181,7 @@ pub fn required_launch_paths(app_id: &str) -> Result<LaunchPaths, LaunchError> {
             PathBuf::from("/var/cache/pocketforge/apps").join(app_id),
         )?,
         platform_runtime: inventory.platform_runtime,
-        resource_paths: ["/usr", "/lib", "/lib64", "/bin", "/sbin", "/etc"]
-            .into_iter()
-            .map(PathBuf::from)
-            .collect(),
+        resource_paths: platform_resource_paths(),
         resources: inventory.resources,
     })
 }
@@ -211,6 +223,18 @@ mod tests {
                 ruleset: None,
             })
         }
+    }
+
+    #[test]
+    fn device_regression_platform_library_is_in_read_execute_set() {
+        let paths = platform_resource_paths();
+        assert!(
+            paths.contains(&PathBuf::from("/opt/pocketforge/lib")),
+            "reading /opt/pocketforge/lib/libSDL3-pocketforge.so.0 under the derived ruleset would return EACCES"
+        );
+        assert!(paths.contains(&PathBuf::from("/usr")));
+        assert!(!paths.contains(&PathBuf::from("/opt")));
+        assert!(!paths.contains(&PathBuf::from("/opt/pocketforge")));
     }
 
     #[test]
