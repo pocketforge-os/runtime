@@ -1,4 +1,6 @@
 # path<TAB>sha256(stripped matching line); comments classify reviewed occurrences.
+# TRANSITIONAL domain=pf-builder-vm: bench/input-latency/inputlat.c and
+# crates/pf-input-broker/itest/source_drive.py; removal/migration is tsp-ihne1.56.5.
 bench/input-latency/inputlat.c	c3099bbdaa1c906511818181dd2096272a78c59fe4f5c1ef977c38351edf054e
 bench/input-latency/inputlat.c	4fad93789478ce0cba4a64dd38cb684df0ebce417b61d5e84c83666e9dacc838
 bench/input-latency/inputlat.c	9e40b91cd0effd051baf351781c24db11f5b483e2c449fca86c9d843800d5838

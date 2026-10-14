@@ -11,6 +11,14 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#ifndef O_CLOEXEC
+#define O_CLOEXEC 0
+#endif
+
+/* Some strict C11 translation units hide these POSIX declarations. */
+extern FILE *popen(const char *command, const char *type);
+extern int pclose(FILE *stream);
+
 #define PF_UINPUT_REFUSAL_REASON "unsafe_uinput_domain"
 #define PF_UINPUT_ALLOW_REASON "safe_uinput_domain"
 #define PF_UINPUT_BUILDER_MARKER "/etc/pocketforge/ephemeral-runner.conf"
@@ -89,7 +97,8 @@ static void pf_uinput_probe_dt(struct pf_uinput_probe *p) {
     p->dt = PF_STATE_OK;
     int tsp = 0, a133 = 0, a100 = 0, old_a133 = 0, old_arm = 0;
     for (size_t off = 0; off < n;) {
-        size_t left = n - off, len = strnlen(buf + off, left);
+        size_t left = n - off, len = 0;
+        while (len < left && buf[off + len] != '\0') len++;
         if (len == left) { p->dt = PF_STATE_ERROR; return; }
         if (len) {
             p->dt_nonempty = 1;

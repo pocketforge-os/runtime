@@ -10,7 +10,7 @@ import sys
 ROOT = Path(__file__).resolve().parents[1]
 MANIFEST = ROOT / "tests/uinput-inventory.txt"
 SOURCE_SUFFIXES = {".c", ".h", ".py", ".rs", ".sh", ".toml", ".service", ".yml", ".yaml"}
-PATTERN = re.compile(r"/dev/uinput|\bUI_(?:DEV_)?CREATE\b|\b(?:UInput|VirtualDevice)\s*\(|(?:--device|-v|--mount)[^\n]*/dev/input")
+PATTERN = re.compile(r"/dev/uinput|\bUI_(?:DEV_)?CREATE\b|\bUInput\s*\(|\bVirtualDevice(?:::\w+)?\s*\(|(?:--device|-v|--mount)[^\n]*/dev/input")
 
 
 def fingerprint(path, line):
