@@ -20,6 +20,9 @@ import os
 import sys
 import time
 
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "..", "guard"))
+from uinput_domain_guard import require_safe_host  # noqa: E402
+
 
 def main():
     ap = argparse.ArgumentParser()
@@ -31,6 +34,8 @@ def main():
     ap.add_argument("--inject-file", required=True)
     ap.add_argument("--stop-file", required=True)
     a = ap.parse_args()
+
+    require_safe_host()
 
     sys.path.insert(0, os.path.join(a.sim, "synth"))
     from uinput_synth import Synth, load_descriptor  # noqa: E402  (reuse the sim's synth)

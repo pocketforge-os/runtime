@@ -73,17 +73,7 @@ pub struct Uinput {
 impl Uinput {
     /// Configure + instantiate the virtual device from `spec`.
     pub fn create(spec: &UinputSpec) -> io::Result<Uinput> {
-        let path = std::ffi::CString::new("/dev/uinput").unwrap();
-        // SAFETY: valid C string; standard uinput open.
-        let raw = unsafe {
-            libc::open(
-                path.as_ptr(),
-                libc::O_RDWR | libc::O_NONBLOCK | libc::O_CLOEXEC,
-            )
-        };
-        if raw < 0 {
-            return Err(io::Error::last_os_error());
-        }
+        let raw = pf_uinput_domain::guarded_host_open(open_uinput)?;
         // SAFETY: fresh owned fd from a successful open.
         let fd = unsafe { OwnedFd::from_raw_fd(raw) };
         let dev = Uinput {
@@ -242,6 +232,22 @@ impl Uinput {
     /// Commit the current report (`EV_SYN`/`SYN_REPORT`).
     pub fn syn(&self) -> io::Result<()> {
         self.emit(codes::EV_SYN, codes::SYN_REPORT, 0)
+    }
+}
+
+fn open_uinput() -> io::Result<RawFd> {
+    let path = std::ffi::CString::new("/dev/uinput").unwrap();
+    // SAFETY: valid C string; standard uinput open after the domain guard.
+    let raw = unsafe {
+        libc::open(
+            path.as_ptr(),
+            libc::O_RDWR | libc::O_NONBLOCK | libc::O_CLOEXEC,
+        )
+    };
+    if raw < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(raw)
     }
 }
 

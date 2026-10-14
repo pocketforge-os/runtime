@@ -466,6 +466,7 @@ dependencies = [
  "pf-prefs",
  "pf-prefsd",
  "pf-session-authority",
+ "pf-uinput-domain",
  "pf-wire",
  "pocketforge",
  "serde_json",
@@ -485,6 +486,7 @@ name = "pf-input-decode"
 version = "0.0.1"
 dependencies = [
  "libc",
+ "pf-uinput-domain",
  "tempfile",
 ]
 
@@ -665,6 +667,13 @@ dependencies = [
  "cosmic-text",
  "pf-text-raster",
  "tiny-skia",
+]
+
+[[package]]
+name = "pf-uinput-domain"
+version = "0.0.1"
+dependencies = [
+ "sha2",
 ]
 
 [[package]]

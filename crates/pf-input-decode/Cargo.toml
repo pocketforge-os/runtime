@@ -17,6 +17,7 @@ name = "pf-input-decode"
 path = "src/bin/pf-input-decode.rs"
 
 [dependencies]
+pf-uinput-domain = { workspace = true }
 # libc: the ONE place raw syscalls are unavoidable — the uinput ioctls (UI_SET_*/UI_DEV_CREATE),
 # input_event / uinput_user_dev struct layouts, and the termios setup for 19200 8N1 raw serial.
 # The ioctl table is carried self-contained (typed as libc::Ioctl, the pf-input-collect /
