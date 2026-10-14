@@ -112,6 +112,32 @@ pub enum SensorObservation {
     Undefined,
 }
 
+/// Why the kernel panel-orientation probe could not supply a trustworthy value.
+/// This remains an internal reducer input; orientation RPC v1 exposes only the stable
+/// `degraded` reason strings in [`OrientationState`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PanelOrientationFailure {
+    Missing,
+    Unreadable,
+    Invalid,
+}
+
+/// Provenance for the fixed panel mount used by the reducer.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum PanelOrientationSource {
+    #[default]
+    DrmConnector,
+    DeviceTree,
+    DescriptorFallback(PanelOrientationFailure),
+    UnknownFallback(PanelOrientationFailure),
+}
+
+impl PanelOrientationSource {
+    pub const fn is_fallback(self) -> bool {
+        matches!(self, Self::DescriptorFallback(_) | Self::UnknownFallback(_))
+    }
+}
+
 impl SensorObservation {
     fn turn(self) -> Option<QuarterTurn> {
         match self {
@@ -132,6 +158,7 @@ pub fn mount_matrices_agree(descriptor: &MountMatrix, kernel: &MountMatrix) -> b
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OrientationInputs {
     pub panel_orientation: QuarterTurn,
+    pub panel_orientation_source: PanelOrientationSource,
     pub descriptor_panel_orientation: Option<QuarterTurn>,
     pub screen_posture: QuarterTurn,
     pub accelerometer_present: bool,
@@ -149,6 +176,7 @@ impl Default for OrientationInputs {
     fn default() -> Self {
         Self {
             panel_orientation: QuarterTurn::Normal,
+            panel_orientation_source: PanelOrientationSource::DrmConnector,
             descriptor_panel_orientation: None,
             screen_posture: QuarterTurn::Normal,
             accelerometer_present: false,
@@ -231,8 +259,8 @@ pub struct OrientationController {
 ///
 /// Implementations retain the prior value for transiently undefined inputs (for example an
 /// iio-sensor-proxy `undefined` observation) and return an error only when a trustworthy complete
-/// snapshot cannot be formed. The authority invokes this before publishing its socket and on
-/// every lifecycle tick.
+/// snapshot cannot be formed. The authority performs its first probe before publishing its socket,
+/// then re-samples after bind in the isolated input-driver thread.
 pub trait OrientationInputSource: Send {
     fn snapshot(
         &mut self,
@@ -243,8 +271,8 @@ pub trait OrientationInputSource: Send {
 
 pub type ActiveApp = Arc<Mutex<Option<String>>>;
 
-/// Sample a source and atomically publish its reduced result. This function is also the daemon's
-/// startup gate: it completes once before the authority socket is bound.
+/// Sample a source and atomically publish its reduced result. The daemon calls this once before its
+/// socket is bound; later calls run after bind in the input-driver thread.
 pub fn refresh_from_source(
     source: &mut dyn OrientationInputSource,
     controller: &OrientationController,
@@ -389,6 +417,9 @@ impl OrientationPolicy {
             .is_some_and(|expected| expected != self.inputs.panel_orientation)
         {
             degraded.push("panel_orientation_mismatch".to_owned());
+        }
+        if self.inputs.panel_orientation_source.is_fallback() {
+            degraded.push("panel_orientation_fallback".to_owned());
         }
         if self.inputs.accelerometer_present && !self.inputs.accelerometer_mount_matches {
             degraded.push("accelerometer_mount_mismatch".to_owned());

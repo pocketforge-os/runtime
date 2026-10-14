@@ -2,7 +2,8 @@
 
 use pf_session_authority::orientation::{
     HallDebouncer, LogicalOrientation, MountMatrix, OrientationController, OrientationInputs,
-    OrientationPolicy, OrientationWatch, Presentation, QuarterTurn, SensorObservation,
+    OrientationPolicy, OrientationState, OrientationWatch, Presentation, QuarterTurn,
+    SensorObservation,
 };
 use std::sync::Arc;
 use std::thread;
@@ -10,6 +11,24 @@ use std::time::{Duration, Instant};
 
 fn inputs() -> OrientationInputs {
     OrientationInputs::default()
+}
+
+#[test]
+fn orientation_state_v1_wire_shape_excludes_internal_panel_source() {
+    assert_eq!(
+        serde_json::to_value(OrientationState::default()).unwrap(),
+        serde_json::json!({
+            "serial": 1,
+            "output": "normal",
+            "logical": "landscape",
+            "app": "landscape",
+            "presentation": "fill",
+            "whole_body": "normal",
+            "screen_only": "normal",
+            "locked": false,
+            "degraded": [],
+        })
+    );
 }
 
 #[test]

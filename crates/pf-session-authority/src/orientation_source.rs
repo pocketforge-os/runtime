@@ -2,12 +2,15 @@
 //!
 //! The adapter deliberately samples stateful inputs as complete snapshots: connector/DT mount,
 //! current EV_SW bits, iio-sensor-proxy's classified orientation, preferences, and the foreground
-//! app manifest. Re-sampling on every source interval also recovers after resume and lost evdev
-//! reports without depending on an edge arriving.
+//! app manifest. A panel orientation that is missing, unreadable, invalid, or late uses a typed
+//! descriptor/unknown fallback and marks the v1 state degraded instead of blocking daemon
+//! readiness. Re-sampling on every source interval recovers that fallback, resume state, and lost
+//! evdev reports without depending on an edge arriving.
 
 use crate::orientation::{
     HallDebouncer, LogicalOrientation, MountMatrix, OrientationInputSource, OrientationInputs,
-    QuarterTurn, SensorObservation, AUTO_ROTATE_KEY, USER_ROTATION_KEY,
+    PanelOrientationFailure, PanelOrientationSource, QuarterTurn, SensorObservation,
+    AUTO_ROTATE_KEY, USER_ROTATION_KEY,
 };
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -123,6 +126,7 @@ pub struct LinuxOrientationSource {
     paths: LinuxOrientationPaths,
     descriptor: Descriptor,
     hall: Option<HallDebouncer>,
+    panel_source: Option<PanelOrientationSource>,
     started: Instant,
 }
 
@@ -142,6 +146,7 @@ impl LinuxOrientationSource {
             paths,
             descriptor,
             hall: None,
+            panel_source: None,
             started: Instant::now(),
         })
     }
@@ -155,9 +160,57 @@ impl LinuxOrientationSource {
             .and_then(|screen| parse_rotation(&screen.rotation))
     }
 
-    fn panel_orientation(&self) -> Option<QuarterTurn> {
-        read_drm_panel_orientation(&self.paths.drm_class)
-            .or_else(|| read_dt_rotation(&self.paths.device_tree))
+    fn panel_orientation(
+        &mut self,
+        descriptor: Option<QuarterTurn>,
+    ) -> (QuarterTurn, PanelOrientationSource) {
+        let drm = probe_drm_panel_orientation(&self.paths.drm_class);
+        let (orientation, source) = if let Some(orientation) = drm.orientation {
+            (orientation, PanelOrientationSource::DrmConnector)
+        } else {
+            let dt = probe_dt_rotation(&self.paths.device_tree);
+            if let Some(orientation) = dt.orientation {
+                (orientation, PanelOrientationSource::DeviceTree)
+            } else {
+                let failure = drm.failure.combine(dt.failure);
+                match descriptor {
+                    Some(orientation) => (
+                        orientation,
+                        PanelOrientationSource::DescriptorFallback(failure),
+                    ),
+                    None => (
+                        QuarterTurn::Normal,
+                        PanelOrientationSource::UnknownFallback(failure),
+                    ),
+                }
+            }
+        };
+        if self.panel_source != Some(source) {
+            match source {
+                PanelOrientationSource::DescriptorFallback(reason) => eprintln!(
+                    "pf-session-authorityd: panel_orientation_fallback reason={} fallback=descriptor",
+                    reason.as_str()
+                ),
+                PanelOrientationSource::UnknownFallback(reason) => eprintln!(
+                    "pf-session-authorityd: panel_orientation_fallback reason={} fallback=unknown",
+                    reason.as_str()
+                ),
+                PanelOrientationSource::DrmConnector | PanelOrientationSource::DeviceTree
+                    if self.panel_source.is_some_and(PanelOrientationSource::is_fallback) =>
+                {
+                    eprintln!(
+                        "pf-session-authorityd: panel_orientation_recovered source={}",
+                        match source {
+                            PanelOrientationSource::DrmConnector => "drm_connector",
+                            _ => "device_tree",
+                        }
+                    );
+                }
+                _ => {}
+            }
+            self.panel_source = Some(source);
+        }
+        (orientation, source)
     }
 
     fn preferences(&self, inputs: &mut OrientationInputs) -> Result<(), String> {
@@ -401,10 +454,10 @@ impl OrientationInputSource for LinuxOrientationSource {
         previous: &OrientationInputs,
     ) -> Result<OrientationInputs, String> {
         let mut inputs = previous.clone();
-        inputs.descriptor_panel_orientation = self.expected_panel();
-        inputs.panel_orientation = self
-            .panel_orientation()
-            .ok_or_else(|| "no panel orientation from DRM connector or panel DT node".to_owned())?;
+        let descriptor = self.expected_panel();
+        inputs.descriptor_panel_orientation = descriptor;
+        (inputs.panel_orientation, inputs.panel_orientation_source) =
+            self.panel_orientation(descriptor);
         self.preferences(&mut inputs)?;
         inputs.app_orientations = self.app_orientations(active_app)?;
         self.accelerometer(&mut inputs);
@@ -435,23 +488,90 @@ fn posture_rotation(joint: &Joint, value: f64) -> QuarterTurn {
         .unwrap_or(QuarterTurn::Normal)
 }
 
-fn read_drm_panel_orientation(root: &Path) -> Option<QuarterTurn> {
-    fs::read_dir(root).ok()?.flatten().find_map(|entry| {
+impl PanelOrientationFailure {
+    const fn combine(self, other: Self) -> Self {
+        use PanelOrientationFailure::{Invalid, Missing, Unreadable};
+        match (self, other) {
+            (Unreadable, _) | (_, Unreadable) => Unreadable,
+            (Invalid, _) | (_, Invalid) => Invalid,
+            _ => Missing,
+        }
+    }
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Missing => "missing",
+            Self::Unreadable => "unreadable",
+            Self::Invalid => "invalid",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PanelProbe {
+    orientation: Option<QuarterTurn>,
+    failure: PanelOrientationFailure,
+}
+
+fn io_failure(error: &io::Error) -> PanelOrientationFailure {
+    if error.kind() == io::ErrorKind::NotFound {
+        PanelOrientationFailure::Missing
+    } else {
+        PanelOrientationFailure::Unreadable
+    }
+}
+
+fn probe_drm_panel_orientation(root: &Path) -> PanelProbe {
+    let entries = match fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(error) => {
+            return PanelProbe {
+                orientation: None,
+                failure: io_failure(&error),
+            };
+        }
+    };
+    let mut failure = PanelOrientationFailure::Missing;
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                failure = failure.combine(io_failure(&error));
+                continue;
+            }
+        };
         let path = entry.path();
         if fs::read_to_string(path.join("status"))
             .ok()
             .is_some_and(|status| status.trim() != "connected")
         {
-            return None;
+            continue;
         }
-        fs::read_to_string(path.join("panel_orientation"))
-            .ok()
-            .and_then(|value| parse_rotation(&value))
-    })
+        match fs::read_to_string(path.join("panel_orientation")) {
+            Ok(value) => match parse_rotation(&value) {
+                Some(orientation) => {
+                    return PanelProbe {
+                        orientation: Some(orientation),
+                        failure,
+                    };
+                }
+                None => failure = failure.combine(PanelOrientationFailure::Invalid),
+            },
+            Err(error) => failure = failure.combine(io_failure(&error)),
+        }
+    }
+    PanelProbe {
+        orientation: None,
+        failure,
+    }
 }
 
-fn read_dt_rotation(root: &Path) -> Option<QuarterTurn> {
-    fn visit(path: &Path, depth: usize) -> Option<QuarterTurn> {
+fn probe_dt_rotation(root: &Path) -> PanelProbe {
+    fn visit(
+        path: &Path,
+        depth: usize,
+        failure: &mut PanelOrientationFailure,
+    ) -> Option<QuarterTurn> {
         if depth > 12 {
             return None;
         }
@@ -463,22 +583,52 @@ fn read_dt_rotation(root: &Path) -> Option<QuarterTurn> {
             .is_some_and(|name| name == "panel" || name.starts_with("panel@"));
         if is_panel {
             let rotation = path.join("rotation");
-            if let Ok(bytes) = fs::read(rotation) {
-                if bytes.len() >= 4 {
-                    let value = u32::from_be_bytes(bytes[..4].try_into().ok()?);
-                    if let Some(turn) = parse_rotation(&value.to_string()) {
-                        return Some(turn);
+            match fs::read(rotation) {
+                Ok(bytes) => {
+                    if bytes.len() >= 4 {
+                        let value = u32::from_be_bytes(bytes[..4].try_into().ok()?);
+                        if let Some(turn) = parse_rotation(&value.to_string()) {
+                            return Some(turn);
+                        }
                     }
+                    *failure = failure.combine(PanelOrientationFailure::Invalid);
                 }
+                Err(error) => *failure = failure.combine(io_failure(&error)),
             }
         }
-        fs::read_dir(path)
-            .ok()?
-            .flatten()
-            .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
-            .find_map(|entry| visit(&entry.path(), depth + 1))
+        let entries = match fs::read_dir(path) {
+            Ok(entries) => entries,
+            Err(error) => {
+                *failure = failure.combine(io_failure(&error));
+                return None;
+            }
+        };
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    *failure = failure.combine(io_failure(&error));
+                    continue;
+                }
+            };
+            match entry.file_type() {
+                Ok(kind) if kind.is_dir() => {
+                    if let Some(rotation) = visit(&entry.path(), depth + 1, failure) {
+                        return Some(rotation);
+                    }
+                }
+                Ok(_) => {}
+                Err(error) => *failure = failure.combine(io_failure(&error)),
+            }
+        }
+        None
     }
-    visit(root, 0)
+    let mut failure = PanelOrientationFailure::Missing;
+    let orientation = visit(root, 0, &mut failure);
+    PanelProbe {
+        orientation,
+        failure,
+    }
 }
 
 fn read_sensor_orientation(paths: &LinuxOrientationPaths) -> Option<SensorObservation> {
@@ -655,7 +805,10 @@ mod tests {
         fs::write(camera.join("rotation"), 180_u32.to_be_bytes()).unwrap();
         fs::write(panel.join("rotation"), 270_u32.to_be_bytes()).unwrap();
 
-        assert_eq!(read_dt_rotation(&root), Some(QuarterTurn::Left));
+        assert_eq!(
+            probe_dt_rotation(&root).orientation,
+            Some(QuarterTurn::Left)
+        );
 
         fs::remove_dir_all(root).unwrap();
     }
