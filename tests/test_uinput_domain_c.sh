@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 root="$(cd "$(dirname "$0")/.." && pwd)"
-expected=6f58e75f72b48a3e426417a55056b688b9c1e4cba2cf7a9e92fea686e47a050d
+expected=538fce952f5de6cb901c46c1919aedc44dcd436e753f7786c1a6e5fe21ad2fb9
 actual="$(sha256sum "$root/tests/fixtures/uinput-domain-v1.tsv" | awk '{print $1}')"
 [[ "$actual" == "$expected" ]]
 tmp="$(mktemp -d "${RUNNER_TEMP:-/tmp}/uinput-domain-c.XXXXXX")"

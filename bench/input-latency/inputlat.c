@@ -85,7 +85,9 @@ static int make_uinput(const char *name, char *evnode, size_t evnode_sz) {
     struct pf_uinput_verdict verdict;
     int fd = pf_uinput_guarded_open("/dev/uinput", O_RDWR, pf_uinput_real_open, NULL, &verdict);
     if (fd < 0) {
-        if (errno == EPERM) fprintf(stderr, "reason=%s domain=%s\n", verdict.reason, pf_uinput_domain_name(verdict.domain));
+        if (errno == EPERM) fprintf(stderr, "reason=%s domain=%s%s%s\n", verdict.reason,
+            pf_uinput_domain_name(verdict.domain), verdict.probe ? " probe=" : "",
+            verdict.probe ? verdict.probe : "");
         else perror("open /dev/uinput");
         return -1;
     }

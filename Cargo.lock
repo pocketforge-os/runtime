@@ -673,6 +673,7 @@ dependencies = [
 name = "pf-uinput-domain"
 version = "0.0.1"
 dependencies = [
+ "libc",
  "sha2",
 ]
 

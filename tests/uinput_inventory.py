@@ -2,6 +2,7 @@
 """Reject unclassified kernel-input creation/exposure occurrences."""
 
 import argparse
+from collections import Counter, defaultdict
 import hashlib
 from pathlib import Path
 import re
@@ -49,17 +50,26 @@ def occurrences(extra=None):
 
 
 def load_manifest():
-    return {line.split("\t#", 1)[0] for line in MANIFEST.read_text().splitlines()
-            if line and not line.startswith("#")}
+    return Counter(line.split("\t#", 1)[0] for line in MANIFEST.read_text().splitlines()
+                   if line and not line.startswith("#"))
 
 
-def check(extra=None, quiet=False):
-    allowed = load_manifest()
-    bad = [item for item in occurrences(extra) if item[0] not in allowed]
-    if bad and not quiet:
-        for _, path, number, line in bad:
-            print(f"unclassified uinput occurrence: {path}:{number}: {line}", file=sys.stderr)
-    return not bad
+def check(extra=None, quiet=False, allowed=None):
+    allowed = load_manifest() if allowed is None else allowed
+    items = occurrences(extra)
+    live = Counter(item[0] for item in items)
+    by_key = defaultdict(list)
+    for item in items:
+        by_key[item[0]].append(item)
+    unclassified = live - allowed
+    stale = allowed - live
+    if not quiet:
+        for key, count in unclassified.items():
+            for _, path, number, line in by_key[key][-count:]:
+                print(f"unclassified uinput occurrence: {path}:{number}: {line}", file=sys.stderr)
+        for key, count in stale.items():
+            print(f"stale uinput inventory entry ({count}): {key}", file=sys.stderr)
+    return not unclassified and not stale
 
 
 def main():
@@ -71,12 +81,22 @@ def main():
         for key, path, number, line in occurrences():
             print(f"{key}\t# {path}:{number} {line}")
         return 0
+    known = occurrences()[0]
+    if args.self_test and check([(known[1], known[3])], quiet=True):
+        print("inventory self-test failed: duplicate live occurrence was accepted", file=sys.stderr)
+        return 2
+    stale = load_manifest()
+    stale[f"seeded/stale.c\t{'0' * 64}"] += 1
+    if args.self_test and check(quiet=True, allowed=stale):
+        print("inventory self-test failed: stale manifest entry was accepted", file=sys.stderr)
+        return 2
     if args.self_test and check([("seeded/violation.c", 'open("/dev/uinput", O_RDWR);')], quiet=True):
         print("inventory self-test failed: seeded violation was accepted", file=sys.stderr)
         return 2
     if not check():
         return 1
-    print("uinput-inventory: PASS seeded_violation=red clean_tree=green")
+    print("uinput-inventory: PASS seeded_violation=red duplicate_live=red "
+          "stale_manifest=red clean_tree=green")
     return 0
 
 

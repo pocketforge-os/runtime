@@ -17,11 +17,22 @@ the device, or issuing `UI_DEV_CREATE`/`UI_CREATE`:
    `arm,sun50iw10p1`. It is accepted only on bare metal.
 4. Transitional builder admission requires all of: a VM; the hardened,
    root-owned `/etc/pocketforge/ephemeral-runner.conf` marker; and readable
-   logind state proving that no session of type `x11`, `wayland`, or `tty` is
-   attached to a seat. This exception is removed by `tsp-ihne1.56.5`.
+   logind state proving that every session has an empty `Seat=` property. Any
+   nonempty seat refuses regardless of whether `Type=` is `x11`, `wayland`,
+   `tty`, `mir`, `web`, `unspecified`, empty, or a future value. The marker is
+   opened without following symlinks and the opened file descriptor itself is
+   validated, so pathname replacement cannot validate one inode and consume
+   another. This exception is removed by `tsp-ihne1.56.5`.
 5. Everything else is refused with `reason=unsafe_uinput_domain` and a stable
    `domain=` class. An environment variable, root, a group, a device name, the
    presence of `/dev/uinput`, or VM detection by itself never authorizes use.
+
+Every subprocess probe has a 2.0 second deadline. A missing, failed, or timed
+out probe refuses as `domain=probe-error`, with `probe=systemd-detect-virt` or
+`probe=loginctl` appended to the reason token. Device-tree and marker read
+errors similarly identify `probe=device-tree-compatible` or
+`probe=builder-marker`. A nonempty device-tree compatible property must be a
+well-formed NUL-terminated string list; malformed or unterminated data refuses.
 
 The pfvd DT is the verified unmodified release DTB passed by
 `pfvd/crates/pfvd-core/src/runtime/qemu/command.rs`; its digest is pinned in
@@ -35,6 +46,7 @@ must consume those exact bytes and pin their SHA-256. Fields are tab-separated;
 `compatibles` is a semicolon-separated set (compatible strings themselves contain
 commas). Probe enums are intentionally closed so
 unknown input fails fixture parsing instead of becoming an accidental allow.
+The `probe` column is `-` unless the refusal is a typed probe error.
 
 Allowed results use `reason=safe_uinput_domain`. Refused results always use
 `reason=unsafe_uinput_domain`.

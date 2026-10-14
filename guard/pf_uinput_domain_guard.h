@@ -4,24 +4,26 @@
 #include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 #ifndef O_CLOEXEC
-#define O_CLOEXEC 0
+#define O_CLOEXEC 02000000
 #endif
-
-/* Some strict C11 translation units hide these POSIX declarations. */
-extern FILE *popen(const char *command, const char *type);
-extern int pclose(FILE *stream);
+#ifndef O_NOFOLLOW
+#define O_NOFOLLOW 0400000
+#endif
 
 #define PF_UINPUT_REFUSAL_REASON "unsafe_uinput_domain"
 #define PF_UINPUT_ALLOW_REASON "safe_uinput_domain"
 #define PF_UINPUT_BUILDER_MARKER "/etc/pocketforge/ephemeral-runner.conf"
+#define PF_UINPUT_PROBE_TIMEOUT_MS 2000
 
 enum pf_uinput_check { PF_CHECK_NO, PF_CHECK_YES, PF_CHECK_ERROR };
 enum pf_uinput_state { PF_STATE_MISSING, PF_STATE_OK, PF_STATE_INVALID, PF_STATE_ERROR };
@@ -43,7 +45,7 @@ struct pf_uinput_probe {
     enum pf_uinput_logind logind;
 };
 
-struct pf_uinput_verdict { int allowed; const char *reason; enum pf_uinput_domain domain; };
+struct pf_uinput_verdict { int allowed; const char *reason; enum pf_uinput_domain domain; const char *probe; };
 
 static const char *pf_uinput_domain_name(enum pf_uinput_domain domain) {
     static const char *names[] = { "pfvd-guest", "dut", "pf-builder-vm", "container",
@@ -51,40 +53,102 @@ static const char *pf_uinput_domain_name(enum pf_uinput_domain domain) {
     return names[(int)domain];
 }
 
-static struct pf_uinput_verdict pf_uinput_make_verdict(int allowed, enum pf_uinput_domain domain) {
-    struct pf_uinput_verdict out = { allowed, allowed ? PF_UINPUT_ALLOW_REASON : PF_UINPUT_REFUSAL_REASON, domain };
+static struct pf_uinput_verdict pf_uinput_make_verdict(int allowed, enum pf_uinput_domain domain, const char *probe) {
+    struct pf_uinput_verdict out = { allowed, allowed ? PF_UINPUT_ALLOW_REASON : PF_UINPUT_REFUSAL_REASON, domain, probe };
     return out;
 }
 
 static struct pf_uinput_verdict pf_uinput_domain_evaluate(const struct pf_uinput_probe *p) {
-    if (p->container == PF_CHECK_ERROR) return pf_uinput_make_verdict(0, PF_DOMAIN_PROBE_ERROR);
-    if (p->container == PF_CHECK_YES) return pf_uinput_make_verdict(0, PF_DOMAIN_CONTAINER);
-    if (p->vm == PF_CHECK_ERROR || p->dt == PF_STATE_ERROR) return pf_uinput_make_verdict(0, PF_DOMAIN_PROBE_ERROR);
-    if (p->vm == PF_CHECK_YES && p->current_compatible) return pf_uinput_make_verdict(1, PF_DOMAIN_PFVD_GUEST);
-    if (p->vm == PF_CHECK_NO && (p->current_compatible || p->legacy_compatible)) return pf_uinput_make_verdict(1, PF_DOMAIN_DUT);
+    if (p->container == PF_CHECK_ERROR) return pf_uinput_make_verdict(0, PF_DOMAIN_PROBE_ERROR, "systemd-detect-virt");
+    if (p->container == PF_CHECK_YES) return pf_uinput_make_verdict(0, PF_DOMAIN_CONTAINER, NULL);
+    if (p->vm == PF_CHECK_ERROR) return pf_uinput_make_verdict(0, PF_DOMAIN_PROBE_ERROR, "systemd-detect-virt");
+    if (p->dt == PF_STATE_ERROR) return pf_uinput_make_verdict(0, PF_DOMAIN_PROBE_ERROR, "device-tree-compatible");
+    if (p->vm == PF_CHECK_YES && p->current_compatible) return pf_uinput_make_verdict(1, PF_DOMAIN_PFVD_GUEST, NULL);
+    if (p->vm == PF_CHECK_NO && (p->current_compatible || p->legacy_compatible)) return pf_uinput_make_verdict(1, PF_DOMAIN_DUT, NULL);
     if (p->vm == PF_CHECK_YES) {
-        if (p->marker == PF_STATE_ERROR) return pf_uinput_make_verdict(0, PF_DOMAIN_PROBE_ERROR);
-        if (p->marker != PF_STATE_OK) return pf_uinput_make_verdict(0, PF_DOMAIN_UNTRUSTED_VM);
-        if (p->logind == PF_LOGIND_NO_SEAT) return pf_uinput_make_verdict(1, PF_DOMAIN_PF_BUILDER_VM);
-        if (p->logind == PF_LOGIND_SEAT) return pf_uinput_make_verdict(0, PF_DOMAIN_VM_WITH_SEAT);
-        return pf_uinput_make_verdict(0, PF_DOMAIN_PROBE_ERROR);
+        if (p->marker == PF_STATE_ERROR) return pf_uinput_make_verdict(0, PF_DOMAIN_PROBE_ERROR, "builder-marker");
+        if (p->marker != PF_STATE_OK) return pf_uinput_make_verdict(0, PF_DOMAIN_UNTRUSTED_VM, NULL);
+        if (p->logind == PF_LOGIND_NO_SEAT) return pf_uinput_make_verdict(1, PF_DOMAIN_PF_BUILDER_VM, NULL);
+        if (p->logind == PF_LOGIND_SEAT) return pf_uinput_make_verdict(0, PF_DOMAIN_VM_WITH_SEAT, NULL);
+        return pf_uinput_make_verdict(0, PF_DOMAIN_PROBE_ERROR, "loginctl");
     }
-    return pf_uinput_make_verdict(0, p->dt == PF_STATE_OK && p->dt_nonempty ? PF_DOMAIN_DUT_MISMATCH : PF_DOMAIN_BARE_METAL);
+    return pf_uinput_make_verdict(0, p->dt == PF_STATE_OK && p->dt_nonempty ? PF_DOMAIN_DUT_MISMATCH : PF_DOMAIN_BARE_METAL, NULL);
+}
+
+/* Some strict C11 translation units hide these POSIX declarations. */
+extern int kill(pid_t pid, int sig);
+extern int usleep(unsigned int usec);
+
+static int pf_uinput_run_capture(char *const argv[], char *output, size_t capacity, int timeout_ms) {
+    int pipefd[2];
+    if (pipe(pipefd) < 0) return -1;
+    pid_t pid = fork();
+    if (pid < 0) { close(pipefd[0]); close(pipefd[1]); return -1; }
+    if (pid == 0) {
+        int nullfd = open("/dev/null", O_RDWR);
+        close(pipefd[0]);
+        if (nullfd >= 0) { dup2(nullfd, 0); dup2(nullfd, 2); if (nullfd > 2) close(nullfd); }
+        dup2(pipefd[1], 1);
+        if (pipefd[1] > 2) close(pipefd[1]);
+        execvp(argv[0], argv);
+        _exit(127);
+    }
+    close(pipefd[1]);
+    int flags = fcntl(pipefd[0], F_GETFL, 0);
+    if (flags < 0 || fcntl(pipefd[0], F_SETFL, flags | O_NONBLOCK) < 0) {
+        kill(pid, SIGKILL); waitpid(pid, NULL, 0); close(pipefd[0]); return -1;
+    }
+    size_t used = 0;
+    int overflow = 0, status = 0;
+    int steps = timeout_ms / 10 + 1;
+    for (int step = 0; step < steps; ++step) {
+        for (;;) {
+            char discard[256];
+            char *target = used + 1 < capacity ? output + used : discard;
+            size_t room = used + 1 < capacity ? capacity - used - 1 : sizeof discard;
+            ssize_t got = read(pipefd[0], target, room);
+            if (got > 0) {
+                if (target == discard) overflow = 1;
+                else used += (size_t)got;
+                continue;
+            }
+            if (got < 0 && errno != EAGAIN && errno != EWOULDBLOCK) overflow = 1;
+            break;
+        }
+        pid_t waited = waitpid(pid, &status, WNOHANG);
+        if (waited == pid) {
+            for (;;) {
+                char discard[256];
+                char *target = used + 1 < capacity ? output + used : discard;
+                size_t room = used + 1 < capacity ? capacity - used - 1 : sizeof discard;
+                ssize_t got = read(pipefd[0], target, room);
+                if (got <= 0) break;
+                if (target == discard) overflow = 1;
+                else used += (size_t)got;
+            }
+            close(pipefd[0]);
+            if (capacity) output[used < capacity ? used : capacity - 1] = 0;
+            return !overflow && WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+        }
+        if (waited < 0) { close(pipefd[0]); return -1; }
+        usleep(10000);
+    }
+    kill(pid, SIGKILL);
+    waitpid(pid, NULL, 0);
+    close(pipefd[0]);
+    errno = ETIMEDOUT;
+    return -1;
+}
+
+static enum pf_uinput_check pf_uinput_command_check_program(const char *program, const char *kind, int timeout_ms) {
+    char *argv[] = { (char *)program, (char *)kind, (char *)"--quiet", NULL };
+    char output[1];
+    int code = pf_uinput_run_capture(argv, output, sizeof output, timeout_ms);
+    return code == 0 ? PF_CHECK_YES : code == 1 ? PF_CHECK_NO : PF_CHECK_ERROR;
 }
 
 static enum pf_uinput_check pf_uinput_command_check(const char *kind) {
-    pid_t pid = fork();
-    if (pid < 0) return PF_CHECK_ERROR;
-    if (pid == 0) {
-        int nullfd = open("/dev/null", O_RDWR);
-        if (nullfd >= 0) { dup2(nullfd, 0); dup2(nullfd, 1); dup2(nullfd, 2); if (nullfd > 2) close(nullfd); }
-        execlp("systemd-detect-virt", "systemd-detect-virt", kind, "--quiet", (char *)NULL);
-        _exit(127);
-    }
-    int status;
-    if (waitpid(pid, &status, 0) != pid || !WIFEXITED(status)) return PF_CHECK_ERROR;
-    int code = WEXITSTATUS(status);
-    return code == 0 ? PF_CHECK_YES : code == 1 ? PF_CHECK_NO : PF_CHECK_ERROR;
+    return pf_uinput_command_check_program("systemd-detect-virt", kind, PF_UINPUT_PROBE_TIMEOUT_MS);
 }
 
 static void pf_uinput_probe_dt(struct pf_uinput_probe *p) {
@@ -114,14 +178,18 @@ static void pf_uinput_probe_dt(struct pf_uinput_probe *p) {
     p->legacy_compatible = old_a133 && old_arm;
 }
 
-static enum pf_uinput_state pf_uinput_probe_marker(void) {
+static enum pf_uinput_state pf_uinput_probe_marker_path(const char *path) {
     struct stat st;
-    if (stat(PF_UINPUT_BUILDER_MARKER, &st) < 0) return errno == ENOENT ? PF_STATE_MISSING : PF_STATE_ERROR;
-    if (!S_ISREG(st.st_mode) || st.st_uid != 0 || (st.st_mode & 0022)) return PF_STATE_INVALID;
-    int fd = open(PF_UINPUT_BUILDER_MARKER, O_RDONLY | O_CLOEXEC);
-    if (fd < 0) return PF_STATE_ERROR;
+    int fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (fd < 0) return errno == ENOENT ? PF_STATE_MISSING : errno == ELOOP ? PF_STATE_INVALID : PF_STATE_ERROR;
+    if (fstat(fd, &st) < 0) { close(fd); return PF_STATE_ERROR; }
+    if (!S_ISREG(st.st_mode) || st.st_uid != 0 || (st.st_mode & 0022)) { close(fd); return PF_STATE_INVALID; }
     close(fd);
     return PF_STATE_OK;
+}
+
+static enum pf_uinput_state pf_uinput_probe_marker(void) {
+    return pf_uinput_probe_marker_path(PF_UINPUT_BUILDER_MARKER);
 }
 
 static int pf_uinput_safe_session_id(const char *id) {
@@ -131,30 +199,34 @@ static int pf_uinput_safe_session_id(const char *id) {
 }
 
 static enum pf_uinput_logind pf_uinput_probe_logind(void) {
-    FILE *list = popen("loginctl list-sessions --no-legend --no-pager", "r");
-    if (!list) return PF_LOGIND_UNREADABLE;
-    char line[1024], id[128];
+    char listing[4096];
+    char *list_argv[] = { (char *)"loginctl", (char *)"list-sessions", (char *)"--no-legend", (char *)"--no-pager", NULL };
+    if (pf_uinput_run_capture(list_argv, listing, sizeof listing, PF_UINPUT_PROBE_TIMEOUT_MS) != 0)
+        return PF_LOGIND_UNREADABLE;
+    char id[128], *list_save = NULL;
     enum pf_uinput_logind result = PF_LOGIND_NO_SEAT;
-    while (fgets(line, sizeof line, list)) {
+    for (char *line = strtok_r(listing, "\r\n", &list_save); line; line = strtok_r(NULL, "\r\n", &list_save)) {
+        if (!*line) continue;
         if (sscanf(line, "%127s", id) != 1 || !pf_uinput_safe_session_id(id)) { result = PF_LOGIND_UNREADABLE; break; }
-        char command[256];
-        snprintf(command, sizeof command, "loginctl show-session %s --no-pager -p Type -p Seat", id);
-        FILE *show = popen(command, "r");
-        if (!show) { result = PF_LOGIND_UNREADABLE; break; }
-        char type[64] = "", seat[128] = "";
+        char shown[2048];
+        char *show_argv[] = { (char *)"loginctl", (char *)"show-session", id, (char *)"--no-pager",
+            (char *)"-p", (char *)"Type", (char *)"-p", (char *)"Seat", NULL };
+        if (pf_uinput_run_capture(show_argv, shown, sizeof shown, PF_UINPUT_PROBE_TIMEOUT_MS) != 0) {
+            result = PF_LOGIND_UNREADABLE; break;
+        }
+        char seat[128] = "";
         int type_count = 0, seat_count = 0;
-        while (fgets(line, sizeof line, show)) {
-            line[strcspn(line, "\r\n")] = 0;
-            if (!strncmp(line, "Type=", 5)) { snprintf(type, sizeof type, "%s", line + 5); type_count++; }
-            else if (!strncmp(line, "Seat=", 5)) { snprintf(seat, sizeof seat, "%s", line + 5); seat_count++; }
+        char *show_save = NULL;
+        for (char *property = strtok_r(shown, "\r\n", &show_save); property;
+             property = strtok_r(NULL, "\r\n", &show_save)) {
+            if (!strncmp(property, "Type=", 5)) { type_count++; }
+            else if (!strncmp(property, "Seat=", 5)) { snprintf(seat, sizeof seat, "%s", property + 5); seat_count++; }
             else { result = PF_LOGIND_UNREADABLE; }
         }
-        int status = pclose(show);
-        if (status != 0 || type_count != 1 || seat_count != 1 || result == PF_LOGIND_UNREADABLE) { result = PF_LOGIND_UNREADABLE; break; }
-        if (*seat && (!strcmp(type, "x11") || !strcmp(type, "wayland") || !strcmp(type, "tty"))) { result = PF_LOGIND_SEAT; break; }
+        if (type_count != 1 || seat_count != 1 || result == PF_LOGIND_UNREADABLE) { result = PF_LOGIND_UNREADABLE; break; }
+        if (*seat) { result = PF_LOGIND_SEAT; break; }
     }
-    int status = pclose(list);
-    return status == 0 ? result : PF_LOGIND_UNREADABLE;
+    return result;
 }
 
 static struct pf_uinput_probe pf_uinput_domain_probe(void) {

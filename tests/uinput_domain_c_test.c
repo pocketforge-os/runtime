@@ -5,7 +5,7 @@ static int calls;
 static int fake_open(const char *path, int flags, void *ctx) { (void)path; (void)flags; (void)ctx; calls++; return 71; }
 static enum pf_uinput_check check(const char *s) { return !strcmp(s,"yes") ? PF_CHECK_YES : !strcmp(s,"no") ? PF_CHECK_NO : PF_CHECK_ERROR; }
 static enum pf_uinput_state state(const char *s) { return !strcmp(s,"ok") || !strcmp(s,"valid") ? PF_STATE_OK : !strcmp(s,"missing") ? PF_STATE_MISSING : !strcmp(s,"invalid") ? PF_STATE_INVALID : PF_STATE_ERROR; }
-static enum pf_uinput_logind logind(const char *s) { return !strcmp(s,"no-seat") ? PF_LOGIND_NO_SEAT : strstr(s,"-seat") ? PF_LOGIND_SEAT : !strcmp(s,"not-probed") ? PF_LOGIND_NOT_PROBED : PF_LOGIND_UNREADABLE; }
+static enum pf_uinput_logind logind(const char *s) { return !strcmp(s,"no-seat") || !strcmp(s,"mir-seatless") ? PF_LOGIND_NO_SEAT : strstr(s,"-seat") ? PF_LOGIND_SEAT : !strcmp(s,"not-probed") ? PF_LOGIND_NOT_PROBED : PF_LOGIND_UNREADABLE; }
 
 int main(int argc, char **argv) {
     if (argc != 2) return 2;
@@ -13,14 +13,16 @@ int main(int argc, char **argv) {
     char line[2048]; if (!fgets(line, sizeof line, f)) return 2;
     int rows = 0;
     while (fgets(line, sizeof line, f)) {
-        char *field[10], *save = NULL, *p = strtok_r(line, "\t\r\n", &save);
-        for (int i = 0; i < 10; i++) { if (!p) return 3; field[i] = p; p = strtok_r(NULL, "\t\r\n", &save); }
+        char *field[11], *save = NULL, *p = strtok_r(line, "\t\r\n", &save);
+        for (int i = 0; i < 11; i++) { if (!p) return 3; field[i] = p; p = strtok_r(NULL, "\t\r\n", &save); }
         struct pf_uinput_probe probe = { check(field[1]), check(field[2]), state(field[3]),
             strstr(field[4],"pocketforge,tsp") && strstr(field[4],"allwinner,sun50i-a133") && strstr(field[4],"allwinner,sun50i-a100"),
             strstr(field[4],"allwinner,a133") && strstr(field[4],"arm,sun50iw10p1"), strcmp(field[4],"-") != 0,
             state(field[5]), logind(field[6]) };
         struct pf_uinput_verdict got = pf_uinput_domain_evaluate(&probe);
-        if (got.allowed != !strcmp(field[7],"allow") || strcmp(got.reason,field[8]) || strcmp(pf_uinput_domain_name(got.domain),field[9])) return 4;
+        if (got.allowed != !strcmp(field[7],"allow") || strcmp(got.reason,field[8]) ||
+            strcmp(pf_uinput_domain_name(got.domain),field[9]) ||
+            strcmp(got.probe ? got.probe : "-", field[10])) return 4;
         calls = 0;
         struct pf_uinput_verdict guarded;
         int fd = pf_uinput_guarded_open_probe(&probe, "mock", 0, fake_open, NULL, &guarded);
@@ -29,6 +31,18 @@ int main(int argc, char **argv) {
         rows++;
     }
     fclose(f);
-    printf("uinput-domain-c: PASS fixture_rows=%d opener=mocked\n", rows);
-    return rows == 18 ? 0 : 7;
+    char *sleep_argv[] = { (char *)"/bin/sleep", (char *)"5", NULL };
+    char output[1];
+    if (pf_uinput_run_capture(sleep_argv, output, sizeof output, 50) != -1 || errno != ETIMEDOUT) return 8;
+    if (pf_uinput_command_check_program("/definitely/missing/pf-probe", "--quiet", 50) != PF_CHECK_ERROR) return 9;
+
+    char marker_dir[] = "/tmp/pf-uinput-marker.XXXXXX";
+    if (!mkdtemp(marker_dir)) return 10;
+    char marker[512]; snprintf(marker, sizeof marker, "%s/marker", marker_dir);
+    if (symlink("missing-target", marker) != 0) return 11;
+    if (pf_uinput_probe_marker_path(marker) != PF_STATE_INVALID) return 12;
+    if (unlink(marker) != 0 || rmdir(marker_dir) != 0) return 13;
+
+    printf("uinput-domain-c: PASS fixture_rows=%d opener=mocked sleeping_probe=refused missing_probe=refused symlink_marker=refused\n", rows);
+    return rows == 23 ? 0 : 7;
 }
