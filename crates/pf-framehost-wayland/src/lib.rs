@@ -21,7 +21,6 @@ use wayland_client::protocol::{
 };
 #[cfg(feature = "keyboard")]
 use wayland_client::protocol::{wl_keyboard, wl_seat};
-#[cfg(feature = "keyboard")]
 use wayland_client::WEnum;
 use wayland_client::{delegate_noop, Connection, Dispatch, EventQueue, QueueHandle};
 use wayland_protocols::xdg::shell::client::{xdg_surface, xdg_toplevel, xdg_wm_base};
@@ -77,6 +76,17 @@ pub struct RepeatInfo {
 pub enum BufferTransform {
     Normal,
     Rotate90,
+}
+
+/// How the logical surface size is established.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SizeMode {
+    /// Device-faithful: the caller pins the size and configure events never resize.
+    Pinned,
+    /// Compositor-driven: adopt the `xdg_toplevel` configure size (falling back to the
+    /// `wl_output` current mode only when the compositor configures 0x0), submit buffers
+    /// untransformed, and treat later configure events as resizes.
+    CompositorDriven,
 }
 
 /// Connection/setup failures retain enough type information for reconnect policy.
@@ -179,6 +189,14 @@ struct State {
     size: ValidatedSize,
     buffer_size: ValidatedSize,
     buffer_transform: BufferTransform,
+    size_mode: SizeMode,
+    size_adopted: bool,
+    configure_error: Option<(i32, i32)>,
+    /// Bound `wl_output` proxies, kept alive so their mode events keep arriving; only
+    /// `output_current_mode` is consumed (the 0x0-configure fallback).
+    outputs: Vec<wl_output::WlOutput>,
+    output_current_mode: Option<(u32, u32)>,
+    preferred_transform_hint: Option<u32>,
     closed: bool,
     released_buffers: Vec<u64>,
 }
@@ -193,6 +211,25 @@ impl State {
         size: ValidatedSize,
         buffer_size: ValidatedSize,
         buffer_transform: BufferTransform,
+    ) -> Self {
+        Self::new_with_mode(size, buffer_size, buffer_transform, SizeMode::Pinned)
+    }
+
+    fn new_configure_driven() -> Self {
+        let placeholder = ValidatedSize::new(1, 1).expect("1x1 is a valid placeholder size");
+        Self::new_with_mode(
+            placeholder,
+            placeholder,
+            BufferTransform::Normal,
+            SizeMode::CompositorDriven,
+        )
+    }
+
+    fn new_with_mode(
+        size: ValidatedSize,
+        buffer_size: ValidatedSize,
+        buffer_transform: BufferTransform,
+        size_mode: SizeMode,
     ) -> Self {
         Self {
             compositor: None,
@@ -221,8 +258,48 @@ impl State {
             size,
             buffer_size,
             buffer_transform,
+            size_mode,
+            size_adopted: false,
+            configure_error: None,
+            outputs: Vec::new(),
+            output_current_mode: None,
+            preferred_transform_hint: None,
             closed: false,
             released_buffers: Vec::new(),
+        }
+    }
+
+    /// Adopt a compositor configure size as the new logical (and buffer) size.
+    ///
+    /// The xdg-shell protocol allows either configure dimension to be zero, meaning
+    /// "client chooses" for that axis. Initial configures choose from the current mode
+    /// of the first `wl_output` that advertised one; later configures keep the current
+    /// client-chosen axis. Anything unusable is recorded as a fail-closed configure error.
+    fn adopt_configure(&mut self, width: i32, height: i32) {
+        let fallback = if self.size_adopted {
+            Some(self.size.dimensions())
+        } else {
+            self.output_current_mode
+        };
+        let resolve_axis = |configured: i32, fallback: Option<u32>| match configured {
+            0 => fallback,
+            1.. => u32::try_from(configured).ok(),
+            _ => None,
+        };
+        let adopted = match (
+            resolve_axis(width, fallback.map(|size| size.0)),
+            resolve_axis(height, fallback.map(|size| size.1)),
+        ) {
+            (Some(width), Some(height)) => ValidatedSize::new(width, height).ok(),
+            _ => None,
+        };
+        match adopted {
+            Some(validated) => {
+                self.size = validated;
+                self.buffer_size = validated;
+                self.size_adopted = true;
+            }
+            None => self.configure_error = Some((width, height)),
         }
     }
 
@@ -238,8 +315,10 @@ impl State {
         let toplevel = xdg_surface.get_toplevel(qh, ());
         toplevel.set_title("PocketForge".into());
         toplevel.set_app_id("org.pocketforge.shell".into());
-        toplevel.set_min_size(self.size.width_i32, self.size.height_i32);
-        toplevel.set_max_size(self.size.width_i32, self.size.height_i32);
+        if self.size_mode == SizeMode::Pinned {
+            toplevel.set_min_size(self.size.width_i32, self.size.height_i32);
+            toplevel.set_max_size(self.size.width_i32, self.size.height_i32);
+        }
         if self.buffer_transform == BufferTransform::Rotate90 {
             surface.set_buffer_transform(wl_output::Transform::_90);
         }
@@ -286,18 +365,20 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
         {
             match interface.as_str() {
                 "wl_compositor" => {
-                    state.compositor = Some(registry.bind(name, version.min(4), qh, ()))
+                    state.compositor = Some(registry.bind(name, version.min(6), qh, ()))
                 }
                 "wl_shm" => state.shm = Some(registry.bind(name, 1, qh, ())),
                 "xdg_wm_base" => state.wm_base = Some(registry.bind(name, 1, qh, ())),
+                "wl_output" => state
+                    .outputs
+                    .push(registry.bind(name, version.min(4), qh, ())),
                 #[cfg(feature = "keyboard")]
                 "wl_seat" if state.seat.is_none() => {
                     state.seat = Some(registry.bind(name, version.min(7), qh, ()));
                     state.seat_name = Some(name);
                 }
-                _ => return,
+                _ => (),
             }
-            state.init_xdg(qh);
         }
         #[cfg(feature = "keyboard")]
         if let wl_registry::Event::GlobalRemove { name } = event {
@@ -466,6 +547,33 @@ fn transfer_pressed_key_releases(old: &mut State, replacement: &mut State) {
     std::mem::swap(&mut old.key_events, &mut replacement.key_events);
 }
 
+impl Dispatch<wl_output::WlOutput, ()> for State {
+    fn event(
+        state: &mut Self,
+        _: &wl_output::WlOutput,
+        event: wl_output::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let wl_output::Event::Mode {
+            flags: WEnum::Value(wl_output::Mode::Current),
+            width,
+            height,
+            ..
+        } = event
+        {
+            if state.output_current_mode.is_none() {
+                if let (Ok(width), Ok(height)) = (u32::try_from(width), u32::try_from(height)) {
+                    if width > 0 && height > 0 {
+                        state.output_current_mode = Some((width, height));
+                    }
+                }
+            }
+        }
+    }
+}
+
 impl Dispatch<xdg_wm_base::XdgWmBase, ()> for State {
     fn event(
         _: &mut Self,
@@ -495,8 +603,14 @@ impl Dispatch<xdg_toplevel::XdgToplevel, ()> for State {
 }
 
 fn handle_toplevel_event(state: &mut State, event: xdg_toplevel::Event) {
-    if let xdg_toplevel::Event::Close = event {
-        state.closed = true;
+    match event {
+        xdg_toplevel::Event::Close => state.closed = true,
+        xdg_toplevel::Event::Configure { width, height, .. }
+            if state.size_mode == SizeMode::CompositorDriven =>
+        {
+            state.adopt_configure(width, height);
+        }
+        _ => {}
     }
 }
 
@@ -511,13 +625,40 @@ impl Dispatch<xdg_surface::XdgSurface, ()> for State {
     ) {
         if let xdg_surface::Event::Configure { serial } = event {
             surface.ack_configure(serial);
+            if state.size_mode == SizeMode::CompositorDriven
+                && !state.size_adopted
+                && state.configure_error.is_none()
+            {
+                // The xdg_surface configure arrived without a usable toplevel size.
+                state.configure_error = Some((0, 0));
+            }
             state.configured = true;
         }
     }
 }
 
 delegate_noop!(State: ignore wl_compositor::WlCompositor);
-delegate_noop!(State: ignore wl_surface::WlSurface);
+impl Dispatch<wl_surface::WlSurface, ()> for State {
+    fn event(
+        state: &mut Self,
+        _: &wl_surface::WlSurface,
+        event: wl_surface::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let wl_surface::Event::PreferredBufferTransform { transform } = event {
+            let raw = u32::from(transform);
+            // Diagnostics only: under the orientation contract the compositor owns
+            // physical rotation, so the hint is recorded and logged, never applied.
+            eprintln!(
+                "pf-framehost-wayland: compositor suggested preferred_buffer_transform={raw}; recorded, not applied"
+            );
+            state.preferred_transform_hint = Some(raw);
+        }
+    }
+}
+
 delegate_noop!(State: ignore wl_shm::WlShm);
 delegate_noop!(State: ignore wl_shm_pool::WlShmPool);
 #[derive(Clone, Copy)]
@@ -552,6 +693,7 @@ pub struct WaylandHost {
     next_buffer_id: u64,
     socket_path: Option<PathBuf>,
     buffer_transform: BufferTransform,
+    size_mode: SizeMode,
 }
 
 impl WaylandHost {
@@ -568,7 +710,11 @@ impl WaylandHost {
         let size = ValidatedSize::new(width, height)?;
         let connection = Connection::connect_to_env()
             .map_err(|e| WaylandHostError::CompositorUnavailable(e.to_string()))?;
-        Self::connect_with_connection(connection, size, size, BufferTransform::Normal, None)
+        Self::connect_with_connection(
+            connection,
+            State::new_with_buffer(size, size, BufferTransform::Normal),
+            None,
+        )
     }
 
     /// Connect to a compositor endpoint published as an absolute Unix socket path.
@@ -595,24 +741,47 @@ impl WaylandHost {
             .map_err(|error| WaylandHostError::CompositorUnavailable(error.to_string()))?;
         Self::connect_with_connection(
             connection,
-            size,
-            buffer_size,
-            transform,
+            State::new_with_buffer(size, buffer_size, transform),
+            Some(socket_path.to_path_buf()),
+        )
+    }
+
+    /// Connect to a compositor endpoint whose logical size is configure-driven.
+    ///
+    /// The surface size comes from the compositor's `xdg_toplevel` configure event
+    /// (falling back to the current `wl_output` mode only when the compositor configures
+    /// 0x0, as the protocol allows). Buffers are submitted untransformed: the compositor
+    /// owns physical panel rotation. Later configure events resize the surface, so
+    /// callers must re-layout whenever [`FrameHost::metrics`] changes.
+    pub fn connect_with_socket_configure_driven(
+        socket_path: &Path,
+    ) -> Result<Self, WaylandHostError> {
+        if !socket_path.is_absolute() {
+            return Err(WaylandHostError::CompositorUnavailable(
+                "Wayland socket path is not absolute".to_owned(),
+            ));
+        }
+        let socket = UnixStream::connect(socket_path)
+            .map_err(|error| WaylandHostError::CompositorUnavailable(error.to_string()))?;
+        let connection = Connection::from_socket(socket)
+            .map_err(|error| WaylandHostError::CompositorUnavailable(error.to_string()))?;
+        Self::connect_with_connection(
+            connection,
+            State::new_configure_driven(),
             Some(socket_path.to_path_buf()),
         )
     }
 
     fn connect_with_connection(
         connection: Connection,
-        size: ValidatedSize,
-        buffer_size: ValidatedSize,
-        buffer_transform: BufferTransform,
+        mut state: State,
         socket_path: Option<PathBuf>,
     ) -> Result<Self, WaylandHostError> {
         let mut queue = connection.new_event_queue();
         let qh = queue.handle();
         connection.display().get_registry(&qh, ());
-        let mut state = State::new_with_buffer(size, buffer_size, buffer_transform);
+        let buffer_transform = state.buffer_transform;
+        let size_mode = state.size_mode;
         queue
             .roundtrip(&mut state)
             .map_err(|e| WaylandHostError::Protocol(e.to_string()))?;
@@ -625,10 +794,18 @@ impl WaylandHost {
                 return Err(WaylandHostError::MissingGlobal(global.1));
             }
         }
+        // The surface is created only after the registry roundtrip collected every
+        // global, so the commit (and the configure it provokes) is ordered after all
+        // registry binds on the wire. A configure-driven host therefore sees any
+        // wl_output mode events before the 0x0-configure fallback resolves.
+        state.init_xdg(&qh);
         while !state.configured {
             queue
                 .blocking_dispatch(&mut state)
                 .map_err(|e| WaylandHostError::Protocol(e.to_string()))?;
+        }
+        if let Some((width, height)) = state.configure_error {
+            return Err(WaylandHostError::InvalidConfigure { width, height });
         }
         Ok(Self {
             connection,
@@ -641,20 +818,24 @@ impl WaylandHost {
             next_buffer_id: 1,
             socket_path,
             buffer_transform,
+            size_mode,
         })
     }
 
     /// Rebuild every protocol object after compositor loss.
     pub fn reconnect(&mut self) -> Result<(), WaylandHostError> {
         let (width, height) = self.state.size.dimensions();
-        let mut replacement = match &self.socket_path {
-            Some(socket_path) => Self::connect_with_socket_and_transform(
+        let mut replacement = match (&self.socket_path, self.size_mode) {
+            (Some(socket_path), SizeMode::CompositorDriven) => {
+                Self::connect_with_socket_configure_driven(socket_path)?
+            }
+            (Some(socket_path), SizeMode::Pinned) => Self::connect_with_socket_and_transform(
                 socket_path,
                 width,
                 height,
                 self.buffer_transform,
             )?,
-            None => Self::connect_with_size(width, height)?,
+            (None, _) => Self::connect_with_size(width, height)?,
         };
         replacement
             .set_text_scale(self.text_scale)
@@ -689,6 +870,30 @@ impl WaylandHost {
         Ok(())
     }
 
+    /// Replace a lost connection with a newly published socket, preserving the size policy.
+    ///
+    /// Configure-driven hosts reconnect configure-driven (the replacement compositor
+    /// re-states the logical size); pinned hosts keep their stored size and transform.
+    pub fn reconnect_with_socket(&mut self, socket_path: &Path) -> Result<(), WaylandHostError> {
+        let (width, height) = self.state.size.dimensions();
+        let mut replacement = match self.size_mode {
+            SizeMode::CompositorDriven => Self::connect_with_socket_configure_driven(socket_path)?,
+            SizeMode::Pinned => Self::connect_with_socket_and_transform(
+                socket_path,
+                width,
+                height,
+                self.buffer_transform,
+            )?,
+        };
+        replacement
+            .set_text_scale(self.text_scale)
+            .expect("the stored text scale was previously validated");
+        #[cfg(feature = "keyboard")]
+        transfer_pressed_key_releases(&mut self.state, &mut replacement.state);
+        *self = replacement;
+        Ok(())
+    }
+
     /// Set accessibility text scale for subsequent frames.
     ///
     /// Validation is owned by `Rasterizer`; only an accepted factor is retained for reconnects.
@@ -701,6 +906,14 @@ impl WaylandHost {
     /// Return whether the compositor has requested that this toplevel close.
     pub fn is_closed(&self) -> bool {
         self.state.closed
+    }
+
+    /// The last `wl_surface.preferred_buffer_transform` the compositor suggested, if any.
+    ///
+    /// Diagnostics only: this client never rotates its own buffers; the compositor owns
+    /// physical panel rotation.
+    pub fn preferred_buffer_transform_hint(&self) -> Option<u32> {
+        self.state.preferred_transform_hint
     }
 
     /// Return the next queued keyboard transition without waiting for the compositor.
@@ -783,6 +996,9 @@ impl WaylandHost {
         self.connection
             .flush()
             .map_err(|e| WaylandHostError::Protocol(e.to_string()))?;
+        if let Some((width, height)) = self.state.configure_error {
+            return Err(WaylandHostError::InvalidConfigure { width, height });
+        }
         let released = &self.state.released_buffers;
         self.buffers.retain(|(id, _, _)| !released.contains(id));
         self.state.released_buffers.clear();
