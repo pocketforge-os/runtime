@@ -552,6 +552,10 @@ where
                 event.code = code;
                 event.value = value;
                 output.push(event);
+                if event_type == ioc::EV_SYN && code == ioc::SYN_REPORT {
+                    sink.write_events(&output)?;
+                    output.clear();
+                }
                 Ok(())
             },
         )?;

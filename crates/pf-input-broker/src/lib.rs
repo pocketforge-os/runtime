@@ -47,7 +47,10 @@ pub use broker::{
     acquire_input_fd, handle_acquire, missing_source_capabilities, read_events_raw, serve_acquire,
     serve_client, InputBroker, MissingCapabilities, RunConfig, SourceCapabilities, SourceIdentity,
 };
-pub use io::{EventSink, EventSource, FdEventSink, FdEventSource, RecordingSink, SourceState};
+pub use io::{
+    is_private_stream_eof, EventSink, EventSource, FdEventSink, FdEventSource, PrivateStreamEof,
+    RecordingSink, SourceState,
+};
 pub use policy::TokenBucket;
 pub use remap::{Posture, Remap, RemapError, Rotation};
 pub use safe_return::{

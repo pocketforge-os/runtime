@@ -34,8 +34,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use pf_input_broker::{
-    serve_client, serve_system_menu_provider, FdEventSink, FdEventSource, InputBroker, RunConfig,
-    SafeReturnIntake, SourceIdentity, SystemMenuRouter,
+    is_private_stream_eof, serve_client, serve_system_menu_provider, FdEventSink, FdEventSource,
+    InputBroker, RunConfig, SafeReturnIntake, SourceIdentity, SystemMenuRouter,
 };
 use pocketforge::backends::InProcessBackend;
 use pocketforge::{Backend, Descriptor};
@@ -161,7 +161,7 @@ fn run_private(args: &[String], test_io: TestIo) -> Result<(), Box<dyn std::erro
     match InputBroker::run_with_io(&mut source, &mut sink, RunConfig::new(&descriptor, &STOP)) {
         // A finite private stream ends by closing its writer. A partial record or syscall error
         // remains an error and exits non-zero.
-        Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+        Err(error) if is_private_stream_eof(&error) => Ok(()),
         result => result.map_err(Into::into),
     }
 }

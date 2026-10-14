@@ -4,13 +4,14 @@
 
 use std::collections::VecDeque;
 use std::io::{self, Write};
+use std::mem::ManuallyDrop;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::process::Command;
 use std::sync::atomic::AtomicBool;
 
 use pf_input_broker::{
-    EventSink, EventSource, FdEventSource, InputBroker, RecordingSink, RunConfig, SourceState,
-    TokenBucket,
+    is_private_stream_eof, EventSink, EventSource, FdEventSource, InputBroker, RecordingSink,
+    RunConfig, SourceState, TokenBucket,
 };
 use pocketforge::Descriptor;
 
@@ -35,6 +36,32 @@ id = "west"
 kind = "button"
 ev_type = "EV_KEY"
 code = "BTN_X"
+"#,
+    )
+    .unwrap()
+}
+
+fn descriptor_with_axis() -> Descriptor {
+    Descriptor::from_toml(
+        r#"
+[identity]
+id = "private-seam-axis"
+manufacturer = "PocketForge"
+model = "Private seam axis fixture"
+sdl_guid = "030000005e0400008e02000010010000"
+
+[[inputs]]
+id = "west"
+kind = "button"
+ev_type = "EV_KEY"
+code = "BTN_X"
+
+[[inputs]]
+id = "x"
+kind = "axis"
+ev_type = "EV_ABS"
+code = "ABS_X"
+range = { min = -32768, max = 32767, fuzz = 0, flat = 0 }
 "#,
     )
     .unwrap()
@@ -105,7 +132,7 @@ fn fragmented_private_stream_runs_real_remap_and_policy_loop() {
     let config = RunConfig::new(&descriptor, &stop).with_token_bucket(TokenBucket::new(1.0, 0.0));
     let error = InputBroker::run_with_io(&mut source, &mut sink, config).unwrap_err();
 
-    assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+    assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
     assert_eq!(
         sink.events()
             .iter()
@@ -127,10 +154,13 @@ fn fd_source_distinguishes_clean_eof_partial_eof_and_read_failure() {
     drop(clean_write);
     let mut clean = FdEventSource::from_owned_fd(clean_read);
     let mut out: [libc::input_event; 2] = unsafe { std::mem::zeroed() };
-    assert_eq!(
-        clean.read_events(&mut out).unwrap_err().kind(),
-        io::ErrorKind::BrokenPipe
-    );
+    let clean_eof = clean.read_events(&mut out).unwrap_err();
+    assert_eq!(clean_eof.kind(), io::ErrorKind::UnexpectedEof);
+    assert!(is_private_stream_eof(&clean_eof));
+    assert!(!is_private_stream_eof(&io::Error::new(
+        io::ErrorKind::UnexpectedEof,
+        "unrelated adapter failure",
+    )));
 
     let (partial_read, partial_write) = seqpacket_pair();
     write_packet(
@@ -153,11 +183,25 @@ fn fd_source_distinguishes_clean_eof_partial_eof_and_read_failure() {
         error.raw_os_error().is_some(),
         "the syscall error is preserved"
     );
+
+    let (invalid_read, _invalid_write) = seqpacket_pair();
+    let raw = invalid_read.as_raw_fd();
+    let mut invalid = ManuallyDrop::new(FdEventSource::from_owned_fd(invalid_read));
+    // SAFETY: deliberately invalidate this process-private descriptor to exercise POLLNVAL. The
+    // source is ManuallyDrop so it cannot close the same descriptor a second time.
+    assert_eq!(unsafe { libc::close(raw) }, 0);
+    assert_eq!(
+        invalid.read_events(&mut out).unwrap_err().kind(),
+        io::ErrorKind::BrokenPipe,
+        "poll failure must remain distinct from clean stream completion"
+    );
 }
 
 struct MockEvdevAdapter {
     batches: VecDeque<io::Result<Vec<libc::input_event>>>,
     reads: usize,
+    pressed_failure: bool,
+    abs_failure: bool,
 }
 
 impl EventSource for MockEvdevAdapter {
@@ -174,11 +218,19 @@ impl EventSource for MockEvdevAdapter {
 
 impl SourceState for MockEvdevAdapter {
     fn pressed_keys(&self, _codes: &[u16]) -> io::Result<Vec<u16>> {
-        Ok(Vec::new())
+        if self.pressed_failure {
+            Err(io::Error::other("scripted pressed-state failure"))
+        } else {
+            Ok(Vec::new())
+        }
     }
 
     fn abs_value(&self, _code: u16) -> io::Result<i32> {
-        Ok(0)
+        if self.abs_failure {
+            Err(io::Error::other("scripted abs-state failure"))
+        } else {
+            Ok(0)
+        }
     }
 }
 
@@ -204,6 +256,8 @@ fn mocked_production_adapters_use_the_same_run_with_io_loop() {
             Err(io::Error::new(io::ErrorKind::BrokenPipe, "mock unplug")),
         ]),
         reads: 0,
+        pressed_failure: false,
+        abs_failure: false,
     };
     let mut sink = MockUinputAdapter::default();
     let stop = AtomicBool::new(false);
@@ -216,6 +270,42 @@ fn mocked_production_adapters_use_the_same_run_with_io_loop() {
     assert_eq!(source.reads, 2);
     assert_eq!(sink.writes, 1);
     assert_eq!(sink.events[0].code, BTN_WEST);
+}
+
+#[test]
+fn committed_report_reaches_sink_before_later_recovery_query_failure() {
+    for (pressed_failure, abs_failure) in [(true, false), (false, true)] {
+        let mut source = MockEvdevAdapter {
+            batches: VecDeque::from([Ok(vec![
+                event(EV_KEY, BTN_X, 1),
+                event(EV_SYN, SYN_REPORT, 0),
+                event(EV_SYN, 3, 0), // SYN_DROPPED
+                event(EV_SYN, SYN_REPORT, 0),
+            ])]),
+            reads: 0,
+            pressed_failure,
+            abs_failure,
+        };
+        let mut sink = MockUinputAdapter::default();
+        let stop = AtomicBool::new(false);
+
+        let error = InputBroker::run_with_io(
+            &mut source,
+            &mut sink,
+            RunConfig::new(&descriptor_with_axis(), &stop),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert_eq!(
+            sink.events
+                .iter()
+                .map(|event| (event.type_, event.code, event.value))
+                .collect::<Vec<_>>(),
+            vec![(EV_KEY, BTN_WEST, 1), (EV_SYN, SYN_REPORT, 0)],
+            "the committed report preceding a recovery-query error was lost"
+        );
+    }
 }
 
 #[test]
@@ -286,5 +376,59 @@ code = "BTN_X"
     assert!(count > 0, "record fd: {}", io::Error::last_os_error());
     let expected = [event(EV_KEY, BTN_WEST, 1), event(EV_SYN, SYN_REPORT, 0)];
     assert_eq!(&recorded[..count as usize], event_bytes(&expected));
+    std::fs::remove_file(descriptor_path).unwrap();
+}
+
+#[test]
+fn binary_private_fd_mode_does_not_treat_closed_record_sink_as_clean_eof() {
+    let descriptor_path = std::env::temp_dir().join(format!(
+        "pf-input-broker-private-closed-sink-{}.toml",
+        std::process::id()
+    ));
+    std::fs::write(
+        &descriptor_path,
+        r#"
+[identity]
+id = "private-seam-closed-sink"
+manufacturer = "PocketForge"
+model = "Private seam closed sink fixture"
+sdl_guid = "030000005e0400008e02000010010000"
+
+[[inputs]]
+id = "west"
+kind = "button"
+ev_type = "EV_KEY"
+code = "BTN_X"
+"#,
+    )
+    .unwrap();
+
+    let (event_read, event_write) = seqpacket_pair();
+    let (record_read, record_write) = seqpacket_pair();
+    inherit_on_exec(&event_read);
+    inherit_on_exec(&record_write);
+    drop(record_read);
+    let input = [event(EV_KEY, BTN_X, 1), event(EV_SYN, SYN_REPORT, 0)];
+    write_packet(&event_write, event_bytes(&input));
+
+    let result = Command::new(env!("CARGO_BIN_EXE_pf-input-broker"))
+        .arg("--descriptor")
+        .arg(&descriptor_path)
+        .arg("--test-event-fd")
+        .arg(event_read.as_raw_fd().to_string())
+        .arg("--test-record-fd")
+        .arg(record_write.as_raw_fd().to_string())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap()
+        .wait_with_output()
+        .unwrap();
+
+    assert!(
+        !result.status.success(),
+        "a failed record sink was incorrectly reported as clean completion"
+    );
+    drop(event_write);
     std::fs::remove_file(descriptor_path).unwrap();
 }

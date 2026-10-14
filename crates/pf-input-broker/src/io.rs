@@ -6,6 +6,25 @@
 use std::io;
 use std::os::fd::{AsRawFd, OwnedFd};
 
+/// Typed marker for a private input stream that ended exactly between native event records.
+#[derive(Debug)]
+pub struct PrivateStreamEof;
+
+impl std::fmt::Display for PrivateStreamEof {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("private event source reached EOF")
+    }
+}
+
+impl std::error::Error for PrivateStreamEof {}
+
+/// Whether an I/O failure is the private source's confirmed clean stream completion.
+pub fn is_private_stream_eof(error: &io::Error) -> bool {
+    error
+        .get_ref()
+        .is_some_and(|inner| inner.downcast_ref::<PrivateStreamEof>().is_some())
+}
+
 /// A source of complete native Linux input-event records.
 pub trait EventSource {
     /// Read up to `out.len()` complete records. `Ok(0)` means no record is currently available.
@@ -120,8 +139,8 @@ impl EventSource for FdEventSource {
             if read == 0 {
                 return if self.pending.is_empty() {
                     Err(io::Error::new(
-                        io::ErrorKind::BrokenPipe,
-                        "private event source reached EOF",
+                        io::ErrorKind::UnexpectedEof,
+                        PrivateStreamEof,
                     ))
                 } else {
                     Err(io::Error::new(
