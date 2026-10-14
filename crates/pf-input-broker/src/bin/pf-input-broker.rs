@@ -9,6 +9,8 @@
 //!                   [--safe-return-sock <authority.sock>]
 //!                   [--system-menu-sock <provider.sock>]
 //!                   [--allow-unidentified-pad]
+//!   pf-input-broker --descriptor <caps.toml>
+//!                   --test-event-fd <inherited-fd> --test-record-fd <inherited-fd>
 //!
 //! Each `--acquire-sock` connection is a persistent PFW1 session: repeated `Acquire("input")`
 //! (each answered with a fresh re-emit fd), read-only preference operations (prefsd via
@@ -24,6 +26,7 @@
 //! `--no-grab` is the R-C blessed-binary path (Steam Link): re-emit + hand the fd WITHOUT the
 //! exclusive grab (so a `uinput`-producing consumer is not broken).
 
+use std::os::fd::{FromRawFd, OwnedFd, RawFd};
 use std::os::raw::c_int;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixListener;
@@ -31,8 +34,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use pf_input_broker::{
-    serve_client, serve_system_menu_provider, InputBroker, SafeReturnIntake, SourceIdentity,
-    SystemMenuRouter,
+    is_private_stream_eof, serve_client, serve_system_menu_provider, FdEventSink, FdEventSource,
+    InputBroker, RunConfig, SafeReturnIntake, SourceIdentity, SystemMenuRouter,
 };
 use pocketforge::backends::InProcessBackend;
 use pocketforge::{Backend, Descriptor};
@@ -52,25 +55,135 @@ fn arg(args: &[String], flag: &str) -> Option<String> {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let desc_path = arg(&args, "--descriptor")
+    let mode = test_io_mode(&args)?;
+    dispatch_mode(
+        mode,
+        |test_io| run_private(&args, test_io),
+        || run_production(&args),
+    )
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TestIo {
+    event_fd: RawFd,
+    record_fd: RawFd,
+}
+
+fn fd_arg(args: &[String], flag: &str) -> Result<Option<RawFd>, Box<dyn std::error::Error>> {
+    let Some(index) = args.iter().position(|arg| arg == flag) else {
+        return Ok(None);
+    };
+    let value = args
+        .get(index + 1)
+        .ok_or_else(|| format!("{flag} requires a non-negative inherited fd"))?;
+    let fd: RawFd = value
+        .parse()
+        .map_err(|_| format!("{flag} requires a non-negative inherited fd"))?;
+    if fd < 0 {
+        return Err(format!("{flag} requires a non-negative inherited fd").into());
+    }
+    Ok(Some(fd))
+}
+
+fn test_io_mode(args: &[String]) -> Result<Option<TestIo>, Box<dyn std::error::Error>> {
+    let event_fd = fd_arg(args, "--test-event-fd")?;
+    let record_fd = fd_arg(args, "--test-record-fd")?;
+    let mode = match (event_fd, record_fd) {
+        (None, None) => return Ok(None),
+        (Some(event_fd), Some(record_fd)) => TestIo {
+            event_fd,
+            record_fd,
+        },
+        _ => return Err("--test-event-fd and --test-record-fd must be supplied together".into()),
+    };
+    if mode.event_fd == mode.record_fd {
+        return Err("test event and record fds must be distinct".into());
+    }
+    for flag in [
+        "--source",
+        "--no-grab",
+        "--acquire-sock",
+        "--safe-return-sock",
+        "--system-menu-sock",
+        "--allow-unidentified-pad",
+    ] {
+        if args.iter().any(|arg| arg == flag) {
+            return Err(format!("{flag} is unavailable with private test fds").into());
+        }
+    }
+    Ok(Some(mode))
+}
+
+fn dispatch_mode<T>(
+    mode: Option<TestIo>,
+    private: impl FnOnce(TestIo) -> T,
+    production: impl FnOnce() -> T,
+) -> T {
+    match mode {
+        Some(test_io) => private(test_io),
+        None => production(),
+    }
+}
+
+fn descriptor_path(args: &[String]) -> Result<String, Box<dyn std::error::Error>> {
+    arg(args, "--descriptor")
         .or_else(|| std::env::var("PF_DESCRIPTOR").ok())
-        .ok_or("need --descriptor <caps.toml> (or PF_DESCRIPTOR)")?;
-    let acquire_sock = arg(&args, "--acquire-sock");
-    let safe_return_sock = arg(&args, "--safe-return-sock");
-    let system_menu_sock = arg(&args, "--system-menu-sock");
+        .ok_or_else(|| "need --descriptor <caps.toml> (or PF_DESCRIPTOR)".into())
+}
+
+fn take_inherited_fd(fd: RawFd) -> std::io::Result<OwnedFd> {
+    // SAFETY: F_GETFD validates that the inherited descriptor is open without changing it.
+    if unsafe { libc::fcntl(fd, libc::F_GETFD) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: this mode takes ownership of each distinct inherited descriptor exactly once.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+fn install_signal_handlers() {
+    // SAFETY: the handlers only set an atomic flag. Cast via a fn pointer so the conversion to
+    // sighandler_t is explicit.
+    let handler = on_signal as extern "C" fn(c_int) as libc::sighandler_t;
+    unsafe {
+        libc::signal(libc::SIGINT, handler);
+        libc::signal(libc::SIGTERM, handler);
+    }
+}
+
+fn run_private(args: &[String], test_io: TestIo) -> Result<(), Box<dyn std::error::Error>> {
+    let descriptor = Descriptor::load(descriptor_path(args)?)?;
+    let mut source = FdEventSource::from_owned_fd(take_inherited_fd(test_io.event_fd)?);
+    let mut sink = FdEventSink::from_owned_fd(take_inherited_fd(test_io.record_fd)?);
+    install_signal_handlers();
+    println!("ready");
+    use std::io::Write;
+    std::io::stdout().flush()?;
+    match InputBroker::run_with_io(&mut source, &mut sink, RunConfig::new(&descriptor, &STOP)) {
+        // A finite private stream ends by closing its writer. A partial record or syscall error
+        // remains an error and exits non-zero.
+        Err(error) if is_private_stream_eof(&error) => Ok(()),
+        result => result.map_err(Into::into),
+    }
+}
+
+fn run_production(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let desc_path = descriptor_path(args)?;
+    let acquire_sock = arg(args, "--acquire-sock");
+    let safe_return_sock = arg(args, "--safe-return-sock");
+    let system_menu_sock = arg(args, "--system-menu-sock");
     if system_menu_sock.is_some() && safe_return_sock.is_none() {
         return Err("--system-menu-sock requires --safe-return-sock".into());
     }
     let grab = !args.iter().any(|a| a == "--no-grab");
     // Identity is fail-closed by default: the source must be the decoder's built-in controller
     // (virtual path + decoder phys + trusted record), not merely descriptor-compatible.
-    let identity = source_identity(&args);
+    let identity = source_identity(args);
     if let Some(warning) = identity_warning(&identity) {
         eprintln!("{warning}");
     }
 
     let descriptor = Descriptor::load(&desc_path)?;
-    let source = match arg(&args, "--source") {
+    let source = match arg(args, "--source") {
         Some(path) => std::path::PathBuf::from(path),
         None => discover_with_timeout(&descriptor, &identity)?,
     };
@@ -90,13 +203,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .node_path()
         .ok_or("could not resolve the re-emit event node")?;
 
-    // SAFETY: installing simple signal handlers that only set an atomic flag. Cast via a fn
-    // pointer (not a fn item) so the conversion to sighandler_t is explicit, not a numeric cast.
-    let handler = on_signal as extern "C" fn(c_int) as libc::sighandler_t;
-    unsafe {
-        libc::signal(libc::SIGINT, handler);
-        libc::signal(libc::SIGTERM, handler);
-    }
+    install_signal_handlers();
 
     let src_name = broker.source_name().unwrap_or_default();
     eprintln!(
@@ -299,6 +406,49 @@ fn send_ready(socket: &str) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
+
+    #[test]
+    fn private_fd_flags_bypass_counted_production_openers() {
+        let args = vec![
+            "--test-event-fd".to_owned(),
+            "7".to_owned(),
+            "--test-record-fd".to_owned(),
+            "8".to_owned(),
+        ];
+        let mode = test_io_mode(&args).unwrap();
+        let evdev_opens = Cell::new(0);
+        let uinput_opens = Cell::new(0);
+
+        let selected = dispatch_mode(
+            mode,
+            |_| "private",
+            || {
+                evdev_opens.set(evdev_opens.get() + 1);
+                uinput_opens.set(uinput_opens.get() + 1);
+                "production"
+            },
+        );
+
+        assert_eq!(selected, "private");
+        assert_eq!(evdev_opens.get(), 0);
+        assert_eq!(uinput_opens.get(), 0);
+    }
+
+    #[test]
+    fn private_fd_flags_are_paired_and_reject_production_options() {
+        assert!(test_io_mode(&["--test-event-fd".into(), "7".into()]).is_err());
+        assert!(test_io_mode(&[
+            "--test-event-fd".into(),
+            "7".into(),
+            "--test-record-fd".into(),
+            "8".into(),
+            "--source".into(),
+            "unused".into(),
+        ])
+        .is_err());
+        assert_eq!(test_io_mode(&[]).unwrap(), None);
+    }
 
     #[test]
     fn built_in_pad_identity_is_default_and_opt_out_is_explicit_and_loud() {

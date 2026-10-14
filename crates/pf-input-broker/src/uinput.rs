@@ -9,6 +9,7 @@
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 
+use crate::io::EventSink;
 use crate::ioc;
 
 /// Absolute-axis calibration (mirrors `input_absinfo`).
@@ -199,6 +200,15 @@ impl Uinput {
 impl AsRawFd for Uinput {
     fn as_raw_fd(&self) -> RawFd {
         self.fd.as_raw_fd()
+    }
+}
+
+impl EventSink for Uinput {
+    fn write_events(&mut self, events: &[libc::input_event]) -> io::Result<()> {
+        for event in events {
+            self.emit(event.type_, event.code, event.value)?;
+        }
+        Ok(())
     }
 }
 

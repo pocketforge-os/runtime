@@ -17,6 +17,7 @@ use pocketforge::server::handle_request;
 use pocketforge::Backend;
 
 use crate::evdev::Evdev;
+use crate::io::{EventSink, EventSource, SourceState};
 use crate::ioc;
 use crate::policy::TokenBucket;
 use crate::remap::{AbsAction, Posture, Remap};
@@ -178,19 +179,41 @@ pub struct InputBroker {
     pump: ReportPump,
 }
 
-/// Authoritative source state the pump consults after `SYN_DROPPED`: the grabbed evdev source in
-/// production, a fixture in hermetic tests.
-pub(crate) trait SourceState {
-    fn pressed_keys(&self, codes: &[u16]) -> io::Result<Vec<u16>>;
-    fn abs_value(&self, code: u16) -> io::Result<i32>;
+/// Configuration for the shared production/private event loop.
+pub struct RunConfig<'a> {
+    descriptor: Option<&'a Descriptor>,
+    pump: Option<&'a mut ReportPump>,
+    token_bucket: Option<TokenBucket>,
+    start: std::time::Instant,
+    stop: &'a AtomicBool,
 }
 
-impl SourceState for Evdev {
-    fn pressed_keys(&self, codes: &[u16]) -> io::Result<Vec<u16>> {
-        Evdev::pressed_keys(self, codes)
+impl<'a> RunConfig<'a> {
+    /// Build a fresh descriptor-derived remap and policy pump for a private event stream.
+    pub fn new(descriptor: &'a Descriptor, stop: &'a AtomicBool) -> Self {
+        Self {
+            descriptor: Some(descriptor),
+            pump: None,
+            token_bucket: None,
+            start: std::time::Instant::now(),
+            stop,
+        }
     }
-    fn abs_value(&self, code: u16) -> io::Result<i32> {
-        Evdev::abs_value(self, code)
+
+    /// Override the default report-rate policy, primarily for deterministic policy tests.
+    pub fn with_token_bucket(mut self, token_bucket: TokenBucket) -> Self {
+        self.token_bucket = Some(token_bucket);
+        self
+    }
+
+    fn existing(pump: &'a mut ReportPump, start: std::time::Instant, stop: &'a AtomicBool) -> Self {
+        Self {
+            descriptor: None,
+            pump: Some(pump),
+            token_bucket: None,
+            start,
+            stop,
+        }
     }
 }
 
@@ -452,37 +475,44 @@ impl InputBroker {
 
     /// Block up to `timeout_ms` for the source to become readable. `true` if events are pending.
     pub fn wait_readable(&self, timeout_ms: i32) -> io::Result<bool> {
-        let mut pfd = libc::pollfd {
-            fd: self.source.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        // SAFETY: single valid pollfd.
-        let rc = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
-        if rc < 0 {
-            let e = io::Error::last_os_error();
-            if e.raw_os_error() == Some(libc::EINTR) {
-                return Ok(false);
-            }
-            return Err(e);
-        }
-        if rc > 0 && (pfd.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL)) != 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "upstream input device disconnected",
-            ));
-        }
-        Ok(rc > 0 && (pfd.revents & libc::POLLIN) != 0)
+        self.source.wait_readable(timeout_ms)
     }
 
     /// Run the pump until `stop` is set (poll-driven; no busy spin).
     pub fn run(&mut self, stop: &AtomicBool) -> io::Result<()> {
-        while !stop.load(Ordering::Acquire) {
-            if self.wait_readable(200)? {
-                self.pump_once()?;
+        let config = RunConfig::existing(&mut self.pump, self.start, stop);
+        Self::run_with_io(&mut self.source, &mut self.sink, config)
+    }
+
+    /// Run the real descriptor remap and policy loop with explicit event adapters.
+    ///
+    /// Production [`run`](Self::run) calls this with [`Evdev`] and [`Uinput`]. Hermetic callers
+    /// use an [`FdEventSource`](crate::io::FdEventSource) and a private or recording sink.
+    pub fn run_with_io<S, K>(
+        source: &mut S,
+        sink: &mut K,
+        mut config: RunConfig<'_>,
+    ) -> io::Result<()>
+    where
+        S: EventSource + SourceState,
+        K: EventSink,
+    {
+        if let Some(pump) = config.pump.take() {
+            if let Some(token_bucket) = config.token_bucket.take() {
+                pump.bucket = token_bucket;
             }
+            return run_io_loop(source, sink, pump, config.start, config.stop);
         }
-        Ok(())
+        let descriptor = config
+            .descriptor
+            .expect("a fresh run config always carries a descriptor");
+        let remap = Remap::from_descriptor(descriptor)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
+        let mut pump = ReportPump::new(remap);
+        if let Some(token_bucket) = config.token_bucket {
+            pump.bucket = token_bucket;
+        }
+        run_io_loop(source, sink, &mut pump, config.start, config.stop)
     }
 
     /// Open a fresh read fd on the re-emit node — the fd handed to an app via `SCM_RIGHTS`.
@@ -492,6 +522,48 @@ impl InputBroker {
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "re-emit node not resolved"))?;
         open_read_fd(&node)
     }
+}
+
+fn run_io_loop<S, K>(
+    source: &mut S,
+    sink: &mut K,
+    pump: &mut ReportPump,
+    start: std::time::Instant,
+    stop: &AtomicBool,
+) -> io::Result<()>
+where
+    S: EventSource + SourceState,
+    K: EventSink,
+{
+    let mut buffer: [libc::input_event; 64] = unsafe { std::mem::zeroed() };
+    while !stop.load(Ordering::Acquire) {
+        let count = source.read_events(&mut buffer)?;
+        if count == 0 {
+            continue;
+        }
+        let mut output = Vec::new();
+        pump.process(
+            &buffer[..count],
+            start.elapsed().as_secs_f64(),
+            source,
+            &mut |event_type, code, value| {
+                let mut event: libc::input_event = unsafe { std::mem::zeroed() };
+                event.type_ = event_type;
+                event.code = code;
+                event.value = value;
+                output.push(event);
+                if event_type == ioc::EV_SYN && code == ioc::SYN_REPORT {
+                    sink.write_events(&output)?;
+                    output.clear();
+                }
+                Ok(())
+            },
+        )?;
+        if !output.is_empty() {
+            sink.write_events(&output)?;
+        }
+    }
+    Ok(())
 }
 
 fn finish_discovery(
