@@ -4,6 +4,7 @@ use pf_app_launch::policy::{
 };
 use pf_app_manifest::{parse_manifest, parse_platform_contract, ResolvedApp};
 use std::collections::BTreeMap;
+use std::io;
 use std::path::{Path, PathBuf};
 
 fn resolved(
@@ -135,6 +136,38 @@ fn browser_profile_has_scopes_and_no_fs_or_net_rules() {
 fn device_regression_input_selects_broker_or_raw_route() {
     let root = PathBuf::from("/fixture");
     let app = resolved(&root, &["input"], false, true);
+    let connect = |policy: &pf_app_launch::policy::PolicyDecision, path: &Path| {
+        policy
+            .landlock
+            .filesystem
+            .iter()
+            .any(|rule| rule.path == path && rule.access == FsAccess::UnixConnect)
+            .then_some(())
+            .ok_or_else(|| io::Error::from_raw_os_error(libc::EACCES))
+    };
+
+    // Build 10 inventories raw evdev while PF_BROKER_SOCK points at the broker. On the old
+    // compiler this exact connect outcome was EACCES even though the raw route derived.
+    let both = derive_policy(&app, &inputs(&root)).unwrap();
+    connect(&both, Path::new("/run/pocketforge/input-broker.sock")).unwrap();
+    assert!(both.endpoints.contains(&MediatedEndpoint::InputBroker));
+    assert!(both
+        .unit
+        .device_allow
+        .iter()
+        .any(|grant| grant.path == Path::new("/dev/input/event0") && grant.mode == "r"));
+    for denied in [
+        "/run/pocketforge/prefsd.sock",
+        "/run/pocketforge/session-authority.sock",
+        "/run/pocketforge/system-menu.sock",
+    ] {
+        assert_eq!(
+            connect(&both, Path::new(denied))
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::EACCES)
+        );
+    }
 
     let mut broker_only = inputs(&root);
     broker_only.resources.remove("input-devices");
@@ -177,14 +210,6 @@ fn device_regression_input_selects_broker_or_raw_route() {
         .iter()
         .any(|group| group == "input"));
     assert!(raw
-        .unit
-        .device_allow
-        .iter()
-        .any(|grant| grant.path == Path::new("/dev/input/event0") && grant.mode == "r"));
-
-    let both = derive_policy(&app, &inputs(&root)).unwrap();
-    assert!(both.endpoints.contains(&MediatedEndpoint::InputBroker));
-    assert!(both
         .unit
         .device_allow
         .iter()

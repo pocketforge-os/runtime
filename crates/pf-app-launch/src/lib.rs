@@ -228,13 +228,22 @@ mod tests {
     #[test]
     fn device_regression_platform_library_is_in_read_execute_set() {
         let paths = platform_resource_paths();
-        assert!(
-            paths.contains(&PathBuf::from("/opt/pocketforge/lib")),
-            "reading /opt/pocketforge/lib/libSDL3-pocketforge.so.0 under the derived ruleset would return EACCES"
-        );
-        assert!(paths.contains(&PathBuf::from("/usr")));
-        assert!(!paths.contains(&PathBuf::from("/opt")));
-        assert!(!paths.contains(&PathBuf::from("/opt/pocketforge")));
+        let read = |path: &Path| {
+            paths
+                .iter()
+                .any(|root| path.starts_with(root))
+                .then_some(())
+                .ok_or_else(|| io::Error::from_raw_os_error(libc::EACCES))
+        };
+
+        read(Path::new("/opt/pocketforge/lib/libSDL3-pocketforge.so.0")).unwrap();
+        read(Path::new("/usr/lib/libc.so.6")).unwrap();
+        for denied in ["/opt/foreign.so", "/opt/pocketforge/private/secret"] {
+            assert_eq!(
+                read(Path::new(denied)).unwrap_err().raw_os_error(),
+                Some(libc::EACCES)
+            );
+        }
     }
 
     #[test]
