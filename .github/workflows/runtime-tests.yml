@@ -35,10 +35,10 @@ jobs:
     if: >-
       github.event_name != 'pull_request' ||
       github.event.pull_request.head.repo.full_name == github.repository
-    uses: pocketforge-os/shared-workflows/.github/workflows/rust-container.yml@9b6bcc48670af31e9a9117d3075f6bbb19e3806a
+    uses: pocketforge-os/shared-workflows/.github/workflows/rust-container.yml@4085a8e8bd02bd5e4fb87f986578b7237c089c07
     with:
       source-sha: ${{ github.sha }}
-      workflow-sha: 9b6bcc48670af31e9a9117d3075f6bbb19e3806a
+      workflow-sha: 4085a8e8bd02bd5e4fb87f986578b7237c089c07
       image: 10.0.32.86:5555/pocketforge/ci-rust@sha256:801f15f7e8fd20b449e3b0d0a7a56d632e28dae825b251a19a30e6f8b32bd8e9
       script: scripts/ci-container.sh
   # GitHub prefixes reusable job names. Keep the existing required check exact;
