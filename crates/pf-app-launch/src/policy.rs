@@ -255,7 +255,11 @@ pub fn derive_policy(
             _ => Err(PolicyError(format!("required resource {name} is missing"))),
         }
     };
-    let mut add_devices = |name: &str, mode: &str, optional: bool| -> Result<(), PolicyError> {
+    let add_devices = |devices: &mut BTreeMap<PathBuf, String>,
+                       name: &str,
+                       mode: &str,
+                       optional: bool|
+     -> Result<(), PolicyError> {
         for path in resource(name, optional)? {
             devices
                 .entry(path)
@@ -273,18 +277,28 @@ pub fn derive_policy(
         groups.insert("video".to_owned());
         socket_paths.extend(resource("display-sockets", false)?);
         read_only_paths.extend(resource("session-environment", false)?);
-        add_devices("render-devices", "rw", false)?;
+        add_devices(&mut devices, "render-devices", "rw", false)?;
     }
     if launch.audio || capability_bases.contains("audio") {
         groups.insert("audio".to_owned());
         let optional = !launch.audio && capability_optional.get("audio") == Some(&true);
-        socket_paths.extend(resource("audio-sockets", optional)?);
-        read_only_paths.extend(resource("session-environment", optional)?);
-        add_devices("audio-devices", "rw", optional)?;
+        let audio_sockets = resource("audio-sockets", true)?;
+        let audio_devices = resource("audio-devices", true)?;
+        if !optional && audio_sockets.is_empty() && audio_devices.is_empty() {
+            return Err(PolicyError(
+                "required audio resource is missing: expected audio-devices or audio-sockets"
+                    .to_owned(),
+            ));
+        }
+        socket_paths.extend(audio_sockets);
+        for path in audio_devices {
+            devices.insert(path, "rw".to_owned());
+        }
     }
     if capability_bases.contains("input") {
         groups.insert("input".to_owned());
         add_devices(
+            &mut devices,
             "input-devices",
             "r",
             capability_optional.get("input") == Some(&true),
@@ -296,12 +310,12 @@ pub fn derive_policy(
             .into_iter()
             .filter(|name| capability_bases.contains(*name))
             .all(|name| capability_optional.get(name) == Some(&true));
-        add_devices("input-devices", "rw", optional)?;
+        add_devices(&mut devices, "input-devices", "rw", optional)?;
     }
     if capability_bases.contains("video-decode") {
         let optional = capability_optional.get("video-decode") == Some(&true);
-        add_devices("video-decode-devices", "rw", optional)?;
-        add_devices("media-devices", "rw", optional)?;
+        add_devices(&mut devices, "video-decode-devices", "rw", optional)?;
+        add_devices(&mut devices, "media-devices", "rw", optional)?;
         if ["video-decode-devices", "media-devices"]
             .into_iter()
             .any(|name| {
