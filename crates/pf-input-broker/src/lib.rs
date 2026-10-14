@@ -35,6 +35,7 @@
 
 pub mod broker;
 pub mod evdev;
+pub mod io;
 pub mod ioc;
 pub mod policy;
 pub mod remap;
@@ -44,8 +45,9 @@ pub mod uinput;
 
 pub use broker::{
     acquire_input_fd, handle_acquire, missing_source_capabilities, read_events_raw, serve_acquire,
-    serve_client, InputBroker, MissingCapabilities, SourceCapabilities, SourceIdentity,
+    serve_client, InputBroker, MissingCapabilities, RunConfig, SourceCapabilities, SourceIdentity,
 };
+pub use io::{EventSink, EventSource, FdEventSink, FdEventSource, RecordingSink, SourceState};
 pub use policy::TokenBucket;
 pub use remap::{Posture, Remap, RemapError, Rotation};
 pub use safe_return::{

@@ -7,6 +7,7 @@ use std::io;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::path::Path;
 
+use crate::io::{EventSource, SourceState};
 use crate::ioc;
 
 /// An opened evdev source device.
@@ -203,6 +204,51 @@ impl Evdev {
             ));
         }
         Ok(n as usize / std::mem::size_of::<libc::input_event>())
+    }
+
+    /// Block up to `timeout_ms` for this source to become readable.
+    pub fn wait_readable(&self, timeout_ms: i32) -> io::Result<bool> {
+        let mut pfd = libc::pollfd {
+            fd: self.fd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: one valid pollfd.
+        let rc = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
+        if rc < 0 {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::EINTR) {
+                return Ok(false);
+            }
+            return Err(error);
+        }
+        if rc > 0 && (pfd.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL)) != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "upstream input device disconnected",
+            ));
+        }
+        Ok(rc > 0 && (pfd.revents & libc::POLLIN) != 0)
+    }
+}
+
+impl EventSource for Evdev {
+    fn read_events(&mut self, out: &mut [libc::input_event]) -> io::Result<usize> {
+        if self.wait_readable(200)? {
+            Evdev::read_events(self, out)
+        } else {
+            Ok(0)
+        }
+    }
+}
+
+impl SourceState for Evdev {
+    fn pressed_keys(&self, codes: &[u16]) -> io::Result<Vec<u16>> {
+        Evdev::pressed_keys(self, codes)
+    }
+
+    fn abs_value(&self, code: u16) -> io::Result<i32> {
+        Evdev::abs_value(self, code)
     }
 }
 
