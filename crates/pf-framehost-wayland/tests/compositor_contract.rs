@@ -52,6 +52,7 @@ struct Observations {
 struct FixtureConfig {
     initial_configure: (i32, i32),
     output_mode: Option<(i32, i32)>,
+    output_mode_preferred: bool,
 }
 
 #[derive(Clone)]
@@ -245,7 +246,11 @@ impl GlobalDispatch<wl_output::WlOutput, ()> for CompositorState {
             "contract-panel".to_owned(),
             wl_output::Transform::Normal,
         );
-        output.mode(wl_output::Mode::Current, width, height, 60_000);
+        let mut flags = wl_output::Mode::Current;
+        if state.config.output_mode_preferred {
+            flags |= wl_output::Mode::Preferred;
+        }
+        output.mode(flags, width, height, 60_000);
         output.scale(1);
         output.done();
     }
@@ -769,6 +774,7 @@ fn configure_driven_connect_output_binding_and_reconnect_share_controls() {
         FixtureConfig {
             initial_configure: (720, 1280),
             output_mode: Some((1280, 720)),
+            output_mode_preferred: false,
         },
     );
     let mut host = WaylandHost::connect_with_socket_configure_driven(&socket_a)
@@ -800,6 +806,7 @@ fn configure_driven_connect_output_binding_and_reconnect_share_controls() {
         FixtureConfig {
             initial_configure: (1280, 720),
             output_mode: None,
+            output_mode_preferred: false,
         },
     );
     host.reconnect_with_socket(&socket_b)
@@ -834,6 +841,7 @@ fn zero_axis_fallback_and_invalid_configure_share_controls() {
         FixtureConfig {
             initial_configure: (0, 0),
             output_mode: Some((720, 1280)),
+            output_mode_preferred: true,
         },
     );
     let fallback_host = WaylandHost::connect_with_socket_configure_driven(&fallback_socket)
@@ -854,6 +862,7 @@ fn zero_axis_fallback_and_invalid_configure_share_controls() {
         FixtureConfig {
             initial_configure: (0, 0),
             output_mode: None,
+            output_mode_preferred: false,
         },
     );
     assert!(matches!(
@@ -871,6 +880,7 @@ fn zero_axis_fallback_and_invalid_configure_share_controls() {
         FixtureConfig {
             initial_configure: (0, 720),
             output_mode: Some((1280, 800)),
+            output_mode_preferred: false,
         },
     );
     let mut asymmetric_host = WaylandHost::connect_with_socket_configure_driven(&width_zero_socket)
@@ -895,6 +905,7 @@ fn zero_axis_fallback_and_invalid_configure_share_controls() {
         FixtureConfig {
             initial_configure: (720, 0),
             output_mode: Some((1024, 1280)),
+            output_mode_preferred: false,
         },
     );
     asymmetric_host
@@ -919,6 +930,7 @@ fn zero_axis_fallback_and_invalid_configure_share_controls() {
         FixtureConfig {
             initial_configure: (-1, 720),
             output_mode: Some((720, 1280)),
+            output_mode_preferred: false,
         },
     );
     assert!(matches!(
