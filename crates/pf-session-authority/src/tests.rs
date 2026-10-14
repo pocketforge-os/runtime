@@ -1006,6 +1006,19 @@ impl pf_app_launch::Exec for MustNotExec {
     }
 }
 
+#[derive(Default)]
+struct MustNotEnforce;
+
+impl pf_app_launch::PolicyEnforcer for MustNotEnforce {
+    fn enforce_policy(
+        &mut self,
+        _: &pf_app_launch::policy::PolicyDecision,
+    ) -> Result<pf_app_launch::landlock::AppliedPolicy, pf_app_launch::landlock::LandlockError>
+    {
+        panic!("mutated application must fail before policy enforcement")
+    }
+}
+
 struct MutatingHelperSystem {
     resolver: Resolver,
     executable: PathBuf,
@@ -1015,11 +1028,19 @@ impl SessionSystem for MutatingHelperSystem {
     fn start_foreground(&mut self, request: &LaunchRequest, _: &str) -> Result<(), String> {
         fs::remove_file(&self.executable).map_err(|error| error.to_string())?;
         let xdg = self.executable.parent().unwrap().join("xdg");
+        let mut enforcer = MustNotEnforce;
         let error = pf_app_launch::launch_with(
             &self.resolver,
             &request.item_id,
-            &xdg.join("config"),
-            &xdg.join("state"),
+            &pf_app_launch::LaunchPaths {
+                xdg_config: xdg.join("config"),
+                xdg_state: xdg.join("state"),
+                xdg_cache: xdg.join("cache"),
+                platform_runtime: xdg.join("runtime"),
+                resource_paths: Vec::new(),
+                resources: BTreeMap::new(),
+            },
+            &mut enforcer,
             &mut MustNotExec,
         )
         .unwrap_err();

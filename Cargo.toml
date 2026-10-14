@@ -69,11 +69,13 @@ serde = { version = "1", features = ["derive"] }
 # serde_json backs the single current-state JSON preference document (owner ruling Q2). Only the
 # NEW pf-prefs leaf crate depends on it; the dependency-light wire/facade crates are untouched.
 serde_json = "1"
+sha2 = "0.10"
 toml = "0.8"
 # libc: ONLY the pf-input-broker daemon links it — it is privileged OS code (evdev/uinput
 # ioctls, SCM_RIGHTS). The wire/facade crates stay dependency-light; this is the one place
 # raw syscalls are unavoidable, and libc gives the correct struct layouts + ioctl FFI.
 libc = "0.2"
+linux-raw-sys = { version = "0.12", features = ["landlock"] }
 taffy = { version = "0.7.7", default-features = false, features = ["std", "taffy_tree", "flexbox", "grid", "content_size"] }
 
 # A release profile that prefers determinism + small daemons (E2 ships privileged

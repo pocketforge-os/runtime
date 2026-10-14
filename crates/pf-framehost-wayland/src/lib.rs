@@ -557,13 +557,13 @@ impl Dispatch<wl_output::WlOutput, ()> for State {
         _: &QueueHandle<Self>,
     ) {
         if let wl_output::Event::Mode {
-            flags: WEnum::Value(wl_output::Mode::Current),
+            flags: WEnum::Value(flags),
             width,
             height,
             ..
         } = event
         {
-            if state.output_current_mode.is_none() {
+            if flags.contains(wl_output::Mode::Current) && state.output_current_mode.is_none() {
                 if let (Ok(width), Ok(height)) = (u32::try_from(width), u32::try_from(height)) {
                     if width > 0 && height > 0 {
                         state.output_current_mode = Some((width, height));

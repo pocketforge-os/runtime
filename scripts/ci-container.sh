@@ -14,6 +14,7 @@ test -z "${CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER:-}"
 echo '::group::Lock and offline vendor gates (including negative control)'
 bash scripts/check-vendor.sh
 bash scripts/test-check-vendor.sh
+bash scripts/test-clean-ci-cross-artifacts.sh
 cargo metadata --offline --locked --format-version 1 > /dev/null
 echo '::endgroup::'
 echo '::group::Whole workspace with real platform fixtures'
@@ -30,6 +31,9 @@ cargo build --offline --locked --target aarch64-unknown-linux-musl -p pf-frameho
 echo '::endgroup::'
 echo '::group::GNU AArch64 staticlib C SDK and ELF ABI smoke'
 bash ctest/run-aarch64.sh
+echo '::endgroup::'
+echo '::group::Release verified cross-build artifacts before host lint'
+bash scripts/clean-ci-cross-artifacts.sh
 echo '::endgroup::'
 echo '::group::Format and whole-workspace clippy (warnings are errors)'
 cargo fmt --all -- --check
