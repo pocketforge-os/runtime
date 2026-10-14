@@ -12,6 +12,50 @@ use std::path::{Component, Path, PathBuf};
 pub const POLICY_SCHEMA_VERSION: u32 = 1;
 const DNS_PORT: u16 = 53;
 
+#[derive(Clone, Copy)]
+enum DisplayResourceGrant {
+    ReadOnly,
+    Socket,
+    DeviceReadWrite,
+}
+
+#[derive(Clone, Copy)]
+struct DisplayRouteResource {
+    class: &'static str,
+    grant: DisplayResourceGrant,
+}
+
+struct DisplayRoute {
+    requirement: &'static str,
+    resources: &'static [DisplayRouteResource],
+}
+
+// A display route is complete only when every resource class in one row is present. Future
+// variants (for example an explicitly mediated X11 route) extend this table instead of adding a
+// parallel display-policy branch.
+const DISPLAY_ROUTES: &[DisplayRoute] = &[
+    DisplayRoute {
+        requirement: "display-devices",
+        resources: &[DisplayRouteResource {
+            class: "display-devices",
+            grant: DisplayResourceGrant::DeviceReadWrite,
+        }],
+    },
+    DisplayRoute {
+        requirement: "both display-sockets and session-environment",
+        resources: &[
+            DisplayRouteResource {
+                class: "display-sockets",
+                grant: DisplayResourceGrant::Socket,
+            },
+            DisplayRouteResource {
+                class: "session-environment",
+                grant: DisplayResourceGrant::ReadOnly,
+            },
+        ],
+    },
+];
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PolicyInputs {
     pub platform_runtime: PathBuf,
@@ -275,8 +319,41 @@ pub fn derive_policy(
 
     if launch.takes_display {
         groups.insert("video".to_owned());
-        socket_paths.extend(resource("display-sockets", false)?);
-        read_only_paths.extend(resource("session-environment", false)?);
+        let complete_routes = DISPLAY_ROUTES
+            .iter()
+            .filter(|route| {
+                route.resources.iter().all(|required| {
+                    inputs
+                        .resources
+                        .get(required.class)
+                        .is_some_and(|paths| !paths.is_empty())
+                })
+            })
+            .collect::<Vec<_>>();
+        if complete_routes.is_empty() {
+            let expected = DISPLAY_ROUTES
+                .iter()
+                .map(|route| route.requirement)
+                .collect::<Vec<_>>()
+                .join(" or ");
+            return Err(PolicyError(format!(
+                "required display resource is missing: expected {expected}"
+            )));
+        }
+        for route in complete_routes {
+            for required in route.resources {
+                let paths = resource(required.class, false)?;
+                match required.grant {
+                    DisplayResourceGrant::ReadOnly => read_only_paths.extend(paths),
+                    DisplayResourceGrant::Socket => socket_paths.extend(paths),
+                    DisplayResourceGrant::DeviceReadWrite => {
+                        for path in paths {
+                            devices.insert(path, "rw".to_owned());
+                        }
+                    }
+                }
+            }
+        }
         add_devices(&mut devices, "render-devices", "rw", false)?;
     }
     if launch.audio || capability_bases.contains("audio") {
