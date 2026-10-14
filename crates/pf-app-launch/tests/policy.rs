@@ -4,6 +4,7 @@ use pf_app_launch::policy::{
 };
 use pf_app_manifest::{parse_manifest, parse_platform_contract, ResolvedApp};
 use std::collections::BTreeMap;
+use std::io;
 use std::path::{Path, PathBuf};
 
 fn resolved(
@@ -67,6 +68,10 @@ fn inputs(root: &Path) -> PolicyInputs {
             vec![PathBuf::from("/run/pocketforge/session/audio-0")],
         ),
         (
+            "broker-sockets".into(),
+            vec![PathBuf::from("/run/pocketforge/input-broker.sock")],
+        ),
+        (
             "display-sockets".into(),
             vec![PathBuf::from("/run/pocketforge/session/wayland-0")],
         ),
@@ -128,28 +133,148 @@ fn browser_profile_has_scopes_and_no_fs_or_net_rules() {
 }
 
 #[test]
-fn input_and_bluetooth_capabilities_are_mediated_not_raw() {
+fn device_regression_input_selects_broker_or_raw_route() {
     let root = PathBuf::from("/fixture");
-    let policy = derive_policy(
-        &resolved(&root, &["bluetooth", "input"], false, true),
-        &inputs(&root),
-    )
-    .unwrap();
+    let app = resolved(&root, &["input"], false, true);
+    let connect = |policy: &pf_app_launch::policy::PolicyDecision, path: &Path| {
+        policy
+            .landlock
+            .filesystem
+            .iter()
+            .any(|rule| rule.path == path && rule.access == FsAccess::UnixConnect)
+            .then_some(())
+            .ok_or_else(|| io::Error::from_raw_os_error(libc::EACCES))
+    };
 
-    // C3 keeps input's current raw grant until tsp-mc9m.41.996.9 flips this one compiler.
-    assert!(policy
-        .unit
-        .supplementary_groups
-        .iter()
-        .any(|group| group == "input"));
-    assert!(policy
+    // Build 10 inventories raw evdev while PF_BROKER_SOCK points at the broker. On the old
+    // compiler this exact connect outcome was EACCES even though the raw route derived.
+    let both = derive_policy(&app, &inputs(&root)).unwrap();
+    connect(&both, Path::new("/run/pocketforge/input-broker.sock")).unwrap();
+    assert!(both.endpoints.contains(&MediatedEndpoint::InputBroker));
+    assert!(both
         .unit
         .device_allow
         .iter()
         .any(|grant| grant.path == Path::new("/dev/input/event0") && grant.mode == "r"));
-    assert!(!policy.endpoints.contains(&MediatedEndpoint::InputBroker));
+    for denied in [
+        "/run/pocketforge/prefsd.sock",
+        "/run/pocketforge/session-authority.sock",
+        "/run/pocketforge/system-menu.sock",
+    ] {
+        assert_eq!(
+            connect(&both, Path::new(denied))
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::EACCES)
+        );
+    }
+
+    let mut broker_only = inputs(&root);
+    broker_only.resources.remove("input-devices");
+    let broker = derive_policy(&app, &broker_only).unwrap();
+    assert!(broker.endpoints.contains(&MediatedEndpoint::InputBroker));
+    assert!(broker.unit.device_allow.is_empty());
+    assert!(!broker
+        .unit
+        .supplementary_groups
+        .iter()
+        .any(|group| group == "input"));
+    assert!(broker
+        .unit
+        .bind_read_write
+        .contains(&PathBuf::from("/run/pocketforge/input-broker.sock")));
+    assert!(broker.landlock.filesystem.iter().any(|rule| {
+        rule.path == Path::new("/run/pocketforge/input-broker.sock")
+            && rule.access == FsAccess::UnixConnect
+    }), "UnixConnect to /run/pocketforge/input-broker.sock under the derived ruleset would return EACCES");
+    for denied in [
+        "/run/pocketforge/prefsd.sock",
+        "/run/pocketforge/session-authority.sock",
+        "/run/pocketforge/system-menu.sock",
+    ] {
+        assert!(!broker.unit.bind_read_write.contains(&PathBuf::from(denied)));
+        assert!(!broker
+            .landlock
+            .filesystem
+            .iter()
+            .any(|rule| rule.path == Path::new(denied)));
+    }
+
+    let mut raw_only = inputs(&root);
+    raw_only.resources.remove("broker-sockets");
+    let raw = derive_policy(&app, &raw_only).unwrap();
+    assert!(!raw.endpoints.contains(&MediatedEndpoint::InputBroker));
+    assert!(raw
+        .unit
+        .supplementary_groups
+        .iter()
+        .any(|group| group == "input"));
+    assert!(raw
+        .unit
+        .device_allow
+        .iter()
+        .any(|grant| grant.path == Path::new("/dev/input/event0") && grant.mode == "r"));
+
+    let mut no_route = inputs(&root);
+    no_route.resources.remove("broker-sockets");
+    no_route.resources.remove("input-devices");
+    assert_eq!(
+        derive_policy(&app, &no_route).unwrap_err().to_string(),
+        "required input resource is missing: expected broker-sockets or input-devices"
+    );
+    derive_policy(&resolved(&root, &["input?"], false, true), &no_route).unwrap();
+}
+
+#[test]
+fn input_actuators_share_routes_and_escalate_only_raw_devices() {
+    let root = PathBuf::from("/fixture");
+    let app = resolved(&root, &["input", "rumble", "vibration"], false, true);
+
+    let mut broker_only = inputs(&root);
+    broker_only.resources.remove("input-devices");
+    let broker = derive_policy(&app, &broker_only).unwrap();
+    assert!(broker.endpoints.contains(&MediatedEndpoint::InputBroker));
+    assert!(broker.unit.device_allow.is_empty());
+
+    let mut raw_only = inputs(&root);
+    raw_only.resources.remove("broker-sockets");
+    let raw = derive_policy(&app, &raw_only).unwrap();
+    assert!(raw
+        .unit
+        .device_allow
+        .iter()
+        .any(|grant| grant.path == Path::new("/dev/input/event0") && grant.mode == "rw"));
+
+    let mut no_route = inputs(&root);
+    no_route.resources.remove("broker-sockets");
+    no_route.resources.remove("input-devices");
+    derive_policy(
+        &resolved(&root, &["rumble?", "vibration?"], false, true),
+        &no_route,
+    )
+    .unwrap();
+    assert_eq!(
+        derive_policy(
+            &resolved(&root, &["input?", "rumble"], false, true),
+            &no_route,
+        )
+        .unwrap_err()
+        .to_string(),
+        "required input resource is missing: expected broker-sockets or input-devices"
+    );
+}
+
+#[test]
+fn bluetooth_policy_remains_separate_from_input_routes() {
+    let root = PathBuf::from("/fixture");
+    let policy = derive_policy(
+        &resolved(&root, &["bluetooth"], false, true),
+        &inputs(&root),
+    )
+    .unwrap();
 
     assert!(policy.endpoints.contains(&MediatedEndpoint::BluetoothPort));
+    assert!(!policy.endpoints.contains(&MediatedEndpoint::InputBroker));
     assert!(!policy
         .unit
         .restrict_address_families

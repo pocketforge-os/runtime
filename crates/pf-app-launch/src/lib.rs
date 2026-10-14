@@ -98,6 +98,21 @@ pub struct LaunchPaths {
     pub resources: std::collections::BTreeMap<String, Vec<PathBuf>>,
 }
 
+fn platform_resource_paths() -> Vec<PathBuf> {
+    [
+        "/usr",
+        "/lib",
+        "/lib64",
+        "/bin",
+        "/sbin",
+        "/etc",
+        "/opt/pocketforge/lib",
+    ]
+    .into_iter()
+    .map(PathBuf::from)
+    .collect()
+}
+
 /// Resolve, compile and enforce policy, then execute an installed application.
 pub fn launch_with<E: Exec, P: PolicyEnforcer>(
     resolver: &Resolver,
@@ -166,10 +181,7 @@ pub fn required_launch_paths(app_id: &str) -> Result<LaunchPaths, LaunchError> {
             PathBuf::from("/var/cache/pocketforge/apps").join(app_id),
         )?,
         platform_runtime: inventory.platform_runtime,
-        resource_paths: ["/usr", "/lib", "/lib64", "/bin", "/sbin", "/etc"]
-            .into_iter()
-            .map(PathBuf::from)
-            .collect(),
+        resource_paths: platform_resource_paths(),
         resources: inventory.resources,
     })
 }
@@ -210,6 +222,27 @@ mod tests {
                 enforced: true,
                 ruleset: None,
             })
+        }
+    }
+
+    #[test]
+    fn device_regression_platform_library_is_in_read_execute_set() {
+        let paths = platform_resource_paths();
+        let read = |path: &Path| {
+            paths
+                .iter()
+                .any(|root| path.starts_with(root))
+                .then_some(())
+                .ok_or_else(|| io::Error::from_raw_os_error(libc::EACCES))
+        };
+
+        read(Path::new("/opt/pocketforge/lib/libSDL3-pocketforge.so.0")).unwrap();
+        read(Path::new("/usr/lib/libc.so.6")).unwrap();
+        for denied in ["/opt/foreign.so", "/opt/pocketforge/private/secret"] {
+            assert_eq!(
+                read(Path::new(denied)).unwrap_err().raw_os_error(),
+                Some(libc::EACCES)
+            );
         }
     }
 

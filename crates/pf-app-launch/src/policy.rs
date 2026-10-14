@@ -56,6 +56,34 @@ const DISPLAY_ROUTES: &[DisplayRoute] = &[
     },
 ];
 
+#[derive(Clone, Copy)]
+enum InputRouteGrant {
+    BrokerSocket,
+    RawDevice,
+}
+
+struct InputRoute {
+    requirement: &'static str,
+    class: &'static str,
+    grant: InputRouteGrant,
+}
+
+// The broker and raw-device routes are inventory-selected. The shipped input broker uses the
+// same PFW1 socket for input acquisition, rumble and sensor operations, so its existing
+// broker-sockets class is deliberately shared instead of aliasing one path under two class names.
+const INPUT_ROUTES: &[InputRoute] = &[
+    InputRoute {
+        requirement: "broker-sockets",
+        class: "broker-sockets",
+        grant: InputRouteGrant::BrokerSocket,
+    },
+    InputRoute {
+        requirement: "input-devices",
+        class: "input-devices",
+        grant: InputRouteGrant::RawDevice,
+    },
+];
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PolicyInputs {
     pub platform_runtime: PathBuf,
@@ -292,6 +320,7 @@ pub fn derive_policy(
     let mut socket_paths = BTreeSet::new();
     let mut devices: BTreeMap<PathBuf, String> = BTreeMap::new();
     let mut groups = BTreeSet::new();
+    let mut uses_input_broker = false;
     let resource = |name: &str, optional: bool| -> Result<Vec<PathBuf>, PolicyError> {
         match inputs.resources.get(name) {
             Some(paths) if !paths.is_empty() => Ok(paths.clone()),
@@ -372,22 +401,53 @@ pub fn derive_policy(
             devices.insert(path, "rw".to_owned());
         }
     }
-    if capability_bases.contains("input") {
-        groups.insert("input".to_owned());
-        add_devices(
-            &mut devices,
-            "input-devices",
-            "r",
-            capability_optional.get("input") == Some(&true),
-        )?;
-    }
-    if capability_bases.contains("rumble") || capability_bases.contains("vibration") {
-        groups.insert("input".to_owned());
-        let optional = ["rumble", "vibration"]
-            .into_iter()
-            .filter(|name| capability_bases.contains(*name))
-            .all(|name| capability_optional.get(name) == Some(&true));
-        add_devices(&mut devices, "input-devices", "rw", optional)?;
+    let requested_input = ["input", "rumble", "vibration"]
+        .into_iter()
+        .filter(|name| capability_bases.contains(*name))
+        .collect::<Vec<_>>();
+    if !requested_input.is_empty() {
+        let optional = requested_input
+            .iter()
+            .all(|name| capability_optional.get(*name) == Some(&true));
+        let complete_routes = INPUT_ROUTES
+            .iter()
+            .filter(|route| {
+                inputs
+                    .resources
+                    .get(route.class)
+                    .is_some_and(|paths| !paths.is_empty())
+            })
+            .collect::<Vec<_>>();
+        if complete_routes.is_empty() && !optional {
+            let expected = INPUT_ROUTES
+                .iter()
+                .map(|route| route.requirement)
+                .collect::<Vec<_>>()
+                .join(" or ");
+            return Err(PolicyError(format!(
+                "required input resource is missing: expected {expected}"
+            )));
+        }
+        let raw_mode = if requested_input
+            .iter()
+            .any(|name| matches!(*name, "rumble" | "vibration"))
+        {
+            "rw"
+        } else {
+            "r"
+        };
+        for route in complete_routes {
+            match route.grant {
+                InputRouteGrant::BrokerSocket => {
+                    socket_paths.extend(resource(route.class, false)?);
+                    uses_input_broker = true;
+                }
+                InputRouteGrant::RawDevice => {
+                    groups.insert("input".to_owned());
+                    add_devices(&mut devices, route.class, raw_mode, false)?;
+                }
+            }
+        }
     }
     if capability_bases.contains("video-decode") {
         let optional = capability_optional.get("video-decode") == Some(&true);
@@ -495,8 +555,6 @@ pub fn derive_policy(
         }
     }
 
-    // C3: input groups/devices intentionally preserve today's raw grant. The input mediation
-    // bead changes the mapping above in this compiler, without adding a second policy list.
     let supplementary_groups = groups.into_iter().collect();
     let device_allow = devices
         .into_iter()
@@ -504,6 +562,9 @@ pub fn derive_policy(
         .collect();
 
     let mut endpoints = Vec::new();
+    if uses_input_broker {
+        endpoints.push(MediatedEndpoint::InputBroker);
+    }
     if capability_bases.contains("bluetooth") {
         endpoints.push(MediatedEndpoint::BluetoothPort);
     }
