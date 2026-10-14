@@ -2,13 +2,12 @@
 
 use std::fmt;
 use std::fs;
-use std::io;
+use std::io::{self, Read};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
-use std::sync::mpsc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub const REFUSAL_REASON: &str = "unsafe_uinput_domain";
 pub const ALLOW_REASON: &str = "safe_uinput_domain";
@@ -170,28 +169,36 @@ pub fn evaluate(probe: &Probe) -> Verdict {
 }
 
 fn run_command(program: &Path, args: &[&str], timeout: Duration) -> io::Result<Output> {
-    let child = Command::new(program)
+    let mut child = Command::new(program)
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()?;
-    let pid = child.id();
-    let (sender, receiver) = mpsc::sync_channel(1);
-    thread::spawn(move || {
-        let _ = sender.send(child.wait_with_output());
+    let mut stdout = child.stdout.take().expect("piped stdout");
+    let reader = thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stdout.read_to_end(&mut bytes).map(|_| bytes)
     });
-    match receiver.recv_timeout(timeout) {
-        Ok(result) => result,
-        Err(mpsc::RecvTimeoutError::Timeout) => {
-            // SAFETY: pid came from the still-live child and SIGKILL has no borrowed memory contract.
-            unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
-            let _ = receiver.recv();
-            Err(io::Error::new(io::ErrorKind::TimedOut, "probe timed out"))
+    let started = Instant::now();
+    loop {
+        if let Some(status) = child.try_wait()? {
+            let stdout = reader
+                .join()
+                .map_err(|_| io::Error::other("probe output reader panicked"))??;
+            return Ok(Output {
+                status,
+                stdout,
+                stderr: Vec::new(),
+            });
         }
-        Err(mpsc::RecvTimeoutError::Disconnected) => {
-            Err(io::Error::other("probe waiter disconnected"))
+        if started.elapsed() >= timeout {
+            child.kill()?;
+            child.wait()?;
+            let _ = reader.join();
+            return Err(io::Error::new(io::ErrorKind::TimedOut, "probe timed out"));
         }
+        thread::sleep(Duration::from_millis(10));
     }
 }
 
