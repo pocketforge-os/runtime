@@ -4,6 +4,7 @@ use pf_framehost_wayland::{
 use pf_ports::{FrameHost, PresentFailure};
 use pf_render::Rasterizer;
 use pf_scene::{Bounds, Node, NodeId, Role, Scene, SurfaceMetrics};
+use std::collections::VecDeque;
 use std::fs::File;
 use std::os::fd::AsFd;
 use std::os::unix::fs::FileExt;
@@ -69,6 +70,7 @@ struct BufferData {
 
 struct CompositorState {
     observations: Arc<Mutex<Observations>>,
+    configure_requests: Arc<Mutex<VecDeque<(i32, i32)>>>,
     config: FixtureConfig,
     xdg_surface: Option<xdg_surface::XdgSurface>,
     toplevel: Option<xdg_toplevel::XdgToplevel>,
@@ -77,11 +79,16 @@ struct CompositorState {
     transform: Option<wl_output::Transform>,
     damage: Option<DamageObservation>,
     configured: bool,
+    next_configure_serial: u32,
     keymap: String,
 }
 
 impl CompositorState {
-    fn new(observations: Arc<Mutex<Observations>>, config: FixtureConfig) -> Self {
+    fn new(
+        observations: Arc<Mutex<Observations>>,
+        configure_requests: Arc<Mutex<VecDeque<(i32, i32)>>>,
+        config: FixtureConfig,
+    ) -> Self {
         let context = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
         let keymap = xkb::Keymap::new_from_names(
             &context,
@@ -96,6 +103,7 @@ impl CompositorState {
         .get_as_string(xkb::KEYMAP_FORMAT_TEXT_V1);
         Self {
             observations,
+            configure_requests,
             config,
             xdg_surface: None,
             toplevel: None,
@@ -104,6 +112,7 @@ impl CompositorState {
             transform: None,
             damage: None,
             configured: false,
+            next_configure_serial: 2,
             keymap,
         }
     }
@@ -122,6 +131,22 @@ impl CompositorState {
         );
         xdg_surface.configure(1);
         self.configured = true;
+    }
+
+    fn send_requested_configure(&mut self) {
+        let requested = self
+            .configure_requests
+            .lock()
+            .expect("configure requests lock")
+            .pop_front();
+        let (Some((width, height)), Some(toplevel), Some(xdg_surface)) =
+            (requested, &self.toplevel, &self.xdg_surface)
+        else {
+            return;
+        };
+        toplevel.configure(width, height, Vec::new());
+        xdg_surface.configure(self.next_configure_serial);
+        self.next_configure_serial += 1;
     }
 
     fn record_frame(&mut self) {
@@ -503,6 +528,7 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for CompositorState {
 struct TestCompositor {
     socket_path: PathBuf,
     observations: Arc<Mutex<Observations>>,
+    configure_requests: Arc<Mutex<VecDeque<(i32, i32)>>>,
     running: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
 }
@@ -519,6 +545,8 @@ impl TestCompositor {
             .expect("set fixture listener nonblocking");
         let observations = Arc::new(Mutex::new(Observations::default()));
         let thread_observations = observations.clone();
+        let configure_requests = Arc::new(Mutex::new(VecDeque::new()));
+        let thread_configure_requests = configure_requests.clone();
         let running = Arc::new(AtomicBool::new(true));
         let thread_running = running.clone();
         let thread = thread::spawn(move || {
@@ -531,7 +559,8 @@ impl TestCompositor {
             if config.output_mode.is_some() {
                 handle.create_global::<CompositorState, wl_output::WlOutput, _>(4, ());
             }
-            let mut state = CompositorState::new(thread_observations, config);
+            let mut state =
+                CompositorState::new(thread_observations, thread_configure_requests, config);
 
             while thread_running.load(Ordering::Acquire) {
                 match listener.accept() {
@@ -547,6 +576,7 @@ impl TestCompositor {
                 display
                     .dispatch_clients(&mut state)
                     .expect("dispatch fixture clients");
+                state.send_requested_configure();
                 display.flush_clients().expect("flush fixture clients");
                 thread::sleep(Duration::from_millis(1));
             }
@@ -554,6 +584,7 @@ impl TestCompositor {
         Self {
             socket_path,
             observations,
+            configure_requests,
             running,
             thread: Some(thread),
         }
@@ -585,6 +616,13 @@ impl TestCompositor {
             assert!(Instant::now() < deadline, "fixture output binding timeout");
             thread::sleep(Duration::from_millis(2));
         }
+    }
+
+    fn send_configure(&self, width: i32, height: i32) {
+        self.configure_requests
+            .lock()
+            .expect("configure requests lock")
+            .push_back((width, height));
     }
 
     fn stop(mut self) {
@@ -701,6 +739,19 @@ fn wait_for_transport_error(host: &mut WaylandHost) -> WaylandHostError {
     }
 }
 
+fn wait_for_metrics(host: &mut WaylandHost, expected: (f32, f32)) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        host.poll().expect("poll requested configure");
+        let metrics = host.metrics();
+        if (metrics.logical_width, metrics.logical_height) == expected {
+            return;
+        }
+        assert!(Instant::now() < deadline, "configure metrics timeout");
+        thread::sleep(Duration::from_millis(2));
+    }
+}
+
 #[test]
 fn configure_driven_connect_output_binding_and_reconnect_share_controls() {
     let runtime = TempDir::new().expect("fixture runtime directory");
@@ -773,7 +824,7 @@ fn configure_driven_connect_output_binding_and_reconnect_share_controls() {
 }
 
 #[test]
-fn zero_configure_fallback_and_invalid_configure_share_controls() {
+fn zero_axis_fallback_and_invalid_configure_share_controls() {
     let runtime = TempDir::new().expect("fixture runtime directory");
 
     // Positive control: protocol-defined 0x0 uses the bound wl_output current mode.
@@ -813,19 +864,67 @@ fn zero_configure_fallback_and_invalid_configure_share_controls() {
         })
     ));
 
-    // Negative control: a partly-zero configure is invalid, never an output fallback.
-    let invalid_socket = runtime.path().join("wayland-invalid-configure");
+    // Positive controls: either independently unspecified initial axis comes from output.
+    let width_zero_socket = runtime.path().join("wayland-width-zero");
+    let width_zero = TestCompositor::start_configured(
+        width_zero_socket.clone(),
+        FixtureConfig {
+            initial_configure: (0, 720),
+            output_mode: Some((1280, 800)),
+        },
+    );
+    let mut asymmetric_host = WaylandHost::connect_with_socket_configure_driven(&width_zero_socket)
+        .expect("zero initial width comes from output");
+    assert_eq!(
+        (
+            asymmetric_host.metrics().logical_width,
+            asymmetric_host.metrics().logical_height,
+        ),
+        (1280.0, 720.0)
+    );
+
+    // Later zero axes retain the current client-chosen value, not the output's other axis.
+    width_zero.send_configure(640, 0);
+    wait_for_metrics(&mut asymmetric_host, (640.0, 720.0));
+    width_zero.send_configure(0, 480);
+    wait_for_metrics(&mut asymmetric_host, (640.0, 480.0));
+
+    let height_zero_socket = runtime.path().join("wayland-height-zero");
+    let height_zero = TestCompositor::start_configured(
+        height_zero_socket.clone(),
+        FixtureConfig {
+            initial_configure: (720, 0),
+            output_mode: Some((1024, 1280)),
+        },
+    );
+    asymmetric_host
+        .reconnect_with_socket(&height_zero_socket)
+        .expect("zero initial height comes from output after reconnect");
+    assert_eq!(
+        (
+            asymmetric_host.metrics().logical_width,
+            asymmetric_host.metrics().logical_height,
+        ),
+        (720.0, 1280.0)
+    );
+    height_zero.send_configure(0, 800);
+    wait_for_metrics(&mut asymmetric_host, (720.0, 800.0));
+    height_zero.send_configure(600, 0);
+    wait_for_metrics(&mut asymmetric_host, (600.0, 800.0));
+
+    // Negative control: a negative protocol dimension still fails closed.
+    let invalid_socket = runtime.path().join("wayland-negative-configure");
     let _invalid = TestCompositor::start_configured(
         invalid_socket.clone(),
         FixtureConfig {
-            initial_configure: (0, 720),
+            initial_configure: (-1, 720),
             output_mode: Some((720, 1280)),
         },
     );
     assert!(matches!(
         WaylandHost::connect_with_socket_configure_driven(&invalid_socket),
         Err(WaylandHostError::InvalidConfigure {
-            width: 0,
+            width: -1,
             height: 720
         })
     ));
