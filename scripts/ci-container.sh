@@ -12,6 +12,7 @@ test -z "${RUSTFLAGS:-}" # musl linker comes from the workspace configuration
 test -z "${CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER:-}"
 
 echo '::group::Lock and offline vendor gates (including negative control)'
+bash scripts/test-uinput-domain.sh
 bash scripts/check-vendor.sh
 bash scripts/test-check-vendor.sh
 bash scripts/test-clean-ci-cross-artifacts.sh

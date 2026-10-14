@@ -1,0 +1,15 @@
+[package]
+name = "pf-uinput-domain"
+description = "Fail-closed execution-domain guard for kernel input-device creators"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+libc = { workspace = true }
+
+[dev-dependencies]
+sha2 = { workspace = true }

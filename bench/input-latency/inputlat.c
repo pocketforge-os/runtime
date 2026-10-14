@@ -41,6 +41,7 @@
 #include <sys/wait.h>
 #include <linux/input.h>
 #include <linux/uinput.h>
+#include "../../guard/pf_uinput_domain_guard.h"
 
 static const int KEYS[] = { BTN_SOUTH, BTN_EAST, BTN_WEST, BTN_NORTH };
 
@@ -81,8 +82,15 @@ static void stats(const char *name, uint64_t *lat, size_t n, int last) {
 // Create a uinput EV_KEY device carrying KEYS; return the uinput write-fd, fill evnode with the
 // /dev/input/eventN the kernel materializes for it.
 static int make_uinput(const char *name, char *evnode, size_t evnode_sz) {
-    int fd = open("/dev/uinput", O_RDWR);
-    if (fd < 0) { perror("open /dev/uinput"); return -1; }
+    struct pf_uinput_verdict verdict;
+    int fd = pf_uinput_guarded_open("/dev/uinput", O_RDWR, pf_uinput_real_open, NULL, &verdict);
+    if (fd < 0) {
+        if (errno == EPERM) fprintf(stderr, "reason=%s domain=%s%s%s\n", verdict.reason,
+            pf_uinput_domain_name(verdict.domain), verdict.probe ? " probe=" : "",
+            verdict.probe ? verdict.probe : "");
+        else perror("open /dev/uinput");
+        return -1;
+    }
     if (ioctl(fd, UI_SET_EVBIT, EV_KEY) < 0) { perror("UI_SET_EVBIT EV_KEY"); return -1; }
     if (ioctl(fd, UI_SET_EVBIT, EV_SYN) < 0) { perror("UI_SET_EVBIT EV_SYN"); return -1; }
     for (size_t i = 0; i < sizeof KEYS / sizeof KEYS[0]; i++)

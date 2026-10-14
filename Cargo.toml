@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/pf-uinput-domain",
     "crates/pf-wire",
     "crates/pocketforge",
     "crates/libpocketforge",
@@ -46,6 +47,7 @@ authors = ["PocketForge <noreply@pocketforge.os>"]
 
 [workspace.dependencies]
 pf-wire = { path = "crates/pf-wire", version = "0.0.1" }
+pf-uinput-domain = { path = "crates/pf-uinput-domain", version = "0.0.1" }
 pocketforge = { path = "crates/pocketforge", version = "0.0.1" }
 # E4 preference data layer (tsp-xubv.1) — a NEW leaf crate + its CLI.
 pf-prefs = { path = "crates/pf-prefs", version = "0.0.1" }

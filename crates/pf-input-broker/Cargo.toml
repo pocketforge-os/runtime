@@ -21,6 +21,7 @@ name = "pf-input-read"
 path = "src/bin/pf-input-read.rs"
 
 [dependencies]
+pf-uinput-domain = { workspace = true }
 pocketforge = { workspace = true }
 pf-wire = { workspace = true }
 libc = { workspace = true }
