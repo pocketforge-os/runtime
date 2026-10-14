@@ -1,6 +1,6 @@
 use pf_app_launch::policy::{
-    derive_policy, render_systemd_dropin, AppClass, MediatedEndpoint, NetAccess, PolicyInputs,
-    PolicyResourceInventory,
+    derive_policy, render_systemd_dropin, AppClass, FsAccess, MediatedEndpoint, NetAccess,
+    PolicyInputs, PolicyResourceInventory,
 };
 use pf_app_manifest::{parse_manifest, parse_platform_contract, ResolvedApp};
 use std::collections::BTreeMap;
@@ -67,12 +67,20 @@ fn inputs(root: &Path) -> PolicyInputs {
             vec![PathBuf::from("/run/pocketforge/session/audio-0")],
         ),
         (
+            "display-sockets".into(),
+            vec![PathBuf::from("/run/pocketforge/session/wayland-0")],
+        ),
+        (
             "input-devices".into(),
             vec![PathBuf::from("/dev/input/event0")],
         ),
         (
             "video-decode-devices".into(),
             vec![PathBuf::from("/dev/video0")],
+        ),
+        (
+            "render-devices".into(),
+            vec![PathBuf::from("/dev/dri/renderD128")],
         ),
         ("media-devices".into(), vec![PathBuf::from("/dev/media0")]),
         (
@@ -228,6 +236,147 @@ fn required_audio_accepts_any_available_route_and_rejects_none() {
     // Optional audio preserves its absence-tolerant behavior.
     let optional = resolved(&root, &["audio?"], false, true);
     derive_policy(&optional, &no_route).unwrap();
+}
+
+#[test]
+fn required_display_accepts_complete_direct_or_session_routes_and_rejects_neither() {
+    let root = PathBuf::from("/fixture");
+    let mut app = resolved(&root, &["audio"], false, true);
+    let launch = app.manifest.launch.as_mut().unwrap();
+    launch.takes_display = true;
+    launch.audio = true;
+
+    // Poolsuite on a133-open uses direct framebuffer display and direct ALSA.
+    let mut direct_only = inputs(&root);
+    direct_only.resources.remove("audio-sockets");
+    direct_only.resources.remove("display-sockets");
+    direct_only.resources.remove("session-environment");
+    direct_only
+        .resources
+        .insert("display-devices".into(), vec![PathBuf::from("/dev/fb0")]);
+    let direct = derive_policy(&app, &direct_only).unwrap();
+    assert!(direct
+        .unit
+        .device_allow
+        .iter()
+        .any(|grant| grant.path == Path::new("/dev/fb0") && grant.mode == "rw"));
+    assert!(direct.landlock.filesystem.iter().any(|rule| {
+        rule.path == Path::new("/dev/fb0") && rule.access == FsAccess::DeviceReadWrite
+    }));
+    assert!(direct
+        .unit
+        .bind_read_write
+        .contains(&PathBuf::from("/dev/fb0")));
+    assert!(!direct
+        .unit
+        .bind_read_write
+        .contains(&PathBuf::from("/run/pocketforge/session/wayland-0")));
+    assert!(!direct
+        .unit
+        .bind_read_only
+        .contains(&PathBuf::from("/run/pocketforge/session/environment")));
+    let rendered_direct = render_systemd_dropin(&direct);
+    assert!(rendered_direct.contains("BindPaths=/dev/fb0"));
+    assert!(rendered_direct.contains("DeviceAllow=/dev/fb0 rw"));
+
+    // A compositor session is independently a complete display route.
+    let session_only = inputs(&root);
+    let session = derive_policy(&app, &session_only).unwrap();
+    assert!(session
+        .unit
+        .bind_read_write
+        .contains(&PathBuf::from("/run/pocketforge/session/wayland-0")));
+    assert!(session
+        .unit
+        .bind_read_only
+        .contains(&PathBuf::from("/run/pocketforge/session/environment")));
+    assert!(!session
+        .unit
+        .device_allow
+        .iter()
+        .any(|grant| grant.path == Path::new("/dev/fb0")));
+
+    // If the image intentionally offers both complete routes, preserve both.
+    let mut both_routes = inputs(&root);
+    both_routes
+        .resources
+        .insert("display-devices".into(), vec![PathBuf::from("/dev/fb0")]);
+    let both = derive_policy(&app, &both_routes).unwrap();
+    assert!(both
+        .unit
+        .device_allow
+        .iter()
+        .any(|grant| grant.path == Path::new("/dev/fb0") && grant.mode == "rw"));
+    assert!(both
+        .unit
+        .bind_read_write
+        .contains(&PathBuf::from("/run/pocketforge/session/wayland-0")));
+    assert!(both
+        .unit
+        .bind_read_only
+        .contains(&PathBuf::from("/run/pocketforge/session/environment")));
+
+    let expected = "required display resource is missing: expected display-devices or both \
+                    display-sockets and session-environment";
+    let mut no_route = inputs(&root);
+    no_route.resources.remove("display-sockets");
+    no_route.resources.remove("session-environment");
+    assert_eq!(
+        derive_policy(&app, &no_route).unwrap_err().to_string(),
+        expected
+    );
+
+    let mut socket_only = inputs(&root);
+    socket_only.resources.remove("session-environment");
+    assert_eq!(
+        derive_policy(&app, &socket_only).unwrap_err().to_string(),
+        expected
+    );
+
+    let mut environment_only = inputs(&root);
+    environment_only.resources.remove("display-sockets");
+    assert_eq!(
+        derive_policy(&app, &environment_only)
+            .unwrap_err()
+            .to_string(),
+        expected
+    );
+
+    // A complete direct route remains valid when an incomplete session route is inventoried,
+    // but the incomplete route is not granted. This covers the remaining two combinations of
+    // the three route-resource axes.
+    for missing_session_class in ["display-sockets", "session-environment"] {
+        let mut direct_with_partial_session = inputs(&root);
+        direct_with_partial_session
+            .resources
+            .remove(missing_session_class);
+        direct_with_partial_session
+            .resources
+            .insert("display-devices".into(), vec![PathBuf::from("/dev/fb0")]);
+        let policy = derive_policy(&app, &direct_with_partial_session).unwrap();
+        assert!(policy
+            .unit
+            .device_allow
+            .iter()
+            .any(|grant| grant.path == Path::new("/dev/fb0") && grant.mode == "rw"));
+        assert!(!policy
+            .unit
+            .bind_read_write
+            .contains(&PathBuf::from("/run/pocketforge/session/wayland-0")));
+        assert!(!policy
+            .unit
+            .bind_read_only
+            .contains(&PathBuf::from("/run/pocketforge/session/environment")));
+    }
+
+    let mut missing_render = direct_only;
+    missing_render.resources.remove("render-devices");
+    assert_eq!(
+        derive_policy(&app, &missing_render)
+            .unwrap_err()
+            .to_string(),
+        "required resource render-devices is missing"
+    );
 }
 
 #[test]
