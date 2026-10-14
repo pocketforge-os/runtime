@@ -31,7 +31,8 @@ fn resolved(
     let supported = capabilities
         .iter()
         .filter_map(|token| {
-            let base = token.split_once(':').map_or(*token, |(base, _)| base);
+            let token = token.strip_suffix('?').unwrap_or(token);
+            let base = token.split_once(':').map_or(token, |(base, _)| base);
             (base != "egress").then_some(format!("{base:?}"))
         })
         .collect::<Vec<_>>()
@@ -174,6 +175,59 @@ fn headless_video_decode_gets_the_device_owning_group() {
         .device_allow
         .iter()
         .any(|grant| grant.path == Path::new("/dev/media0") && grant.mode == "rw"));
+}
+
+#[test]
+fn required_audio_accepts_any_available_route_and_rejects_none() {
+    let root = PathBuf::from("/fixture");
+    let mut app = resolved(&root, &["audio"], false, true);
+    let launch = app.manifest.launch.as_mut().unwrap();
+    launch.audio = true;
+    assert!(!launch.takes_display);
+
+    // Poolsuite's direct-ALSA profile has only device resources. It must not
+    // acquire a display-session environment or an unproduced audio socket.
+    let mut devices_only = inputs(&root);
+    devices_only.resources.remove("audio-sockets");
+    devices_only.resources.remove("session-environment");
+    let direct = derive_policy(&app, &devices_only).unwrap();
+    assert!(direct.unit.bind_read_only.is_empty());
+    assert!(!direct
+        .unit
+        .bind_read_write
+        .contains(&PathBuf::from("/run/pocketforge/session/audio-0")));
+    assert!(direct
+        .unit
+        .device_allow
+        .iter()
+        .any(|grant| grant.path == Path::new("/dev/snd/controlC0") && grant.mode == "rw"));
+
+    // A future audio relay may satisfy the same required capability without
+    // exposing ALSA devices directly.
+    let mut socket_only = inputs(&root);
+    socket_only.resources.remove("audio-devices");
+    socket_only.resources.remove("session-environment");
+    let relayed = derive_policy(&app, &socket_only).unwrap();
+    assert!(relayed.unit.device_allow.is_empty());
+    assert!(relayed
+        .unit
+        .bind_read_write
+        .contains(&PathBuf::from("/run/pocketforge/session/audio-0")));
+
+    // Required audio still fails closed when the image offers no audio route.
+    let mut no_route = inputs(&root);
+    no_route.resources.remove("audio-devices");
+    no_route.resources.remove("audio-sockets");
+    no_route.resources.remove("session-environment");
+    let error = derive_policy(&app, &no_route).unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "required audio resource is missing: expected audio-devices or audio-sockets"
+    );
+
+    // Optional audio preserves its absence-tolerant behavior.
+    let optional = resolved(&root, &["audio?"], false, true);
+    derive_policy(&optional, &no_route).unwrap();
 }
 
 #[test]
