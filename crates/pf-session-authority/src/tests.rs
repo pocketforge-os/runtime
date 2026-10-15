@@ -1725,6 +1725,94 @@ fn late_presentation_ack_after_timeout_reaches_idle_with_receipt_in_history() {
     ));
 }
 
+fn gamescope_home(unit: &str, active: bool, presenting: bool) -> GamescopeSessionLifecycle {
+    GamescopeSessionLifecycle::HomeClient {
+        unit: unit.to_owned(),
+        active,
+        presenting,
+        ack_signal: "/run/pocketforge/session/focused-home-unit".to_owned(),
+    }
+}
+
+fn gamescope_home_timed_out(
+    active_before_timeout: bool,
+) -> (Authority<MemoryStore, FakeSystem, TestClock>, String) {
+    let (mut authority, _log) = logged_authority(None);
+    let session_id = launch_running(&mut authority);
+    authority.system.lifecycle = crashed_unit_restored_owner();
+    authority.system.gamescope = Some(gamescope_home(
+        "pf-shell-gamescope.service",
+        active_before_timeout,
+        false,
+    ));
+    authority.tick().unwrap();
+    let expected_rung = if active_before_timeout {
+        RestorationRung::PresentationAcknowledged
+    } else {
+        RestorationRung::OwnerActive
+    };
+    assert!(matches!(
+        authority.state.phase,
+        Phase::Restoring { rung, .. } if rung == expected_rung
+    ));
+    authority.clock.advance(DEFAULT_PRESENTATION_TIMEOUT);
+    authority.tick().unwrap();
+    assert!(matches!(
+        authority.state.phase,
+        Phase::RecoveryRequired { ref reason, .. }
+            if reason.starts_with("presentation_not_acknowledged:")
+    ));
+    (authority, session_id)
+}
+
+#[test]
+fn late_gamescope_home_ack_after_timeout_completes_from_both_rungs() {
+    for active_before_timeout in [false, true] {
+        let (mut authority, session_id) = gamescope_home_timed_out(active_before_timeout);
+        authority.system.gamescope = Some(gamescope_home("pf-shell-gamescope.service", true, true));
+
+        authority.tick().unwrap();
+
+        assert!(matches!(authority.state.phase, Phase::Idle));
+        assert_eq!(
+            authority.state.history[0].receipt,
+            Some(Receipt::Crash {
+                summary: "systemd result: exit-code".into()
+            })
+        );
+        assert_eq!(authority.state.history[0].session_id, session_id);
+        assert_eq!(
+            authority.state.history[0].post_app_owner,
+            Some(PostAppOwnerEvidence {
+                owner_tier: OwnerTier::Gamescope,
+                post_app_owner: PostAppOwner::HomeClient,
+                home_unit: Some("pf-shell-gamescope.service".to_owned()),
+                ack_signal: Some("/run/pocketforge/session/focused-home-unit".to_owned()),
+                ack_latency_ms: Some(DEFAULT_PRESENTATION_TIMEOUT.as_millis() as u64),
+            })
+        );
+    }
+}
+
+#[test]
+fn late_gamescope_home_ack_requires_the_same_active_session_home() {
+    let (mut authority, _) = gamescope_home_timed_out(true);
+    authority.system.gamescope = Some(gamescope_home("wrong-home.service", true, true));
+    authority.tick().unwrap();
+    assert!(matches!(
+        authority.state.phase,
+        Phase::RecoveryRequired { .. }
+    ));
+
+    authority.system.gamescope = None;
+    authority.tick().unwrap();
+    assert!(matches!(
+        authority.state.phase,
+        Phase::RecoveryRequired { .. }
+    ));
+    assert_eq!(authority.state.history[0].receipt, None);
+}
+
 #[test]
 fn every_other_recovery_reason_stays_terminal_for_a_late_ack() {
     for rung in [
@@ -1742,6 +1830,13 @@ fn every_other_recovery_reason_stays_terminal_for_a_late_ack() {
         .unwrap();
         assert_eq!(
             a.observe(Observation::PresentationAcknowledged),
+            Err(AuthorityError::InvalidObservation)
+        );
+        assert_eq!(
+            a.observe(Observation::GamescopeHomePresented {
+                unit: "pf-shell-gamescope.service".to_owned(),
+                ack_signal: "/run/pocketforge/session/focused-home-unit".to_owned(),
+            }),
             Err(AuthorityError::InvalidObservation)
         );
         assert!(matches!(a.state.phase, Phase::RecoveryRequired { .. }));
