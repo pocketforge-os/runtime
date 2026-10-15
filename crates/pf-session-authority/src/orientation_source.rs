@@ -13,7 +13,7 @@ use crate::orientation::{
     AUTO_ROTATE_KEY, USER_ROTATION_KEY,
 };
 use serde::Deserialize;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::CString;
 use std::fs;
 use std::io;
@@ -127,6 +127,7 @@ pub struct LinuxOrientationSource {
     descriptor: Descriptor,
     hall: Option<HallDebouncer>,
     panel_source: Option<PanelOrientationSource>,
+    reported_switch_failures: BTreeSet<String>,
     started: Instant,
 }
 
@@ -147,8 +148,18 @@ impl LinuxOrientationSource {
             descriptor,
             hall: None,
             panel_source: None,
+            reported_switch_failures: BTreeSet::new(),
             started: Instant::now(),
         })
+    }
+
+    fn record_switch_failures(&mut self, failures: impl IntoIterator<Item = SwitchFailure>) {
+        for failure in failures {
+            let record = format!("source={} reason={}", failure.source, failure.reason);
+            if self.reported_switch_failures.insert(record.clone()) {
+                eprintln!("pf-session-authorityd: evdev_switch_source_skipped {record}");
+            }
+        }
     }
 
     fn expected_panel(&self) -> Option<QuarterTurn> {
@@ -286,11 +297,40 @@ impl LinuxOrientationSource {
                 .map_err(|error| format!("parse {}: {error}", path.display()))?,
                 None => BTreeMap::new(),
             };
-        let devices = if self.paths.switch_state_file.is_some() {
-            Vec::new()
+        let (states, switch_snapshot_complete) = if self.paths.switch_state_file.is_some() {
+            (Vec::new(), true)
         } else {
-            discover_switch_devices(&self.paths.input_class, &self.paths.input_devices)
-                .map_err(|error| format!("discover evdev switches: {error}"))?
+            let mut relevant_codes = BTreeSet::from([SW_ROTATE_LOCK, SW_TABLET_MODE]);
+            relevant_codes.extend(
+                self.descriptor
+                    .joints
+                    .iter()
+                    .flat_map(|joint| &joint.switches)
+                    .filter_map(|switch| parse_switch_code(&switch.code)),
+            );
+            let discovery = discover_switch_devices(
+                &self.paths.input_class,
+                &self.paths.input_devices,
+                &relevant_codes,
+            );
+            let mut failures = discovery.failures;
+            let states = discovery
+                .devices
+                .iter()
+                .filter_map(|device| match device.snapshot() {
+                    Ok(state) => Some(state),
+                    Err(error) => {
+                        failures.push(SwitchFailure::new(
+                            &device.name,
+                            format!("read_state_failed:{error}"),
+                        ));
+                        None
+                    }
+                })
+                .collect();
+            let switch_snapshot_complete = failures.is_empty();
+            self.record_switch_failures(failures);
+            (states, switch_snapshot_complete)
         };
         let fixture_value = |source: &str, token: &str| -> Result<Option<bool>, String> {
             match fixture.get(source).and_then(|values| values.get(token)) {
@@ -308,34 +348,21 @@ impl LinuxOrientationSource {
                 .collect::<Result<Vec<_>, _>>()
                 .map(|values| values.into_iter().flatten().collect())
         };
-        inputs.rotate_locks = if self.paths.switch_state_file.is_some() {
-            fixture_values("SW_ROTATE_LOCK")?
-        } else {
-            devices
+        if self.paths.switch_state_file.is_some() {
+            inputs.rotate_locks = fixture_values("SW_ROTATE_LOCK")?;
+            inputs.tablet_mode = fixture_values("SW_TABLET_MODE")?.into_iter().next();
+        } else if switch_snapshot_complete {
+            inputs.rotate_locks = states
                 .iter()
-                .map(|device| {
-                    device.switch(SW_ROTATE_LOCK).map_err(|error| {
-                        format!("read SW_ROTATE_LOCK from {}: {error}", device.name)
-                    })
-                })
-                .collect::<Result<Vec<_>, _>>()?
-                .into_iter()
-                .flatten()
-                .collect()
-        };
-        inputs.tablet_mode = if self.paths.switch_state_file.is_some() {
-            fixture_values("SW_TABLET_MODE")?.into_iter().next()
-        } else {
-            let values = devices
+                .filter_map(|device| device.switch(SW_ROTATE_LOCK))
+                .collect();
+            inputs.tablet_mode = states
                 .iter()
-                .map(|device| {
-                    device.switch(SW_TABLET_MODE).map_err(|error| {
-                        format!("read SW_TABLET_MODE from {}: {error}", device.name)
-                    })
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            values.into_iter().flatten().next()
-        };
+                .find_map(|device| device.switch(SW_TABLET_MODE));
+        } else {
+            inputs.rotate_locks = vec![true];
+            inputs.tablet_mode = Some(false);
+        }
         inputs.tablet_mode_is_posture = false;
 
         let Some(joint) = self
@@ -355,27 +382,36 @@ impl LinuxOrientationSource {
                 .unwrap_or(0.0)
         });
         let mut value = default_value;
+        let mut source_failures = Vec::new();
+        let mut required_source_failed = !switch_snapshot_complete;
         for switch in &joint.switches {
             let Some(code) = parse_switch_code(&switch.code) else {
+                required_source_failed = true;
+                source_failures.push(SwitchFailure::new(
+                    &switch.source,
+                    format!("unsupported_switch:{}", switch.code),
+                ));
                 continue;
             };
             let set = if self.paths.switch_state_file.is_some() {
                 fixture_value(&switch.source, &switch.code)?
             } else {
-                let device = devices
-                    .iter()
-                    .find(|device| device.name == switch.source)
-                    .ok_or_else(|| format!("required evdev source {} is absent", switch.source))?;
-                device.switch(code).map_err(|error| {
-                    format!("read {} from {}: {error}", switch.code, switch.source)
-                })?
+                let Some(device) = states.iter().find(|device| device.name == switch.source) else {
+                    required_source_failed = true;
+                    source_failures
+                        .push(SwitchFailure::new(&switch.source, "required_source_absent"));
+                    continue;
+                };
+                device.switch(code)
             };
-            let set = set.ok_or_else(|| {
-                format!(
-                    "required switch {} is unsupported by {}",
-                    switch.code, switch.source
-                )
-            })?;
+            let Some(set) = set else {
+                required_source_failed = true;
+                source_failures.push(SwitchFailure::new(
+                    &switch.source,
+                    format!("unsupported_switch:{}", switch.code),
+                ));
+                continue;
+            };
             if code == SW_TABLET_MODE {
                 inputs.tablet_mode_is_posture = true;
             }
@@ -383,13 +419,21 @@ impl LinuxOrientationSource {
                 value = (switch.active[0] + switch.active[1]) / 2.0;
             }
         }
-        let proposed = posture_rotation(joint, value);
+        let proposed = posture_rotation(
+            joint,
+            if required_source_failed {
+                default_value
+            } else {
+                value
+            },
+        );
         let now_ms = self.started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
         let hall = self
             .hall
             .get_or_insert_with(|| HallDebouncer::new(proposed, 50));
         hall.observe(proposed, now_ms);
         inputs.screen_posture = hall.advance(now_ms);
+        self.record_switch_failures(source_failures);
         Ok(())
     }
 }
@@ -697,7 +741,7 @@ struct SwitchDevice {
 }
 
 impl SwitchDevice {
-    fn switch(&self, code: u16) -> io::Result<Option<bool>> {
+    fn snapshot(&self) -> io::Result<SwitchState> {
         let mut supported = [0u8; 16];
         // SAFETY: both ioctls receive a live evdev fd and a writable buffer of the encoded size.
         let rc = unsafe {
@@ -709,9 +753,6 @@ impl SwitchDevice {
         };
         if rc < 0 {
             return Err(io::Error::last_os_error());
-        }
-        if supported[usize::from(code) / 8] & (1 << (code % 8)) == 0 {
-            return Ok(None);
         }
         let mut state = [0u8; 16];
         // SAFETY: same as above; EVIOCGSW returns the current stateful EV_SW bitmap.
@@ -725,35 +766,159 @@ impl SwitchDevice {
         if rc < 0 {
             return Err(io::Error::last_os_error());
         }
-        Ok(Some(state[usize::from(code) / 8] & (1 << (code % 8)) != 0))
+        Ok(SwitchState {
+            name: self.name.clone(),
+            supported,
+            state,
+        })
     }
+}
+
+struct SwitchState {
+    name: String,
+    supported: [u8; 16],
+    state: [u8; 16],
+}
+
+impl SwitchState {
+    fn switch(&self, code: u16) -> Option<bool> {
+        let byte = usize::from(code) / 8;
+        let mask = 1 << (code % 8);
+        (self.supported.get(byte)? & mask != 0).then_some(self.state[byte] & mask != 0)
+    }
+}
+
+struct SwitchFailure {
+    source: String,
+    reason: String,
+}
+
+impl SwitchFailure {
+    fn new(source: impl AsRef<str>, reason: impl Into<String>) -> Self {
+        Self {
+            source: source.as_ref().to_owned(),
+            reason: reason.into(),
+        }
+    }
+}
+
+#[derive(Default)]
+struct SwitchDiscovery {
+    devices: Vec<SwitchDevice>,
+    failures: Vec<SwitchFailure>,
+}
+
+fn advertises_relevant_switches(path: &Path, relevant_codes: &BTreeSet<u16>) -> io::Result<bool> {
+    let contents = fs::read_to_string(path)?;
+    let words = contents
+        .split_whitespace()
+        .map(|word| u64::from_str_radix(word.strip_prefix("0x").unwrap_or(word), 16))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    Ok(relevant_codes.iter().any(|code| {
+        let word = usize::from(*code) / u64::BITS as usize;
+        let bit = usize::from(*code) % u64::BITS as usize;
+        words
+            .iter()
+            .rev()
+            .nth(word)
+            .is_some_and(|bits| bits & (1u64 << bit) != 0)
+    }))
 }
 
 fn discover_switch_devices(
     class_root: &Path,
     devices_root: &Path,
-) -> io::Result<Vec<SwitchDevice>> {
-    fs::read_dir(class_root)?
-        .collect::<Result<Vec<_>, _>>()?
-        .into_iter()
-        .filter(|entry| entry.file_name().to_string_lossy().starts_with("event"))
-        .map(|entry| {
-            let name = fs::read_to_string(entry.path().join("device/name"))?;
-            let path = devices_root.join(entry.file_name());
-            let cpath = CString::new(path.as_os_str().as_bytes())
-                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "evdev path has NUL"))?;
-            // SAFETY: cpath is NUL-terminated; a successful fd is immediately owned.
-            let raw = unsafe { libc::open(cpath.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
-            if raw < 0 {
-                return Err(io::Error::last_os_error());
+    relevant_codes: &BTreeSet<u16>,
+) -> SwitchDiscovery {
+    let mut discovery = SwitchDiscovery::default();
+    let entries = match fs::read_dir(class_root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            discovery.failures.push(SwitchFailure::new(
+                class_root.to_string_lossy(),
+                format!("input_root_unavailable:{error}"),
+            ));
+            return discovery;
+        }
+        Err(error) => {
+            discovery.failures.push(SwitchFailure::new(
+                class_root.to_string_lossy(),
+                format!("enumerate_failed:{error}"),
+            ));
+            return discovery;
+        }
+    };
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                discovery.failures.push(SwitchFailure::new(
+                    class_root.to_string_lossy(),
+                    format!("entry_failed:{error}"),
+                ));
+                continue;
             }
-            Ok(SwitchDevice {
-                name: name.trim().to_owned(),
-                // SAFETY: raw is a fresh successful open and has one owner.
-                fd: unsafe { OwnedFd::from_raw_fd(raw) },
-            })
-        })
-        .collect()
+        };
+        let event = entry.file_name();
+        if !event.to_string_lossy().starts_with("event") {
+            continue;
+        }
+        let source = event.to_string_lossy();
+        match advertises_relevant_switches(
+            &entry.path().join("device/capabilities/sw"),
+            relevant_codes,
+        ) {
+            Ok(false) => continue,
+            Ok(true) => {}
+            Err(error) => {
+                discovery.failures.push(SwitchFailure::new(
+                    &source,
+                    format!("capabilities_unavailable:{error}"),
+                ));
+                continue;
+            }
+        }
+        let name = match fs::read_to_string(entry.path().join("device/name")) {
+            Ok(name) => name,
+            Err(error) => {
+                discovery.failures.push(SwitchFailure::new(
+                    &source,
+                    format!("name_unavailable:{error}"),
+                ));
+                continue;
+            }
+        };
+        let path = devices_root.join(&event);
+        let cpath = match CString::new(path.as_os_str().as_bytes()) {
+            Ok(path) => path,
+            Err(_) => {
+                discovery
+                    .failures
+                    .push(SwitchFailure::new(&source, "invalid_devnode_path"));
+                continue;
+            }
+        };
+        // SAFETY: cpath is NUL-terminated; a successful fd is immediately owned.
+        let raw = unsafe { libc::open(cpath.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
+        if raw < 0 {
+            let error = io::Error::last_os_error();
+            let reason = match error.raw_os_error() {
+                Some(code) if code == libc::ENOENT || code == libc::ENODEV => {
+                    format!("devnode_unavailable:{error}")
+                }
+                _ => format!("open_failed:{error}"),
+            };
+            discovery.failures.push(SwitchFailure::new(&source, reason));
+            continue;
+        }
+        discovery.devices.push(SwitchDevice {
+            name: name.trim().to_owned(),
+            // SAFETY: raw is a fresh successful open and has one owner.
+            fd: unsafe { OwnedFd::from_raw_fd(raw) },
+        });
+    }
+    discovery
 }
 
 fn parse_switch_code(value: &str) -> Option<u16> {
@@ -790,6 +955,94 @@ fn eviocgsw(len: usize) -> libc::c_ulong {
 mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn switch_discovery_root(label: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("pf-switch-discovery-{label}-{unique}"));
+        fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    fn write_switch_capability(root: &Path, event: &str, bits: &str) {
+        let device = root.join("class").join(event).join("device");
+        fs::create_dir_all(device.join("capabilities")).unwrap();
+        fs::write(device.join("name"), format!("{event}\n")).unwrap();
+        fs::write(device.join("capabilities/sw"), bits).unwrap();
+    }
+
+    fn discover_test_switches(root: &Path) -> SwitchDiscovery {
+        discover_switch_devices(
+            &root.join("class"),
+            &root.join("dev"),
+            &BTreeSet::from([SW_LID]),
+        )
+    }
+
+    #[test]
+    fn switch_discovery_skips_a_switch_device_whose_devnode_disappeared() {
+        let root = switch_discovery_root("missing-node");
+        write_switch_capability(&root, "event0", "1\n");
+        fs::create_dir_all(root.join("dev")).unwrap();
+
+        let discovery = discover_test_switches(&root);
+        assert!(discovery.devices.is_empty());
+        assert_eq!(discovery.failures.len(), 1);
+        assert!(discovery.failures[0]
+            .reason
+            .starts_with("devnode_unavailable:"));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn switch_discovery_records_a_missing_input_root() {
+        let root = switch_discovery_root("missing-root");
+
+        let discovery = discover_test_switches(&root);
+        assert!(discovery.devices.is_empty());
+        assert_eq!(discovery.failures.len(), 1);
+        assert!(discovery.failures[0]
+            .reason
+            .starts_with("input_root_unavailable:"));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn switch_discovery_does_not_open_a_non_switch_device() {
+        let root = switch_discovery_root("non-switch");
+        write_switch_capability(&root, "event0", "0\n");
+        // A directory is intentionally openable with O_RDONLY. The old unfiltered
+        // discovery therefore returned it as a device; capability filtering must not.
+        fs::create_dir_all(root.join("dev/event0")).unwrap();
+
+        let discovery = discover_test_switches(&root);
+        assert!(discovery.devices.is_empty());
+        assert!(discovery.failures.is_empty());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn switch_discovery_confines_an_open_error_to_one_source() {
+        let root = switch_discovery_root("one-source-error");
+        write_switch_capability(&root, "event0", "1\n");
+        write_switch_capability(&root, "event1", "1\n");
+        fs::create_dir_all(root.join("dev")).unwrap();
+        std::os::unix::fs::symlink("event0", root.join("dev/event0")).unwrap();
+        fs::write(root.join("dev/event1"), b"").unwrap();
+
+        let discovery = discover_test_switches(&root);
+        assert_eq!(discovery.devices.len(), 1);
+        assert_eq!(discovery.devices[0].name, "event1");
+        assert_eq!(discovery.failures.len(), 1);
+        assert!(discovery.failures[0].reason.starts_with("open_failed:"));
+
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn dt_fallback_ignores_camera_rotation_and_reads_panel_rotation() {
