@@ -1132,6 +1132,67 @@ fn gamescope_target_residency_resident_hold_stays_session_idle() {
 }
 
 #[test]
+fn gamescope_session_idle_reacts_when_resident_hold_drops_after_commit() {
+    let mut authority = authority();
+    launch_running(&mut authority);
+    authority.system.lifecycle = Some(SystemLifecycle {
+        app: AppUnitState::InactiveSuccess,
+        foreground_target_active: false,
+        selected_owner_active: false,
+    });
+
+    // The resident sample is valid and session_idle is committed.
+    authority.system.gamescope = Some(GamescopeSessionLifecycle::SessionIdle);
+    authority.tick().unwrap();
+    assert_eq!(
+        authority.state.history[0].post_app_owner,
+        Some(PostAppOwnerEvidence {
+            owner_tier: OwnerTier::Gamescope,
+            post_app_owner: PostAppOwner::SessionIdle,
+            home_unit: None,
+            ack_signal: None,
+            ack_latency_ms: None,
+        })
+    );
+
+    // The hold drops immediately after that sample. The target is still active with an empty
+    // Job, exactly as in the integration journal, so the authority must keep observing it.
+    authority.system.gamescope = Some(GamescopeSessionLifecycle::Transient { diagnostic: None });
+    authority.tick().unwrap();
+    assert!(!authority.system.calls.iter().any(|call| call == "owner"));
+
+    // StopWhenUnneeded tears the target down about 0.5 s later. Reconciliation must leave
+    // session_idle and enter the legacy selected-owner presentation ladder.
+    authority.clock.advance(Duration::from_millis(557));
+    authority.system.gamescope = None;
+    authority.tick().unwrap();
+    assert!(authority.system.calls.iter().any(|call| call == "owner"));
+    assert!(matches!(
+        authority.state.phase,
+        Phase::Restoring {
+            rung: RestorationRung::OwnerActive,
+            ..
+        }
+    ));
+
+    authority
+        .system
+        .lifecycle
+        .as_mut()
+        .unwrap()
+        .selected_owner_active = true;
+    authority.tick().unwrap();
+    assert!(matches!(
+        authority.state.phase,
+        Phase::Restoring {
+            rung: RestorationRung::PresentationAcknowledged,
+            ..
+        }
+    ));
+    assert_eq!(authority.state.history[0].post_app_owner, None);
+}
+
+#[test]
 fn graceful_safe_return_observes_every_rung_before_returned() {
     let mut a = authority();
     let LaunchResult::Accepted { session_id: id } = a
