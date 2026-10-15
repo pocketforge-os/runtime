@@ -110,7 +110,7 @@ any unknown state; downgrading mid-close is not supported.
 The authority escalates by itself; the menu shows progress only and never takes a second
 decision (every-menu-spec Q3). One close sequence:
 
-1. `safe_return` → bounded `try_send(Prepare {session_id, item_id})` →
+1. `safe_return` → bounded `try_send(Prepare {session_id, item_id, grace})` →
    `systemctl stop --no-block pf-app@<item>.service` → `stopping_gracefully`. Non-blocking so the
    authority keeps ticking while the unit stops;
    the unit's own `TimeoutStopSec` (2 s in the image) remains the backstop for the process
@@ -118,7 +118,8 @@ decision (every-menu-spec Q3). One close sequence:
 2. If systemd reports the unit inactive during the grace window, the authority performs bounded
    `try_send(Discard {session_id, item_id})` and the close completes as `returned` — even when the
    unit result is `timeout` (systemd's own SIGKILL beat the authority; no second kill is sent).
-3. If the grace period (`--grace-period-ms`, default `DEFAULT_GRACE_PERIOD` = 1500 ms)
+3. If the grace period (`--grace-period-ms`, default `DEFAULT_GRACE_PERIOD` = 1500 ms,
+   production maximum 300000 ms)
    expires first, the authority performs bounded `try_send(ForceStop)` and immediately invokes
    `systemctl kill --kill-who=all`, then publishes `force_stopping {reason: stop_timeout}`. The
    sampler's ≤300 ms work is concurrent and is not in the authority or unit-stop budget. A daemon
@@ -189,9 +190,10 @@ existing foreground-target / selected-owner path; entries on that legacy path om
 ### Escalation notifier
 
 `Authority::with_escalation_notifier` attaches a bounded producer for the hang sampler. Beginning
-a graceful stop performs one `SyncSender::try_send(Prepare { session_id, item_id })` before the
-stop request. The receiving thread resolves and pins the target and performs read-only preparation;
-the authority never waits for that work. Every escalation then performs exactly one
+a graceful stop performs one `SyncSender::try_send(Prepare { session_id, item_id, grace })` before
+the stop request. The receiving thread resolves and pins the target and performs read-only
+preparation; the sampler retains it for that grace plus three seconds of slack. The authority never
+waits for that work. Every escalation then performs exactly one
 `try_send(ForceStop { session_id, item_id, reason })` and immediately calls
 `enforce_termination`. A graceful `UnitInactive` performs one `try_send(Discard)`. Full or
 disconnected queues only lose the best-effort diagnostic; they cannot delay, fail, or reorder the

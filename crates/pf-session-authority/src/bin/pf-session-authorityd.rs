@@ -92,11 +92,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     pf_session_authority::EscalationNotice::Prepare {
                         session_id,
                         item_id,
+                        grace,
                     } => {
                         let _ = pf_hang_sampler::client::send_prepare(
                             &hang_sampler_socket,
                             &item_id,
                             &session_id,
+                            grace,
                         );
                     }
                     pf_session_authority::EscalationNotice::ForceStop {
@@ -287,7 +289,8 @@ Options:
   --command-preset PRESET          Command templates to use: device (default), desktop-sim
                                    desktop-sim maintains sessions/{session_id}.running and
                                    shell-selected markers below --state-dir
-  --grace-period-ms MS             Graceful-stop window before self-escalation (default 1500;
+  --grace-period-ms MS             Graceful-stop window before self-escalation (default 1500,
+                                   maximum 300000;
                                    sampler notification never delays termination)
   --hang-sampler-socket PATH       Best-effort sampler trigger socket
                                    (default /run/pocketforge/hang-sampler.sock)
@@ -365,7 +368,13 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
                 grace =
                     Duration::from_millis(value.parse::<u64>().map_err(|error| {
                         format!("--grace-period-ms expects milliseconds: {error}")
-                    })?)
+                    })?);
+                if grace > pf_hang_sampler::MAX_PREPARED_GRACE {
+                    return Err(format!(
+                        "--grace-period-ms exceeds {} milliseconds",
+                        pf_hang_sampler::MAX_PREPARED_GRACE.as_millis()
+                    ));
+                }
             }
             "--hang-sampler-socket" => hang_sampler_socket = value.into(),
             "--start-command" => start = Some(value),
@@ -601,6 +610,21 @@ mod tests {
         )
         .unwrap();
         assert_eq!(args.grace, Duration::from_millis(2500));
+
+        let error = parse_args(
+            [
+                "--state-dir",
+                "/tmp/pf",
+                "--socket",
+                "/tmp/pf.sock",
+                "--grace-period-ms",
+                "300001",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        )
+        .unwrap_err();
+        assert!(error.contains("exceeds"), "{error}");
 
         let error = parse_args(
             [

@@ -3,7 +3,7 @@ use crate::protocol::{
     AUTHORITY_UNIT, MAX_REQUEST_BYTES, MENU_SIDE_UNIT,
 };
 use crate::report::HangHow;
-use crate::{sample_target, EpisodeKey, EpisodeStore, Frame, PreparedSample, PREPARED_WORKER_TTL};
+use crate::{prepared_worker_ttl, sample_target, EpisodeKey, EpisodeStore, Frame, PreparedSample};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
@@ -124,7 +124,11 @@ impl Sampler {
                 }
                 (AuditOutcome::Accepted, None)
             }
-            TriggerRequest::Prepare { target, session_id } => {
+            TriggerRequest::Prepare {
+                target,
+                session_id,
+                grace_ms,
+            } => {
                 let Some(fd) = process_fd else {
                     return (AuditOutcome::InvalidRequest, None);
                 };
@@ -134,9 +138,13 @@ impl Sampler {
                 let Ok(app_id) = authorize_target(&process, &target) else {
                     return (AuditOutcome::RefusedTarget, None);
                 };
+                let Ok(ttl) = prepared_worker_ttl(grace_ms) else {
+                    return (AuditOutcome::InvalidRequest, None);
+                };
                 let Ok(worker) = PreparedSample::prepare(
                     process.pid(),
                     target.start_time,
+                    ttl,
                     &self.allowed_build_ids,
                 ) else {
                     return (AuditOutcome::SampleUnavailable, None);
@@ -151,7 +159,7 @@ impl Sampler {
                         app_id,
                         process,
                         worker,
-                        expires_at: Instant::now() + PREPARED_WORKER_TTL,
+                        expires_at: Instant::now() + ttl,
                     },
                 );
                 (AuditOutcome::Accepted, None)

@@ -3689,6 +3689,7 @@ fn escalation_notifier_covers_every_close_path_kill() {
         EscalationNotice::Prepare {
             session_id: id.clone(),
             item_id: APP_ID.to_owned(),
+            grace: Duration::from_millis(10),
         }
     );
     a.clock.advance(Duration::from_millis(10));
@@ -3767,6 +3768,7 @@ fn escalation_notifier_covers_every_close_path_kill() {
         EscalationNotice::Prepare {
             session_id: id4.clone(),
             item_id: APP_ID.to_owned(),
+            grace: Duration::from_millis(10),
         }
     );
     assert_eq!(
@@ -3819,6 +3821,7 @@ fn graceful_exit_discards_prepared_sample_without_force_stop() {
         EscalationNotice::Prepare {
             session_id: id.clone(),
             item_id: APP_ID.to_owned(),
+            grace: Duration::from_millis(10),
         }
     );
     assert_eq!(

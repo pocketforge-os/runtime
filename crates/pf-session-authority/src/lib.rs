@@ -2194,6 +2194,7 @@ pub enum EscalationNotice {
     Prepare {
         session_id: String,
         item_id: String,
+        grace: Duration,
     },
     ForceStop {
         session_id: String,
@@ -2639,6 +2640,7 @@ impl<S: StateStore, B: SessionSystem, C: Clock> Authority<S, B, C> {
             notifier.notify(EscalationNotice::Prepare {
                 session_id: session_id.to_owned(),
                 item_id: item_id.to_owned(),
+                grace: self.grace,
             });
         }
     }

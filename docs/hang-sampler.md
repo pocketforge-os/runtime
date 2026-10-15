@@ -37,10 +37,13 @@ name.
 
 ## Worker and unwind
 
-Closing pre-forks a worker and gives it five seconds (the 1500 ms default grace plus slack) to
-retain its owned unwind tables and await ForceStop. Prepared state and workers are bounded to 128
-session/item keys; expiry, replacement, discard, or daemon death kills/reaps the worker without
-ever attaching to the app. On ForceStop the ready worker verifies start time, arms a monotonic
+Closing pre-forks a worker and gives it the configured grace period plus three seconds of slack to
+retain its owned unwind tables and await ForceStop. Production configuration caps grace at five
+minutes; prepared state and workers are also bounded to 128 session/item keys. Expiry, replacement,
+discard, or daemon death kills/reaps the worker without ever attaching to the app. On ForceStop the
+ready worker verifies start time and the complete file-backed mapping identity captured at
+preparation. Mapping drift (including `dlopen`, `dlclose`, remap, or `exec`) discards the attempt
+instead of applying stale unwind data. It then arms a monotonic
 POSIX timer that sends it uncatchable `SIGKILL` at 300 ms, then uses `PTRACE_SEIZE`,
 `PTRACE_INTERRUPT`, and `PTRACE_DETACH` without `PTRACE_O_EXITKILL`. Linux therefore detaches and
 resumes a live target if the worker crashes or its deadline fires. A concurrently issued authority

@@ -14,8 +14,22 @@ pub mod transport;
 mod unwind;
 
 pub const SAMPLE_DEADLINE: Duration = Duration::from_millis(300);
-pub const PREPARED_WORKER_TTL: Duration = Duration::from_secs(5);
+pub const MAX_PREPARED_GRACE: Duration = Duration::from_secs(300);
+pub const PREPARED_WORKER_SLACK: Duration = Duration::from_secs(3);
 const MAX_RETAINED_EPISODES: usize = 128;
+
+fn prepared_worker_ttl(grace_ms: u64) -> io::Result<Duration> {
+    let grace = Duration::from_millis(grace_ms);
+    if grace > MAX_PREPARED_GRACE {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "prepared grace exceeds limit",
+        ));
+    }
+    grace
+        .checked_add(PREPARED_WORKER_SLACK)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "prepared grace is too large"))
+}
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub struct EpisodeKey {
@@ -294,6 +308,7 @@ fn pipe_pair() -> io::Result<(OwnedFd, OwnedFd)> {
 fn prepared_worker(
     pid: i32,
     expected_start_time: u64,
+    ttl: Duration,
     allowlist: &BTreeSet<Vec<u8>>,
     command: OwnedFd,
     output: OwnedFd,
@@ -302,7 +317,7 @@ fn prepared_worker(
     if unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) } != 0 {
         return Err(io::Error::last_os_error());
     }
-    let _ttl = arm_sigkill_timer(PREPARED_WORKER_TTL)?;
+    let _ttl = arm_sigkill_timer(ttl)?;
     let prepared = unwind::prepare(pid)?;
     let mut ready = std::fs::File::from(ready);
     ready.write_all(&[1])?;
@@ -343,7 +358,12 @@ pub struct PreparedSample {
 }
 
 impl PreparedSample {
-    pub fn prepare(pid: i32, start_time: u64, allowlist: &BTreeSet<Vec<u8>>) -> io::Result<Self> {
+    pub fn prepare(
+        pid: i32,
+        start_time: u64,
+        ttl: Duration,
+        allowlist: &BTreeSet<Vec<u8>>,
+    ) -> io::Result<Self> {
         let (command_read, command_write) = pipe_pair()?;
         let (output_read, output_write) = pipe_pair()?;
         let (ready_read, ready_write) = pipe_pair()?;
@@ -358,6 +378,7 @@ impl PreparedSample {
             let code = if prepared_worker(
                 pid,
                 start_time,
+                ttl,
                 allowlist,
                 command_read,
                 output_write,
@@ -554,6 +575,16 @@ mod tests {
     }
 
     #[test]
+    fn prepared_worker_lifetime_tracks_grace_with_bounded_slack() {
+        assert_eq!(
+            prepared_worker_ttl(1_500).unwrap(),
+            Duration::from_millis(1_500) + PREPARED_WORKER_SLACK
+        );
+        assert!(prepared_worker_ttl(MAX_PREPARED_GRACE.as_millis() as u64).is_ok());
+        assert!(prepared_worker_ttl(MAX_PREPARED_GRACE.as_millis() as u64 + 1).is_err());
+    }
+
+    #[test]
     fn episode_store_bounds_completed_recovered_and_finalized_state() {
         let mut store = EpisodeStore::default();
         for nonce in 0..256 {
@@ -681,6 +712,35 @@ mod tests {
         (child, reader)
     }
 
+    fn spawn_mapping_target() -> (Child, BufReader<std::process::ChildStdout>) {
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "tests::live_target_helper",
+                "--nocapture",
+            ])
+            .env("PF_HANG_MAP_HELPER", "1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut reader = BufReader::new(child.stdout.take().unwrap());
+        loop {
+            let mut line = String::new();
+            assert_ne!(
+                reader.read_line(&mut line).unwrap(),
+                0,
+                "target exited early"
+            );
+            if line.trim() == "TARGET_READY" {
+                break;
+            }
+        }
+        (child, reader)
+    }
+
     extern "C" fn signal_target_handler(_: libc::c_int) {
         let marker = b"SIGNAL\n";
         unsafe {
@@ -734,7 +794,7 @@ mod tests {
             events: libc::POLLIN,
             revents: 0,
         };
-        let ready = unsafe { libc::poll(&mut pollfd, 1, 100) };
+        let ready = unsafe { libc::poll(&mut pollfd, 1, 1_000) };
         if ready != 1 || pollfd.revents & libc::POLLIN == 0 {
             return false;
         }
@@ -747,7 +807,8 @@ mod tests {
     fn live_target_helper() {
         let counter = std::env::var_os("PF_HANG_COUNTER_HELPER").is_some();
         let signal = std::env::var_os("PF_HANG_SIGNAL_HELPER").is_some();
-        if std::env::var_os("PF_HANG_TARGET_HELPER").is_none() && !counter && !signal {
+        let mapping = std::env::var_os("PF_HANG_MAP_HELPER").is_some();
+        if std::env::var_os("PF_HANG_TARGET_HELPER").is_none() && !counter && !signal && !mapping {
             return;
         }
         // Permit the sibling tracer under Yama scope 1 without adding a container capability.
@@ -770,6 +831,34 @@ mod tests {
             if counter {
                 println!("TICK");
                 thread::sleep(Duration::from_millis(5));
+            } else if mapping {
+                let mut command = [0_u8; 1];
+                assert_eq!(
+                    unsafe {
+                        libc::read(
+                            libc::STDIN_FILENO,
+                            command.as_mut_ptr().cast(),
+                            command.len(),
+                        )
+                    },
+                    1
+                );
+                let executable = std::fs::File::open(std::env::current_exe().unwrap()).unwrap();
+                let mapped = unsafe {
+                    libc::mmap(
+                        std::ptr::null_mut(),
+                        4096,
+                        libc::PROT_READ | libc::PROT_EXEC,
+                        libc::MAP_PRIVATE,
+                        executable.as_raw_fd(),
+                        0,
+                    )
+                };
+                assert_ne!(mapped, libc::MAP_FAILED);
+                println!("MAP_READY");
+                let mut hold = [0_u8; 1];
+                unsafe { libc::read(libc::STDIN_FILENO, hold.as_mut_ptr().cast(), hold.len()) };
+                return;
             } else if signal {
                 let mut command = [0_u8; 1];
                 if unsafe {
@@ -792,8 +881,13 @@ mod tests {
     fn prepare_does_not_stop_target() {
         let (mut target, mut output) = spawn_counter_target();
         let start_time = protocol::proc_start_time(target.id() as i32).unwrap();
-        let prepared = PreparedSample::prepare(target.id() as i32, start_time, &BTreeSet::new())
-            .expect("read-only preparation must succeed");
+        let prepared = PreparedSample::prepare(
+            target.id() as i32,
+            start_time,
+            Duration::from_secs(5),
+            &BTreeSet::new(),
+        )
+        .expect("read-only preparation must succeed");
 
         for _ in 0..2 {
             let mut line = String::new();
@@ -811,15 +905,42 @@ mod tests {
     fn sampler_never_suppresses_a_racing_signal() {
         const ATTEMPTS: usize = 32;
         let (mut target, mut output) = spawn_signal_target();
-        let mut delivered = 0;
-        for _ in 0..ATTEMPTS {
+        for attempt in 0..ATTEMPTS {
             trace_signal_delivery_stop(target.id() as i32);
-            delivered += usize::from(handler_ran(&mut output));
+            assert!(
+                handler_ran(&mut output),
+                "the tracer suppressed signal attempt {attempt}"
+            );
         }
         assert!(target.try_wait().unwrap().is_none(), "target must resume");
         target.kill().unwrap();
         target.wait().unwrap();
-        assert_eq!(delivered, ATTEMPTS, "the tracer suppressed a signal");
+    }
+
+    #[test]
+    fn prepared_unwind_rejects_changed_process_image() {
+        let (mut target, mut output) = spawn_mapping_target();
+        let start_time = protocol::proc_start_time(target.id() as i32).unwrap();
+        let prepared = PreparedSample::prepare(
+            target.id() as i32,
+            start_time,
+            Duration::from_secs(5),
+            &BTreeSet::new(),
+        )
+        .expect("read-only preparation must succeed");
+
+        target.stdin.as_mut().unwrap().write_all(b"M").unwrap();
+        let mut line = String::new();
+        assert_ne!(output.read_line(&mut line).unwrap(), 0, "target exited");
+        assert_eq!(line.trim(), "MAP_READY");
+
+        let frames = prepared.sample();
+        target.kill().unwrap();
+        target.wait().unwrap();
+        assert!(
+            frames.is_empty(),
+            "a changed process image must discard the prepared sample"
+        );
     }
 
     #[test]

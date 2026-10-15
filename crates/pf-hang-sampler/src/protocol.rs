@@ -35,6 +35,7 @@ pub enum TriggerRequest {
     Prepare {
         target: TargetIdentity,
         session_id: String,
+        grace_ms: u64,
     },
     ForceStop {
         item_id: String,

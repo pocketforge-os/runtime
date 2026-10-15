@@ -18,6 +18,7 @@ struct LoadedModule {
 
 pub(crate) struct PreparedUnwind {
     modules: Vec<LoadedModule>,
+    mappings: Vec<MappingIdentity>,
 }
 
 #[derive(Default)]
@@ -28,21 +29,38 @@ struct MapGroup {
     executable: bool,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct MappingIdentity {
+    start: u64,
+    end: u64,
+    offset: u64,
+    permissions: String,
+    device: String,
+    inode: u64,
+    path: String,
+}
+
+struct ProcessMappings {
+    files: Vec<(String, MapGroup)>,
+    identity: Vec<MappingIdentity>,
+}
+
 fn parse_hex(text: &str) -> io::Result<u64> {
     u64::from_str_radix(text, 16)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid process map"))
 }
 
-fn mapped_files(pid: i32) -> io::Result<Vec<(String, MapGroup)>> {
+fn mapped_files(pid: i32) -> io::Result<ProcessMappings> {
     let maps = fs::read_to_string(format!("/proc/{pid}/maps"))?;
     let mut groups = BTreeMap::<String, MapGroup>::new();
+    let mut mappings = Vec::new();
     for line in maps.lines() {
         let mut fields = line.split_whitespace();
         let range = fields.next().unwrap_or("");
         let permissions = fields.next().unwrap_or("");
         let offset = fields.next().unwrap_or("");
-        let _device = fields.next();
-        let _inode = fields.next();
+        let device = fields.next().unwrap_or("");
+        let inode = fields.next().unwrap_or("");
         let path = fields.collect::<Vec<_>>().join(" ");
         if !path.starts_with('/') || path.ends_with(" (deleted)") {
             continue;
@@ -53,6 +71,18 @@ fn mapped_files(pid: i32) -> io::Result<Vec<(String, MapGroup)>> {
         let start = parse_hex(start)?;
         let end = parse_hex(end)?;
         let offset = parse_hex(offset)?;
+        let inode = inode
+            .parse::<u64>()
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid process map"))?;
+        mappings.push(MappingIdentity {
+            start,
+            end,
+            offset,
+            permissions: permissions.to_owned(),
+            device: device.to_owned(),
+            inode,
+            path: path.clone(),
+        });
         let base = start.checked_sub(offset).ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidData, "invalid process map base")
         })?;
@@ -67,10 +97,13 @@ fn mapped_files(pid: i32) -> io::Result<Vec<(String, MapGroup)>> {
         group.base = group.base.min(base);
         group.executable |= permissions.as_bytes().get(2) == Some(&b'x');
     }
-    Ok(groups
-        .into_iter()
-        .filter(|(_, group)| group.executable)
-        .collect())
+    Ok(ProcessMappings {
+        files: groups
+            .into_iter()
+            .filter(|(_, group)| group.executable)
+            .collect(),
+        identity: mappings,
+    })
 }
 
 fn section(file: &object::File<'_>, name: &str) -> Option<(Range<u64>, Vec<u8>)> {
@@ -80,9 +113,9 @@ fn section(file: &object::File<'_>, name: &str) -> Option<(Range<u64>, Vec<u8>)>
     Some((start..start.checked_add(section.size())?, data))
 }
 
-fn load_modules(pid: i32) -> io::Result<Vec<LoadedModule>> {
+fn load_modules(pid: i32, files: Vec<(String, MapGroup)>) -> Vec<LoadedModule> {
     let mut modules = Vec::new();
-    for (path, group) in mapped_files(pid)? {
+    for (path, group) in files {
         let rooted = format!("/proc/{pid}/root{path}");
         let Ok(bytes) = fs::read(rooted) else {
             continue;
@@ -127,13 +160,25 @@ fn load_modules(pid: i32) -> io::Result<Vec<LoadedModule>> {
             },
         });
     }
-    Ok(modules)
+    modules
 }
 
 pub(crate) fn prepare(pid: i32) -> io::Result<PreparedUnwind> {
+    let mappings = mapped_files(pid)?;
     Ok(PreparedUnwind {
-        modules: load_modules(pid)?,
+        modules: load_modules(pid, mappings.files),
+        mappings: mappings.identity,
     })
+}
+
+impl PreparedUnwind {
+    fn validate_process_image(&self, pid: i32) -> io::Result<()> {
+        let current = mapped_files(pid)?;
+        if current.identity != self.mappings {
+            return Err(io::Error::other("prepared process image changed"));
+        }
+        Ok(())
+    }
 }
 
 fn read_word(pid: i32, address: u64) -> Result<u64, ()> {
@@ -197,6 +242,7 @@ pub(crate) fn unwind_prepared(
 ) -> io::Result<Vec<Frame>> {
     use framehop::x86_64::{CacheX86_64, UnwindRegsX86_64, UnwinderX86_64};
 
+    prepared.validate_process_image(pid)?;
     let modules = &prepared.modules;
     let mut unwinder = UnwinderX86_64::<Vec<u8>>::new();
     for module in modules {
@@ -244,6 +290,7 @@ pub(crate) fn unwind_prepared(
 ) -> io::Result<Vec<Frame>> {
     use framehop::aarch64::{CacheAarch64, PtrAuthMask, UnwindRegsAarch64, UnwinderAarch64};
 
+    prepared.validate_process_image(pid)?;
     let modules = &prepared.modules;
     let mut unwinder = UnwinderAarch64::<Vec<u8>>::new();
     for module in modules {

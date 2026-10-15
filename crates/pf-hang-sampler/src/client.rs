@@ -4,6 +4,7 @@ use std::io;
 use std::os::fd::{AsFd, FromRawFd, OwnedFd};
 use std::path::Path;
 use std::process::Command;
+use std::time::Duration;
 
 fn process_handle(pid: i32) -> io::Result<OwnedFd> {
     let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) as i32 };
@@ -42,9 +43,24 @@ fn main_pid(unit: &str) -> io::Result<i32> {
     Ok(pid)
 }
 
-pub fn send_prepare(socket: &Path, item_id: &str, session_id: &str) -> io::Result<()> {
+pub fn send_prepare(
+    socket: &Path,
+    item_id: &str,
+    session_id: &str,
+    grace: Duration,
+) -> io::Result<()> {
     pf_app_manifest::validate_app_id(item_id)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid application id"))?;
+    if grace > crate::MAX_PREPARED_GRACE {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "grace period exceeds hang-sampler limit",
+        ));
+    }
+    let grace_ms = grace
+        .as_millis()
+        .try_into()
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "grace period is too large"))?;
     let unit = format!("pf-app@{item_id}.service");
     let pid = main_pid(&unit)?;
     let handle = process_handle(pid)?;
@@ -55,6 +71,7 @@ pub fn send_prepare(socket: &Path, item_id: &str, session_id: &str) -> io::Resul
             start_time: proc_start_time(pid)?,
         },
         session_id: session_id.to_owned(),
+        grace_ms,
     };
     transport::send_request(socket, &request, Some(handle.as_fd()))
 }
