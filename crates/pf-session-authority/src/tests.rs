@@ -1769,11 +1769,7 @@ fn gamescope_home_timed_out(
 fn late_gamescope_home_ack_after_timeout_completes_from_both_rungs() {
     for active_before_timeout in [false, true] {
         let (mut authority, session_id) = gamescope_home_timed_out(active_before_timeout);
-        authority.system.gamescope = Some(gamescope_home(
-            "pf-shell-gamescope.service",
-            true,
-            true,
-        ));
+        authority.system.gamescope = Some(gamescope_home("pf-shell-gamescope.service", true, true));
 
         authority.tick().unwrap();
 

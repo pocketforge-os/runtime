@@ -23,8 +23,9 @@
 //! stop escalates at its deadline instead of up to a tick later. The
 //! presentation-acknowledgement rung has a deadline ([`DEFAULT_PRESENTATION_TIMEOUT`]); on expiry
 //! the authority records `RecoveryRequired` with reason `presentation_not_acknowledged` and keeps
-//! the owed receipt, so a late acknowledgement still completes the ladder truthfully. That is the
-//! only recovery a client can complete; every other `RecoveryRequired` reason stays terminal.
+//! the owed receipt, so a late client acknowledgement or the configured Gamescope home becoming
+//! presented still completes the ladder truthfully. Presentation timeout is the only
+//! self-healing `RecoveryRequired` reason; every other reason stays terminal.
 //!
 //! Closes are the authority's own escalation ladder, and contract v2 of the RPC publishes its
 //! progress for the system menu (every-menu spec §9.6): `StoppingGracefully` when a graceful stop
@@ -2690,7 +2691,7 @@ impl<S: StateStore, B: SessionSystem, C: Clock> Authority<S, B, C> {
                 return Ok(());
             };
             if matches!(self.state.phase, Phase::RecoveryRequired { .. }) {
-                return Ok(());
+                return self.reconcile_late_gamescope_home();
             }
             let snapshot = match self.system.lifecycle(&item_id) {
                 Ok(Some(snapshot)) => snapshot,
@@ -2819,6 +2820,59 @@ impl<S: StateStore, B: SessionSystem, C: Clock> Authority<S, B, C> {
         }
         Ok(())
     }
+
+    fn reconcile_late_gamescope_home(&mut self) -> Result<(), AuthorityError> {
+        let Phase::RecoveryRequired {
+            session_id,
+            reason,
+            pending_receipt: Some(_),
+            ..
+        } = &self.state.phase
+        else {
+            return Ok(());
+        };
+        if !is_presentation_timeout(reason) {
+            return Ok(());
+        }
+        let session_id = session_id.clone();
+        let Some(evidence) = self
+            .state
+            .history
+            .iter()
+            .find(|entry| entry.session_id == session_id)
+            .and_then(|entry| entry.post_app_owner.as_ref())
+        else {
+            // The legacy fb0 presentation path has no Gamescope owner evidence and remains
+            // byte-for-byte unchanged: only its explicit client acknowledgement can recover.
+            return Ok(());
+        };
+        if evidence.owner_tier != OwnerTier::Gamescope
+            || evidence.post_app_owner != PostAppOwner::HomeClient
+        {
+            return Ok(());
+        }
+        let (Some(expected_unit), Some(expected_signal)) =
+            (evidence.home_unit.clone(), evidence.ack_signal.clone())
+        else {
+            return Ok(());
+        };
+        let gamescope = self
+            .system
+            .gamescope_session_lifecycle()
+            .map_err(AuthorityError::Backend)?;
+        match gamescope {
+            Some(GamescopeSessionLifecycle::HomeClient {
+                unit,
+                active: true,
+                presenting: true,
+                ack_signal,
+            }) if unit == expected_unit && ack_signal == expected_signal => {
+                self.observe(Observation::GamescopeHomePresented { unit, ack_signal })
+            }
+            _ => Ok(()),
+        }
+    }
+
     fn begin_restoration(&mut self, receipt: Receipt) -> Result<(), AuthorityError> {
         let session_id = self
             .session_id()
@@ -3097,8 +3151,8 @@ impl<S: StateStore, B: SessionSystem, C: Clock> Authority<S, B, C> {
                 self.refresh_home_evidence(&id, &unit, &ack_signal, latency_ms);
                 self.complete_restoration(id, receipt)
             }
-            // A late acknowledgement after the presentation deadline expired: the only
-            // self-healing exit from RecoveryRequired. The owed receipt becomes history now.
+            // A late client acknowledgement after the presentation deadline expired. The owed
+            // receipt becomes history now; the system-driven Gamescope form is handled below.
             (
                 Phase::RecoveryRequired {
                     session_id,
@@ -3111,9 +3165,52 @@ impl<S: StateStore, B: SessionSystem, C: Clock> Authority<S, B, C> {
                 let (id, receipt) = (session_id.clone(), receipt.clone());
                 self.complete_restoration(id, receipt)
             }
+            (
+                Phase::RecoveryRequired {
+                    session_id,
+                    reason,
+                    pending_receipt: Some(receipt),
+                    ..
+                },
+                Observation::GamescopeHomePresented { unit, ack_signal },
+            ) if is_presentation_timeout(reason) => {
+                let (id, receipt) = (session_id.clone(), receipt.clone());
+                if !self.recorded_gamescope_home_matches(&id, &unit, &ack_signal) {
+                    return Err(AuthorityError::InvalidObservation);
+                }
+                let latency_ms = self.home_ack_started.map(|started| {
+                    self.clock
+                        .now()
+                        .as_nanos()
+                        .saturating_sub(started.as_nanos())
+                        / 1_000_000
+                });
+                self.refresh_home_evidence(&id, &unit, &ack_signal, latency_ms);
+                self.complete_restoration(id, receipt)
+            }
             _ => Err(AuthorityError::InvalidObservation),
         }
     }
+
+    fn recorded_gamescope_home_matches(
+        &self,
+        session_id: &str,
+        unit: &str,
+        ack_signal: &str,
+    ) -> bool {
+        self.state
+            .history
+            .iter()
+            .find(|entry| entry.session_id == session_id)
+            .and_then(|entry| entry.post_app_owner.as_ref())
+            .is_some_and(|evidence| {
+                evidence.owner_tier == OwnerTier::Gamescope
+                    && evidence.post_app_owner == PostAppOwner::HomeClient
+                    && evidence.home_unit.as_deref() == Some(unit)
+                    && evidence.ack_signal.as_deref() == Some(ack_signal)
+            })
+    }
+
     fn complete_restoration(&mut self, id: String, receipt: Receipt) -> Result<(), AuthorityError> {
         if let Some(entry) = self.state.history.iter_mut().find(|e| e.session_id == id) {
             entry.receipt = Some(receipt.clone());
