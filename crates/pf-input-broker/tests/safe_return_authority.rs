@@ -124,7 +124,8 @@ impl CommandExecutor for FakeSystemd {
     }
 
     fn query(&mut self, program: &str, args: &[String]) -> Result<CommandOutput, String> {
-        let u = self.units.lock().unwrap();
+        let mut u = self.units.lock().unwrap();
+        u.calls.push(format!("{program} {}", args.join(" ")));
         let args: Vec<&str> = args.iter().map(String::as_str).collect();
         let output = |code: i32, stdout: &str| {
             Ok(CommandOutput {
@@ -133,6 +134,12 @@ impl CommandExecutor for FakeSystemd {
             })
         };
         match args.as_slice() {
+            ["is-active", "--quiet", "pocketforge-gamescope-session.target"] => {
+                // This suite pins the legacy fb0 return path: no compositor session owns the
+                // display, so the authority must continue through foreground.target and the
+                // selected shell owner exactly as it did before session-aware reconciliation.
+                output(3, "")
+            }
             ["show", "--property", "ActiveState", "--value", unit] if *unit == APP_UNIT => {
                 output(0, &u.app_state)
             }
@@ -335,6 +342,12 @@ fn safe_return_from_a_non_shell_client_starts_the_graceful_stop() {
         "{calls:?}"
     );
     assert!(!calls.iter().any(|c| c.contains(" kill ")), "{calls:?}");
+    assert!(
+        calls.contains(
+            &"systemctl is-active --quiet pocketforge-gamescope-session.target".to_owned()
+        ),
+        "{calls:?}"
+    );
 }
 
 #[test]
