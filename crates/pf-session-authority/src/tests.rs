@@ -312,7 +312,16 @@ fn command_system_selects_gamescope_home_or_idle_without_starting_fb0_owner() {
         outputs: VecDeque::from([
             CommandOutput {
                 code: 0,
-                stdout: "ActiveState=active\nJob=\n".into(),
+                stdout: concat!(
+                    "ActiveState=active\n",
+                    "Job=\n",
+                    "BoundBy=pocketforge-gamescope-resident.service\n",
+                )
+                .into(),
+            },
+            CommandOutput {
+                code: 0,
+                stdout: "LoadState=loaded\nActiveState=active\n".into(),
             },
             CommandOutput {
                 code: 0,
@@ -321,6 +330,19 @@ fn command_system_selects_gamescope_home_or_idle_without_starting_fb0_owner() {
             CommandOutput {
                 code: 0,
                 stdout: String::new(),
+            },
+            CommandOutput {
+                code: 0,
+                stdout: "LoadState=loaded\nActiveState=active\n".into(),
+            },
+            CommandOutput {
+                code: 0,
+                stdout: concat!(
+                    "ActiveState=active\n",
+                    "Job=\n",
+                    "BoundBy=pocketforge-gamescope-resident.service\n",
+                )
+                .into(),
             },
         ]),
         ..FakeExecutor::default()
@@ -353,7 +375,20 @@ fn command_system_selects_gamescope_home_or_idle_without_starting_fb0_owner() {
                     "ActiveState".into(),
                     "--property".into(),
                     "Job".into(),
+                    "--property".into(),
+                    "BoundBy".into(),
                     "pocketforge-gamescope-session.target".into(),
+                ],
+            ),
+            (
+                "systemctl".into(),
+                vec![
+                    "show".into(),
+                    "--property".into(),
+                    "LoadState".into(),
+                    "--property".into(),
+                    "ActiveState".into(),
+                    "pocketforge-gamescope-resident.service".into(),
                 ],
             ),
             (
@@ -376,6 +411,30 @@ fn command_system_selects_gamescope_home_or_idle_without_starting_fb0_owner() {
             ),
             (
                 "systemctl".into(),
+                vec![
+                    "show".into(),
+                    "--property".into(),
+                    "LoadState".into(),
+                    "--property".into(),
+                    "ActiveState".into(),
+                    "pocketforge-gamescope-resident.service".into(),
+                ],
+            ),
+            (
+                "systemctl".into(),
+                vec![
+                    "show".into(),
+                    "--property".into(),
+                    "ActiveState".into(),
+                    "--property".into(),
+                    "Job".into(),
+                    "--property".into(),
+                    "BoundBy".into(),
+                    "pocketforge-gamescope-session.target".into(),
+                ],
+            ),
+            (
+                "systemctl".into(),
                 vec!["start".into(), "pf-shell-gamescope.service".into()],
             ),
         ]
@@ -387,10 +446,34 @@ fn command_system_selects_gamescope_home_or_idle_without_starting_fb0_owner() {
     let mut idle = CommandSystem::with_executor(
         CommandTemplates::default(),
         FakeExecutor {
-            outputs: VecDeque::from([CommandOutput {
-                code: 0,
-                stdout: "ActiveState=active\nJob=\n".into(),
-            }]),
+            outputs: VecDeque::from([
+                CommandOutput {
+                    code: 0,
+                    stdout: concat!(
+                        "ActiveState=active\n",
+                        "Job=\n",
+                        "BoundBy=pocketforge-gamescope-resident.service\n",
+                    )
+                    .into(),
+                },
+                CommandOutput {
+                    code: 0,
+                    stdout: "LoadState=loaded\nActiveState=active\n".into(),
+                },
+                CommandOutput {
+                    code: 0,
+                    stdout: "LoadState=loaded\nActiveState=active\n".into(),
+                },
+                CommandOutput {
+                    code: 0,
+                    stdout: concat!(
+                        "ActiveState=active\n",
+                        "Job=\n",
+                        "BoundBy=pocketforge-gamescope-resident.service\n",
+                    )
+                    .into(),
+                },
+            ]),
             ..FakeExecutor::default()
         },
     );
@@ -398,14 +481,58 @@ fn command_system_selects_gamescope_home_or_idle_without_starting_fb0_owner() {
         idle.gamescope_session_lifecycle().unwrap(),
         Some(GamescopeSessionLifecycle::SessionIdle)
     );
-    assert_eq!(idle.into_executor().calls.len(), 1);
+    assert_eq!(idle.into_executor().calls.len(), 4);
+
+    let mut transient = CommandSystem::with_executor(
+        CommandTemplates::default(),
+        FakeExecutor {
+            outputs: VecDeque::from([
+                CommandOutput {
+                    code: 0,
+                    stdout: "ActiveState=active\nJob=\nBoundBy=\n".into(),
+                },
+                CommandOutput {
+                    code: 0,
+                    stdout: "LoadState=loaded\nActiveState=inactive\n".into(),
+                },
+            ]),
+            ..FakeExecutor::default()
+        },
+    );
+    assert!(matches!(
+        transient.gamescope_session_lifecycle().unwrap(),
+        Some(GamescopeSessionLifecycle::Transient { diagnostic: None })
+    ));
+
+    let mut misconfigured = CommandSystem::with_executor(
+        CommandTemplates::default(),
+        FakeExecutor {
+            outputs: VecDeque::from([
+                CommandOutput {
+                    code: 0,
+                    stdout: "ActiveState=active\nJob=\nBoundBy=\n".into(),
+                },
+                CommandOutput {
+                    code: 0,
+                    stdout: "LoadState=loaded\nActiveState=active\n".into(),
+                },
+            ]),
+            ..FakeExecutor::default()
+        },
+    );
+    assert!(matches!(
+        misconfigured.gamescope_session_lifecycle().unwrap(),
+        Some(GamescopeSessionLifecycle::Transient {
+            diagnostic: Some(ref diagnostic),
+        }) if diagnostic.contains("active_without_bound_by")
+    ));
 
     let mut transitioning = CommandSystem::with_executor(
         CommandTemplates::default(),
         FakeExecutor {
             outputs: VecDeque::from([CommandOutput {
                 code: 0,
-                stdout: "ActiveState=active\nJob=421\n".into(),
+                stdout: "ActiveState=active\nJob=421\nBoundBy=\n".into(),
             }]),
             ..FakeExecutor::default()
         },
@@ -415,17 +542,54 @@ fn command_system_selects_gamescope_home_or_idle_without_starting_fb0_owner() {
         Some(GamescopeSessionLifecycle::Transitioning)
     );
 
+    let mut deactivating = CommandSystem::with_executor(
+        CommandTemplates::default(),
+        FakeExecutor {
+            outputs: VecDeque::from([CommandOutput {
+                code: 0,
+                stdout: "ActiveState=deactivating\nJob=\nBoundBy=\n".into(),
+            }]),
+            ..FakeExecutor::default()
+        },
+    );
+    assert_eq!(
+        deactivating.gamescope_session_lifecycle().unwrap(),
+        Some(GamescopeSessionLifecycle::Transitioning)
+    );
+
     let mut missing = CommandSystem::with_executor_and_session_owner(
         CommandTemplates::default(),
         FakeExecutor {
             outputs: VecDeque::from([
                 CommandOutput {
                     code: 0,
-                    stdout: "ActiveState=active\nJob=\n".into(),
+                    stdout: concat!(
+                        "ActiveState=active\n",
+                        "Job=\n",
+                        "BoundBy=pocketforge-gamescope-resident.service\n",
+                    )
+                    .into(),
+                },
+                CommandOutput {
+                    code: 0,
+                    stdout: "LoadState=loaded\nActiveState=active\n".into(),
                 },
                 CommandOutput {
                     code: 0,
                     stdout: "not-found\n".into(),
+                },
+                CommandOutput {
+                    code: 0,
+                    stdout: "LoadState=loaded\nActiveState=active\n".into(),
+                },
+                CommandOutput {
+                    code: 0,
+                    stdout: concat!(
+                        "ActiveState=active\n",
+                        "Job=\n",
+                        "BoundBy=pocketforge-gamescope-resident.service\n",
+                    )
+                    .into(),
                 },
             ]),
             ..FakeExecutor::default()
@@ -439,14 +603,14 @@ fn command_system_selects_gamescope_home_or_idle_without_starting_fb0_owner() {
         missing.gamescope_session_lifecycle().unwrap(),
         Some(GamescopeSessionLifecycle::SessionIdle)
     );
-    assert_eq!(missing.into_executor().calls.len(), 2);
+    assert_eq!(missing.into_executor().calls.len(), 5);
 
     let mut fb0 = CommandSystem::with_executor(
         CommandTemplates::default(),
         FakeExecutor {
             outputs: VecDeque::from([CommandOutput {
                 code: 0,
-                stdout: "ActiveState=inactive\nJob=\n".into(),
+                stdout: "ActiveState=inactive\nJob=\nBoundBy=\n".into(),
             }]),
             ..FakeExecutor::default()
         },
@@ -475,6 +639,142 @@ fn command_system_selects_gamescope_home_or_idle_without_starting_fb0_owner() {
         .gamescope_session_lifecycle()
         .unwrap_err()
         .contains("omitted Job"));
+
+    let mut missing_bound_by = CommandSystem::with_executor(
+        CommandTemplates::default(),
+        FakeExecutor {
+            outputs: VecDeque::from([CommandOutput {
+                code: 0,
+                stdout: "ActiveState=active\nJob=\n".into(),
+            }]),
+            ..FakeExecutor::default()
+        },
+    );
+    assert!(missing_bound_by
+        .gamescope_session_lifecycle()
+        .unwrap_err()
+        .contains("omitted BoundBy"));
+
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn command_system_revalidates_residency_before_terminal_gamescope_observations() {
+    let target_active = || CommandOutput {
+        code: 0,
+        stdout: concat!(
+            "ActiveState=active\n",
+            "Job=\n",
+            "BoundBy=pocketforge-gamescope-resident.service\n",
+        )
+        .into(),
+    };
+    let target_inactive = || CommandOutput {
+        code: 0,
+        stdout: "ActiveState=inactive\nJob=\nBoundBy=\n".into(),
+    };
+    let resident_active = || CommandOutput {
+        code: 0,
+        stdout: "LoadState=loaded\nActiveState=active\n".into(),
+    };
+    let resident_inactive = || CommandOutput {
+        code: 0,
+        stdout: "LoadState=loaded\nActiveState=inactive\n".into(),
+    };
+
+    // Target changes after its first sample but before BindsTo propagation reaches the resident.
+    let mut idle_target_changed = CommandSystem::with_executor(
+        CommandTemplates::default(),
+        FakeExecutor {
+            outputs: VecDeque::from([
+                target_active(),
+                resident_active(),
+                resident_active(),
+                target_inactive(),
+            ]),
+            ..FakeExecutor::default()
+        },
+    );
+    assert_eq!(
+        idle_target_changed.gamescope_session_lifecycle().unwrap(),
+        Some(GamescopeSessionLifecycle::Transitioning)
+    );
+
+    // BindsTo propagation reaches the resident between its first and second samples.
+    let mut idle_resident_changed = CommandSystem::with_executor(
+        CommandTemplates::default(),
+        FakeExecutor {
+            outputs: VecDeque::from([
+                target_active(),
+                resident_active(),
+                resident_inactive(),
+                target_active(),
+            ]),
+            ..FakeExecutor::default()
+        },
+    );
+    assert_eq!(
+        idle_resident_changed.gamescope_session_lifecycle().unwrap(),
+        Some(GamescopeSessionLifecycle::Transitioning)
+    );
+
+    let dir = scratch("gamescope-residency-revalidation");
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    let signal = dir.join("focused-home-unit");
+    fs::write(&signal, b"pf-shell-gamescope.service\n").unwrap();
+    let config = || SessionOwnerConfig {
+        home_client_unit: Some("pf-shell-gamescope.service".to_owned()),
+        home_client_presentation: Some(signal.clone()),
+    };
+    let home_loaded = || CommandOutput {
+        code: 0,
+        stdout: "loaded\n".into(),
+    };
+    let home_active = || CommandOutput {
+        code: 0,
+        stdout: String::new(),
+    };
+
+    let mut home_target_changed = CommandSystem::with_executor_and_session_owner(
+        CommandTemplates::default(),
+        FakeExecutor {
+            outputs: VecDeque::from([
+                target_active(),
+                resident_active(),
+                home_loaded(),
+                home_active(),
+                resident_active(),
+                target_inactive(),
+            ]),
+            ..FakeExecutor::default()
+        },
+        config(),
+    );
+    assert_eq!(
+        home_target_changed.gamescope_session_lifecycle().unwrap(),
+        Some(GamescopeSessionLifecycle::Transitioning)
+    );
+
+    let mut home_resident_changed = CommandSystem::with_executor_and_session_owner(
+        CommandTemplates::default(),
+        FakeExecutor {
+            outputs: VecDeque::from([
+                target_active(),
+                resident_active(),
+                home_loaded(),
+                home_active(),
+                resident_inactive(),
+                target_active(),
+            ]),
+            ..FakeExecutor::default()
+        },
+        config(),
+    );
+    assert_eq!(
+        home_resident_changed.gamescope_session_lifecycle().unwrap(),
+        Some(GamescopeSessionLifecycle::Transitioning)
+    );
 
     fs::remove_dir_all(dir).unwrap();
 }
@@ -628,6 +928,13 @@ fn gamescope_post_app_owner_is_home_or_session_idle_never_fb0() {
     idle.system.gamescope = Some(GamescopeSessionLifecycle::SessionIdle);
     idle.tick().unwrap();
     assert!(matches!(idle.state.phase, Phase::Idle));
+    assert_eq!(
+        idle.state
+            .resident_monitor
+            .as_ref()
+            .map(|monitor| monitor.rung),
+        Some(ResidentMonitorRung::Resident)
+    );
     assert!(!idle.system.calls.iter().any(|call| call == "owner"));
     assert_eq!(
         idle.state.history[0].post_app_owner,
@@ -726,9 +1033,9 @@ fn gamescope_target_residency_transient_stop_waits_for_fb0_fallback() {
         foreground_target_active: false,
         selected_owner_active: false,
     });
-    // Exact integration ordering: the app is already inactive, but the StopWhenUnneeded
-    // Gamescope target is still active with its own stop job pending.
-    authority.system.gamescope = Some(GamescopeSessionLifecycle::Transitioning);
+    // Exact integration ordering from job 116374400439: the app is already inactive, but the
+    // StopWhenUnneeded target remains active with an empty Job and no independent resident pin.
+    authority.system.gamescope = Some(GamescopeSessionLifecycle::Transient { diagnostic: None });
     authority.tick().unwrap();
 
     assert!(matches!(
@@ -741,8 +1048,8 @@ fn gamescope_target_residency_transient_stop_waits_for_fb0_fallback() {
     assert!(authority.state.history[0].receipt.is_none());
     assert!(!authority.system.calls.iter().any(|call| call == "owner"));
 
-    // The live journal observed this transition about 50 ms later.
-    authority.clock.advance(Duration::from_millis(50));
+    // The live journal observed this transition about 557 ms later.
+    authority.clock.advance(Duration::from_millis(557));
     authority.system.gamescope = None;
     authority.tick().unwrap();
     assert!(authority.system.calls.iter().any(|call| call == "owner"));
@@ -770,6 +1077,41 @@ fn gamescope_target_residency_transient_stop_waits_for_fb0_fallback() {
 }
 
 #[test]
+fn gamescope_resident_active_without_bound_by_is_logged_and_waits() {
+    let lines = Arc::new(Mutex::new(Vec::new()));
+    let captured = Arc::clone(&lines);
+    let mut authority = authority().with_log_sink(move |line| {
+        captured.lock().unwrap().push(line.to_owned());
+    });
+    launch_running(&mut authority);
+    authority.system.lifecycle = Some(SystemLifecycle {
+        app: AppUnitState::InactiveSuccess,
+        foreground_target_active: false,
+        selected_owner_active: false,
+    });
+    authority.system.gamescope = Some(GamescopeSessionLifecycle::Transient {
+        diagnostic: Some(
+            "gamescope_residency_misconfigured reason=active_without_bound_by".to_owned(),
+        ),
+    });
+
+    authority.tick().unwrap();
+
+    assert!(matches!(
+        authority.state.phase,
+        Phase::Restoring {
+            rung: RestorationRung::TargetReleased,
+            ..
+        }
+    ));
+    assert_eq!(
+        *lines.lock().unwrap(),
+        ["gamescope_residency_misconfigured reason=active_without_bound_by"]
+    );
+    assert!(!authority.system.calls.iter().any(|call| call == "owner"));
+}
+
+#[test]
 fn gamescope_target_residency_resident_hold_stays_session_idle() {
     let mut authority = authority();
     launch_running(&mut authority);
@@ -784,6 +1126,14 @@ fn gamescope_target_residency_resident_hold_stays_session_idle() {
 
     assert!(matches!(authority.state.phase, Phase::Idle));
     assert_eq!(
+        authority
+            .state
+            .resident_monitor
+            .as_ref()
+            .map(|monitor| monitor.rung),
+        Some(ResidentMonitorRung::Resident)
+    );
+    assert_eq!(
         authority.state.history[0].post_app_owner,
         Some(PostAppOwnerEvidence {
             owner_tier: OwnerTier::Gamescope,
@@ -794,6 +1144,358 @@ fn gamescope_target_residency_resident_hold_stays_session_idle() {
         })
     );
     assert!(!authority.system.calls.iter().any(|call| call == "owner"));
+}
+
+#[test]
+fn gamescope_session_idle_completes_and_releases_the_next_launch_slot() {
+    let mut authority = authority();
+    let completed_id = launch_running(&mut authority);
+    authority.system.lifecycle = Some(SystemLifecycle {
+        app: AppUnitState::InactiveSuccess,
+        foreground_target_active: false,
+        selected_owner_active: false,
+    });
+    authority.system.gamescope = Some(GamescopeSessionLifecycle::SessionIdle);
+
+    authority.tick().unwrap();
+
+    assert!(matches!(authority.state.phase, Phase::Idle));
+    assert_eq!(authority.state.history[0].receipt, Some(Receipt::Returned));
+    assert_eq!(authority.state.history[0].session_id, completed_id);
+    assert!(authority
+        .events_for("monitor-test")
+        .iter()
+        .any(|(_, event)| {
+            matches!(
+                event,
+                SessionEvent::Terminal(TerminalReceipt::Returned { session_id })
+                    if session_id == &completed_id
+            )
+        }));
+    assert!(matches!(
+        authority
+            .launch(LaunchRequest {
+                item_id: APP_ID.to_owned(),
+            })
+            .unwrap(),
+        LaunchResult::Accepted { .. }
+    ));
+    assert!(authority.state.resident_monitor.is_none());
+    authority.system.lifecycle.as_mut().unwrap().app = AppUnitState::Active;
+    authority.system.gamescope = None;
+    authority.tick().unwrap();
+    assert!(!authority.system.calls.iter().any(|call| call == "owner"));
+}
+
+#[test]
+fn gamescope_session_idle_reacts_when_resident_hold_drops_after_commit() {
+    let mut authority = authority();
+    launch_running(&mut authority);
+    authority.system.lifecycle = Some(SystemLifecycle {
+        app: AppUnitState::InactiveSuccess,
+        foreground_target_active: false,
+        selected_owner_active: false,
+    });
+
+    // The resident sample is valid and session_idle is committed.
+    authority.system.gamescope = Some(GamescopeSessionLifecycle::SessionIdle);
+    authority.tick().unwrap();
+    assert!(matches!(authority.state.phase, Phase::Idle));
+    assert_eq!(
+        authority.state.history[0].post_app_owner,
+        Some(PostAppOwnerEvidence {
+            owner_tier: OwnerTier::Gamescope,
+            post_app_owner: PostAppOwner::SessionIdle,
+            home_unit: None,
+            ack_signal: None,
+            ack_latency_ms: None,
+        })
+    );
+    assert_eq!(authority.state.history[0].receipt, Some(Receipt::Returned));
+
+    // The hold drops immediately after that sample. The target is still active with an empty
+    // Job, exactly as in the integration journal, so the authority must keep observing it.
+    authority.system.gamescope = Some(GamescopeSessionLifecycle::Transient { diagnostic: None });
+    authority.tick().unwrap();
+    assert_eq!(
+        authority
+            .state
+            .resident_monitor
+            .as_ref()
+            .map(|monitor| monitor.rung),
+        Some(ResidentMonitorRung::TargetReleased)
+    );
+    assert!(!authority.system.calls.iter().any(|call| call == "owner"));
+
+    // StopWhenUnneeded tears the target down about 0.5 s later. Reconciliation must leave
+    // session_idle and enter the legacy selected-owner presentation ladder.
+    authority.clock.advance(Duration::from_millis(557));
+    authority.system.gamescope = None;
+    authority.tick().unwrap();
+    assert!(authority.system.calls.iter().any(|call| call == "owner"));
+    assert!(matches!(authority.state.phase, Phase::Idle));
+    assert_eq!(
+        authority
+            .state
+            .resident_monitor
+            .as_ref()
+            .map(|monitor| monitor.rung),
+        Some(ResidentMonitorRung::OwnerActive)
+    );
+
+    authority
+        .system
+        .lifecycle
+        .as_mut()
+        .unwrap()
+        .selected_owner_active = true;
+    authority.tick().unwrap();
+    assert!(matches!(authority.state.phase, Phase::Idle));
+    assert_eq!(
+        authority
+            .state
+            .resident_monitor
+            .as_ref()
+            .map(|monitor| monitor.rung),
+        Some(ResidentMonitorRung::PresentationAcknowledged)
+    );
+    assert_eq!(
+        authority
+            .state
+            .resident_monitor
+            .as_ref()
+            .map(|monitor| &monitor.receipt),
+        Some(&Receipt::Returned)
+    );
+    authority
+        .observe(Observation::PresentationAcknowledged)
+        .unwrap();
+    assert!(authority.state.resident_monitor.is_none());
+}
+
+#[test]
+fn gamescope_home_outcomes_converge_after_the_resident_sample_goes_stale() {
+    for (active, presenting) in [(false, false), (true, false), (true, true)] {
+        let mut authority = authority();
+        launch_running(&mut authority);
+        authority.system.lifecycle = Some(SystemLifecycle {
+            app: AppUnitState::InactiveSuccess,
+            foreground_target_active: false,
+            selected_owner_active: false,
+        });
+        authority.system.gamescope = Some(gamescope_home(
+            "pf-shell-gamescope.service",
+            active,
+            presenting,
+        ));
+        authority.tick().unwrap();
+        assert!(authority.state.resident_monitor.is_some());
+
+        // Release immediately after the final resident sample, then observe the target stop.
+        authority.system.gamescope =
+            Some(GamescopeSessionLifecycle::Transient { diagnostic: None });
+        authority.tick().unwrap();
+        authority.system.gamescope = None;
+        authority.tick().unwrap();
+
+        assert!(authority.system.calls.iter().any(|call| call == "owner"));
+        assert!(matches!(
+            authority.state.phase,
+            Phase::Restoring {
+                rung: RestorationRung::OwnerActive,
+                ..
+            } | Phase::Idle
+        ));
+    }
+
+    let (mut late, _) = gamescope_home_timed_out(true);
+    late.system.gamescope = Some(gamescope_home("pf-shell-gamescope.service", true, true));
+    late.tick().unwrap();
+    assert!(matches!(late.state.phase, Phase::Idle));
+    late.system.gamescope = Some(GamescopeSessionLifecycle::Transient { diagnostic: None });
+    late.tick().unwrap();
+    late.system.gamescope = None;
+    late.tick().unwrap();
+    assert!(late.system.calls.iter().any(|call| call == "owner"));
+    assert_eq!(
+        late.state
+            .resident_monitor
+            .as_ref()
+            .map(|monitor| monitor.rung),
+        Some(ResidentMonitorRung::OwnerActive)
+    );
+}
+
+fn assert_resident_monitor_waits_for_foreground_release(
+    mut authority: Authority<MemoryStore, FakeSystem, TestClock>,
+    expected_receipt: Receipt,
+) {
+    assert!(authority.state.resident_monitor.is_some());
+    let owner_calls_before = authority
+        .system
+        .calls
+        .iter()
+        .filter(|call| call.as_str() == "owner")
+        .count();
+
+    authority.system.gamescope = Some(GamescopeSessionLifecycle::Transient { diagnostic: None });
+    authority.tick().unwrap();
+    assert_eq!(
+        authority
+            .state
+            .resident_monitor
+            .as_ref()
+            .map(|monitor| monitor.rung),
+        Some(ResidentMonitorRung::TargetReleased)
+    );
+
+    // Gamescope is gone, but the ordinary TargetReleased gate still owns the framebuffer.
+    // Repeated ticks must neither activate nor duplicate the selected owner.
+    authority.system.gamescope = None;
+    authority
+        .system
+        .lifecycle
+        .as_mut()
+        .unwrap()
+        .foreground_target_active = true;
+    for _ in 0..3 {
+        authority.tick().unwrap();
+    }
+    assert_eq!(
+        authority
+            .system
+            .calls
+            .iter()
+            .filter(|call| call.as_str() == "owner")
+            .count(),
+        owner_calls_before
+    );
+
+    authority
+        .system
+        .lifecycle
+        .as_mut()
+        .unwrap()
+        .foreground_target_active = false;
+    authority.tick().unwrap();
+    assert_eq!(
+        authority
+            .system
+            .calls
+            .iter()
+            .filter(|call| call.as_str() == "owner")
+            .count(),
+        owner_calls_before + 1
+    );
+
+    authority
+        .system
+        .lifecycle
+        .as_mut()
+        .unwrap()
+        .selected_owner_active = true;
+    authority.tick().unwrap();
+    authority
+        .observe(Observation::PresentationAcknowledged)
+        .unwrap();
+    assert!(matches!(authority.state.phase, Phase::Idle));
+    assert!(authority.state.resident_monitor.is_none());
+    assert_eq!(authority.state.history[0].receipt, Some(expected_receipt));
+}
+
+#[test]
+fn resident_monitor_reuses_the_foreground_target_release_gate_for_every_source() {
+    let resident_lifecycle = SystemLifecycle {
+        app: AppUnitState::InactiveSuccess,
+        foreground_target_active: true,
+        selected_owner_active: false,
+    };
+
+    let mut session_idle = authority();
+    launch_running(&mut session_idle);
+    session_idle.system.lifecycle = Some(resident_lifecycle.clone());
+    session_idle.system.gamescope = Some(GamescopeSessionLifecycle::SessionIdle);
+    session_idle.tick().unwrap();
+    assert_resident_monitor_waits_for_foreground_release(session_idle, Receipt::Returned);
+
+    for (active, presenting) in [(false, false), (true, false), (true, true)] {
+        let mut home = authority();
+        launch_running(&mut home);
+        home.system.lifecycle = Some(resident_lifecycle.clone());
+        home.system.gamescope = Some(gamescope_home(
+            "pf-shell-gamescope.service",
+            active,
+            presenting,
+        ));
+        home.tick().unwrap();
+        assert_resident_monitor_waits_for_foreground_release(home, Receipt::Returned);
+    }
+
+    let (mut late_home, _) = gamescope_home_timed_out(true);
+    late_home.system.gamescope = Some(gamescope_home("pf-shell-gamescope.service", true, true));
+    late_home.tick().unwrap();
+    late_home
+        .system
+        .lifecycle
+        .as_mut()
+        .unwrap()
+        .foreground_target_active = true;
+    assert_resident_monitor_waits_for_foreground_release(
+        late_home,
+        Receipt::Crash {
+            summary: "systemd result: exit-code".to_owned(),
+        },
+    );
+}
+
+#[test]
+fn gamescope_resident_monitor_latches_stop_restart_aba() {
+    let mut authority = authority();
+    launch_running(&mut authority);
+    authority.system.lifecycle = Some(SystemLifecycle {
+        app: AppUnitState::InactiveSuccess,
+        foreground_target_active: false,
+        selected_owner_active: false,
+    });
+    authority.system.gamescope = Some(GamescopeSessionLifecycle::SessionIdle);
+    authority.tick().unwrap();
+
+    // The monitor is durable across an authority restart before systemd begins the ABA.
+    let (store, system, clock) = authority.into_parts();
+    let mut authority = Authority::open_with_resolver(
+        store,
+        system,
+        clock,
+        3,
+        Duration::from_millis(10),
+        test_resolver(),
+    )
+    .unwrap();
+
+    authority.system.gamescope = Some(GamescopeSessionLifecycle::Transitioning);
+    authority.tick().unwrap();
+    assert_eq!(
+        authority
+            .state
+            .resident_monitor
+            .as_ref()
+            .map(|monitor| monitor.rung),
+        Some(ResidentMonitorRung::TargetReleased)
+    );
+    authority.system.gamescope = None;
+    authority.tick().unwrap();
+    authority.system.gamescope = Some(GamescopeSessionLifecycle::SessionIdle);
+    authority.tick().unwrap();
+
+    assert!(authority.system.calls.iter().any(|call| call == "owner"));
+    assert_eq!(
+        authority
+            .state
+            .resident_monitor
+            .as_ref()
+            .map(|monitor| monitor.rung),
+        Some(ResidentMonitorRung::OwnerActive)
+    );
 }
 
 #[test]
@@ -1922,9 +2624,13 @@ fn late_gamescope_home_ack_requires_the_same_active_session_home() {
     authority.tick().unwrap();
     assert!(matches!(
         authority.state.phase,
-        Phase::RecoveryRequired { .. }
+        Phase::Restoring {
+            rung: RestorationRung::OwnerActive,
+            ..
+        }
     ));
     assert_eq!(authority.state.history[0].receipt, None);
+    assert!(authority.system.calls.iter().any(|call| call == "owner"));
 }
 
 #[test]

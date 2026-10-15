@@ -76,6 +76,8 @@ pub mod orientation_source;
 
 /// Default deadline for the restored shell to acknowledge its first presentation.
 pub const DEFAULT_PRESENTATION_TIMEOUT: Duration = Duration::from_secs(10);
+const GAMESCOPE_SESSION_TARGET: &str = "pocketforge-gamescope-session.target";
+const GAMESCOPE_RESIDENT_UNIT: &str = "pocketforge-gamescope-resident.service";
 
 /// Version of the private SDK-front wire ([`FrontEnvelope`]).
 pub const FRONT_WIRE_VERSION: u32 = 1;
@@ -301,6 +303,25 @@ pub enum RestorationRung {
     PresentationAcknowledged,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+enum ResidentMonitorRung {
+    Resident,
+    TargetReleased,
+    OwnerActive,
+    PresentationAcknowledged,
+    RecoveryRequired,
+}
+
+/// A completed Gamescope restoration remains observable without holding the app launch slot.
+/// Its receipt belongs to the app-less fallback transition and is consumed when presentation is
+/// acknowledged; app history has already received its own terminal receipt.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct ResidentMonitor {
+    item_id: String,
+    receipt: Receipt,
+    rung: ResidentMonitorRung,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 struct PublishedEvent {
     sequence: u64,
@@ -402,6 +423,8 @@ pub struct PersistedState {
     pub return_slot: Option<ReturnSlot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     url_transition: Option<UrlTransition>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    resident_monitor: Option<ResidentMonitor>,
 }
 
 impl Default for PersistedState {
@@ -417,6 +440,7 @@ impl Default for PersistedState {
             acknowledged: BTreeMap::new(),
             return_slot: None,
             url_transition: None,
+            resident_monitor: None,
         }
     }
 }
@@ -741,13 +765,16 @@ impl<E: CommandExecutor> CommandSystem<E> {
         Ok(output.stdout.trim().to_owned())
     }
 
-    fn active_state_and_job(&mut self, unit: &str) -> Result<(String, Option<String>), String> {
+    fn gamescope_target_state(&mut self) -> Result<GamescopeTargetState, String> {
+        let unit = GAMESCOPE_SESSION_TARGET;
         let output = self.query(&[
             "show",
             "--property",
             "ActiveState",
             "--property",
             "Job",
+            "--property",
+            "BoundBy",
             unit,
         ])?;
         if output.code != 0 {
@@ -758,6 +785,7 @@ impl<E: CommandExecutor> CommandSystem<E> {
         }
         let mut active_state = None;
         let mut job = None;
+        let mut bound_by = None;
         for line in output.stdout.lines() {
             let (property, value) = line
                 .split_once('=')
@@ -767,7 +795,10 @@ impl<E: CommandExecutor> CommandSystem<E> {
                 "Job" if job.is_none() => {
                     job = Some((!value.is_empty()).then(|| value.to_owned()));
                 }
-                "ActiveState" | "Job" => {
+                "BoundBy" if bound_by.is_none() => {
+                    bound_by = Some(value.split_whitespace().map(str::to_owned).collect());
+                }
+                "ActiveState" | "Job" | "BoundBy" => {
                     return Err(format!(
                         "duplicate systemctl property {property} for {unit}"
                     ));
@@ -782,7 +813,60 @@ impl<E: CommandExecutor> CommandSystem<E> {
         let active_state =
             active_state.ok_or_else(|| format!("systemctl omitted ActiveState for {unit}"))?;
         let job = job.ok_or_else(|| format!("systemctl omitted Job for {unit}"))?;
-        Ok((active_state, job))
+        let bound_by = bound_by.ok_or_else(|| format!("systemctl omitted BoundBy for {unit}"))?;
+        Ok(GamescopeTargetState {
+            active_state,
+            job,
+            bound_by,
+        })
+    }
+
+    fn resident_unit_state(&mut self) -> Result<Option<String>, String> {
+        let unit = GAMESCOPE_RESIDENT_UNIT;
+        let output = self.query(&[
+            "show",
+            "--property",
+            "LoadState",
+            "--property",
+            "ActiveState",
+            unit,
+        ])?;
+        if output.code != 0 {
+            return Err(format!(
+                "systemctl show LoadState/ActiveState {unit} exited {}",
+                output.code
+            ));
+        }
+        let mut load_state = None;
+        let mut active_state = None;
+        for line in output.stdout.lines() {
+            let (property, value) = line
+                .split_once('=')
+                .ok_or_else(|| format!("malformed systemctl property for {unit}: {line:?}"))?;
+            match property {
+                "LoadState" if load_state.is_none() => load_state = Some(value.to_owned()),
+                "ActiveState" if active_state.is_none() => active_state = Some(value.to_owned()),
+                "LoadState" | "ActiveState" => {
+                    return Err(format!(
+                        "duplicate systemctl property {property} for {unit}"
+                    ));
+                }
+                _ => {
+                    return Err(format!(
+                        "unexpected systemctl property {property} for {unit}"
+                    ));
+                }
+            }
+        }
+        let load_state =
+            load_state.ok_or_else(|| format!("systemctl omitted LoadState for {unit}"))?;
+        let active_state =
+            active_state.ok_or_else(|| format!("systemctl omitted ActiveState for {unit}"))?;
+        match load_state.as_str() {
+            "not-found" => Ok(None),
+            "loaded" => Ok(Some(active_state)),
+            state => Err(format!("resident unit {unit} has LoadState {state:?}")),
+        }
     }
 
     fn is_active(&mut self, unit: &str) -> Result<bool, String> {
@@ -883,10 +967,28 @@ pub struct SystemLifecycle {
     pub selected_owner_active: bool,
 }
 
+fn selected_owner_release_ready(
+    foreground_target_active: bool,
+    gamescope: &Option<GamescopeSessionLifecycle>,
+) -> bool {
+    gamescope.is_none() && !foreground_target_active
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct GamescopeTargetState {
+    active_state: String,
+    job: Option<String>,
+    bound_by: Vec<String>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum GamescopeSessionLifecycle {
     /// The target has a unit job or is deactivating, so ownership is not stable yet.
     Transitioning,
+    /// The target has no independent resident pin and must be allowed to become inactive.
+    Transient {
+        diagnostic: Option<String>,
+    },
     SessionIdle,
     HomeClient {
         unit: String,
@@ -919,12 +1021,12 @@ impl<E: CommandExecutor> SessionSystem for CommandSystem<E> {
     }
 
     fn gamescope_session_lifecycle(&mut self) -> Result<Option<GamescopeSessionLifecycle>, String> {
-        let target = "pocketforge-gamescope-session.target";
-        let (active_state, job) = self.active_state_and_job(target)?;
-        if job.is_some() || active_state == "deactivating" {
+        let target = GAMESCOPE_SESSION_TARGET;
+        let target_state = self.gamescope_target_state()?;
+        if target_state.job.is_some() || target_state.active_state == "deactivating" {
             return Ok(Some(GamescopeSessionLifecycle::Transitioning));
         }
-        match active_state.as_str() {
+        match target_state.active_state.as_str() {
             "active" => {}
             "inactive" | "failed" => return Ok(None),
             state => {
@@ -933,38 +1035,64 @@ impl<E: CommandExecutor> SessionSystem for CommandSystem<E> {
                 ));
             }
         }
-        let (Some(unit), Some(signal)) = (
+        let resident_state = self.resident_unit_state()?;
+        let resident_active = matches!(resident_state.as_deref(), Some("active" | "activating"));
+        let resident_bound = target_state
+            .bound_by
+            .iter()
+            .any(|unit| unit == GAMESCOPE_RESIDENT_UNIT);
+        if !resident_active || !resident_bound {
+            let diagnostic = (resident_active && !resident_bound).then(|| {
+                format!(
+                    "gamescope_residency_misconfigured reason=active_without_bound_by unit={GAMESCOPE_RESIDENT_UNIT} target={GAMESCOPE_SESSION_TARGET}"
+                )
+            });
+            return Ok(Some(GamescopeSessionLifecycle::Transient { diagnostic }));
+        }
+        let lifecycle = match (
             self.session_owner.home_client_unit.clone(),
             self.session_owner.home_client_presentation.clone(),
-        ) else {
-            return Ok(Some(GamescopeSessionLifecycle::SessionIdle));
-        };
-        match self.property(&unit, "LoadState")?.as_str() {
-            "not-found" => return Ok(Some(GamescopeSessionLifecycle::SessionIdle)),
-            "loaded" => {}
-            state => return Err(format!("home client {unit} has LoadState {state:?}")),
-        }
-        let active = self.is_active(&unit)?;
-        let presenting = if active {
-            match fs::read_to_string(&signal) {
-                Ok(value) => value == format!("{unit}\n"),
-                Err(error) if error.kind() == io::ErrorKind::NotFound => false,
-                Err(error) => {
-                    return Err(format!(
-                        "read Gamescope presentation signal {}: {error}",
-                        signal.display()
-                    ))
+        ) {
+            (Some(unit), Some(signal)) => match self.property(&unit, "LoadState")?.as_str() {
+                "not-found" => GamescopeSessionLifecycle::SessionIdle,
+                "loaded" => {
+                    let active = self.is_active(&unit)?;
+                    let presenting = if active {
+                        match fs::read_to_string(&signal) {
+                            Ok(value) => value == format!("{unit}\n"),
+                            Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+                            Err(error) => {
+                                return Err(format!(
+                                    "read Gamescope presentation signal {}: {error}",
+                                    signal.display()
+                                ));
+                            }
+                        }
+                    } else {
+                        false
+                    };
+                    GamescopeSessionLifecycle::HomeClient {
+                        unit,
+                        active,
+                        presenting,
+                        ack_signal: signal.display().to_string(),
+                    }
                 }
-            }
-        } else {
-            false
+                state => return Err(format!("home client {unit} has LoadState {state:?}")),
+            },
+            _ => GamescopeSessionLifecycle::SessionIdle,
         };
-        Ok(Some(GamescopeSessionLifecycle::HomeClient {
-            unit,
-            active,
-            presenting,
-            ack_signal: signal.display().to_string(),
-        }))
+
+        // `systemctl show` is D-Bus-backed but each unit is observed separately. Re-read both
+        // ends of the residency edge after collecting any home-client evidence; a target or
+        // resident transition between the first and second samples must not yield a terminal
+        // Gamescope owner observation assembled from two systemd epochs.
+        let resident_after = self.resident_unit_state()?;
+        let target_after = self.gamescope_target_state()?;
+        if resident_after != resident_state || target_after != target_state {
+            return Ok(Some(GamescopeSessionLifecycle::Transitioning));
+        }
+        Ok(Some(lifecycle))
     }
 
     fn activate_home_client(&mut self, unit: &str) -> Result<(), String> {
@@ -2668,7 +2796,8 @@ impl<S: StateStore, B: SessionSystem, C: Clock> Authority<S, B, C> {
             }
             self.persist()?;
         }
-        self.reconcile_systemd()
+        self.reconcile_systemd()?;
+        self.reconcile_resident_monitor()
     }
     pub fn tick(&mut self) -> Result<(), AuthorityError> {
         self.reconcile()?;
@@ -2709,6 +2838,36 @@ impl<S: StateStore, B: SessionSystem, C: Clock> Authority<S, B, C> {
     /// re-armed for a full timeout rather than failing immediately: unlike an overdue graceful
     /// stop, an early expiry here would only record a spurious recovery.
     fn enforce_presentation_deadline(&mut self) -> Result<(), AuthorityError> {
+        if matches!(self.state.phase, Phase::Idle)
+            && self.state.resident_monitor.as_ref().is_some_and(|monitor| {
+                monitor.rung == ResidentMonitorRung::PresentationAcknowledged
+            })
+        {
+            let now = self.clock.now();
+            let timeout = self.presentation_timeout;
+            let deadline = *self
+                .presentation_deadline
+                .get_or_insert_with(|| now.saturating_add(timeout));
+            if now >= deadline {
+                let item_id = self
+                    .state
+                    .resident_monitor
+                    .as_ref()
+                    .map(|monitor| monitor.item_id.clone())
+                    .unwrap_or_default();
+                let code = ReasonCode::PresentationNotAcknowledged.as_str();
+                let detail = format!(
+                    "app-less restoration presentation not acknowledged within {} ms",
+                    timeout.as_millis()
+                );
+                self.log(&lifecycle_failure_line(code, &item_id, &detail));
+                self.state.resident_monitor.as_mut().unwrap().rung =
+                    ResidentMonitorRung::RecoveryRequired;
+                self.presentation_deadline = None;
+                self.persist()?;
+            }
+            return Ok(());
+        }
         let Phase::Restoring {
             item_id,
             receipt,
@@ -2826,13 +2985,25 @@ impl<S: StateStore, B: SessionSystem, C: Clock> Authority<S, B, C> {
                     _,
                 ) => match gamescope.clone() {
                     Some(GamescopeSessionLifecycle::Transitioning) => None,
+                    Some(GamescopeSessionLifecycle::Transient { diagnostic }) => {
+                        if let Some(diagnostic) = diagnostic {
+                            self.log(&diagnostic);
+                        }
+                        None
+                    }
                     Some(GamescopeSessionLifecycle::SessionIdle) => {
                         Some(Observation::GamescopeSessionIdle)
                     }
                     Some(GamescopeSessionLifecycle::HomeClient {
                         unit, ack_signal, ..
                     }) => Some(Observation::GamescopeHomeAvailable { unit, ack_signal }),
-                    None if !snapshot.foreground_target_active => Some(Observation::TargetReleased),
+                    None if selected_owner_release_ready(
+                        snapshot.foreground_target_active,
+                        &gamescope,
+                    ) =>
+                    {
+                        Some(Observation::TargetReleased)
+                    }
                     None => None,
                 },
                 (
@@ -2877,6 +3048,140 @@ impl<S: StateStore, B: SessionSystem, C: Clock> Authority<S, B, C> {
             self.observe(observation)?;
         }
         Ok(())
+    }
+
+    /// Re-samples a completed resident restoration on every service-loop tick. This is a
+    /// post-terminal convergence path, not a read/commit lease: observing release is latched so
+    /// a later equal-looking resident endpoint cannot erase an intervening transition.
+    fn reconcile_resident_monitor(&mut self) -> Result<(), AuthorityError> {
+        let Some(monitor) = self.state.resident_monitor.clone() else {
+            return Ok(());
+        };
+        match monitor.rung {
+            ResidentMonitorRung::Resident | ResidentMonitorRung::TargetReleased => {
+                let gamescope = self
+                    .system
+                    .gamescope_session_lifecycle()
+                    .map_err(AuthorityError::Backend)?;
+                match gamescope {
+                    Some(GamescopeSessionLifecycle::Transitioning)
+                    | Some(GamescopeSessionLifecycle::Transient { .. }) => {
+                        if monitor.rung != ResidentMonitorRung::TargetReleased {
+                            self.state.resident_monitor.as_mut().unwrap().rung =
+                                ResidentMonitorRung::TargetReleased;
+                            self.persist()?;
+                        }
+                        Ok(())
+                    }
+                    None => {
+                        if monitor.rung != ResidentMonitorRung::TargetReleased {
+                            self.state.resident_monitor.as_mut().unwrap().rung =
+                                ResidentMonitorRung::TargetReleased;
+                            self.persist()?;
+                        }
+                        let snapshot = self
+                            .system
+                            .lifecycle(&monitor.item_id)
+                            .map_err(AuthorityError::Backend)?;
+                        if snapshot.as_ref().is_some_and(|snapshot| {
+                            selected_owner_release_ready(
+                                snapshot.foreground_target_active,
+                                &gamescope,
+                            )
+                        }) {
+                            self.begin_resident_monitor_fallback()
+                        } else {
+                            Ok(())
+                        }
+                    }
+                    Some(_) => Ok(()),
+                }
+            }
+            ResidentMonitorRung::OwnerActive => {
+                let selected_owner_active = self
+                    .system
+                    .lifecycle(&monitor.item_id)
+                    .map_err(AuthorityError::Backend)?
+                    .is_some_and(|snapshot| snapshot.selected_owner_active);
+                if selected_owner_active {
+                    self.state.resident_monitor.as_mut().unwrap().rung =
+                        ResidentMonitorRung::PresentationAcknowledged;
+                    self.presentation_deadline =
+                        Some(self.clock.deadline_after(self.presentation_timeout).0);
+                    self.persist()?;
+                }
+                Ok(())
+            }
+            ResidentMonitorRung::PresentationAcknowledged
+            | ResidentMonitorRung::RecoveryRequired => Ok(()),
+        }
+    }
+
+    fn begin_resident_monitor_fallback(&mut self) -> Result<(), AuthorityError> {
+        match self.state.phase.clone() {
+            Phase::Idle => {
+                self.system
+                    .activate_selected_owner()
+                    .map_err(AuthorityError::Backend)?;
+                self.state.resident_monitor.as_mut().unwrap().rung =
+                    ResidentMonitorRung::OwnerActive;
+                self.persist()
+            }
+            Phase::Restoring {
+                session_id,
+                item_id,
+                receipt,
+                ..
+            } => {
+                self.system
+                    .activate_selected_owner()
+                    .map_err(AuthorityError::Backend)?;
+                self.set_post_app_owner_for_fallback(&session_id);
+                self.home_ack_started = None;
+                self.presentation_deadline = None;
+                self.state.resident_monitor = None;
+                self.state.phase = Phase::Restoring {
+                    session_id,
+                    item_id,
+                    receipt,
+                    rung: RestorationRung::OwnerActive,
+                };
+                self.persist()
+            }
+            Phase::RecoveryRequired {
+                session_id,
+                item_id,
+                reason,
+                pending_receipt: Some(receipt),
+            } if is_presentation_timeout(&reason) => {
+                self.system
+                    .activate_selected_owner()
+                    .map_err(AuthorityError::Backend)?;
+                self.set_post_app_owner_for_fallback(&session_id);
+                self.home_ack_started = None;
+                self.presentation_deadline = None;
+                self.state.resident_monitor = None;
+                self.state.phase = Phase::Restoring {
+                    session_id,
+                    item_id,
+                    receipt,
+                    rung: RestorationRung::OwnerActive,
+                };
+                self.persist()
+            }
+            _ => Ok(()),
+        }
+    }
+
+    fn set_post_app_owner_for_fallback(&mut self, session_id: &str) {
+        if let Some(entry) = self
+            .state
+            .history
+            .iter_mut()
+            .find(|entry| entry.session_id == session_id)
+        {
+            entry.post_app_owner = None;
+        }
     }
 
     fn reconcile_late_gamescope_home(&mut self) -> Result<(), AuthorityError> {
@@ -3043,15 +3348,16 @@ impl<S: StateStore, B: SessionSystem, C: Clock> Authority<S, B, C> {
             (
                 Phase::Restoring {
                     session_id,
+                    item_id,
                     receipt,
                     rung: RestorationRung::TargetReleased,
-                    ..
                 },
                 Observation::GamescopeSessionIdle,
             ) => {
-                let (id, receipt) = (session_id.clone(), receipt.clone());
+                let (session_id, item_id, receipt) =
+                    (session_id.clone(), item_id.clone(), receipt.clone());
                 self.set_post_app_owner(
-                    &id,
+                    &session_id,
                     PostAppOwnerEvidence {
                         owner_tier: OwnerTier::Gamescope,
                         post_app_owner: PostAppOwner::SessionIdle,
@@ -3060,7 +3366,8 @@ impl<S: StateStore, B: SessionSystem, C: Clock> Authority<S, B, C> {
                         ack_latency_ms: None,
                     },
                 );
-                self.complete_restoration(id, receipt)
+                self.arm_resident_monitor(&item_id);
+                self.complete_restoration(session_id, receipt)
             }
             (
                 Phase::Restoring {
@@ -3088,6 +3395,7 @@ impl<S: StateStore, B: SessionSystem, C: Clock> Authority<S, B, C> {
                         ack_latency_ms: None,
                     },
                 );
+                self.arm_resident_monitor(&item_id);
                 self.home_ack_started = Some(self.clock.now());
                 self.presentation_deadline =
                     Some(self.clock.deadline_after(self.presentation_timeout).0);
@@ -3111,6 +3419,14 @@ impl<S: StateStore, B: SessionSystem, C: Clock> Authority<S, B, C> {
                 let session_id = session_id.clone();
                 let item_id = item_id.clone();
                 let receipt = receipt.clone();
+                if let Some(entry) = self
+                    .state
+                    .history
+                    .iter_mut()
+                    .find(|entry| entry.session_id == session_id)
+                {
+                    entry.post_app_owner = None;
+                }
                 if let Err(reason) = self.system.activate_selected_owner() {
                     return self
                         .recover(format!("{}: {reason}", ReasonCode::OwnerNotActive.as_str()));
@@ -3192,13 +3508,14 @@ impl<S: StateStore, B: SessionSystem, C: Clock> Authority<S, B, C> {
             (
                 Phase::Restoring {
                     session_id,
+                    item_id,
                     receipt,
                     rung: RestorationRung::PresentationAcknowledged,
-                    ..
                 },
                 Observation::GamescopeHomePresented { unit, ack_signal },
             ) => {
                 let (id, receipt) = (session_id.clone(), receipt.clone());
+                let item_id = item_id.clone();
                 let latency_ms = self.home_ack_started.map(|started| {
                     self.clock
                         .now()
@@ -3207,6 +3524,9 @@ impl<S: StateStore, B: SessionSystem, C: Clock> Authority<S, B, C> {
                         / 1_000_000
                 });
                 self.refresh_home_evidence(&id, &unit, &ack_signal, latency_ms);
+                if self.state.resident_monitor.is_none() {
+                    self.arm_resident_monitor(&item_id);
+                }
                 self.complete_restoration(id, receipt)
             }
             // A late client acknowledgement after the presentation deadline expired. The owed
@@ -3226,13 +3546,14 @@ impl<S: StateStore, B: SessionSystem, C: Clock> Authority<S, B, C> {
             (
                 Phase::RecoveryRequired {
                     session_id,
+                    item_id,
                     reason,
                     pending_receipt: Some(receipt),
-                    ..
                 },
                 Observation::GamescopeHomePresented { unit, ack_signal },
             ) if is_presentation_timeout(reason) => {
                 let (id, receipt) = (session_id.clone(), receipt.clone());
+                let item_id = item_id.clone();
                 if !self.recorded_gamescope_home_matches(&id, &unit, &ack_signal) {
                     return Err(AuthorityError::InvalidObservation);
                 }
@@ -3244,7 +3565,23 @@ impl<S: StateStore, B: SessionSystem, C: Clock> Authority<S, B, C> {
                         / 1_000_000
                 });
                 self.refresh_home_evidence(&id, &unit, &ack_signal, latency_ms);
+                if self.state.resident_monitor.is_none() {
+                    self.arm_resident_monitor(&item_id);
+                }
                 self.complete_restoration(id, receipt)
+            }
+            (Phase::Idle, Observation::PresentationAcknowledged)
+                if self.state.resident_monitor.as_ref().is_some_and(|monitor| {
+                    matches!(
+                        monitor.rung,
+                        ResidentMonitorRung::PresentationAcknowledged
+                            | ResidentMonitorRung::RecoveryRequired
+                    )
+                }) =>
+            {
+                self.presentation_deadline = None;
+                self.state.resident_monitor = None;
+                self.persist()
             }
             _ => Err(AuthorityError::InvalidObservation),
         }
@@ -3283,6 +3620,14 @@ impl<S: StateStore, B: SessionSystem, C: Clock> Authority<S, B, C> {
         self.state.phase = Phase::Idle;
         self.state.return_slot = None;
         self.persist()
+    }
+
+    fn arm_resident_monitor(&mut self, item_id: &str) {
+        self.state.resident_monitor = Some(ResidentMonitor {
+            item_id: item_id.to_owned(),
+            receipt: Receipt::Returned,
+            rung: ResidentMonitorRung::Resident,
+        });
     }
 
     fn set_post_app_owner(&mut self, session_id: &str, evidence: PostAppOwnerEvidence) {
@@ -3836,6 +4181,7 @@ impl<S: StateStore, B: SessionSystem, C: Clock> Authority<S, B, C> {
     ) -> Result<(String, Option<T>), AuthorityError> {
         let id = format!("session-{}", self.state.next_session);
         let before_intent = self.state.clone();
+        self.state.resident_monitor = None;
         self.state.next_session += 1;
         self.state.phase = Phase::Starting {
             session_id: id.clone(),

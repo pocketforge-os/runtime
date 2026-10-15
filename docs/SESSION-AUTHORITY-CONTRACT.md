@@ -141,17 +141,40 @@ Restoration first asks systemd whether `pocketforge-gamescope-session.target` is
 is active, an inactive `pocketforge-foreground.target` is not a release signal and the authority
 never starts `pf-shell-selected.service`.
 
-The Gamescope target counts as resident only when `ActiveState=active` and its own systemd `Job`
-property is empty in the same snapshot. A queued unit job or `ActiveState=deactivating` is
-nonterminal: reconciliation waits for the target to become inactive, then continues through the
-legacy selected-owner and presentation acknowledgement rungs.
+Gamescope residency has one explicit signal: `pocketforge-gamescope-resident.service`. The image
+starts this `Type=oneshot`, `RemainAfterExit=yes` unit for resident opt-in; the unit `BindsTo=` the
+session target. The authority commits `session_idle` (or activates the configured home client)
+only when the resident unit is `active` or `activating` **and** the session target's D-Bus
+`BoundBy` property names that exact unit. A resident outcome completes the app restoration and
+frees its launch slot normally, while also arming a persisted resident monitor. Every service-loop
+tick re-samples the target and resident hold. If the hold later drops, the monitor latches that
+transition, waits for the target to stop, and runs an app-less selected-owner and presentation
+acknowledgement ladder. A new app launch disarms the monitor in the same durable start intent, so
+the new foreground session supersedes it without double restoration. `pf-app@` and the broker are
+transient pins and never count as residency. An active resident unit missing from `BoundBy` is
+logged as a misconfiguration and treated as transient.
+
+This mirrors systemd's `StopWhenUnneeded=` predicate: its
+[`UNIT_ATOM_PINS_STOP_WHEN_UNNEEDED`](https://github.com/systemd/systemd/blob/main/src/core/unit.c#L2015-L2040)
+walk is populated by the reverse `RequiredBy`, `RequisiteOf`, `WantedBy`, `BoundBy`, and `UpheldBy`
+dependency atoms ([mapping](https://github.com/systemd/systemd/blob/main/src/core/unit-dependency-atom.c#L34-L53)).
+If the explicit resident `BoundBy` pin is absent, an active target with an empty `Job` is still
+transient: reconciliation waits for the target to become inactive, then continues through the
+legacy selected-owner and presentation acknowledgement rungs. A queued unit job or
+`ActiveState=deactivating` is likewise nonterminal. Before returning either a `session_idle` or a
+terminal-capable home-client observation, the authority re-reads the resident state and the full
+target tuple; either changing between samples yields a nonterminal transition instead of evidence
+assembled from two systemd epochs. This snapshot is advisory rather than a lease: the post-terminal
+resident monitor provides eventual convergence if the hold changes immediately after the read,
+including terminal configured-home and late-acknowledgement outcomes.
 
 The Gamescope home client is optional configuration: `--home-client-unit` and
 `--home-client-presentation` must be supplied together. The latter names a compositor-owned file
 below `/run/pocketforge/session`; its complete content is the configured unit name plus a newline
 only while that client is the focused presenting surface. A configured unit whose systemd
 `LoadState` is `not-found` is treated like no configured unit. In either absent-client case the
-terminal history entry records `post_app_owner=session_idle` and the session stays active.
+terminal history entry records `post_app_owner=session_idle`, the receipt is published, and the
+session stays active under the resident monitor.
 
 When the home client exists, the authority starts (or keeps) that exact configured unit, then
 requires both an active unit and the matching compositor signal. The existing 10-second
