@@ -32,6 +32,7 @@ members = [
     "crates/pf-session-client",
     "crates/pf-session-contract",
     "crates/pf-problem-report",
+    "crates/pf-hang-sampler",
     "crates/pf-input-ipc",
     "crates/pf-menu",
 ]
@@ -66,6 +67,7 @@ pf-app-manifest = { path = "crates/pf-app-manifest", version = "0.0.1" }
 pf-session-authority = { path = "crates/pf-session-authority", version = "0.0.1" }
 pf-session-contract = { path = "crates/pf-session-contract", version = "0.0.1" }
 pf-problem-report = { path = "crates/pf-problem-report", version = "0.0.1" }
+pf-hang-sampler = { path = "crates/pf-hang-sampler", version = "0.0.1" }
 pf-input-ipc = { path = "crates/pf-input-ipc", version = "0.0.1" }
 serde = { version = "1", features = ["derive"] }
 # serde_json backs the single current-state JSON preference document (owner ruling Q2). Only the
@@ -77,6 +79,8 @@ toml = "0.8"
 # ioctls, SCM_RIGHTS). The wire/facade crates stay dependency-light; this is the one place
 # raw syscalls are unavoidable, and libc gives the correct struct layouts + ioctl FFI.
 libc = "0.2"
+framehop = { version = "=0.15.0", default-features = false, features = ["std"] }
+object = { version = "=0.37.3", default-features = false, features = ["read_core", "elf", "std"] }
 linux-raw-sys = { version = "0.12", features = ["landlock"] }
 taffy = { version = "0.7.7", default-features = false, features = ["std", "taffy_tree", "flexbox", "grid", "content_size"] }
 

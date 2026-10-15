@@ -34,8 +34,8 @@
 //! retryable — a further `SafeReturn` runs the whole close sequence again — because the menu row
 //! offers exactly that retry. Contract v1 clients never see these events; see
 //! `docs/SESSION-AUTHORITY-CONTRACT.md`. Right before every close-path escalation the optional
-//! [`EscalationHook`] fires synchronously so the root hang sampler can take its sample; with no
-//! hook attached the escalation path adds no observable delay.
+//! [`EscalationNotifier`] makes one bounded `try_send`; the root hang sampler runs on the
+//! receiving thread and can never delay or veto forced termination.
 
 //! # URL handoff (tsp-ght0z)
 //!
@@ -102,9 +102,8 @@ pub const DEFAULT_TICK_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Default graceful-stop window before the authority escalates by itself.
 ///
-/// Budget: grace (1500 ms) plus the root hang sampler's own bound (≤300 ms, `cr-collect`)
-/// must stay inside the app unit's `TimeoutStopSec=2 s` SIGKILL backstop, so escalation is
-/// the authority's decision and the backstop stays the last resort.
+/// The sampler is notified off the close critical path, so this grace period is the only
+/// authority-owned delay before `enforce_termination`.
 pub const DEFAULT_GRACE_PERIOD: Duration = Duration::from_millis(1500);
 
 /// Baseline session RPC contract: launch/safe-return/events/acknowledge/history/observe/tick
@@ -2189,18 +2188,33 @@ fn stderr_log_sink() -> LogSink {
     Box::new(|line: &str| eprintln!("{line}"))
 }
 
-/// Everything a sampler needs to capture the hang it is about to escalate out of.
-pub struct EscalationContext<'a> {
-    pub session_id: &'a str,
-    pub item_id: &'a str,
+/// Owned context queued for the hang-sampler worker when the authority escalates a close.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EscalationNotice {
+    pub session_id: String,
+    pub item_id: String,
     pub reason: ForceStopReason,
 }
 
-/// Fires synchronously immediately before every close-path `enforce_termination`, so the root
-/// hang sampler (`cr-collect`) can seize, unwind and detach inside its own budget. The
-/// authority adds no delay of its own: with no hook attached the escalation is a single
-/// branch. The hook owns its time bound; the close is never delayed past it by the authority.
-pub type EscalationHook = Box<dyn FnMut(&EscalationContext) + Send>;
+/// Cloneable producer for a bounded hang-sampler queue.
+///
+/// The authority only calls [`mpsc::SyncSender::try_send`]. A full or disconnected queue means the
+/// best-effort sample is unavailable; it is never a close failure and never blocks termination.
+#[derive(Clone, Debug)]
+pub struct EscalationNotifier {
+    sender: mpsc::SyncSender<EscalationNotice>,
+}
+
+impl EscalationNotifier {
+    pub fn bounded(capacity: usize) -> (Self, mpsc::Receiver<EscalationNotice>) {
+        let (sender, receiver) = mpsc::sync_channel(capacity);
+        (Self { sender }, receiver)
+    }
+
+    fn notify(&self, notice: EscalationNotice) {
+        let _ = self.sender.try_send(notice);
+    }
+}
 
 pub struct Authority<S, B, C> {
     store: S,
@@ -2215,7 +2229,7 @@ pub struct Authority<S, B, C> {
     presentation_deadline: Option<MonotonicTime>,
     home_ack_started: Option<MonotonicTime>,
     log: LogSink,
-    escalation: Option<EscalationHook>,
+    escalation: Option<EscalationNotifier>,
     now_fn: fn() -> SystemTime,
     url_handler: Box<dyn UrlHandlerResolver + Send>,
     /// Monotonic `OpenUrl` timestamps per caller, oldest first (memory only).
@@ -2492,12 +2506,9 @@ impl<S: StateStore, B: SessionSystem, C: Clock> Authority<S, B, C> {
         self.log = Box::new(sink);
         self
     }
-    /// Attaches the sampler hook that fires immediately before every close-path escalation.
-    pub fn with_escalation_hook(
-        mut self,
-        hook: impl FnMut(&EscalationContext) + Send + 'static,
-    ) -> Self {
-        self.escalation = Some(Box::new(hook));
+    /// Attaches the bounded, non-blocking sampler notification producer.
+    pub fn with_escalation_notifier(mut self, notifier: EscalationNotifier) -> Self {
+        self.escalation = Some(notifier);
         self
     }
     fn log(&mut self, line: &str) {
@@ -2596,19 +2607,18 @@ impl<S: StateStore, B: SessionSystem, C: Clock> Authority<S, B, C> {
         self.publish(WireEvent::RecoveryRequired { session_id, reason });
         self.persist()
     }
-    /// Runs the sampler hook (if any) and then the forced kill. Every close-path escalation
-    /// goes through here so the hook can never be bypassed; with no hook attached this is one
-    /// branch and the kill itself.
+    /// Best-effort queues a sample request and immediately runs the forced kill. Every close-path
+    /// escalation goes through here; queue saturation or receiver failure cannot affect close.
     fn escalate(
         &mut self,
         item_id: &str,
         session_id: &str,
         reason: ForceStopReason,
     ) -> Result<(), String> {
-        if let Some(hook) = self.escalation.as_mut() {
-            hook(&EscalationContext {
-                session_id,
-                item_id,
+        if let Some(notifier) = &self.escalation {
+            notifier.notify(EscalationNotice {
+                session_id: session_id.to_owned(),
+                item_id: item_id.to_owned(),
                 reason,
             });
         }

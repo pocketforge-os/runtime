@@ -184,13 +184,17 @@ monotonic acknowledgement latency. Stopping the Gamescope target returns reconci
 existing foreground-target / selected-owner path; entries on that legacy path omit the additive
 `post_app_owner` field and retain their previous serialized shape.
 
-### Escalation hook
+### Escalation notifier
 
-`Authority::with_escalation_hook` attaches a sampler (the crash collector's hang sampler,
-`cr-collect`) that runs synchronously immediately before every close-path
-`enforce_termination`, with `EscalationContext { session_id, item_id, reason }`. The hook must
-self-bound (the design budget is 300 ms); the authority adds no timeout of its own. With no
-hook attached, escalation is a single branch — pinned by a timing test with a sleeping-hook
-negative control. The hook does not fire when systemd beats the deadline or when the unit is
-already inactive across a daemon restart (no kill is sent in either case) or outside close
-paths.
+`Authority::with_escalation_notifier` attaches a bounded producer for the hang sampler. Every
+close-path escalation performs exactly one `SyncSender::try_send` of an owned
+`EscalationNotice { session_id, item_id, reason }` and then immediately calls
+`enforce_termination`. A full or disconnected queue only loses the best-effort sample; it cannot
+delay, fail, or reorder the close ladder. Sampler target discovery, socket I/O, ptrace and unwind
+all run on the receiving thread.
+
+The notifier does not fire when systemd beats the deadline, when the unit is already inactive
+across a daemon restart (no kill is sent), or outside close paths. The timing test compares the
+same call/event sequence with no notifier and with a consumer that sleeps for 150 ms; both
+authority paths complete under the same bound while a direct sleeping-call negative control is
+measured as slow.

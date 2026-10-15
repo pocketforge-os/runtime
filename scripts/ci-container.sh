@@ -28,6 +28,7 @@ echo '::group::AArch64 musl cross-build, workspace rust-lld (no RUSTFLAGS)'
 cargo build --offline --locked --target aarch64-unknown-linux-musl -p pf-app-launch --bin pf-app-launch
 cargo build --offline --locked --target aarch64-unknown-linux-musl -p pf-input-collect --bin pf-input-collect
 cargo build --offline --locked --target aarch64-unknown-linux-musl -p pf-collect-ui --bin pf-collect-ui
+cargo build --offline --locked --target aarch64-unknown-linux-musl -p pf-hang-sampler --bin pf-hang-sampler
 cargo build --offline --locked --target aarch64-unknown-linux-musl -p pf-framehost-wayland
 echo '::endgroup::'
 echo '::group::GNU AArch64 staticlib C SDK and ELF ABI smoke'

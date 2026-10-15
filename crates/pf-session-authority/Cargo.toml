@@ -10,6 +10,7 @@ authors.workspace = true
 [dependencies]
 libc.workspace = true
 pf-app-manifest.workspace = true
+pf-hang-sampler.workspace = true
 pf-peer-identity.workspace = true
 pf-ports.workspace = true
 pf-prefs.workspace = true
