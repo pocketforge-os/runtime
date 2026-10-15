@@ -927,13 +927,14 @@ fn gamescope_post_app_owner_is_home_or_session_idle_never_fb0() {
     idle.system.lifecycle = Some(lifecycle.clone());
     idle.system.gamescope = Some(GamescopeSessionLifecycle::SessionIdle);
     idle.tick().unwrap();
-    assert!(matches!(
-        idle.state.phase,
-        Phase::Restoring {
-            rung: RestorationRung::SessionIdle,
-            ..
-        }
-    ));
+    assert!(matches!(idle.state.phase, Phase::Idle));
+    assert_eq!(
+        idle.state
+            .resident_monitor
+            .as_ref()
+            .map(|monitor| monitor.rung),
+        Some(ResidentMonitorRung::Resident)
+    );
     assert!(!idle.system.calls.iter().any(|call| call == "owner"));
     assert_eq!(
         idle.state.history[0].post_app_owner,
@@ -1123,13 +1124,15 @@ fn gamescope_target_residency_resident_hold_stays_session_idle() {
 
     authority.tick().unwrap();
 
-    assert!(matches!(
-        authority.state.phase,
-        Phase::Restoring {
-            rung: RestorationRung::SessionIdle,
-            ..
-        }
-    ));
+    assert!(matches!(authority.state.phase, Phase::Idle));
+    assert_eq!(
+        authority
+            .state
+            .resident_monitor
+            .as_ref()
+            .map(|monitor| monitor.rung),
+        Some(ResidentMonitorRung::Resident)
+    );
     assert_eq!(
         authority.state.history[0].post_app_owner,
         Some(PostAppOwnerEvidence {
@@ -1157,11 +1160,18 @@ fn gamescope_session_idle_completes_and_releases_the_next_launch_slot() {
     authority.tick().unwrap();
 
     assert!(matches!(authority.state.phase, Phase::Idle));
-    assert_eq!(
-        authority.state.history[0].receipt,
-        Some(Receipt::Returned)
-    );
+    assert_eq!(authority.state.history[0].receipt, Some(Receipt::Returned));
     assert_eq!(authority.state.history[0].session_id, completed_id);
+    assert!(authority
+        .events_for("monitor-test")
+        .iter()
+        .any(|(_, event)| {
+            matches!(
+                event,
+                SessionEvent::Terminal(TerminalReceipt::Returned { session_id })
+                    if session_id == &completed_id
+            )
+        }));
     assert!(matches!(
         authority
             .launch(LaunchRequest {
@@ -1170,6 +1180,11 @@ fn gamescope_session_idle_completes_and_releases_the_next_launch_slot() {
             .unwrap(),
         LaunchResult::Accepted { .. }
     ));
+    assert!(authority.state.resident_monitor.is_none());
+    authority.system.lifecycle.as_mut().unwrap().app = AppUnitState::Active;
+    authority.system.gamescope = None;
+    authority.tick().unwrap();
+    assert!(!authority.system.calls.iter().any(|call| call == "owner"));
 }
 
 #[test]
@@ -1185,13 +1200,7 @@ fn gamescope_session_idle_reacts_when_resident_hold_drops_after_commit() {
     // The resident sample is valid and session_idle is committed.
     authority.system.gamescope = Some(GamescopeSessionLifecycle::SessionIdle);
     authority.tick().unwrap();
-    assert!(matches!(
-        authority.state.phase,
-        Phase::Restoring {
-            rung: RestorationRung::SessionIdle,
-            ..
-        }
-    ));
+    assert!(matches!(authority.state.phase, Phase::Idle));
     assert_eq!(
         authority.state.history[0].post_app_owner,
         Some(PostAppOwnerEvidence {
@@ -1202,12 +1211,20 @@ fn gamescope_session_idle_reacts_when_resident_hold_drops_after_commit() {
             ack_latency_ms: None,
         })
     );
-    assert!(authority.state.history[0].receipt.is_none());
+    assert_eq!(authority.state.history[0].receipt, Some(Receipt::Returned));
 
     // The hold drops immediately after that sample. The target is still active with an empty
     // Job, exactly as in the integration journal, so the authority must keep observing it.
     authority.system.gamescope = Some(GamescopeSessionLifecycle::Transient { diagnostic: None });
     authority.tick().unwrap();
+    assert_eq!(
+        authority
+            .state
+            .resident_monitor
+            .as_ref()
+            .map(|monitor| monitor.rung),
+        Some(ResidentMonitorRung::TargetReleased)
+    );
     assert!(!authority.system.calls.iter().any(|call| call == "owner"));
 
     // StopWhenUnneeded tears the target down about 0.5 s later. Reconciliation must leave
@@ -1216,13 +1233,15 @@ fn gamescope_session_idle_reacts_when_resident_hold_drops_after_commit() {
     authority.system.gamescope = None;
     authority.tick().unwrap();
     assert!(authority.system.calls.iter().any(|call| call == "owner"));
-    assert!(matches!(
-        authority.state.phase,
-        Phase::Restoring {
-            rung: RestorationRung::OwnerActive,
-            ..
-        }
-    ));
+    assert!(matches!(authority.state.phase, Phase::Idle));
+    assert_eq!(
+        authority
+            .state
+            .resident_monitor
+            .as_ref()
+            .map(|monitor| monitor.rung),
+        Some(ResidentMonitorRung::OwnerActive)
+    );
 
     authority
         .system
@@ -1231,14 +1250,130 @@ fn gamescope_session_idle_reacts_when_resident_hold_drops_after_commit() {
         .unwrap()
         .selected_owner_active = true;
     authority.tick().unwrap();
-    assert!(matches!(
-        authority.state.phase,
-        Phase::Restoring {
-            rung: RestorationRung::PresentationAcknowledged,
-            ..
-        }
-    ));
-    assert_eq!(authority.state.history[0].post_app_owner, None);
+    assert!(matches!(authority.state.phase, Phase::Idle));
+    assert_eq!(
+        authority
+            .state
+            .resident_monitor
+            .as_ref()
+            .map(|monitor| monitor.rung),
+        Some(ResidentMonitorRung::PresentationAcknowledged)
+    );
+    assert_eq!(
+        authority
+            .state
+            .resident_monitor
+            .as_ref()
+            .map(|monitor| &monitor.receipt),
+        Some(&Receipt::Returned)
+    );
+    authority
+        .observe(Observation::PresentationAcknowledged)
+        .unwrap();
+    assert!(authority.state.resident_monitor.is_none());
+}
+
+#[test]
+fn gamescope_home_outcomes_converge_after_the_resident_sample_goes_stale() {
+    for (active, presenting) in [(false, false), (true, false), (true, true)] {
+        let mut authority = authority();
+        launch_running(&mut authority);
+        authority.system.lifecycle = Some(SystemLifecycle {
+            app: AppUnitState::InactiveSuccess,
+            foreground_target_active: false,
+            selected_owner_active: false,
+        });
+        authority.system.gamescope = Some(gamescope_home(
+            "pf-shell-gamescope.service",
+            active,
+            presenting,
+        ));
+        authority.tick().unwrap();
+        assert!(authority.state.resident_monitor.is_some());
+
+        // Release immediately after the final resident sample, then observe the target stop.
+        authority.system.gamescope =
+            Some(GamescopeSessionLifecycle::Transient { diagnostic: None });
+        authority.tick().unwrap();
+        authority.system.gamescope = None;
+        authority.tick().unwrap();
+
+        assert!(authority.system.calls.iter().any(|call| call == "owner"));
+        assert!(matches!(
+            authority.state.phase,
+            Phase::Restoring {
+                rung: RestorationRung::OwnerActive,
+                ..
+            } | Phase::Idle
+        ));
+    }
+
+    let (mut late, _) = gamescope_home_timed_out(true);
+    late.system.gamescope = Some(gamescope_home("pf-shell-gamescope.service", true, true));
+    late.tick().unwrap();
+    assert!(matches!(late.state.phase, Phase::Idle));
+    late.system.gamescope = Some(GamescopeSessionLifecycle::Transient { diagnostic: None });
+    late.tick().unwrap();
+    late.system.gamescope = None;
+    late.tick().unwrap();
+    assert!(late.system.calls.iter().any(|call| call == "owner"));
+    assert_eq!(
+        late.state
+            .resident_monitor
+            .as_ref()
+            .map(|monitor| monitor.rung),
+        Some(ResidentMonitorRung::OwnerActive)
+    );
+}
+
+#[test]
+fn gamescope_resident_monitor_latches_stop_restart_aba() {
+    let mut authority = authority();
+    launch_running(&mut authority);
+    authority.system.lifecycle = Some(SystemLifecycle {
+        app: AppUnitState::InactiveSuccess,
+        foreground_target_active: false,
+        selected_owner_active: false,
+    });
+    authority.system.gamescope = Some(GamescopeSessionLifecycle::SessionIdle);
+    authority.tick().unwrap();
+
+    // The monitor is durable across an authority restart before systemd begins the ABA.
+    let (store, system, clock) = authority.into_parts();
+    let mut authority = Authority::open_with_resolver(
+        store,
+        system,
+        clock,
+        3,
+        Duration::from_millis(10),
+        test_resolver(),
+    )
+    .unwrap();
+
+    authority.system.gamescope = Some(GamescopeSessionLifecycle::Transitioning);
+    authority.tick().unwrap();
+    assert_eq!(
+        authority
+            .state
+            .resident_monitor
+            .as_ref()
+            .map(|monitor| monitor.rung),
+        Some(ResidentMonitorRung::TargetReleased)
+    );
+    authority.system.gamescope = None;
+    authority.tick().unwrap();
+    authority.system.gamescope = Some(GamescopeSessionLifecycle::SessionIdle);
+    authority.tick().unwrap();
+
+    assert!(authority.system.calls.iter().any(|call| call == "owner"));
+    assert_eq!(
+        authority
+            .state
+            .resident_monitor
+            .as_ref()
+            .map(|monitor| monitor.rung),
+        Some(ResidentMonitorRung::OwnerActive)
+    );
 }
 
 #[test]
@@ -2367,9 +2502,13 @@ fn late_gamescope_home_ack_requires_the_same_active_session_home() {
     authority.tick().unwrap();
     assert!(matches!(
         authority.state.phase,
-        Phase::RecoveryRequired { .. }
+        Phase::Restoring {
+            rung: RestorationRung::OwnerActive,
+            ..
+        }
     ));
     assert_eq!(authority.state.history[0].receipt, None);
+    assert!(authority.system.calls.iter().any(|call| call == "owner"));
 }
 
 #[test]

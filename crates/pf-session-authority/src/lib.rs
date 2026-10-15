@@ -299,11 +299,27 @@ impl Phase {
 pub enum RestorationRung {
     UnitInactive,
     TargetReleased,
-    /// Gamescope is resident without a configured home client. This rung deliberately remains
-    /// reactive: a later hold release and target stop resumes the legacy fb0 ladder.
-    SessionIdle,
     OwnerActive,
     PresentationAcknowledged,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+enum ResidentMonitorRung {
+    Resident,
+    TargetReleased,
+    OwnerActive,
+    PresentationAcknowledged,
+    RecoveryRequired,
+}
+
+/// A completed Gamescope restoration remains observable without holding the app launch slot.
+/// Its receipt belongs to the app-less fallback transition and is consumed when presentation is
+/// acknowledged; app history has already received its own terminal receipt.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct ResidentMonitor {
+    item_id: String,
+    receipt: Receipt,
+    rung: ResidentMonitorRung,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -407,6 +423,8 @@ pub struct PersistedState {
     pub return_slot: Option<ReturnSlot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     url_transition: Option<UrlTransition>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    resident_monitor: Option<ResidentMonitor>,
 }
 
 impl Default for PersistedState {
@@ -422,6 +440,7 @@ impl Default for PersistedState {
             acknowledged: BTreeMap::new(),
             return_slot: None,
             url_transition: None,
+            resident_monitor: None,
         }
     }
 }
@@ -2770,7 +2789,8 @@ impl<S: StateStore, B: SessionSystem, C: Clock> Authority<S, B, C> {
             }
             self.persist()?;
         }
-        self.reconcile_systemd()
+        self.reconcile_systemd()?;
+        self.reconcile_resident_monitor()
     }
     pub fn tick(&mut self) -> Result<(), AuthorityError> {
         self.reconcile()?;
@@ -2811,6 +2831,36 @@ impl<S: StateStore, B: SessionSystem, C: Clock> Authority<S, B, C> {
     /// re-armed for a full timeout rather than failing immediately: unlike an overdue graceful
     /// stop, an early expiry here would only record a spurious recovery.
     fn enforce_presentation_deadline(&mut self) -> Result<(), AuthorityError> {
+        if matches!(self.state.phase, Phase::Idle)
+            && self.state.resident_monitor.as_ref().is_some_and(|monitor| {
+                monitor.rung == ResidentMonitorRung::PresentationAcknowledged
+            })
+        {
+            let now = self.clock.now();
+            let timeout = self.presentation_timeout;
+            let deadline = *self
+                .presentation_deadline
+                .get_or_insert_with(|| now.saturating_add(timeout));
+            if now >= deadline {
+                let item_id = self
+                    .state
+                    .resident_monitor
+                    .as_ref()
+                    .map(|monitor| monitor.item_id.clone())
+                    .unwrap_or_default();
+                let code = ReasonCode::PresentationNotAcknowledged.as_str();
+                let detail = format!(
+                    "app-less restoration presentation not acknowledged within {} ms",
+                    timeout.as_millis()
+                );
+                self.log(&lifecycle_failure_line(code, &item_id, &detail));
+                self.state.resident_monitor.as_mut().unwrap().rung =
+                    ResidentMonitorRung::RecoveryRequired;
+                self.presentation_deadline = None;
+                self.persist()?;
+            }
+            return Ok(());
+        }
         let Phase::Restoring {
             item_id,
             receipt,
@@ -2945,22 +2995,6 @@ impl<S: StateStore, B: SessionSystem, C: Clock> Authority<S, B, C> {
                 },
                 (
                     Phase::Restoring {
-                        rung: RestorationRung::SessionIdle,
-                        ..
-                    },
-                    _,
-                ) => match gamescope.clone() {
-                    Some(GamescopeSessionLifecycle::Transient { diagnostic }) => {
-                        if let Some(diagnostic) = diagnostic {
-                            self.log(&diagnostic);
-                        }
-                        None
-                    }
-                    None if !snapshot.foreground_target_active => Some(Observation::TargetReleased),
-                    _ => None,
-                },
-                (
-                    Phase::Restoring {
                         rung: RestorationRung::OwnerActive,
                         ..
                     },
@@ -3001,6 +3035,120 @@ impl<S: StateStore, B: SessionSystem, C: Clock> Authority<S, B, C> {
             self.observe(observation)?;
         }
         Ok(())
+    }
+
+    /// Re-samples a completed resident restoration on every service-loop tick. This is a
+    /// post-terminal convergence path, not a read/commit lease: observing release is latched so
+    /// a later equal-looking resident endpoint cannot erase an intervening transition.
+    fn reconcile_resident_monitor(&mut self) -> Result<(), AuthorityError> {
+        let Some(monitor) = self.state.resident_monitor.clone() else {
+            return Ok(());
+        };
+        match monitor.rung {
+            ResidentMonitorRung::Resident | ResidentMonitorRung::TargetReleased => {
+                let gamescope = self
+                    .system
+                    .gamescope_session_lifecycle()
+                    .map_err(AuthorityError::Backend)?;
+                match gamescope {
+                    Some(GamescopeSessionLifecycle::Transitioning)
+                    | Some(GamescopeSessionLifecycle::Transient { .. }) => {
+                        if monitor.rung != ResidentMonitorRung::TargetReleased {
+                            self.state.resident_monitor.as_mut().unwrap().rung =
+                                ResidentMonitorRung::TargetReleased;
+                            self.persist()?;
+                        }
+                        Ok(())
+                    }
+                    None => self.begin_resident_monitor_fallback(),
+                    Some(_) => Ok(()),
+                }
+            }
+            ResidentMonitorRung::OwnerActive => {
+                let selected_owner_active = self
+                    .system
+                    .lifecycle(&monitor.item_id)
+                    .map_err(AuthorityError::Backend)?
+                    .is_some_and(|snapshot| snapshot.selected_owner_active);
+                if selected_owner_active {
+                    self.state.resident_monitor.as_mut().unwrap().rung =
+                        ResidentMonitorRung::PresentationAcknowledged;
+                    self.presentation_deadline =
+                        Some(self.clock.deadline_after(self.presentation_timeout).0);
+                    self.persist()?;
+                }
+                Ok(())
+            }
+            ResidentMonitorRung::PresentationAcknowledged
+            | ResidentMonitorRung::RecoveryRequired => Ok(()),
+        }
+    }
+
+    fn begin_resident_monitor_fallback(&mut self) -> Result<(), AuthorityError> {
+        match self.state.phase.clone() {
+            Phase::Idle => {
+                self.system
+                    .activate_selected_owner()
+                    .map_err(AuthorityError::Backend)?;
+                self.state.resident_monitor.as_mut().unwrap().rung =
+                    ResidentMonitorRung::OwnerActive;
+                self.persist()
+            }
+            Phase::Restoring {
+                session_id,
+                item_id,
+                receipt,
+                ..
+            } => {
+                self.system
+                    .activate_selected_owner()
+                    .map_err(AuthorityError::Backend)?;
+                self.set_post_app_owner_for_fallback(&session_id);
+                self.home_ack_started = None;
+                self.presentation_deadline = None;
+                self.state.resident_monitor = None;
+                self.state.phase = Phase::Restoring {
+                    session_id,
+                    item_id,
+                    receipt,
+                    rung: RestorationRung::OwnerActive,
+                };
+                self.persist()
+            }
+            Phase::RecoveryRequired {
+                session_id,
+                item_id,
+                reason,
+                pending_receipt: Some(receipt),
+            } if is_presentation_timeout(&reason) => {
+                self.system
+                    .activate_selected_owner()
+                    .map_err(AuthorityError::Backend)?;
+                self.set_post_app_owner_for_fallback(&session_id);
+                self.home_ack_started = None;
+                self.presentation_deadline = None;
+                self.state.resident_monitor = None;
+                self.state.phase = Phase::Restoring {
+                    session_id,
+                    item_id,
+                    receipt,
+                    rung: RestorationRung::OwnerActive,
+                };
+                self.persist()
+            }
+            _ => Ok(()),
+        }
+    }
+
+    fn set_post_app_owner_for_fallback(&mut self, session_id: &str) {
+        if let Some(entry) = self
+            .state
+            .history
+            .iter_mut()
+            .find(|entry| entry.session_id == session_id)
+        {
+            entry.post_app_owner = None;
+        }
     }
 
     fn reconcile_late_gamescope_home(&mut self) -> Result<(), AuthorityError> {
@@ -3173,9 +3321,8 @@ impl<S: StateStore, B: SessionSystem, C: Clock> Authority<S, B, C> {
                 },
                 Observation::GamescopeSessionIdle,
             ) => {
-                let session_id = session_id.clone();
-                let item_id = item_id.clone();
-                let receipt = receipt.clone();
+                let (session_id, item_id, receipt) =
+                    (session_id.clone(), item_id.clone(), receipt.clone());
                 self.set_post_app_owner(
                     &session_id,
                     PostAppOwnerEvidence {
@@ -3186,13 +3333,8 @@ impl<S: StateStore, B: SessionSystem, C: Clock> Authority<S, B, C> {
                         ack_latency_ms: None,
                     },
                 );
-                self.state.phase = Phase::Restoring {
-                    session_id,
-                    item_id,
-                    receipt,
-                    rung: RestorationRung::SessionIdle,
-                };
-                self.persist()
+                self.arm_resident_monitor(&item_id);
+                self.complete_restoration(session_id, receipt)
             }
             (
                 Phase::Restoring {
@@ -3220,6 +3362,7 @@ impl<S: StateStore, B: SessionSystem, C: Clock> Authority<S, B, C> {
                         ack_latency_ms: None,
                     },
                 );
+                self.arm_resident_monitor(&item_id);
                 self.home_ack_started = Some(self.clock.now());
                 self.presentation_deadline =
                     Some(self.clock.deadline_after(self.presentation_timeout).0);
@@ -3236,7 +3379,7 @@ impl<S: StateStore, B: SessionSystem, C: Clock> Authority<S, B, C> {
                     session_id,
                     item_id,
                     receipt,
-                    rung: RestorationRung::TargetReleased | RestorationRung::SessionIdle,
+                    rung: RestorationRung::TargetReleased,
                 },
                 Observation::TargetReleased,
             ) => {
@@ -3332,13 +3475,14 @@ impl<S: StateStore, B: SessionSystem, C: Clock> Authority<S, B, C> {
             (
                 Phase::Restoring {
                     session_id,
+                    item_id,
                     receipt,
                     rung: RestorationRung::PresentationAcknowledged,
-                    ..
                 },
                 Observation::GamescopeHomePresented { unit, ack_signal },
             ) => {
                 let (id, receipt) = (session_id.clone(), receipt.clone());
+                let item_id = item_id.clone();
                 let latency_ms = self.home_ack_started.map(|started| {
                     self.clock
                         .now()
@@ -3347,6 +3491,9 @@ impl<S: StateStore, B: SessionSystem, C: Clock> Authority<S, B, C> {
                         / 1_000_000
                 });
                 self.refresh_home_evidence(&id, &unit, &ack_signal, latency_ms);
+                if self.state.resident_monitor.is_none() {
+                    self.arm_resident_monitor(&item_id);
+                }
                 self.complete_restoration(id, receipt)
             }
             // A late client acknowledgement after the presentation deadline expired. The owed
@@ -3366,13 +3513,14 @@ impl<S: StateStore, B: SessionSystem, C: Clock> Authority<S, B, C> {
             (
                 Phase::RecoveryRequired {
                     session_id,
+                    item_id,
                     reason,
                     pending_receipt: Some(receipt),
-                    ..
                 },
                 Observation::GamescopeHomePresented { unit, ack_signal },
             ) if is_presentation_timeout(reason) => {
                 let (id, receipt) = (session_id.clone(), receipt.clone());
+                let item_id = item_id.clone();
                 if !self.recorded_gamescope_home_matches(&id, &unit, &ack_signal) {
                     return Err(AuthorityError::InvalidObservation);
                 }
@@ -3384,7 +3532,23 @@ impl<S: StateStore, B: SessionSystem, C: Clock> Authority<S, B, C> {
                         / 1_000_000
                 });
                 self.refresh_home_evidence(&id, &unit, &ack_signal, latency_ms);
+                if self.state.resident_monitor.is_none() {
+                    self.arm_resident_monitor(&item_id);
+                }
                 self.complete_restoration(id, receipt)
+            }
+            (Phase::Idle, Observation::PresentationAcknowledged)
+                if self.state.resident_monitor.as_ref().is_some_and(|monitor| {
+                    matches!(
+                        monitor.rung,
+                        ResidentMonitorRung::PresentationAcknowledged
+                            | ResidentMonitorRung::RecoveryRequired
+                    )
+                }) =>
+            {
+                self.presentation_deadline = None;
+                self.state.resident_monitor = None;
+                self.persist()
             }
             _ => Err(AuthorityError::InvalidObservation),
         }
@@ -3423,6 +3587,14 @@ impl<S: StateStore, B: SessionSystem, C: Clock> Authority<S, B, C> {
         self.state.phase = Phase::Idle;
         self.state.return_slot = None;
         self.persist()
+    }
+
+    fn arm_resident_monitor(&mut self, item_id: &str) {
+        self.state.resident_monitor = Some(ResidentMonitor {
+            item_id: item_id.to_owned(),
+            receipt: Receipt::Returned,
+            rung: ResidentMonitorRung::Resident,
+        });
     }
 
     fn set_post_app_owner(&mut self, session_id: &str, evidence: PostAppOwnerEvidence) {
@@ -3976,6 +4148,7 @@ impl<S: StateStore, B: SessionSystem, C: Clock> Authority<S, B, C> {
     ) -> Result<(String, Option<T>), AuthorityError> {
         let id = format!("session-{}", self.state.next_session);
         let before_intent = self.state.clone();
+        self.state.resident_monitor = None;
         self.state.next_session += 1;
         self.state.phase = Phase::Starting {
             session_id: id.clone(),
