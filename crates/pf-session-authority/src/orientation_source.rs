@@ -791,6 +791,51 @@ mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    fn switch_discovery_root(label: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("pf-switch-discovery-{label}-{unique}"));
+        fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    fn write_switch_capability(root: &Path, event: &str, bits: &str) {
+        let device = root.join("class").join(event).join("device");
+        fs::create_dir_all(device.join("capabilities")).unwrap();
+        fs::write(device.join("name"), format!("{event}\n")).unwrap();
+        fs::write(device.join("capabilities/sw"), bits).unwrap();
+    }
+
+    #[test]
+    fn switch_discovery_skips_a_switch_device_whose_devnode_disappeared() {
+        let root = switch_discovery_root("missing-node");
+        write_switch_capability(&root, "event0", "1\n");
+        fs::create_dir_all(root.join("dev")).unwrap();
+
+        let devices = discover_switch_devices(&root.join("class"), &root.join("dev"))
+            .expect("a raced-away switch devnode is not fatal");
+        assert!(devices.is_empty());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn switch_discovery_does_not_open_a_non_switch_device() {
+        let root = switch_discovery_root("non-switch");
+        write_switch_capability(&root, "event0", "0\n");
+        // A directory is intentionally openable with O_RDONLY. The old unfiltered
+        // discovery therefore returned it as a device; capability filtering must not.
+        fs::create_dir_all(root.join("dev/event0")).unwrap();
+
+        let devices = discover_switch_devices(&root.join("class"), &root.join("dev"))
+            .expect("a non-switch event must be ignored before open");
+        assert!(devices.is_empty());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn dt_fallback_ignores_camera_rotation_and_reads_panel_rotation() {
         let unique = SystemTime::now()
