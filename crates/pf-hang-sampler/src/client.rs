@@ -42,6 +42,23 @@ fn main_pid(unit: &str) -> io::Result<i32> {
     Ok(pid)
 }
 
+pub fn send_prepare(socket: &Path, item_id: &str, session_id: &str) -> io::Result<()> {
+    pf_app_manifest::validate_app_id(item_id)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid application id"))?;
+    let unit = format!("pf-app@{item_id}.service");
+    let pid = main_pid(&unit)?;
+    let handle = process_handle(pid)?;
+    let request = TriggerRequest::Prepare {
+        target: TargetIdentity {
+            unit,
+            pid,
+            start_time: proc_start_time(pid)?,
+        },
+        session_id: session_id.to_owned(),
+    };
+    transport::send_request(socket, &request, Some(handle.as_fd()))
+}
+
 pub fn send_force_stop(
     socket: &Path,
     item_id: &str,
@@ -50,17 +67,23 @@ pub fn send_force_stop(
 ) -> io::Result<()> {
     pf_app_manifest::validate_app_id(item_id)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid application id"))?;
-    let unit = format!("pf-app@{item_id}.service");
-    let pid = main_pid(&unit)?;
-    let handle = process_handle(pid)?;
     let request = TriggerRequest::ForceStop {
-        target: TargetIdentity {
-            unit,
-            pid,
-            start_time: proc_start_time(pid)?,
-        },
+        item_id: item_id.to_owned(),
         session_id: session_id.to_owned(),
         reason,
     };
-    transport::send_request(socket, &request, Some(handle.as_fd()))
+    transport::send_request(socket, &request, None)
+}
+
+pub fn send_discard(socket: &Path, item_id: &str, session_id: &str) -> io::Result<()> {
+    pf_app_manifest::validate_app_id(item_id)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid application id"))?;
+    transport::send_request(
+        socket,
+        &TriggerRequest::DiscardPrepared {
+            item_id: item_id.to_owned(),
+            session_id: session_id.to_owned(),
+        },
+        None,
+    )
 }

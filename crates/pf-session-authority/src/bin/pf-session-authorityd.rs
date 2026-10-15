@@ -88,20 +88,48 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .name("hang-sampler-notifier".to_owned())
         .spawn(move || {
             while let Ok(notice) = hang_requests.recv() {
-                let reason = match notice.reason {
-                    pf_session_authority::ForceStopReason::StopTimeout => {
-                        pf_hang_sampler::protocol::ForceStopReason::StopTimeout
+                match notice {
+                    pf_session_authority::EscalationNotice::Prepare {
+                        session_id,
+                        item_id,
+                    } => {
+                        let _ = pf_hang_sampler::client::send_prepare(
+                            &hang_sampler_socket,
+                            &item_id,
+                            &session_id,
+                        );
                     }
-                    pf_session_authority::ForceStopReason::StopRequestFailed => {
-                        pf_hang_sampler::protocol::ForceStopReason::StopRequestFailed
+                    pf_session_authority::EscalationNotice::ForceStop {
+                        session_id,
+                        item_id,
+                        reason,
+                    } => {
+                        let reason = match reason {
+                            pf_session_authority::ForceStopReason::StopTimeout => {
+                                pf_hang_sampler::protocol::ForceStopReason::StopTimeout
+                            }
+                            pf_session_authority::ForceStopReason::StopRequestFailed => {
+                                pf_hang_sampler::protocol::ForceStopReason::StopRequestFailed
+                            }
+                        };
+                        let _ = pf_hang_sampler::client::send_force_stop(
+                            &hang_sampler_socket,
+                            &item_id,
+                            &session_id,
+                            reason,
+                        );
                     }
-                };
-                let _ = pf_hang_sampler::client::send_force_stop(
-                    &hang_sampler_socket,
-                    &notice.item_id,
-                    &notice.session_id,
-                    reason,
-                );
+                    pf_session_authority::EscalationNotice::Discard {
+                        session_id,
+                        item_id,
+                    } => {
+                        let _ = pf_hang_sampler::client::send_discard(
+                            &hang_sampler_socket,
+                            &item_id,
+                            &session_id,
+                        );
+                    }
+                }
             }
         })?;
     let mut authority = Authority::open(

@@ -14,6 +14,7 @@ pub mod transport;
 mod unwind;
 
 pub const SAMPLE_DEADLINE: Duration = Duration::from_millis(300);
+pub const PREPARED_WORKER_TTL: Duration = Duration::from_secs(5);
 const MAX_RETAINED_EPISODES: usize = 128;
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
@@ -228,17 +229,161 @@ fn sampling_worker(
     output.write_all(&encoded)
 }
 
+fn pipe_pair() -> io::Result<(OwnedFd, OwnedFd)> {
+    let mut pipe = [0; 2];
+    if unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(unsafe { (OwnedFd::from_raw_fd(pipe[0]), OwnedFd::from_raw_fd(pipe[1])) })
+}
+
+fn prepared_worker(
+    pid: i32,
+    expected_start_time: u64,
+    allowlist: &BTreeSet<Vec<u8>>,
+    command: OwnedFd,
+    output: OwnedFd,
+    ready: OwnedFd,
+) -> io::Result<()> {
+    if unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let _ttl = arm_sigkill_timer(PREPARED_WORKER_TTL)?;
+    let prepared = unwind::prepare(pid)?;
+    let mut ready = std::fs::File::from(ready);
+    ready.write_all(&[1])?;
+    drop(ready);
+
+    let mut command = std::fs::File::from(command);
+    let mut action = [0_u8; 1];
+    command.read_exact(&mut action)?;
+    if action[0] != b'S' {
+        return Ok(());
+    }
+    if protocol::proc_start_time(pid)? != expected_start_time {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "prepared target identity changed",
+        ));
+    }
+    let _deadline = arm_sigkill_timer(SAMPLE_DEADLINE)?;
+    if unsafe { libc::ptrace(libc::PTRACE_SEIZE, pid, 0, 0) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let guard = TraceeGuard(pid);
+    if unsafe { libc::ptrace(libc::PTRACE_INTERRUPT, pid, 0, 0) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    wait_for_ptrace_stop(pid)?;
+    let frames = unwind::unwind_prepared(pid, &prepared, allowlist)?;
+    drop(guard);
+    let encoded = serde_json::to_vec(&frames).map_err(io::Error::other)?;
+    std::fs::File::from(output).write_all(&encoded)
+}
+
+/// A pre-forked worker that has loaded one target's maps and unwind sections without stopping it.
+pub struct PreparedSample {
+    worker: i32,
+    command: std::fs::File,
+    output: std::fs::File,
+}
+
+impl PreparedSample {
+    pub fn prepare(pid: i32, start_time: u64, allowlist: &BTreeSet<Vec<u8>>) -> io::Result<Self> {
+        let (command_read, command_write) = pipe_pair()?;
+        let (output_read, output_write) = pipe_pair()?;
+        let (ready_read, ready_write) = pipe_pair()?;
+        let worker = unsafe { libc::fork() };
+        if worker < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if worker == 0 {
+            drop(command_write);
+            drop(output_read);
+            drop(ready_read);
+            let code = if prepared_worker(
+                pid,
+                start_time,
+                allowlist,
+                command_read,
+                output_write,
+                ready_write,
+            )
+            .is_ok()
+            {
+                0
+            } else {
+                70
+            };
+            unsafe { libc::_exit(code) };
+        }
+        drop(command_read);
+        drop(output_write);
+        drop(ready_write);
+        let mut ready = std::fs::File::from(ready_read);
+        let mut marker = [0_u8; 1];
+        if ready.read_exact(&mut marker).is_err() || marker != [1] {
+            let mut status = 0;
+            unsafe { libc::waitpid(worker, &mut status, 0) };
+            return Err(io::Error::other("hang sample preparation failed"));
+        }
+        Ok(Self {
+            worker,
+            command: std::fs::File::from(command_write),
+            output: std::fs::File::from(output_read),
+        })
+    }
+
+    pub fn sample(mut self) -> Vec<Frame> {
+        if self.command.write_all(b"S").is_err() {
+            return Vec::new();
+        }
+        let mut encoded = Vec::new();
+        if (&self.output)
+            .take(64 * 1024)
+            .read_to_end(&mut encoded)
+            .is_err()
+        {
+            encoded.clear();
+        }
+        let mut status = 0;
+        loop {
+            let result = unsafe { libc::waitpid(self.worker, &mut status, 0) };
+            if result == self.worker {
+                self.worker = 0;
+                break;
+            }
+            if result < 0 && io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+                return Vec::new();
+            }
+        }
+        if !libc::WIFEXITED(status) || libc::WEXITSTATUS(status) != 0 {
+            return Vec::new();
+        }
+        serde_json::from_slice(&encoded).unwrap_or_default()
+    }
+}
+
+impl Drop for PreparedSample {
+    fn drop(&mut self) {
+        if self.worker <= 0 {
+            return;
+        }
+        let _ = self.command.write_all(b"D");
+        unsafe { libc::kill(self.worker, libc::SIGKILL) };
+        let mut status = 0;
+        unsafe { libc::waitpid(self.worker, &mut status, 0) };
+    }
+}
+
 /// Take one bounded sample in a short-lived tracer worker.
 ///
 /// An empty vector is the only externally visible outcome for timeout, target exit, ptrace
 /// refusal, partial reads, unwind failure, worker crash, or malformed worker output.
 pub fn sample_target(pid: i32, allowlist: &BTreeSet<Vec<u8>>) -> Vec<Frame> {
-    let mut pipe = [0; 2];
-    if unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+    let Ok((read_end, write_end)) = pipe_pair() else {
         return Vec::new();
-    }
-    let read_end = unsafe { OwnedFd::from_raw_fd(pipe[0]) };
-    let write_end = unsafe { OwnedFd::from_raw_fd(pipe[1]) };
+    };
     let worker = unsafe { libc::fork() };
     if worker < 0 {
         return Vec::new();
@@ -423,10 +568,40 @@ mod tests {
         child
     }
 
+    fn spawn_counter_target() -> (Child, BufReader<std::process::ChildStdout>) {
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "tests::live_target_helper",
+                "--nocapture",
+            ])
+            .env("PF_HANG_COUNTER_HELPER", "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut reader = BufReader::new(child.stdout.take().unwrap());
+        loop {
+            let mut line = String::new();
+            assert_ne!(
+                reader.read_line(&mut line).unwrap(),
+                0,
+                "target exited early"
+            );
+            if line.trim() == "TARGET_READY" {
+                break;
+            }
+        }
+        (child, reader)
+    }
+
     #[test]
     #[ignore]
     fn live_target_helper() {
-        if std::env::var_os("PF_HANG_TARGET_HELPER").is_none() {
+        let counter = std::env::var_os("PF_HANG_COUNTER_HELPER").is_some();
+        if std::env::var_os("PF_HANG_TARGET_HELPER").is_none() && !counter {
             return;
         }
         // Permit the sibling tracer under Yama scope 1 without adding a container capability.
@@ -436,8 +611,32 @@ mod tests {
         );
         println!("TARGET_READY");
         loop {
-            std::hint::spin_loop();
+            if counter {
+                println!("TICK");
+                thread::sleep(Duration::from_millis(5));
+            } else {
+                std::hint::spin_loop();
+            }
         }
+    }
+
+    #[test]
+    fn prepare_does_not_stop_target() {
+        let (mut target, mut output) = spawn_counter_target();
+        let start_time = protocol::proc_start_time(target.id() as i32).unwrap();
+        let prepared = PreparedSample::prepare(target.id() as i32, start_time, &BTreeSet::new())
+            .expect("read-only preparation must succeed");
+
+        for _ in 0..2 {
+            let mut line = String::new();
+            assert_ne!(output.read_line(&mut line).unwrap(), 0, "target exited");
+            assert_eq!(line.trim(), "TICK");
+        }
+
+        drop(prepared);
+        assert!(target.try_wait().unwrap().is_none());
+        target.kill().unwrap();
+        target.wait().unwrap();
     }
 
     #[test]

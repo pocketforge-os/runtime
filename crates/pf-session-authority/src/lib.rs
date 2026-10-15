@@ -2188,12 +2188,22 @@ fn stderr_log_sink() -> LogSink {
     Box::new(|line: &str| eprintln!("{line}"))
 }
 
-/// Owned context queued for the hang-sampler worker when the authority escalates a close.
+/// Owned command queued for the hang-sampler worker around a graceful close.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct EscalationNotice {
-    pub session_id: String,
-    pub item_id: String,
-    pub reason: ForceStopReason,
+pub enum EscalationNotice {
+    Prepare {
+        session_id: String,
+        item_id: String,
+    },
+    ForceStop {
+        session_id: String,
+        item_id: String,
+        reason: ForceStopReason,
+    },
+    Discard {
+        session_id: String,
+        item_id: String,
+    },
 }
 
 /// Cloneable producer for a bounded hang-sampler queue.
@@ -2616,13 +2626,29 @@ impl<S: StateStore, B: SessionSystem, C: Clock> Authority<S, B, C> {
         reason: ForceStopReason,
     ) -> Result<(), String> {
         if let Some(notifier) = &self.escalation {
-            notifier.notify(EscalationNotice {
+            notifier.notify(EscalationNotice::ForceStop {
                 session_id: session_id.to_owned(),
                 item_id: item_id.to_owned(),
                 reason,
             });
         }
         self.system.enforce_termination(item_id, session_id)
+    }
+    fn prepare_hang_sample(&self, item_id: &str, session_id: &str) {
+        if let Some(notifier) = &self.escalation {
+            notifier.notify(EscalationNotice::Prepare {
+                session_id: session_id.to_owned(),
+                item_id: item_id.to_owned(),
+            });
+        }
+    }
+    fn discard_prepared_hang_sample(&self, item_id: &str, session_id: &str) {
+        if let Some(notifier) = &self.escalation {
+            notifier.notify(EscalationNotice::Discard {
+                session_id: session_id.to_owned(),
+                item_id: item_id.to_owned(),
+            });
+        }
     }
     /// Records a kill failure on a close path as the durable, retryable `StopFailed` phase
     /// (§9.6 "Stop failed") instead of a terminal recovery: the menu row keeps offering the
@@ -2776,6 +2802,7 @@ impl<S: StateStore, B: SessionSystem, C: Clock> Authority<S, B, C> {
             }
             let id = self.session_id().unwrap();
             let item_id = self.item_id().unwrap();
+            self.prepare_hang_sample(&item_id, &id);
             match self.system.request_graceful_stop(&item_id, &id) {
                 Ok(()) => {
                     self.graceful_deadline = Some(self.clock.deadline_after(self.grace).0);
@@ -3327,7 +3354,15 @@ impl<S: StateStore, B: SessionSystem, C: Clock> Authority<S, B, C> {
                 }
                 self.begin_restoration(Receipt::Crash { summary })
             }
-            (Phase::StoppingGracefully { .. }, Observation::UnitInactive) => {
+            (
+                Phase::StoppingGracefully {
+                    session_id,
+                    item_id,
+                    ..
+                },
+                Observation::UnitInactive,
+            ) => {
+                self.discard_prepared_hang_sample(item_id, session_id);
                 self.unit_inactive(Receipt::Returned)
             }
             (Phase::ForceStopping { .. }, Observation::UnitInactive) => {

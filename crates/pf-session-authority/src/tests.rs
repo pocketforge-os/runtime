@@ -4,7 +4,7 @@ use std::cell::Cell;
 use std::io;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::SystemTime;
 
 const APP_ID: &str = "org.example.game";
@@ -3614,6 +3614,7 @@ struct SharedLogSystem {
     fail_graceful: bool,
     fail_force: bool,
     lifecycle: Option<SystemLifecycle>,
+    prepared_before_force: Option<Arc<AtomicBool>>,
 }
 impl SessionSystem for SharedLogSystem {
     fn start_foreground(&mut self, _: &LaunchRequest, _: &str) -> Result<(), String> {
@@ -3629,6 +3630,12 @@ impl SessionSystem for SharedLogSystem {
         }
     }
     fn enforce_termination(&mut self, _: &str, _: &str) -> Result<(), String> {
+        if let Some(prepared) = &self.prepared_before_force {
+            assert!(
+                prepared.load(Ordering::SeqCst),
+                "the notifier consumer must pin the target during Closing"
+            );
+        }
         self.log.lock().unwrap().push("force".into());
         if self.fail_force {
             Err("refused".into())
@@ -3677,12 +3684,19 @@ fn escalation_notifier_covers_every_close_path_kill() {
     let id = launch_notified(&mut a);
     a.intake_safe_return().unwrap();
     a.tick().unwrap();
+    assert_eq!(
+        notices.try_recv().unwrap(),
+        EscalationNotice::Prepare {
+            session_id: id.clone(),
+            item_id: APP_ID.to_owned(),
+        }
+    );
     a.clock.advance(Duration::from_millis(10));
     a.tick().unwrap();
     assert!(matches!(a.state.phase, Phase::ForceStopping { .. }));
     assert_eq!(
         notices.try_recv().unwrap(),
-        EscalationNotice {
+        EscalationNotice::ForceStop {
             session_id: id,
             item_id: APP_ID.to_owned(),
             reason: ForceStopReason::StopTimeout,
@@ -3721,7 +3735,7 @@ fn escalation_notifier_covers_every_close_path_kill() {
     reopened.reconcile().unwrap();
     assert_eq!(
         notices2.try_recv().unwrap(),
-        EscalationNotice {
+        EscalationNotice::ForceStop {
             session_id: id2,
             item_id: APP_ID.to_owned(),
             reason: ForceStopReason::StopTimeout,
@@ -3750,7 +3764,14 @@ fn escalation_notifier_covers_every_close_path_kill() {
     failed_request.tick().unwrap();
     assert_eq!(
         notices4.try_recv().unwrap(),
-        EscalationNotice {
+        EscalationNotice::Prepare {
+            session_id: id4.clone(),
+            item_id: APP_ID.to_owned(),
+        }
+    );
+    assert_eq!(
+        notices4.try_recv().unwrap(),
+        EscalationNotice::ForceStop {
             session_id: id4,
             item_id: APP_ID.to_owned(),
             reason: ForceStopReason::StopRequestFailed,
@@ -3759,9 +3780,9 @@ fn escalation_notifier_covers_every_close_path_kill() {
 }
 
 #[test]
-fn escalation_notifier_never_fires_when_systemd_beats_the_deadline() {
+fn graceful_exit_discards_prepared_sample_without_force_stop() {
     let log: Log = Log::default();
-    let (notifier, notices) = EscalationNotifier::bounded(1);
+    let (notifier, notices) = EscalationNotifier::bounded(2);
     let mut raced = Authority::open_with_resolver(
         MemoryStore::default(),
         SharedLogSystem {
@@ -3775,7 +3796,7 @@ fn escalation_notifier_never_fires_when_systemd_beats_the_deadline() {
     )
     .unwrap()
     .with_escalation_notifier(notifier);
-    launch_notified(&mut raced);
+    let id = launch_notified(&mut raced);
     raced.intake_safe_return().unwrap();
     raced.tick().unwrap();
     raced.system.lifecycle = Some(SystemLifecycle {
@@ -3793,6 +3814,20 @@ fn escalation_notifier_never_fires_when_systemd_beats_the_deadline() {
             ..
         }
     ));
+    assert_eq!(
+        notices.try_recv().unwrap(),
+        EscalationNotice::Prepare {
+            session_id: id.clone(),
+            item_id: APP_ID.to_owned(),
+        }
+    );
+    assert_eq!(
+        notices.try_recv().unwrap(),
+        EscalationNotice::Discard {
+            session_id: id,
+            item_id: APP_ID.to_owned(),
+        }
+    );
     assert!(matches!(notices.try_recv(), Err(mpsc::TryRecvError::Empty)));
     assert!(!log.lock().unwrap().iter().any(|line| line == "force"));
 }
@@ -3849,6 +3884,14 @@ fn restart_over_an_already_stopped_unit_completes_as_returned_without_escalating
 
         reopened.reconcile().unwrap();
 
+        assert_eq!(
+            notices.try_recv().unwrap(),
+            EscalationNotice::Discard {
+                session_id: id.clone(),
+                item_id: APP_ID.to_owned(),
+            },
+            "restart reconciliation must discard preparation left by the prior daemon"
+        );
         assert!(matches!(notices.try_recv(), Err(mpsc::TryRecvError::Empty)));
         assert!(
             !log.lock().unwrap().iter().any(|line| line == "force"),
@@ -3916,7 +3959,7 @@ fn restart_over_an_already_stopped_unit_completes_as_returned_without_escalating
     assert!(matches!(reopened3.state.phase, Phase::ForceStopping { .. }));
     assert_eq!(
         notices3.try_recv().unwrap(),
-        EscalationNotice {
+        EscalationNotice::ForceStop {
             session_id: id3,
             item_id: APP_ID.to_owned(),
             reason: ForceStopReason::StopTimeout,
@@ -3928,7 +3971,7 @@ fn restart_over_an_already_stopped_unit_completes_as_returned_without_escalating
 #[test]
 fn a_failed_kill_is_a_durable_retryable_stop_failed_not_a_terminal_recovery() {
     let log: Log = Log::default();
-    let (notifier, notices) = EscalationNotifier::bounded(1);
+    let (notifier, notices) = EscalationNotifier::bounded(2);
     let sink_log: Log = Log::default();
     let sink = sink_log.clone();
     let mut a = Authority::open_with_resolver(
@@ -3950,6 +3993,10 @@ fn a_failed_kill_is_a_durable_retryable_stop_failed_not_a_terminal_recovery() {
     let id = launch_notified(&mut a);
     a.intake_safe_return().unwrap();
     a.tick().unwrap();
+    assert!(matches!(
+        notices.try_recv().unwrap(),
+        EscalationNotice::Prepare { .. }
+    ));
     a.clock.advance(Duration::from_millis(10));
     a.tick().unwrap();
 
@@ -3965,10 +4012,13 @@ fn a_failed_kill_is_a_durable_retryable_stop_failed_not_a_terminal_recovery() {
         "{:?}",
         a.state.phase
     );
-    assert_eq!(
-        notices.try_recv().unwrap().reason,
-        ForceStopReason::StopTimeout
-    );
+    assert!(matches!(
+        notices.try_recv().unwrap(),
+        EscalationNotice::ForceStop {
+            reason: ForceStopReason::StopTimeout,
+            ..
+        }
+    ));
     // An error is never silent.
     assert_eq!(
         *sink_log.lock().unwrap(),
@@ -4031,10 +4081,12 @@ fn force_close_notifier_is_off_critical_path() {
     std::thread::sleep(Duration::from_millis(150));
     assert!(direct_started.elapsed() >= Duration::from_millis(150));
 
-    let (notifier, receiver) = EscalationNotifier::bounded(1);
+    let (notifier, receiver) = EscalationNotifier::bounded(2);
     let consumer = std::thread::spawn(move || {
-        receiver.recv().unwrap();
+        let prepare = receiver.recv().unwrap();
         std::thread::sleep(Duration::from_millis(150));
+        let force = receiver.recv().unwrap();
+        (prepare, force)
     });
     let mut sampler = prepare(Some(notifier));
     let started = Instant::now();
@@ -4065,10 +4117,15 @@ fn force_close_notifier_is_off_critical_path() {
         *sampler.system.log.lock().unwrap()
     );
     assert_eq!(plain.clock.now(), sampled_clock);
+    assert_eq!(
+        drain_v2(&mut plain, "plain-timeline"),
+        drain_v2(&mut sampler, "sampled-timeline"),
+        "sampler notices must not alter the authority event sequence"
+    );
 
     // Full and disconnected queues are also constant-time loss, never close failures.
     let (full, held_receiver) = EscalationNotifier::bounded(1);
-    full.notify(EscalationNotice {
+    full.notify(EscalationNotice::ForceStop {
         session_id: "occupied".to_owned(),
         item_id: APP_ID.to_owned(),
         reason: ForceStopReason::StopTimeout,
@@ -4090,7 +4147,94 @@ fn force_close_notifier_is_off_critical_path() {
         disconnected.state.phase,
         Phase::ForceStopping { .. }
     ));
-    consumer.join().unwrap();
+    let (prepare_notice, force_notice) = consumer.join().unwrap();
+    assert!(matches!(prepare_notice, EscalationNotice::Prepare { .. }));
+    assert!(matches!(force_notice, EscalationNotice::ForceStop { .. }));
+}
+
+#[test]
+fn force_close_uses_handle_prepared_before_termination() {
+    let (notifier, notices) = EscalationNotifier::bounded(2);
+    let pinned = Arc::new(AtomicBool::new(false));
+    let (pinned_tx, pinned_rx) = mpsc::sync_channel(0);
+    let (release_tx, release_rx) = mpsc::sync_channel(0);
+    let consumer_pinned = Arc::clone(&pinned);
+    let consumer = std::thread::spawn(move || {
+        let prepare = notices.recv().unwrap();
+        assert!(matches!(prepare, EscalationNotice::Prepare { .. }));
+        // This is the notifier-thread boundary: target lookup/pidfd pinning completes here.
+        consumer_pinned.store(true, Ordering::SeqCst);
+        pinned_tx.send(()).unwrap();
+        // Keep the consumer blocked until the authority has issued enforce_termination.
+        release_rx.recv().unwrap();
+        notices.recv().unwrap()
+    });
+    let mut authority = Authority::open_with_resolver(
+        MemoryStore::default(),
+        SharedLogSystem {
+            prepared_before_force: Some(Arc::clone(&pinned)),
+            ..SharedLogSystem::default()
+        },
+        TestClock::new(),
+        3,
+        Duration::from_millis(10),
+        test_resolver(),
+    )
+    .unwrap()
+    .with_escalation_notifier(notifier);
+    let session_id = launch_notified(&mut authority);
+    authority.intake_safe_return().unwrap();
+    authority.tick().unwrap();
+    pinned_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("Closing must queue and complete target pinning before the grace deadline");
+    assert!(pinned.load(Ordering::SeqCst));
+    assert!(!authority
+        .system
+        .log
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|entry| entry == "force"));
+
+    // Leave the ForceStop notice unconsumed until after termination: a blocked notifier
+    // consumer cannot delay the authority's critical path.
+    authority.clock.advance(Duration::from_millis(10));
+    authority.tick().unwrap();
+    assert_eq!(
+        *authority.system.log.lock().unwrap(),
+        ["start", "graceful", "force"]
+    );
+    release_tx.send(()).unwrap();
+    assert_eq!(
+        consumer.join().unwrap(),
+        EscalationNotice::ForceStop {
+            session_id,
+            item_id: APP_ID.to_owned(),
+            reason: ForceStopReason::StopTimeout,
+        }
+    );
+
+    // Negative control: an authority without the notifier runs the same close sequence and
+    // has no channel on which a prepared handle could have been acquired.
+    let mut plain = Authority::open_with_resolver(
+        MemoryStore::default(),
+        SharedLogSystem::default(),
+        TestClock::new(),
+        3,
+        Duration::from_millis(10),
+        test_resolver(),
+    )
+    .unwrap();
+    launch_notified(&mut plain);
+    plain.intake_safe_return().unwrap();
+    plain.tick().unwrap();
+    plain.clock.advance(Duration::from_millis(10));
+    plain.tick().unwrap();
+    assert_eq!(
+        *plain.system.log.lock().unwrap(),
+        ["start", "graceful", "force"]
+    );
 }
 
 #[test]

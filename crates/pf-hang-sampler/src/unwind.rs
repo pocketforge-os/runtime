@@ -16,6 +16,10 @@ struct LoadedModule {
     sections: ExplicitModuleSectionInfo<Vec<u8>>,
 }
 
+pub(crate) struct PreparedUnwind {
+    modules: Vec<LoadedModule>,
+}
+
 #[derive(Default)]
 struct MapGroup {
     start: u64,
@@ -126,6 +130,12 @@ fn load_modules(pid: i32) -> io::Result<Vec<LoadedModule>> {
     Ok(modules)
 }
 
+pub(crate) fn prepare(pid: i32) -> io::Result<PreparedUnwind> {
+    Ok(PreparedUnwind {
+        modules: load_modules(pid)?,
+    })
+}
+
 fn read_word(pid: i32, address: u64) -> Result<u64, ()> {
     let mut word = 0_u64;
     let local = libc::iovec {
@@ -175,11 +185,21 @@ fn map_frames(
 
 #[cfg(target_arch = "x86_64")]
 pub fn unwind_stopped(pid: i32, allowlist: &BTreeSet<Vec<u8>>) -> io::Result<Vec<Frame>> {
+    let prepared = prepare(pid)?;
+    unwind_prepared(pid, &prepared, allowlist)
+}
+
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn unwind_prepared(
+    pid: i32,
+    prepared: &PreparedUnwind,
+    allowlist: &BTreeSet<Vec<u8>>,
+) -> io::Result<Vec<Frame>> {
     use framehop::x86_64::{CacheX86_64, UnwindRegsX86_64, UnwinderX86_64};
 
-    let modules = load_modules(pid)?;
+    let modules = &prepared.modules;
     let mut unwinder = UnwinderX86_64::<Vec<u8>>::new();
-    for module in &modules {
+    for module in modules {
         unwinder.add_module(Module::new(
             String::new(),
             module.avma.clone(),
@@ -207,16 +227,26 @@ pub fn unwind_stopped(pid: i32, allowlist: &BTreeSet<Vec<u8>>) -> io::Result<Vec
             Err(_) => return Err(io::Error::other("unwind failed")),
         }
     }
-    Ok(map_frames(addresses, &modules, allowlist))
+    Ok(map_frames(addresses, modules, allowlist))
 }
 
 #[cfg(target_arch = "aarch64")]
 pub fn unwind_stopped(pid: i32, allowlist: &BTreeSet<Vec<u8>>) -> io::Result<Vec<Frame>> {
+    let prepared = prepare(pid)?;
+    unwind_prepared(pid, &prepared, allowlist)
+}
+
+#[cfg(target_arch = "aarch64")]
+pub(crate) fn unwind_prepared(
+    pid: i32,
+    prepared: &PreparedUnwind,
+    allowlist: &BTreeSet<Vec<u8>>,
+) -> io::Result<Vec<Frame>> {
     use framehop::aarch64::{CacheAarch64, PtrAuthMask, UnwindRegsAarch64, UnwinderAarch64};
 
-    let modules = load_modules(pid)?;
+    let modules = &prepared.modules;
     let mut unwinder = UnwinderAarch64::<Vec<u8>>::new();
-    for module in &modules {
+    for module in modules {
         unwinder.add_module(Module::new(
             String::new(),
             module.avma.clone(),
@@ -256,7 +286,7 @@ pub fn unwind_stopped(pid: i32, allowlist: &BTreeSet<Vec<u8>>) -> io::Result<Vec
             Err(_) => return Err(io::Error::other("unwind failed")),
         }
     }
-    Ok(map_frames(addresses, &modules, allowlist))
+    Ok(map_frames(addresses, modules, allowlist))
 }
 
 #[cfg(test)]

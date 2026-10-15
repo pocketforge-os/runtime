@@ -6,17 +6,27 @@ capability.
 
 ## Trigger API
 
-The closed JSON request is one `AF_UNIX/SOCK_SEQPACKET` packet. Sampling requests carry exactly
-one target process handle with `SCM_RIGHTS`; recovery carries none.
+The closed JSON request is one `AF_UNIX/SOCK_SEQPACKET` packet. Requests that establish a target
+(`suspect_no_reply` and `prepare`) carry exactly one process handle with `SCM_RIGHTS`; recovery,
+discard and force-stop requests carry none.
 
 - `suspect_no_reply { target, hang_nonce }` comes only from `pf-input-broker.service`, after the
   router's two-second foreground-app probe expires. This is unrelated to the menu provider's
   500 ms ping / one-second health timeout.
 - `recovered { target, hang_nonce }` comes only from the same router. It installs a tombstone and
   deletes an already-completed provisional sample; a racing worker cannot recreate it.
-- `force_stop { target, session_id, reason }` comes only from
-  `pf-session-authorityd.service`. The authority submits it with bounded `try_send` and never
-  waits for target lookup, the sampler socket, ptrace or unwind.
+- `prepare { target, session_id }` comes only from `pf-session-authorityd.service`. At Closing the
+  authority submits a bounded `try_send` before it requests the graceful stop. The receiving
+  thread resolves `MainPID`, pins its pidfd/start time and asks the sampler to validate the app
+  cgroup, snapshot `/proc/<pid>/maps`, load build IDs/unwind sections, and pre-fork a worker. This
+  read-only phase never uses ptrace and cannot stop the app.
+- `force_stop { item_id, session_id, reason }` comes only from the authority. At escalation the
+  authority performs one bounded `try_send` and immediately invokes termination; it never waits
+  for target lookup, the sampler socket, ptrace or unwind. The sampler can act only on the pinned
+  preparation with the same session and item identity. Missing or expired preparation is an empty
+  sample; a changed process identity drops the preparation and produces no report.
+- `discard_prepared { item_id, session_id }` comes only from the authority when the app exits in
+  the grace window. It removes the preparation and produces no report.
 
 Caller identity comes from `SO_PEERCRED` plus the exact leaf systemd unit derived by
 `pf-peer-identity`; request data never declares the caller. A process handle is accepted only
@@ -27,12 +37,21 @@ name.
 
 ## Worker and unwind
 
-Each attempt forks a short-lived worker. Before `PTRACE_SEIZE`, it sets parent-death `SIGKILL` and
-arms a monotonic POSIX timer that sends the worker uncatchable `SIGKILL` at 300 ms. The worker uses
-`PTRACE_SEIZE`, `PTRACE_INTERRUPT`, and `PTRACE_DETACH` without `PTRACE_O_EXITKILL`. Linux therefore
-detaches and resumes a live target if the worker crashes or its deadline fires. A concurrently
-issued authority kill still kills a ptrace-stopped target. Every timeout, exit, partial read,
-malformed unwind record or worker failure yields an empty attempt and cannot affect termination.
+Closing pre-forks a worker and gives it five seconds (the 1500 ms default grace plus slack) to
+retain its owned unwind tables and await ForceStop. Prepared state and workers are bounded to 128
+session/item keys; expiry, replacement, discard, or daemon death kills/reaps the worker without
+ever attaching to the app. On ForceStop the ready worker verifies start time, arms a monotonic
+POSIX timer that sends it uncatchable `SIGKILL` at 300 ms, then uses `PTRACE_SEIZE`,
+`PTRACE_INTERRUPT`, and `PTRACE_DETACH` without `PTRACE_O_EXITKILL`. Linux therefore detaches and
+resumes a live target if the worker crashes or its deadline fires. A concurrently issued authority
+kill still kills a ptrace-stopped target. Every timeout, exit, partial read, malformed unwind
+record or worker failure yields an empty attempt and cannot affect termination.
+
+A daemon restart over a lost graceful deadline has no Closing notice in the new daemon lifetime,
+so it sends ForceStop without doing a new preparation and kills immediately. A matching prepared
+worker left in the still-running sampler may be used; otherwise the result is empty. This is the
+only intentionally unprepared authority path. A kill may also win the remaining race after a
+successful preparation; that attempt is empty rather than delaying the close.
 
 The unwinder pins `framehop 0.15.0` and `object 0.37.3` under the workspace's Rust 1.85 MSRV.
 Framehop consumes ELF `.eh_frame_hdr` / `.eh_frame` / `.debug_frame` and falls back to frame

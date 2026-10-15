@@ -32,10 +32,18 @@ pub enum TriggerRequest {
         target: TargetIdentity,
         hang_nonce: u64,
     },
-    ForceStop {
+    Prepare {
         target: TargetIdentity,
         session_id: String,
+    },
+    ForceStop {
+        item_id: String,
+        session_id: String,
         reason: ForceStopReason,
+    },
+    DiscardPrepared {
+        item_id: String,
+        session_id: String,
     },
 }
 
