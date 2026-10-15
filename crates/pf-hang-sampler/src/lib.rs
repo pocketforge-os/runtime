@@ -142,13 +142,33 @@ fn arm_sigkill_timer(timeout: Duration) -> io::Result<libc::timer_t> {
     Ok(timer)
 }
 
-fn wait_for_ptrace_stop(pid: i32) -> io::Result<()> {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PtraceStop {
+    EventStop,
+    SignalDelivery(i32),
+}
+
+impl PtraceStop {
+    const fn detach_signal(self) -> i32 {
+        match self {
+            Self::EventStop => 0,
+            Self::SignalDelivery(signal) => signal,
+        }
+    }
+}
+
+fn wait_for_ptrace_stop(pid: i32) -> io::Result<PtraceStop> {
     let mut status = 0;
     loop {
         // SAFETY: status points to writable storage and pid names the seized tracee.
         let result = unsafe { libc::waitpid(pid, &mut status, libc::__WALL) };
         if result == pid && libc::WIFSTOPPED(status) {
-            return Ok(());
+            let event = (status >> 16) & 0xffff;
+            return if event == libc::PTRACE_EVENT_STOP {
+                Ok(PtraceStop::EventStop)
+            } else {
+                Ok(PtraceStop::SignalDelivery(libc::WSTOPSIG(status)))
+            };
         }
         if result < 0 {
             let error = io::Error::last_os_error();
@@ -176,26 +196,60 @@ fn deadline_worker(pid: i32, stall: Duration) -> io::Result<()> {
     if unsafe { libc::ptrace(libc::PTRACE_SEIZE, pid, 0, 0) } != 0 {
         return Err(io::Error::last_os_error());
     }
+    let mut guard = TraceeGuard::new(pid);
     // SAFETY: pid is now this worker's tracee.
     if unsafe { libc::ptrace(libc::PTRACE_INTERRUPT, pid, 0, 0) } != 0 {
         return Err(io::Error::last_os_error());
     }
-    wait_for_ptrace_stop(pid)?;
+    guard.stopped(wait_for_ptrace_stop(pid)?);
     std::thread::sleep(stall);
     // PTRACE_O_EXITKILL is deliberately absent: if the timer fires, Linux detaches and resumes
     // the live tracee when this worker dies.
-    if unsafe { libc::ptrace(libc::PTRACE_DETACH, pid, 0, 0) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
+    guard.detach()
 }
 
-struct TraceeGuard(i32);
+struct TraceeGuard {
+    pid: i32,
+    stop: Option<PtraceStop>,
+}
+
+impl TraceeGuard {
+    const fn new(pid: i32) -> Self {
+        Self { pid, stop: None }
+    }
+
+    fn stopped(&mut self, stop: PtraceStop) {
+        self.stop = Some(stop);
+    }
+
+    fn detach(&mut self) -> io::Result<()> {
+        let Some(stop) = self.stop else {
+            return Ok(());
+        };
+        let signal = stop.detach_signal() as usize as *mut libc::c_void;
+        if unsafe {
+            libc::ptrace(
+                libc::PTRACE_DETACH,
+                self.pid,
+                std::ptr::null_mut::<libc::c_void>(),
+                signal,
+            )
+        } != 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        self.pid = 0;
+        Ok(())
+    }
+}
 
 impl Drop for TraceeGuard {
     fn drop(&mut self) {
-        // SAFETY: best-effort detach of the tracee owned by this worker. ESRCH means it died.
-        unsafe { libc::ptrace(libc::PTRACE_DETACH, self.0, 0, 0) };
+        if self.pid > 0 {
+            // Unknown stop state is left to tracer-exit cleanup, which preserves a signal already
+            // held by the kernel. A known signal-delivery stop is explicitly re-injected.
+            let _ = self.detach();
+        }
     }
 }
 
@@ -211,13 +265,13 @@ fn sampling_worker(
     if unsafe { libc::ptrace(libc::PTRACE_SEIZE, pid, 0, 0) } != 0 {
         return Err(io::Error::last_os_error());
     }
-    let guard = TraceeGuard(pid);
+    let mut guard = TraceeGuard::new(pid);
     if unsafe { libc::ptrace(libc::PTRACE_INTERRUPT, pid, 0, 0) } != 0 {
         return Err(io::Error::last_os_error());
     }
-    wait_for_ptrace_stop(pid)?;
+    guard.stopped(wait_for_ptrace_stop(pid)?);
     let frames = unwind::unwind_stopped(pid, allowlist)?;
-    drop(guard);
+    guard.detach()?;
     // Disarm before sending the completed result so an already-detached worker cannot lose a
     // valid sample at the boundary.
     let disarmed: libc::itimerspec = unsafe { std::mem::zeroed() };
@@ -270,13 +324,13 @@ fn prepared_worker(
     if unsafe { libc::ptrace(libc::PTRACE_SEIZE, pid, 0, 0) } != 0 {
         return Err(io::Error::last_os_error());
     }
-    let guard = TraceeGuard(pid);
+    let mut guard = TraceeGuard::new(pid);
     if unsafe { libc::ptrace(libc::PTRACE_INTERRUPT, pid, 0, 0) } != 0 {
         return Err(io::Error::last_os_error());
     }
-    wait_for_ptrace_stop(pid)?;
+    guard.stopped(wait_for_ptrace_stop(pid)?);
     let frames = unwind::unwind_prepared(pid, &prepared, allowlist)?;
-    drop(guard);
+    guard.detach()?;
     let encoded = serde_json::to_vec(&frames).map_err(io::Error::other)?;
     std::fs::File::from(output).write_all(&encoded)
 }
@@ -471,6 +525,7 @@ pub fn seize_interrupt_and_expire(pid: i32, stall: Duration) -> io::Result<()> {
 mod tests {
     use super::*;
     use std::io::{BufRead, BufReader};
+    use std::os::fd::AsRawFd;
     use std::process::{Child, Command, Stdio};
     use std::thread;
     use std::time::Instant;
@@ -597,11 +652,102 @@ mod tests {
         (child, reader)
     }
 
+    fn spawn_signal_target() -> (Child, BufReader<std::process::ChildStdout>) {
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "tests::live_target_helper",
+                "--nocapture",
+            ])
+            .env("PF_HANG_SIGNAL_HELPER", "1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut reader = BufReader::new(child.stdout.take().unwrap());
+        loop {
+            let mut line = String::new();
+            assert_ne!(
+                reader.read_line(&mut line).unwrap(),
+                0,
+                "target exited early"
+            );
+            if line.trim() == "TARGET_READY" {
+                break;
+            }
+        }
+        (child, reader)
+    }
+
+    extern "C" fn signal_target_handler(_: libc::c_int) {
+        let marker = b"SIGNAL\n";
+        unsafe {
+            libc::write(libc::STDOUT_FILENO, marker.as_ptr().cast(), marker.len());
+        }
+    }
+
+    fn trace_signal_delivery_stop(pid: i32) {
+        let (ready_read, ready_write) = pipe_pair().unwrap();
+        let (go_read, go_write) = pipe_pair().unwrap();
+        let worker = unsafe { libc::fork() };
+        assert!(worker >= 0);
+        if worker == 0 {
+            drop(ready_read);
+            drop(go_write);
+            let code = (|| -> io::Result<()> {
+                if unsafe { libc::ptrace(libc::PTRACE_SEIZE, pid, 0, 0) } != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                let mut guard = TraceeGuard::new(pid);
+                std::fs::File::from(ready_write).write_all(&[1])?;
+                let mut go = [0_u8; 1];
+                std::fs::File::from(go_read).read_exact(&mut go)?;
+                if unsafe { libc::ptrace(libc::PTRACE_INTERRUPT, pid, 0, 0) } != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                guard.stopped(wait_for_ptrace_stop(pid)?);
+                guard.detach()?;
+                Ok(())
+            })()
+            .map_or(70, |()| 0);
+            unsafe { libc::_exit(code) };
+        }
+        drop(ready_write);
+        drop(go_read);
+        let mut marker = [0_u8; 1];
+        std::fs::File::from(ready_read)
+            .read_exact(&mut marker)
+            .unwrap();
+        assert_eq!(unsafe { libc::kill(pid, libc::SIGUSR1) }, 0);
+        std::fs::File::from(go_write).write_all(&[1]).unwrap();
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(worker, &mut status, 0) }, worker);
+        assert!(libc::WIFEXITED(status));
+        assert_eq!(libc::WEXITSTATUS(status), 0);
+    }
+
+    fn handler_ran(output: &mut BufReader<std::process::ChildStdout>) -> bool {
+        let mut pollfd = libc::pollfd {
+            fd: output.get_ref().as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let ready = unsafe { libc::poll(&mut pollfd, 1, 100) };
+        if ready != 1 || pollfd.revents & libc::POLLIN == 0 {
+            return false;
+        }
+        let mut line = String::new();
+        output.read_line(&mut line).unwrap() != 0 && line.trim() == "SIGNAL"
+    }
+
     #[test]
     #[ignore]
     fn live_target_helper() {
         let counter = std::env::var_os("PF_HANG_COUNTER_HELPER").is_some();
-        if std::env::var_os("PF_HANG_TARGET_HELPER").is_none() && !counter {
+        let signal = std::env::var_os("PF_HANG_SIGNAL_HELPER").is_some();
+        if std::env::var_os("PF_HANG_TARGET_HELPER").is_none() && !counter && !signal {
             return;
         }
         // Permit the sibling tracer under Yama scope 1 without adding a container capability.
@@ -609,11 +755,33 @@ mod tests {
             unsafe { libc::prctl(libc::PR_SET_PTRACER, libc::PR_SET_PTRACER_ANY) },
             0
         );
+        if signal {
+            let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+            action.sa_sigaction = signal_target_handler as *const () as usize;
+            action.sa_flags = libc::SA_RESTART;
+            assert_eq!(unsafe { libc::sigemptyset(&mut action.sa_mask) }, 0);
+            assert_eq!(
+                unsafe { libc::sigaction(libc::SIGUSR1, &action, std::ptr::null_mut()) },
+                0
+            );
+        }
         println!("TARGET_READY");
         loop {
             if counter {
                 println!("TICK");
                 thread::sleep(Duration::from_millis(5));
+            } else if signal {
+                let mut command = [0_u8; 1];
+                if unsafe {
+                    libc::read(
+                        libc::STDIN_FILENO,
+                        command.as_mut_ptr().cast(),
+                        command.len(),
+                    )
+                } == 0
+                {
+                    return;
+                }
             } else {
                 std::hint::spin_loop();
             }
@@ -637,6 +805,21 @@ mod tests {
         assert!(target.try_wait().unwrap().is_none());
         target.kill().unwrap();
         target.wait().unwrap();
+    }
+
+    #[test]
+    fn sampler_never_suppresses_a_racing_signal() {
+        const ATTEMPTS: usize = 32;
+        let (mut target, mut output) = spawn_signal_target();
+        let mut delivered = 0;
+        for _ in 0..ATTEMPTS {
+            trace_signal_delivery_stop(target.id() as i32);
+            delivered += usize::from(handler_ran(&mut output));
+        }
+        assert!(target.try_wait().unwrap().is_none(), "target must resume");
+        target.kill().unwrap();
+        target.wait().unwrap();
+        assert_eq!(delivered, ATTEMPTS, "the tracer suppressed a signal");
     }
 
     #[test]

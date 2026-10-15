@@ -47,6 +47,25 @@ resumes a live target if the worker crashes or its deadline fires. A concurrentl
 kill still kills a ptrace-stopped target. Every timeout, exit, partial read, malformed unwind
 record or worker failure yields an empty attempt and cannot affect termination.
 
+Detach is signal-transparent. `waitpid(..., __WALL)` distinguishes the
+`PTRACE_EVENT_STOP` produced by interrupt/group-stop from a signal-delivery-stop. The former
+detaches with signal zero; the latter passes `WSTOPSIG(status)` as `PTRACE_DETACH` data so the
+kernel re-delivers the held signal. The same remembered signal is used by normal, unwind-error,
+and guard-drop detach paths.
+
+The worker-deadline case relies on verified behavior in both release kernel pins, not an
+assumption. A signal-delivery stop stores the original signal in `exit_code`; explicit detach
+overwrites that field with its data argument, while `exit_ptrace()` calls `__ptrace_detach()`
+without overwriting it. Unlink wakes the tracee, whose signal path consumes the preserved value.
+See A133 7.x `07bb60764cbc64b5a5d760c34709f07f8259e985`
+[`kernel/ptrace.c:151-178`](https://github.com/pocketforge-os/kernel-sunxi-7.x/blob/07bb60764cbc64b5a5d760c34709f07f8259e985/kernel/ptrace.c#L151-L178),
+[`kernel/ptrace.c:589-629`](https://github.com/pocketforge-os/kernel-sunxi-7.x/blob/07bb60764cbc64b5a5d760c34709f07f8259e985/kernel/ptrace.c#L589-L629), and
+[`kernel/signal.c:2413-2508`](https://github.com/pocketforge-os/kernel-sunxi-7.x/blob/07bb60764cbc64b5a5d760c34709f07f8259e985/kernel/signal.c#L2413-L2508); and A523 5.15
+`e63004b0e9478de722571d97cd0e853194ffb9a2`
+[`kernel/ptrace.c:132-170`](https://github.com/pocketforge-os/kernel-sunxi-5.15/blob/e63004b0e9478de722571d97cd0e853194ffb9a2/kernel/ptrace.c#L132-L170),
+[`kernel/ptrace.c:588-628`](https://github.com/pocketforge-os/kernel-sunxi-5.15/blob/e63004b0e9478de722571d97cd0e853194ffb9a2/kernel/ptrace.c#L588-L628), and
+[`kernel/signal.c:2273-2603`](https://github.com/pocketforge-os/kernel-sunxi-5.15/blob/e63004b0e9478de722571d97cd0e853194ffb9a2/kernel/signal.c#L2273-L2603).
+
 A daemon restart over a lost graceful deadline has no Closing notice in the new daemon lifetime,
 so it sends ForceStop without doing a new preparation and kills immediately. A matching prepared
 worker left in the still-running sampler may be used; otherwise the result is empty. This is the
