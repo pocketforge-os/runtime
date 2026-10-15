@@ -157,16 +157,22 @@ fn arm_sigkill_timer(timeout: Duration) -> io::Result<libc::timer_t> {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum PtraceStop {
+enum PtraceStopKind {
     EventStop,
     SignalDelivery(i32),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PtraceStop {
+    kind: PtraceStopKind,
+    status: i32,
+}
+
 impl PtraceStop {
     const fn detach_signal(self) -> i32 {
-        match self {
-            Self::EventStop => 0,
-            Self::SignalDelivery(signal) => signal,
+        match self.kind {
+            PtraceStopKind::EventStop => 0,
+            PtraceStopKind::SignalDelivery(signal) => signal,
         }
     }
 }
@@ -179,9 +185,15 @@ fn wait_for_ptrace_stop(pid: i32) -> io::Result<PtraceStop> {
         if result == pid && libc::WIFSTOPPED(status) {
             let event = (status >> 16) & 0xffff;
             return if event == libc::PTRACE_EVENT_STOP {
-                Ok(PtraceStop::EventStop)
+                Ok(PtraceStop {
+                    kind: PtraceStopKind::EventStop,
+                    status,
+                })
             } else {
-                Ok(PtraceStop::SignalDelivery(libc::WSTOPSIG(status)))
+                Ok(PtraceStop {
+                    kind: PtraceStopKind::SignalDelivery(libc::WSTOPSIG(status)),
+                    status,
+                })
             };
         }
         if result < 0 {
@@ -194,7 +206,7 @@ fn wait_for_ptrace_stop(pid: i32) -> io::Result<PtraceStop> {
         if result == pid {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
-                "sample target exited",
+                format!("sample target wait status was not stopped: {status:#x}"),
             ));
         }
     }
@@ -219,7 +231,7 @@ fn deadline_worker(pid: i32, stall: Duration) -> io::Result<()> {
     std::thread::sleep(stall);
     // PTRACE_O_EXITKILL is deliberately absent: if the timer fires, Linux detaches and resumes
     // the live tracee when this worker dies.
-    guard.detach()
+    guard.detach().map(|_| ())
 }
 
 struct TraceeGuard {
@@ -236,11 +248,12 @@ impl TraceeGuard {
         self.stop = Some(stop);
     }
 
-    fn detach(&mut self) -> io::Result<()> {
+    fn detach(&mut self) -> io::Result<i32> {
         let Some(stop) = self.stop else {
-            return Ok(());
+            return Ok(0);
         };
-        let signal = stop.detach_signal() as usize as *mut libc::c_void;
+        let detach_signal = stop.detach_signal();
+        let signal = detach_signal as usize as *mut libc::c_void;
         if unsafe {
             libc::ptrace(
                 libc::PTRACE_DETACH,
@@ -253,7 +266,7 @@ impl TraceeGuard {
             return Err(io::Error::last_os_error());
         }
         self.pid = 0;
-        Ok(())
+        Ok(detach_signal)
     }
 }
 
@@ -683,8 +696,23 @@ mod tests {
         (child, reader)
     }
 
-    fn spawn_signal_target() -> (Child, BufReader<std::process::ChildStdout>) {
-        let mut child = Command::new(std::env::current_exe().unwrap())
+    struct SignalTarget {
+        child: Child,
+        output: BufReader<std::process::ChildStdout>,
+    }
+
+    impl Drop for SignalTarget {
+        fn drop(&mut self) {
+            if self.child.try_wait().ok().flatten().is_none() {
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+            }
+        }
+    }
+
+    fn spawn_signal_target(spin: bool) -> SignalTarget {
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
             .args([
                 "--ignored",
                 "--exact",
@@ -694,9 +722,11 @@ mod tests {
             .env("PF_HANG_SIGNAL_HELPER", "1")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
+            .stderr(Stdio::null());
+        if spin {
+            command.env("PF_HANG_SIGNAL_SPIN", "1");
+        }
+        let mut child = command.spawn().unwrap();
         let mut reader = BufReader::new(child.stdout.take().unwrap());
         loop {
             let mut line = String::new();
@@ -709,7 +739,10 @@ mod tests {
                 break;
             }
         }
-        (child, reader)
+        SignalTarget {
+            child,
+            output: reader,
+        }
     }
 
     fn spawn_mapping_target() -> (Child, BufReader<std::process::ChildStdout>) {
@@ -748,44 +781,74 @@ mod tests {
         }
     }
 
-    fn trace_signal_delivery_stop(pid: i32) {
-        let (ready_read, ready_write) = pipe_pair().unwrap();
-        let (go_read, go_write) = pipe_pair().unwrap();
-        let worker = unsafe { libc::fork() };
-        assert!(worker >= 0);
-        if worker == 0 {
-            drop(ready_read);
-            drop(go_write);
-            let code = (|| -> io::Result<()> {
-                if unsafe { libc::ptrace(libc::PTRACE_SEIZE, pid, 0, 0) } != 0 {
-                    return Err(io::Error::last_os_error());
-                }
-                let mut guard = TraceeGuard::new(pid);
-                std::fs::File::from(ready_write).write_all(&[1])?;
-                let mut go = [0_u8; 1];
-                std::fs::File::from(go_read).read_exact(&mut go)?;
-                if unsafe { libc::ptrace(libc::PTRACE_INTERRUPT, pid, 0, 0) } != 0 {
-                    return Err(io::Error::last_os_error());
-                }
-                guard.stopped(wait_for_ptrace_stop(pid)?);
-                guard.detach()?;
-                Ok(())
-            })()
-            .map_or(70, |()| 0);
-            unsafe { libc::_exit(code) };
+    fn require_ptrace(request: libc::c_uint, pid: i32, operation: &str) {
+        if unsafe { libc::ptrace(request, pid, 0, 0) } != 0 {
+            let error = io::Error::last_os_error();
+            panic!(
+                "{operation} failed: errno={} ({error})",
+                error.raw_os_error().unwrap_or(0)
+            );
         }
-        drop(ready_write);
-        drop(go_read);
-        let mut marker = [0_u8; 1];
-        std::fs::File::from(ready_read)
-            .read_exact(&mut marker)
-            .unwrap();
-        assert_eq!(unsafe { libc::kill(pid, libc::SIGUSR1) }, 0);
-        std::fs::File::from(go_write).write_all(&[1]).unwrap();
-        let mut status = 0;
-        assert_eq!(unsafe { libc::waitpid(worker, &mut status, 0) }, worker);
-        assert!(libc::WIFEXITED(status));
-        assert_eq!(libc::WEXITSTATUS(status), 0);
+    }
+
+    fn require_sigusr1(pid: i32, operation: &str) {
+        if unsafe { libc::kill(pid, libc::SIGUSR1) } != 0 {
+            let error = io::Error::last_os_error();
+            panic!(
+                "{operation} failed: errno={} ({error})",
+                error.raw_os_error().unwrap_or(0)
+            );
+        }
+    }
+
+    fn require_stop(pid: i32, operation: &str) -> PtraceStop {
+        wait_for_ptrace_stop(pid).unwrap_or_else(|error| {
+            panic!(
+                "{operation} failed: errno={} ({error})",
+                error.raw_os_error().unwrap_or(0)
+            )
+        })
+    }
+
+    fn require_detach(guard: &mut TraceeGuard, operation: &str) -> i32 {
+        guard.detach().unwrap_or_else(|error| {
+            panic!(
+                "{operation} failed: errno={} ({error})",
+                error.raw_os_error().unwrap_or(0)
+            )
+        })
+    }
+
+    fn print_signal_trace(label: &str, stop: PtraceStop, detach_data: i32, acknowledged: bool) {
+        match stop.kind {
+            PtraceStopKind::EventStop => println!(
+                "{label} stop_kind=event-stop status={:#x} detach_data={detach_data} handler_ack={acknowledged}",
+                stop.status
+            ),
+            PtraceStopKind::SignalDelivery(signal) => println!(
+                "{label} stop_kind=signal-delivery-stop signo={signal} status={:#x} detach_data={detach_data} handler_ack={acknowledged}",
+                stop.status
+            ),
+        }
+    }
+
+    fn trace_racing_signal(pid: i32, attempt: usize) -> (PtraceStop, i32) {
+        require_ptrace(
+            libc::PTRACE_SEIZE,
+            pid,
+            &format!("attempt {attempt}: PTRACE_SEIZE"),
+        );
+        let mut guard = TraceeGuard::new(pid);
+        require_sigusr1(pid, &format!("attempt {attempt}: SIGUSR1 kill"));
+        require_ptrace(
+            libc::PTRACE_INTERRUPT,
+            pid,
+            &format!("attempt {attempt}: PTRACE_INTERRUPT"),
+        );
+        let stop = require_stop(pid, &format!("attempt {attempt}: waitpid ptrace stop"));
+        guard.stopped(stop);
+        let detach_data = require_detach(&mut guard, &format!("attempt {attempt}: PTRACE_DETACH"));
+        (stop, detach_data)
     }
 
     fn handler_ran(output: &mut BufReader<std::process::ChildStdout>) -> bool {
@@ -795,6 +858,13 @@ mod tests {
             revents: 0,
         };
         let ready = unsafe { libc::poll(&mut pollfd, 1, 1_000) };
+        if ready < 0 {
+            let error = io::Error::last_os_error();
+            panic!(
+                "handler acknowledgement poll failed: errno={} ({error})",
+                error.raw_os_error().unwrap_or(0)
+            );
+        }
         if ready != 1 || pollfd.revents & libc::POLLIN == 0 {
             return false;
         }
@@ -807,6 +877,7 @@ mod tests {
     fn live_target_helper() {
         let counter = std::env::var_os("PF_HANG_COUNTER_HELPER").is_some();
         let signal = std::env::var_os("PF_HANG_SIGNAL_HELPER").is_some();
+        let signal_spin = std::env::var_os("PF_HANG_SIGNAL_SPIN").is_some();
         let mapping = std::env::var_os("PF_HANG_MAP_HELPER").is_some();
         if std::env::var_os("PF_HANG_TARGET_HELPER").is_none() && !counter && !signal && !mapping {
             return;
@@ -860,6 +931,10 @@ mod tests {
                 unsafe { libc::read(libc::STDIN_FILENO, hold.as_mut_ptr().cast(), hold.len()) };
                 return;
             } else if signal {
+                if signal_spin {
+                    std::hint::spin_loop();
+                    continue;
+                }
                 let mut command = [0_u8; 1];
                 if unsafe {
                     libc::read(
@@ -904,17 +979,85 @@ mod tests {
     #[test]
     fn sampler_never_suppresses_a_racing_signal() {
         const ATTEMPTS: usize = 32;
-        let (mut target, mut output) = spawn_signal_target();
+        let mut target = spawn_signal_target(false);
         for attempt in 0..ATTEMPTS {
-            trace_signal_delivery_stop(target.id() as i32);
+            let (stop, detach_data) = trace_racing_signal(target.child.id() as i32, attempt);
+            let acknowledged = handler_ran(&mut target.output);
+            print_signal_trace(
+                &format!("race attempt={attempt}"),
+                stop,
+                detach_data,
+                acknowledged,
+            );
             assert!(
-                handler_ran(&mut output),
-                "the tracer suppressed signal attempt {attempt}"
+                acknowledged,
+                "signal handler did not acknowledge attempt {attempt}"
             );
         }
-        assert!(target.try_wait().unwrap().is_none(), "target must resume");
-        target.kill().unwrap();
-        target.wait().unwrap();
+        assert!(
+            target.child.try_wait().unwrap().is_none(),
+            "target must resume"
+        );
+    }
+
+    #[test]
+    fn signal_delivery_stop_reinjects_signal() {
+        let mut target = spawn_signal_target(true);
+        let pid = target.child.id() as i32;
+        require_ptrace(libc::PTRACE_SEIZE, pid, "signal branch: PTRACE_SEIZE");
+        let mut guard = TraceeGuard::new(pid);
+        require_sigusr1(pid, "signal branch: SIGUSR1 kill");
+        let stop = require_stop(pid, "signal branch: waitpid ptrace stop");
+        assert_eq!(
+            stop.kind,
+            PtraceStopKind::SignalDelivery(libc::SIGUSR1),
+            "signal branch: unexpected waitpid status {:#x}",
+            stop.status
+        );
+        guard.stopped(stop);
+        let detach_data = require_detach(&mut guard, "signal branch: PTRACE_DETACH");
+        let acknowledged = handler_ran(&mut target.output);
+        print_signal_trace("signal-branch", stop, detach_data, acknowledged);
+        assert!(acknowledged, "signal branch: handler did not acknowledge");
+        assert!(
+            target.child.try_wait().unwrap().is_none(),
+            "signal branch: target did not resume"
+        );
+    }
+
+    #[test]
+    fn event_stop_preserves_queued_signal_without_sigtrap() {
+        let mut target = spawn_signal_target(true);
+        let pid = target.child.id() as i32;
+        require_ptrace(libc::PTRACE_SEIZE, pid, "event branch: PTRACE_SEIZE");
+        let mut guard = TraceeGuard::new(pid);
+        require_ptrace(
+            libc::PTRACE_INTERRUPT,
+            pid,
+            "event branch: PTRACE_INTERRUPT",
+        );
+        let stop = require_stop(pid, "event branch: waitpid ptrace stop");
+        assert_eq!(
+            stop.kind,
+            PtraceStopKind::EventStop,
+            "event branch: unexpected waitpid status {:#x}",
+            stop.status
+        );
+        guard.stopped(stop);
+        require_sigusr1(pid, "event branch: queued SIGUSR1 kill");
+        let detach_data = require_detach(&mut guard, "event branch: PTRACE_DETACH");
+        assert_eq!(
+            detach_data, 0,
+            "event branch: PTRACE_DETACH must not inject a signal"
+        );
+        let acknowledged = handler_ran(&mut target.output);
+        print_signal_trace("event-branch", stop, detach_data, acknowledged);
+        assert!(acknowledged, "event branch: handler did not acknowledge");
+        thread::sleep(Duration::from_millis(10));
+        assert!(
+            target.child.try_wait().unwrap().is_none(),
+            "event branch: target exited; SIGTRAP default action may have fired"
+        );
     }
 
     #[test]
