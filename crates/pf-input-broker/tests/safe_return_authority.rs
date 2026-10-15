@@ -134,12 +134,12 @@ impl CommandExecutor for FakeSystemd {
             })
         };
         match args.as_slice() {
-            ["show", "--property", "ActiveState", "--property", "Job", "pocketforge-gamescope-session.target"] =>
+            ["show", "--property", "ActiveState", "--property", "Job", "--property", "BoundBy", "pocketforge-gamescope-session.target"] =>
             {
                 // This suite pins the legacy fb0 return path: no compositor session owns the
                 // display, so the authority must continue through foreground.target and the
                 // selected shell owner exactly as it did before session-aware reconciliation.
-                output(0, "ActiveState=inactive\nJob=")
+                output(0, "ActiveState=inactive\nJob=\nBoundBy=")
             }
             ["show", "--property", "ActiveState", "--value", unit] if *unit == APP_UNIT => {
                 output(0, &u.app_state)
@@ -345,7 +345,7 @@ fn safe_return_from_a_non_shell_client_starts_the_graceful_stop() {
     assert!(!calls.iter().any(|c| c.contains(" kill ")), "{calls:?}");
     assert!(
         calls.contains(
-            &"systemctl show --property ActiveState --property Job pocketforge-gamescope-session.target"
+            &"systemctl show --property ActiveState --property Job --property BoundBy pocketforge-gamescope-session.target"
                 .to_owned()
         ),
         "{calls:?}"

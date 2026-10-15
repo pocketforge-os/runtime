@@ -76,6 +76,8 @@ pub mod orientation_source;
 
 /// Default deadline for the restored shell to acknowledge its first presentation.
 pub const DEFAULT_PRESENTATION_TIMEOUT: Duration = Duration::from_secs(10);
+const GAMESCOPE_SESSION_TARGET: &str = "pocketforge-gamescope-session.target";
+const GAMESCOPE_RESIDENT_UNIT: &str = "pocketforge-gamescope-resident.service";
 
 /// Version of the private SDK-front wire ([`FrontEnvelope`]).
 pub const FRONT_WIRE_VERSION: u32 = 1;
@@ -741,13 +743,16 @@ impl<E: CommandExecutor> CommandSystem<E> {
         Ok(output.stdout.trim().to_owned())
     }
 
-    fn active_state_and_job(&mut self, unit: &str) -> Result<(String, Option<String>), String> {
+    fn gamescope_target_state(&mut self) -> Result<GamescopeTargetState, String> {
+        let unit = GAMESCOPE_SESSION_TARGET;
         let output = self.query(&[
             "show",
             "--property",
             "ActiveState",
             "--property",
             "Job",
+            "--property",
+            "BoundBy",
             unit,
         ])?;
         if output.code != 0 {
@@ -758,6 +763,7 @@ impl<E: CommandExecutor> CommandSystem<E> {
         }
         let mut active_state = None;
         let mut job = None;
+        let mut bound_by = None;
         for line in output.stdout.lines() {
             let (property, value) = line
                 .split_once('=')
@@ -767,7 +773,10 @@ impl<E: CommandExecutor> CommandSystem<E> {
                 "Job" if job.is_none() => {
                     job = Some((!value.is_empty()).then(|| value.to_owned()));
                 }
-                "ActiveState" | "Job" => {
+                "BoundBy" if bound_by.is_none() => {
+                    bound_by = Some(value.split_whitespace().map(str::to_owned).collect());
+                }
+                "ActiveState" | "Job" | "BoundBy" => {
                     return Err(format!(
                         "duplicate systemctl property {property} for {unit}"
                     ));
@@ -782,7 +791,60 @@ impl<E: CommandExecutor> CommandSystem<E> {
         let active_state =
             active_state.ok_or_else(|| format!("systemctl omitted ActiveState for {unit}"))?;
         let job = job.ok_or_else(|| format!("systemctl omitted Job for {unit}"))?;
-        Ok((active_state, job))
+        let bound_by = bound_by.ok_or_else(|| format!("systemctl omitted BoundBy for {unit}"))?;
+        Ok(GamescopeTargetState {
+            active_state,
+            job,
+            bound_by,
+        })
+    }
+
+    fn resident_unit_state(&mut self) -> Result<Option<String>, String> {
+        let unit = GAMESCOPE_RESIDENT_UNIT;
+        let output = self.query(&[
+            "show",
+            "--property",
+            "LoadState",
+            "--property",
+            "ActiveState",
+            unit,
+        ])?;
+        if output.code != 0 {
+            return Err(format!(
+                "systemctl show LoadState/ActiveState {unit} exited {}",
+                output.code
+            ));
+        }
+        let mut load_state = None;
+        let mut active_state = None;
+        for line in output.stdout.lines() {
+            let (property, value) = line
+                .split_once('=')
+                .ok_or_else(|| format!("malformed systemctl property for {unit}: {line:?}"))?;
+            match property {
+                "LoadState" if load_state.is_none() => load_state = Some(value.to_owned()),
+                "ActiveState" if active_state.is_none() => active_state = Some(value.to_owned()),
+                "LoadState" | "ActiveState" => {
+                    return Err(format!(
+                        "duplicate systemctl property {property} for {unit}"
+                    ));
+                }
+                _ => {
+                    return Err(format!(
+                        "unexpected systemctl property {property} for {unit}"
+                    ));
+                }
+            }
+        }
+        let load_state =
+            load_state.ok_or_else(|| format!("systemctl omitted LoadState for {unit}"))?;
+        let active_state =
+            active_state.ok_or_else(|| format!("systemctl omitted ActiveState for {unit}"))?;
+        match load_state.as_str() {
+            "not-found" => Ok(None),
+            "loaded" => Ok(Some(active_state)),
+            state => Err(format!("resident unit {unit} has LoadState {state:?}")),
+        }
     }
 
     fn is_active(&mut self, unit: &str) -> Result<bool, String> {
@@ -883,10 +945,20 @@ pub struct SystemLifecycle {
     pub selected_owner_active: bool,
 }
 
+struct GamescopeTargetState {
+    active_state: String,
+    job: Option<String>,
+    bound_by: Vec<String>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum GamescopeSessionLifecycle {
     /// The target has a unit job or is deactivating, so ownership is not stable yet.
     Transitioning,
+    /// The target has no independent resident pin and must be allowed to become inactive.
+    Transient {
+        diagnostic: Option<String>,
+    },
     SessionIdle,
     HomeClient {
         unit: String,
@@ -919,12 +991,12 @@ impl<E: CommandExecutor> SessionSystem for CommandSystem<E> {
     }
 
     fn gamescope_session_lifecycle(&mut self) -> Result<Option<GamescopeSessionLifecycle>, String> {
-        let target = "pocketforge-gamescope-session.target";
-        let (active_state, job) = self.active_state_and_job(target)?;
-        if job.is_some() || active_state == "deactivating" {
+        let target = GAMESCOPE_SESSION_TARGET;
+        let target_state = self.gamescope_target_state()?;
+        if target_state.job.is_some() || target_state.active_state == "deactivating" {
             return Ok(Some(GamescopeSessionLifecycle::Transitioning));
         }
-        match active_state.as_str() {
+        match target_state.active_state.as_str() {
             "active" => {}
             "inactive" | "failed" => return Ok(None),
             state => {
@@ -932,6 +1004,20 @@ impl<E: CommandExecutor> SessionSystem for CommandSystem<E> {
                     "Gamescope session target {target} has ActiveState {state:?} without a unit job"
                 ));
             }
+        }
+        let resident_state = self.resident_unit_state()?;
+        let resident_active = matches!(resident_state.as_deref(), Some("active" | "activating"));
+        let resident_bound = target_state
+            .bound_by
+            .iter()
+            .any(|unit| unit == GAMESCOPE_RESIDENT_UNIT);
+        if !resident_active || !resident_bound {
+            let diagnostic = (resident_active && !resident_bound).then(|| {
+                format!(
+                    "gamescope_residency_misconfigured reason=active_without_bound_by unit={GAMESCOPE_RESIDENT_UNIT} target={GAMESCOPE_SESSION_TARGET}"
+                )
+            });
+            return Ok(Some(GamescopeSessionLifecycle::Transient { diagnostic }));
         }
         let (Some(unit), Some(signal)) = (
             self.session_owner.home_client_unit.clone(),
@@ -2826,6 +2912,12 @@ impl<S: StateStore, B: SessionSystem, C: Clock> Authority<S, B, C> {
                     _,
                 ) => match gamescope.clone() {
                     Some(GamescopeSessionLifecycle::Transitioning) => None,
+                    Some(GamescopeSessionLifecycle::Transient { diagnostic }) => {
+                        if let Some(diagnostic) = diagnostic {
+                            self.log(&diagnostic);
+                        }
+                        None
+                    }
                     Some(GamescopeSessionLifecycle::SessionIdle) => {
                         Some(Observation::GamescopeSessionIdle)
                     }
