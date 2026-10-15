@@ -191,10 +191,12 @@ screen_rotation = { screen_main="cw90" }
             switch_state_file: None,
         })
         .unwrap();
-        let error = failing
+        let snapshot = failing
             .snapshot(Some("org.example.game"), &second)
-            .unwrap_err();
-        assert!(error.contains("evdev"), "{label}: {error}");
+            .unwrap_or_else(|error| panic!("{label}: missing evdev paths were fatal: {error}"));
+        assert!(snapshot.rotate_locks.is_empty(), "{label}");
+        assert_eq!(snapshot.tablet_mode, None, "{label}");
+        assert_eq!(snapshot.screen_posture, QuarterTurn::Normal, "{label}");
     }
 
     stop.store(true, Ordering::Release);
