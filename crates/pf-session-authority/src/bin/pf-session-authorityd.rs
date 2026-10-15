@@ -466,6 +466,37 @@ mod tests {
     }
 
     #[test]
+    fn home_client_configuration_is_explicit_and_paired() {
+        let base = ["--state-dir", "/tmp/pf", "--socket", "/tmp/pf.sock"];
+        let parse = |extra: &[&str]| parse_args(base.iter().chain(extra).map(|s| (*s).to_owned()));
+        let args = parse(&[
+            "--home-client-unit",
+            "pf-shell-gamescope.service",
+            "--home-client-presentation",
+            "/run/pocketforge/session/focused-home-unit",
+        ])
+        .unwrap();
+        assert_eq!(
+            args.home_client_unit.as_deref(),
+            Some("pf-shell-gamescope.service")
+        );
+        assert_eq!(
+            args.home_client_presentation.as_deref(),
+            Some(Path::new("/run/pocketforge/session/focused-home-unit"))
+        );
+        assert!(parse(&[
+            "--home-client-unit",
+            "pf-shell-gamescope.service"
+        ])
+        .is_err());
+        assert!(parse(&[
+            "--home-client-presentation",
+            "/run/pocketforge/session/focused-home-unit"
+        ])
+        .is_err());
+    }
+
+    #[test]
     fn grace_period_defaults_to_the_backstop_budget_and_a_flag_overrides_it() {
         let args = parse_args(
             ["--state-dir", "/tmp/pf", "--socket", "/tmp/pf.sock"]
