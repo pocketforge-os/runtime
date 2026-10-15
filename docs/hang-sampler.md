@@ -25,6 +25,13 @@ The closed JSON request is one `AF_UNIX/SOCK_SEQPACKET` packet. Requests that es
 (`suspect_no_reply` and `prepare`) carry exactly one process handle with `SCM_RIGHTS`; recovery,
 discard and force-stop requests carry none.
 
+The wire types, five-minute preparation limit and outbound client live in the dependency-light
+`pf-hang-trigger` crate. It depends only on `libc`, `serde` and `serde_json`; callers such as the
+session authority do not link the privileged sampler, ptrace worker, report encoder or unwinder.
+CI enforces that `pf-session-authority`'s normal dependency tree contains none of
+`pf-hang-sampler`, `framehop`, `object` or `gimli`. `pf-hang-sampler` consumes the same trigger
+crate to decode requests, so there is one serialized wire definition.
+
 - `suspect_no_reply { target, hang_nonce }` comes only from `pf-input-broker.service`, after the
   router's two-second foreground-app probe expires. This is unrelated to the menu provider's
   500 ms ping / one-second health timeout.

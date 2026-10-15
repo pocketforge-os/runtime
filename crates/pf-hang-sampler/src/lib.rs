@@ -6,21 +6,19 @@ use std::io::{self, Read, Write};
 use std::os::fd::{FromRawFd, OwnedFd};
 use std::time::Duration;
 
-pub mod client;
-pub mod protocol;
+mod protocol;
 pub mod report;
 pub mod server;
 pub mod transport;
 mod unwind;
 
 pub const SAMPLE_DEADLINE: Duration = Duration::from_millis(300);
-pub const MAX_PREPARED_GRACE: Duration = Duration::from_secs(300);
 pub const PREPARED_WORKER_SLACK: Duration = Duration::from_secs(3);
 const MAX_RETAINED_EPISODES: usize = 128;
 
 fn prepared_worker_ttl(grace_ms: u64) -> io::Result<Duration> {
     let grace = Duration::from_millis(grace_ms);
-    if grace > MAX_PREPARED_GRACE {
+    if grace > pf_hang_trigger::MAX_PREPARED_GRACE {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "prepared grace exceeds limit",
@@ -342,7 +340,7 @@ fn prepared_worker(
     if action[0] != b'S' {
         return Ok(());
     }
-    if protocol::proc_start_time(pid)? != expected_start_time {
+    if pf_hang_trigger::proc_start_time(pid)? != expected_start_time {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
             "prepared target identity changed",
@@ -594,8 +592,13 @@ mod tests {
             prepared_worker_ttl(1_500).unwrap(),
             Duration::from_millis(1_500) + PREPARED_WORKER_SLACK
         );
-        assert!(prepared_worker_ttl(MAX_PREPARED_GRACE.as_millis() as u64).is_ok());
-        assert!(prepared_worker_ttl(MAX_PREPARED_GRACE.as_millis() as u64 + 1).is_err());
+        assert!(
+            prepared_worker_ttl(pf_hang_trigger::MAX_PREPARED_GRACE.as_millis() as u64).is_ok()
+        );
+        assert!(
+            prepared_worker_ttl(pf_hang_trigger::MAX_PREPARED_GRACE.as_millis() as u64 + 1)
+                .is_err()
+        );
     }
 
     #[test]
@@ -1005,7 +1008,7 @@ mod tests {
     #[test]
     fn prepare_does_not_stop_target() {
         let (mut target, mut output) = spawn_counter_target();
-        let start_time = protocol::proc_start_time(target.id() as i32).unwrap();
+        let start_time = pf_hang_trigger::proc_start_time(target.id() as i32).unwrap();
         let prepared = PreparedSample::prepare(
             target.id() as i32,
             start_time,
@@ -1113,7 +1116,7 @@ mod tests {
     #[test]
     fn prepared_unwind_rejects_changed_process_image() {
         let (mut target, mut output) = spawn_mapping_target();
-        let start_time = protocol::proc_start_time(target.id() as i32).unwrap();
+        let start_time = pf_hang_trigger::proc_start_time(target.id() as i32).unwrap();
         let prepared = PreparedSample::prepare(
             target.id() as i32,
             start_time,

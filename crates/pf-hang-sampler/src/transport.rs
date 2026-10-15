@@ -1,4 +1,3 @@
-use crate::protocol::{encode_request, TriggerRequest};
 use std::io;
 use std::mem::size_of;
 use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
@@ -79,14 +78,4 @@ pub fn accept(listener: BorrowedFd<'_>) -> io::Result<UnixStream> {
         return Err(io::Error::last_os_error());
     }
     Ok(unsafe { UnixStream::from_raw_fd(fd) })
-}
-
-pub fn send_request(
-    socket: &Path,
-    request: &TriggerRequest,
-    process: Option<BorrowedFd<'_>>,
-) -> io::Result<()> {
-    let stream = connect(socket)?;
-    let payload = encode_request(request)?;
-    pf_peer_identity::scm::send_with_fd(stream.as_raw_fd(), &payload, process)
 }

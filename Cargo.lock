@@ -491,8 +491,18 @@ dependencies = [
  "libc",
  "object",
  "pf-app-manifest",
+ "pf-hang-trigger",
  "pf-peer-identity",
  "pf-problem-report",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "pf-hang-trigger"
+version = "0.0.1"
+dependencies = [
+ "libc",
  "serde",
  "serde_json",
 ]
@@ -650,7 +660,7 @@ dependencies = [
  "libc",
  "pf-app-launch",
  "pf-app-manifest",
- "pf-hang-sampler",
+ "pf-hang-trigger",
  "pf-peer-identity",
  "pf-ports",
  "pf-prefs",

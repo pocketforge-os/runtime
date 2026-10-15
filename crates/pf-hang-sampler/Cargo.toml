@@ -12,6 +12,7 @@ framehop.workspace = true
 libc.workspace = true
 object.workspace = true
 pf-app-manifest.workspace = true
+pf-hang-trigger.workspace = true
 pf-peer-identity.workspace = true
 pf-problem-report.workspace = true
 serde.workspace = true

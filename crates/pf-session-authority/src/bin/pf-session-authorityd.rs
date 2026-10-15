@@ -94,7 +94,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         item_id,
                         grace,
                     } => {
-                        let _ = pf_hang_sampler::client::send_prepare(
+                        let _ = pf_hang_trigger::client::send_prepare(
                             &hang_sampler_socket,
                             &item_id,
                             &session_id,
@@ -108,13 +108,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     } => {
                         let reason = match reason {
                             pf_session_authority::ForceStopReason::StopTimeout => {
-                                pf_hang_sampler::protocol::ForceStopReason::StopTimeout
+                                pf_hang_trigger::ForceStopReason::StopTimeout
                             }
                             pf_session_authority::ForceStopReason::StopRequestFailed => {
-                                pf_hang_sampler::protocol::ForceStopReason::StopRequestFailed
+                                pf_hang_trigger::ForceStopReason::StopRequestFailed
                             }
                         };
-                        let _ = pf_hang_sampler::client::send_force_stop(
+                        let _ = pf_hang_trigger::client::send_force_stop(
                             &hang_sampler_socket,
                             &item_id,
                             &session_id,
@@ -125,7 +125,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         session_id,
                         item_id,
                     } => {
-                        let _ = pf_hang_sampler::client::send_discard(
+                        let _ = pf_hang_trigger::client::send_discard(
                             &hang_sampler_socket,
                             &item_id,
                             &session_id,
@@ -369,10 +369,10 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
                     Duration::from_millis(value.parse::<u64>().map_err(|error| {
                         format!("--grace-period-ms expects milliseconds: {error}")
                     })?);
-                if grace > pf_hang_sampler::MAX_PREPARED_GRACE {
+                if grace > pf_hang_trigger::MAX_PREPARED_GRACE {
                     return Err(format!(
                         "--grace-period-ms exceeds {} milliseconds",
-                        pf_hang_sampler::MAX_PREPARED_GRACE.as_millis()
+                        pf_hang_trigger::MAX_PREPARED_GRACE.as_millis()
                     ));
                 }
             }
