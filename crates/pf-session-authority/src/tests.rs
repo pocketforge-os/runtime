@@ -312,7 +312,7 @@ fn command_system_selects_gamescope_home_or_idle_without_starting_fb0_owner() {
         outputs: VecDeque::from([
             CommandOutput {
                 code: 0,
-                stdout: String::new(),
+                stdout: "ActiveState=active\nJob=\n".into(),
             },
             CommandOutput {
                 code: 0,
@@ -348,8 +348,11 @@ fn command_system_selects_gamescope_home_or_idle_without_starting_fb0_owner() {
             (
                 "systemctl".into(),
                 vec![
-                    "is-active".into(),
-                    "--quiet".into(),
+                    "show".into(),
+                    "--property".into(),
+                    "ActiveState".into(),
+                    "--property".into(),
+                    "Job".into(),
                     "pocketforge-gamescope-session.target".into(),
                 ],
             ),
@@ -386,7 +389,7 @@ fn command_system_selects_gamescope_home_or_idle_without_starting_fb0_owner() {
         FakeExecutor {
             outputs: VecDeque::from([CommandOutput {
                 code: 0,
-                stdout: String::new(),
+                stdout: "ActiveState=active\nJob=\n".into(),
             }]),
             ..FakeExecutor::default()
         },
@@ -397,13 +400,28 @@ fn command_system_selects_gamescope_home_or_idle_without_starting_fb0_owner() {
     );
     assert_eq!(idle.into_executor().calls.len(), 1);
 
+    let mut transitioning = CommandSystem::with_executor(
+        CommandTemplates::default(),
+        FakeExecutor {
+            outputs: VecDeque::from([CommandOutput {
+                code: 0,
+                stdout: "ActiveState=active\nJob=421\n".into(),
+            }]),
+            ..FakeExecutor::default()
+        },
+    );
+    assert_eq!(
+        transitioning.gamescope_session_lifecycle().unwrap(),
+        Some(GamescopeSessionLifecycle::Transitioning)
+    );
+
     let mut missing = CommandSystem::with_executor_and_session_owner(
         CommandTemplates::default(),
         FakeExecutor {
             outputs: VecDeque::from([
                 CommandOutput {
                     code: 0,
-                    stdout: String::new(),
+                    stdout: "ActiveState=active\nJob=\n".into(),
                 },
                 CommandOutput {
                     code: 0,
@@ -427,8 +445,8 @@ fn command_system_selects_gamescope_home_or_idle_without_starting_fb0_owner() {
         CommandTemplates::default(),
         FakeExecutor {
             outputs: VecDeque::from([CommandOutput {
-                code: 3,
-                stdout: String::new(),
+                code: 0,
+                stdout: "ActiveState=inactive\nJob=\n".into(),
             }]),
             ..FakeExecutor::default()
         },
@@ -442,6 +460,21 @@ fn command_system_selects_gamescope_home_or_idle_without_starting_fb0_owner() {
             vec!["start".to_owned(), "pf-shell-selected.service".to_owned()]
         )
     );
+
+    let mut malformed = CommandSystem::with_executor(
+        CommandTemplates::default(),
+        FakeExecutor {
+            outputs: VecDeque::from([CommandOutput {
+                code: 0,
+                stdout: "ActiveState=active\n".into(),
+            }]),
+            ..FakeExecutor::default()
+        },
+    );
+    assert!(malformed
+        .gamescope_session_lifecycle()
+        .unwrap_err()
+        .contains("omitted Job"));
 
     fs::remove_dir_all(dir).unwrap();
 }
@@ -695,7 +728,7 @@ fn gamescope_target_residency_transient_stop_waits_for_fb0_fallback() {
     });
     // Exact integration ordering: the app is already inactive, but the StopWhenUnneeded
     // Gamescope target is still active with its own stop job pending.
-    authority.system.gamescope = Some(GamescopeSessionLifecycle::Stopping);
+    authority.system.gamescope = Some(GamescopeSessionLifecycle::Transitioning);
     authority.tick().unwrap();
 
     assert!(matches!(
@@ -721,7 +754,12 @@ fn gamescope_target_residency_transient_stop_waits_for_fb0_fallback() {
         }
     ));
 
-    authority.system.lifecycle.as_mut().unwrap().selected_owner_active = true;
+    authority
+        .system
+        .lifecycle
+        .as_mut()
+        .unwrap()
+        .selected_owner_active = true;
     authority.tick().unwrap();
     authority
         .observe(Observation::PresentationAcknowledged)

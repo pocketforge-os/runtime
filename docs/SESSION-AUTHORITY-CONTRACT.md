@@ -141,6 +141,11 @@ Restoration first asks systemd whether `pocketforge-gamescope-session.target` is
 is active, an inactive `pocketforge-foreground.target` is not a release signal and the authority
 never starts `pf-shell-selected.service`.
 
+The Gamescope target counts as resident only when `ActiveState=active` and its own systemd `Job`
+property is empty in the same snapshot. A queued unit job or `ActiveState=deactivating` is
+nonterminal: reconciliation waits for the target to become inactive, then continues through the
+legacy selected-owner and presentation acknowledgement rungs.
+
 The Gamescope home client is optional configuration: `--home-client-unit` and
 `--home-client-presentation` must be supplied together. The latter names a compositor-owned file
 below `/run/pocketforge/session`; its complete content is the configured unit name plus a newline
