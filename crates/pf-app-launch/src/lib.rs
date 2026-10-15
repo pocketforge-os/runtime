@@ -9,9 +9,9 @@ use crate::policy::{
 };
 use pf_app_manifest::{ReasonCode, ResolveError, Resolver};
 use std::fmt;
-use std::fs;
-use std::io;
-use std::os::unix::fs::FileTypeExt;
+use std::fs::{self, OpenOptions};
+use std::io::{self, Read};
+use std::os::unix::fs::{FileTypeExt, OpenOptionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -180,12 +180,28 @@ fn load_environment(policy: &PolicyDecision) -> Result<Vec<(String, String)>, Po
                 .iter()
                 .find(|mapping| mapping.destination == Path::new(policy::X11_SOCKET_DESTINATION))
                 .ok_or_else(|| PolicyError("x11 DISPLAY has no socket projection".to_owned()))?;
-            let metadata = fs::metadata(&socket.source).map_err(|error| {
+            let socket_file = OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open(&socket.source)
+                .map_err(|error| {
+                    PolicyError(format!(
+                        "inspect x11 socket {}: {error}",
+                        socket.source.display()
+                    ))
+                })?;
+            let metadata = socket_file.metadata().map_err(|error| {
                 PolicyError(format!(
                     "inspect x11 socket {}: {error}",
                     socket.source.display()
                 ))
             })?;
+            if metadata.file_type().is_symlink() {
+                return Err(PolicyError(format!(
+                    "x11 socket {} is an alias",
+                    socket.source.display()
+                )));
+            }
             if !metadata.file_type().is_socket() {
                 return Err(PolicyError(format!(
                     "x11 socket {} is not a filesystem socket",
@@ -193,7 +209,39 @@ fn load_environment(policy: &PolicyDecision) -> Result<Vec<(String, String)>, Po
                 )));
             }
         }
-        let source = fs::read_to_string(&projection.source).map_err(|error| {
+        let mut source_file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+            .open(&projection.source)
+            .map_err(|error| {
+                let detail = if error.raw_os_error() == Some(libc::ELOOP) {
+                    "is an alias".to_owned()
+                } else {
+                    error.to_string()
+                };
+                PolicyError(format!(
+                    "read capability environment {}: {detail}",
+                    projection.source.display()
+                ))
+            })?;
+        if !source_file
+            .metadata()
+            .map_err(|error| {
+                PolicyError(format!(
+                    "inspect capability environment {}: {error}",
+                    projection.source.display()
+                ))
+            })?
+            .file_type()
+            .is_file()
+        {
+            return Err(PolicyError(format!(
+                "capability environment {} is not a regular file",
+                projection.source.display()
+            )));
+        }
+        let mut source = String::new();
+        source_file.read_to_string(&mut source).map_err(|error| {
             PolicyError(format!(
                 "read capability environment {}: {error}",
                 projection.source.display()
@@ -256,7 +304,7 @@ pub fn required_launch_paths(app_id: &str) -> Result<LaunchPaths, LaunchError> {
 mod tests {
     use super::*;
     use std::fs;
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{symlink, PermissionsExt};
     use std::os::unix::net::UnixListener;
 
     #[derive(Default)]
@@ -390,6 +438,25 @@ mod tests {
             load_environment(&policy).unwrap(),
             [("DISPLAY".to_owned(), ":0".to_owned())]
         );
+
+        let socket_alias = dir.join("X0-alias");
+        symlink(&socket, &socket_alias).unwrap();
+        policy.unit.bind_read_write_mappings[0].source = socket_alias;
+        assert!(load_environment(&policy)
+            .unwrap_err()
+            .to_string()
+            .contains("alias"));
+        policy.unit.bind_read_write_mappings[0].source = socket.clone();
+
+        let environment_alias = dir.join("environment-alias");
+        symlink(&environment, &environment_alias).unwrap();
+        policy.environment[0].source = environment_alias;
+        assert!(load_environment(&policy)
+            .unwrap_err()
+            .to_string()
+            .contains("alias"));
+        policy.environment[0].source = environment.clone();
+
         let plain_command = execution_command(Path::new("/usr/bin/env"), &dir, &[]);
         assert_eq!(
             plain_command
