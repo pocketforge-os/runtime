@@ -967,6 +967,13 @@ pub struct SystemLifecycle {
     pub selected_owner_active: bool,
 }
 
+fn selected_owner_release_ready(
+    foreground_target_active: bool,
+    gamescope: &Option<GamescopeSessionLifecycle>,
+) -> bool {
+    gamescope.is_none() && !foreground_target_active
+}
+
 #[derive(Debug, Eq, PartialEq)]
 struct GamescopeTargetState {
     active_state: String,
@@ -2990,7 +2997,13 @@ impl<S: StateStore, B: SessionSystem, C: Clock> Authority<S, B, C> {
                     Some(GamescopeSessionLifecycle::HomeClient {
                         unit, ack_signal, ..
                     }) => Some(Observation::GamescopeHomeAvailable { unit, ack_signal }),
-                    None if !snapshot.foreground_target_active => Some(Observation::TargetReleased),
+                    None if selected_owner_release_ready(
+                        snapshot.foreground_target_active,
+                        &gamescope,
+                    ) =>
+                    {
+                        Some(Observation::TargetReleased)
+                    }
                     None => None,
                 },
                 (
@@ -3060,7 +3073,27 @@ impl<S: StateStore, B: SessionSystem, C: Clock> Authority<S, B, C> {
                         }
                         Ok(())
                     }
-                    None => self.begin_resident_monitor_fallback(),
+                    None => {
+                        if monitor.rung != ResidentMonitorRung::TargetReleased {
+                            self.state.resident_monitor.as_mut().unwrap().rung =
+                                ResidentMonitorRung::TargetReleased;
+                            self.persist()?;
+                        }
+                        let snapshot = self
+                            .system
+                            .lifecycle(&monitor.item_id)
+                            .map_err(AuthorityError::Backend)?;
+                        if snapshot.as_ref().is_some_and(|snapshot| {
+                            selected_owner_release_ready(
+                                snapshot.foreground_target_active,
+                                &gamescope,
+                            )
+                        }) {
+                            self.begin_resident_monitor_fallback()
+                        } else {
+                            Ok(())
+                        }
+                    }
                     Some(_) => Ok(()),
                 }
             }
