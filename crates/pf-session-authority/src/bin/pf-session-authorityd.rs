@@ -8,8 +8,8 @@ use pf_session_authority::orientation_source::{
 use pf_session_authority::{
     run_service_loop, spawn_front_acceptor, spawn_rpc_acceptor_with_orientation, Authority,
     CommandSystem, CommandTemplates, FileStore, FixedUrlHandler, FrontPolicy, PendingRpc,
-    ShellPolicy, DEFAULT_CONNECTION_LIMITS, DEFAULT_GRACE_PERIOD, DEFAULT_PRESENTATION_TIMEOUT,
-    DEFAULT_TICK_INTERVAL,
+    SessionOwnerConfig, ShellPolicy, DEFAULT_CONNECTION_LIMITS, DEFAULT_GRACE_PERIOD,
+    DEFAULT_PRESENTATION_TIMEOUT, DEFAULT_TICK_INTERVAL,
 };
 use std::env;
 use std::fs;
@@ -35,6 +35,8 @@ struct Args {
     shell_unit: String,
     broker_unit: String,
     compositor_unit: String,
+    home_client_unit: Option<String>,
+    home_client_presentation: Option<PathBuf>,
     descriptor: Option<PathBuf>,
     prefs_socket: PathBuf,
     orientation_fixture_root: Option<PathBuf>,
@@ -80,7 +82,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     let mut authority = Authority::open(
         FileStore::new(args.state_dir.join("authority.json")),
-        CommandSystem::new(args.templates),
+        CommandSystem::new_with_session_owner(
+            args.templates,
+            match (args.home_client_unit, args.home_client_presentation) {
+                (Some(unit), Some(signal)) => SessionOwnerConfig::new(unit, signal)?,
+                (None, None) => SessionOwnerConfig::default(),
+                _ => unreachable!("paired home client arguments are validated by parse_args"),
+            },
+        ),
         SystemClock(Instant::now()),
         32,
         args.grace,
@@ -236,6 +245,8 @@ Options:
   --shell-unit UNIT                Full-access shell unit (default pf-shell-selected.service)
   --broker-unit UNIT               Root SafeReturn-only unit (default pf-input-broker.service)
   --compositor-unit UNIT           Read-only orientation consumer (default gamescope-session.service)
+  --home-client-unit UNIT          Gamescope session home client (optional; paired with signal)
+  --home-client-presentation PATH  Compositor-owned focused-home signal (paired with unit)
   --descriptor PATH               Device capabilities descriptor (default $PF_DESCRIPTOR,
                                    $PF_PLATFORM/devices/$PF_DEVICE_ID/capabilities.toml,
                                    or the sole installed per-device descriptor)
@@ -256,6 +267,8 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
     let mut shell_unit = "pf-shell-selected.service".to_owned();
     let mut broker_unit = "pf-input-broker.service".to_owned();
     let mut compositor_unit = "gamescope-session.service".to_owned();
+    let mut home_client_unit = None;
+    let mut home_client_presentation: Option<PathBuf> = None;
     let defaults = LinuxOrientationPaths::default();
     let mut descriptor = None;
     let mut prefs_socket = defaults.prefs_socket;
@@ -282,6 +295,8 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
             "--shell-unit" => shell_unit = value,
             "--broker-unit" => broker_unit = value,
             "--compositor-unit" => compositor_unit = value,
+            "--home-client-unit" => home_client_unit = Some(value),
+            "--home-client-presentation" => home_client_presentation = Some(value.into()),
             "--descriptor" => descriptor = Some(value.into()),
             "--prefsd-socket" => prefs_socket = value.into(),
             "--orientation-fixture-root" => orientation_fixture_root = Some(value.into()),
@@ -341,6 +356,15 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
         pf_app_manifest::validate_app_id(handler)
             .map_err(|_| format!("--url-handler is not an application id: {handler}"))?;
     }
+    match (&home_client_unit, &home_client_presentation) {
+        (None, None) => {}
+        (Some(unit), Some(signal)) => {
+            SessionOwnerConfig::new(unit.clone(), signal.clone())?;
+        }
+        _ => {
+            return Err("--home-client-unit and --home-client-presentation go together".to_owned())
+        }
+    }
     Ok(Args {
         state_dir,
         socket: socket.ok_or("--socket is required")?,
@@ -348,6 +372,8 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
         shell_unit,
         broker_unit,
         compositor_unit,
+        home_client_unit,
+        home_client_presentation,
         descriptor,
         prefs_socket,
         orientation_fixture_root,
@@ -463,6 +489,33 @@ mod tests {
             Some(991)
         );
         assert_eq!(user_uid("pf-front-x:x:1:1::/:/bin/sh\n", "pf-front"), None);
+    }
+
+    #[test]
+    fn home_client_configuration_is_explicit_and_paired() {
+        let base = ["--state-dir", "/tmp/pf", "--socket", "/tmp/pf.sock"];
+        let parse = |extra: &[&str]| parse_args(base.iter().chain(extra).map(|s| (*s).to_owned()));
+        let args = parse(&[
+            "--home-client-unit",
+            "pf-shell-gamescope.service",
+            "--home-client-presentation",
+            "/run/pocketforge/session/focused-home-unit",
+        ])
+        .unwrap();
+        assert_eq!(
+            args.home_client_unit.as_deref(),
+            Some("pf-shell-gamescope.service")
+        );
+        assert_eq!(
+            args.home_client_presentation.as_deref(),
+            Some(Path::new("/run/pocketforge/session/focused-home-unit"))
+        );
+        assert!(parse(&["--home-client-unit", "pf-shell-gamescope.service"]).is_err());
+        assert!(parse(&[
+            "--home-client-presentation",
+            "/run/pocketforge/session/focused-home-unit"
+        ])
+        .is_err());
     }
 
     #[test]

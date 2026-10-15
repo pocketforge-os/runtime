@@ -92,6 +92,18 @@ fn inputs(root: &Path) -> PolicyInputs {
             "session-environment".into(),
             vec![PathBuf::from("/run/pocketforge/session/environment")],
         ),
+        (
+            "x11-environment".into(),
+            vec![PathBuf::from(
+                "/run/pocketforge/session/capabilities/x11/environment",
+            )],
+        ),
+        (
+            "x11-socket".into(),
+            vec![PathBuf::from(
+                "/run/pocketforge/session/capabilities/x11/X0",
+            )],
+        ),
     ]);
     PolicyInputs {
         platform_runtime: root.join("platform-runtime"),
@@ -100,6 +112,66 @@ fn inputs(root: &Path) -> PolicyInputs {
         xdg_cache: root.join("xdg/cache/org.example.app"),
         resource_paths: vec![root.join("platform-dependencies")],
         resources,
+    }
+}
+
+#[test]
+fn x11_projection_is_exact_manifest_scoped_and_fail_closed() {
+    let root = PathBuf::from("/fixture");
+    let socket = Path::new("/run/pocketforge/session/capabilities/x11/X0");
+    let mapping = "BindPaths=/run/pocketforge/session/capabilities/x11/X0:/tmp/.X11-unix/X0";
+
+    let x11 = derive_policy(&resolved(&root, &["x11"], false, true), &inputs(&root)).unwrap();
+    let rendered = render_systemd_dropin(&x11);
+    assert_eq!(rendered.lines().filter(|line| *line == mapping).count(), 1);
+    assert!(x11
+        .landlock
+        .filesystem
+        .iter()
+        .any(|rule| { rule.path == socket && rule.access == FsAccess::UnixConnect }));
+    assert!(!rendered.contains("@/tmp/.X11-unix/X0"));
+
+    let plain = derive_policy(&resolved(&root, &[], false, true), &inputs(&root)).unwrap();
+    let plain_rendered = render_systemd_dropin(&plain);
+    assert!(!plain_rendered.contains("capabilities/x11"));
+    assert!(!plain_rendered.contains("/tmp/.X11-unix/X0"));
+    assert!(!serde_json::to_string(&plain)
+        .unwrap()
+        .contains("capabilities/x11"));
+    assert!(!plain
+        .landlock
+        .filesystem
+        .iter()
+        .any(|rule| rule.path == socket));
+
+    for missing in ["x11-socket", "x11-environment"] {
+        let mut incomplete = inputs(&root);
+        incomplete.resources.remove(missing);
+        assert_eq!(
+            derive_policy(&resolved(&root, &["x11"], false, true), &incomplete)
+                .unwrap_err()
+                .to_string(),
+            format!("required x11 resource {missing} is missing")
+        );
+    }
+
+    for (class, path) in [
+        (
+            "x11-socket",
+            "/run/pocketforge/session/capabilities/x11/@X0",
+        ),
+        ("x11-environment", "/run/pocketforge/session/environment"),
+    ] {
+        let mut malformed = inputs(&root);
+        malformed
+            .resources
+            .insert(class.into(), vec![PathBuf::from(path)]);
+        assert!(
+            derive_policy(&resolved(&root, &["x11"], false, true), &malformed)
+                .unwrap_err()
+                .to_string()
+                .contains("canonical")
+        );
     }
 }
 

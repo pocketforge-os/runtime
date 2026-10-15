@@ -384,6 +384,20 @@ fn input_layer_capability_goldens_and_refusals_share_one_invocation() {
 }
 
 #[test]
+fn x11_is_an_exact_capability_name() {
+    let manifest = parse_manifest(&capability_manifest(&["x11"])).unwrap();
+    assert_eq!(manifest.app.capabilities, ["x11"]);
+
+    for invalid in ["x11:0", "x11?", "x11-abstract"] {
+        let error = parse_manifest(&capability_manifest(&[invalid])).unwrap_err();
+        assert_eq!(
+            error.message, "invalid or duplicate capability",
+            "{invalid}"
+        );
+    }
+}
+
+#[test]
 fn input_layer_contract_support_gates_required_but_not_optional() {
     // A device contract may advertise the input-layer capabilities (sorted, as the exact
     // contract grammar demands)...

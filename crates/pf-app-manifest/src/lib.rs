@@ -46,6 +46,9 @@ pub const KNOWN_CAPABILITIES: &[&str] = &[
     // Platform-owned opt-in for launchers which must create nested user/mount/network
     // namespaces (notably the browser's bwrap sandbox).
     "sandbox.nested_userns",
+    // Xwayland is projected per app from the compositor session. This exact token has no
+    // optional or modifier form because missing capability state must refuse the launch.
+    "x11",
 ];
 
 /// Minimum-spec graphics version vocabulary: OpenGL ES.
@@ -582,6 +585,9 @@ fn validate_requirement(requirement: &CapabilityRequirement) -> Result<(), ()> {
                     Err(())
                 }
             });
+    }
+    if requirement.base == "x11" && requirement.optional {
+        return Err(());
     }
     if let Some(modifier) = requirement.modifier.as_deref() {
         if !matches!(

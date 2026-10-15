@@ -135,6 +135,27 @@ The service loop wakes at armed deadlines instead of waiting for the next period
 (`Authority::time_until_next_deadline`), so escalation lands at the deadline, not up to a tick
 interval late.
 
+## Post-app ownership tiers
+
+Restoration first asks systemd whether `pocketforge-gamescope-session.target` is active. While it
+is active, an inactive `pocketforge-foreground.target` is not a release signal and the authority
+never starts `pf-shell-selected.service`.
+
+The Gamescope home client is optional configuration: `--home-client-unit` and
+`--home-client-presentation` must be supplied together. The latter names a compositor-owned file
+below `/run/pocketforge/session`; its complete content is the configured unit name plus a newline
+only while that client is the focused presenting surface. A configured unit whose systemd
+`LoadState` is `not-found` is treated like no configured unit. In either absent-client case the
+terminal history entry records `post_app_owner=session_idle` and the session stays active.
+
+When the home client exists, the authority starts (or keeps) that exact configured unit, then
+requires both an active unit and the matching compositor signal. The existing 10-second
+presentation deadline covers the whole activation-and-presentation interval. The history receipt
+records `owner_tier=gamescope`, `post_app_owner=home_client`, `home_unit`, `ack_signal`, and the
+monotonic acknowledgement latency. Stopping the Gamescope target returns reconciliation to the
+existing foreground-target / selected-owner path; entries on that legacy path omit the additive
+`post_app_owner` field and retain their previous serialized shape.
+
 ### Escalation hook
 
 `Authority::with_escalation_hook` attaches a sampler (the crash collector's hang sampler,
