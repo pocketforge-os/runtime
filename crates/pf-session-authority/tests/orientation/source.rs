@@ -177,10 +177,7 @@ screen_rotation = { screen_main="cw90" }
         if label == "capabilities" {
             write(input_class.join("event0/device/name"), "Buttons\n");
         } else if label == "snapshot" {
-            write(
-                input_class.join("event0/device/capabilities/sw"),
-                "1000\n",
-            );
+            write(input_class.join("event0/device/capabilities/sw"), "1000\n");
             write(input_class.join("event0/device/name"), "Buttons\n");
             write(input_devices.join("event0"), "not an evdev node\n");
         }
@@ -205,6 +202,64 @@ screen_rotation = { screen_main="cw90" }
             .unwrap_or_else(|error| panic!("{label}: missing evdev paths were fatal: {error}"));
         assert_eq!(snapshot.rotate_locks, [true], "{label}");
         assert_eq!(snapshot.tablet_mode, Some(false), "{label}");
+        assert_eq!(snapshot.screen_posture, QuarterTurn::Normal, "{label}");
+    }
+
+    for (label, unavailable_switch) in [
+        (
+            "absent-required",
+            r#"{ ev_type="EV_SW", code="SW_LID", source="Missing", active=[90,180] }"#,
+        ),
+        (
+            "unsupported-required",
+            r#"{ ev_type="EV_SW", code="SW_UNKNOWN", source="Hall", active=[90,180] }"#,
+        ),
+    ] {
+        let joint_descriptor = root.join(format!("{label}-capabilities.toml"));
+        write(
+            &joint_descriptor,
+            format!(
+                r#"
+[[screens]]
+id = "screen_main"
+role = "primary"
+rotation = "cw90"
+
+[[joints]]
+id = "screen"
+kind = "swivel"
+default = 0
+switches = [
+  {unavailable_switch},
+  {{ ev_type="EV_SW", code="SW_LID", source="Hall", active=[90,180] }},
+]
+[[joints.postures]]
+id = "deck"
+range = [0,90]
+screen_rotation = {{ screen_main="none" }}
+[[joints.postures]]
+id = "turned"
+range = [90,180]
+screen_rotation = {{ screen_main="cw90" }}
+"#
+            ),
+        );
+        let mut failing = LinuxOrientationSource::open(LinuxOrientationPaths {
+            descriptor: joint_descriptor,
+            prefs_socket: prefs_socket.clone(),
+            app_root: root.join("apps"),
+            drm_class: root.join("drm"),
+            device_tree: root.join("dt"),
+            input_class: root.join("unused-input-class"),
+            input_devices: root.join("unused-input-devices"),
+            iio_devices: root.join("iio"),
+            sensor_orientation_file: Some(root.join("sensor-orientation")),
+            switch_state_file: Some(root.join("switches.json")),
+        })
+        .unwrap();
+        let snapshot = failing
+            .snapshot(Some("org.example.game"), &second)
+            .unwrap_or_else(|error| panic!("{label}: unavailable joint source was fatal: {error}"));
         assert_eq!(snapshot.screen_posture, QuarterTurn::Normal, "{label}");
     }
 

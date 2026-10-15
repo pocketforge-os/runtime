@@ -297,8 +297,8 @@ impl LinuxOrientationSource {
                 .map_err(|error| format!("parse {}: {error}", path.display()))?,
                 None => BTreeMap::new(),
             };
-        let states = if self.paths.switch_state_file.is_some() {
-            Vec::new()
+        let (states, switch_snapshot_complete) = if self.paths.switch_state_file.is_some() {
+            (Vec::new(), true)
         } else {
             let mut relevant_codes = BTreeSet::from([SW_ROTATE_LOCK, SW_TABLET_MODE]);
             relevant_codes.extend(
@@ -328,8 +328,9 @@ impl LinuxOrientationSource {
                     }
                 })
                 .collect();
+            let switch_snapshot_complete = failures.is_empty();
             self.record_switch_failures(failures);
-            states
+            (states, switch_snapshot_complete)
         };
         let fixture_value = |source: &str, token: &str| -> Result<Option<bool>, String> {
             match fixture.get(source).and_then(|values| values.get(token)) {
@@ -347,21 +348,18 @@ impl LinuxOrientationSource {
                 .collect::<Result<Vec<_>, _>>()
                 .map(|values| values.into_iter().flatten().collect())
         };
-        inputs.rotate_locks = if self.paths.switch_state_file.is_some() {
-            fixture_values("SW_ROTATE_LOCK")?
-        } else {
-            states
+        if self.paths.switch_state_file.is_some() {
+            inputs.rotate_locks = fixture_values("SW_ROTATE_LOCK")?;
+            inputs.tablet_mode = fixture_values("SW_TABLET_MODE")?.into_iter().next();
+        } else if switch_snapshot_complete {
+            inputs.rotate_locks = states
                 .iter()
                 .filter_map(|device| device.switch(SW_ROTATE_LOCK))
-                .collect()
-        };
-        inputs.tablet_mode = if self.paths.switch_state_file.is_some() {
-            fixture_values("SW_TABLET_MODE")?.into_iter().next()
-        } else {
-            states
+                .collect();
+            inputs.tablet_mode = states
                 .iter()
-                .find_map(|device| device.switch(SW_TABLET_MODE))
-        };
+                .find_map(|device| device.switch(SW_TABLET_MODE));
+        }
         inputs.tablet_mode_is_posture = false;
 
         let Some(joint) = self
@@ -382,14 +380,21 @@ impl LinuxOrientationSource {
         });
         let mut value = default_value;
         let mut source_failures = Vec::new();
+        let mut required_source_failed = !switch_snapshot_complete;
         for switch in &joint.switches {
             let Some(code) = parse_switch_code(&switch.code) else {
+                required_source_failed = true;
+                source_failures.push(SwitchFailure::new(
+                    &switch.source,
+                    format!("unsupported_switch:{}", switch.code),
+                ));
                 continue;
             };
             let set = if self.paths.switch_state_file.is_some() {
                 fixture_value(&switch.source, &switch.code)?
             } else {
                 let Some(device) = states.iter().find(|device| device.name == switch.source) else {
+                    required_source_failed = true;
                     source_failures
                         .push(SwitchFailure::new(&switch.source, "required_source_absent"));
                     continue;
@@ -397,6 +402,7 @@ impl LinuxOrientationSource {
                 device.switch(code)
             };
             let Some(set) = set else {
+                required_source_failed = true;
                 source_failures.push(SwitchFailure::new(
                     &switch.source,
                     format!("unsupported_switch:{}", switch.code),
@@ -410,7 +416,14 @@ impl LinuxOrientationSource {
                 value = (switch.active[0] + switch.active[1]) / 2.0;
             }
         }
-        let proposed = posture_rotation(joint, value);
+        let proposed = posture_rotation(
+            joint,
+            if required_source_failed {
+                default_value
+            } else {
+                value
+            },
+        );
         let now_ms = self.started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
         let hall = self
             .hall
@@ -818,7 +831,13 @@ fn discover_switch_devices(
     let mut discovery = SwitchDiscovery::default();
     let entries = match fs::read_dir(class_root) {
         Ok(entries) => entries,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return discovery,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            discovery.failures.push(SwitchFailure::new(
+                class_root.to_string_lossy(),
+                format!("input_root_unavailable:{error}"),
+            ));
+            return discovery;
+        }
         Err(error) => {
             discovery.failures.push(SwitchFailure::new(
                 class_root.to_string_lossy(),
