@@ -560,6 +560,7 @@ mod tests {
     use super::*;
     use std::io::{BufRead, BufReader};
     use std::os::fd::AsRawFd;
+    use std::os::unix::process::CommandExt;
     use std::process::{Child, Command, Stdio};
     use std::thread;
     use std::time::Instant;
@@ -726,7 +727,31 @@ mod tests {
         if spin {
             command.env("PF_HANG_SIGNAL_SPIN", "1");
         }
-        let mut child = command.spawn().unwrap();
+        // The review runner may block SIGUSR1 in its process mask. Unblock it before exec so the
+        // test harness's leader and every subsequently created thread inherit the precondition.
+        unsafe {
+            command.pre_exec(|| {
+                let mut signals: libc::sigset_t = std::mem::zeroed();
+                if libc::sigemptyset(&mut signals) != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                if libc::sigaddset(&mut signals, libc::SIGUSR1) != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                let result =
+                    libc::pthread_sigmask(libc::SIG_UNBLOCK, &signals, std::ptr::null_mut());
+                if result != 0 {
+                    return Err(io::Error::from_raw_os_error(result));
+                }
+                Ok(())
+            });
+        }
+        let mut child = command.spawn().unwrap_or_else(|error| {
+            panic!(
+                "signal target spawn/SIGUSR1 unblock failed: errno={} ({error})",
+                error.raw_os_error().unwrap_or(0)
+            )
+        });
         let mut reader = BufReader::new(child.stdout.take().unwrap());
         loop {
             let mut line = String::new();
@@ -778,6 +803,30 @@ mod tests {
         let marker = b"SIGNAL\n";
         unsafe {
             libc::write(libc::STDOUT_FILENO, marker.as_ptr().cast(), marker.len());
+        }
+    }
+
+    fn require_sigusr1_unblocked(operation: &str) {
+        let mut signals: libc::sigset_t = unsafe { std::mem::zeroed() };
+        if unsafe { libc::sigemptyset(&mut signals) } != 0 {
+            let error = io::Error::last_os_error();
+            panic!(
+                "{operation} sigemptyset failed: errno={} ({error})",
+                error.raw_os_error().unwrap_or(0)
+            );
+        }
+        if unsafe { libc::sigaddset(&mut signals, libc::SIGUSR1) } != 0 {
+            let error = io::Error::last_os_error();
+            panic!(
+                "{operation} sigaddset failed: errno={} ({error})",
+                error.raw_os_error().unwrap_or(0)
+            );
+        }
+        let result =
+            unsafe { libc::pthread_sigmask(libc::SIG_UNBLOCK, &signals, std::ptr::null_mut()) };
+        if result != 0 {
+            let error = io::Error::from_raw_os_error(result);
+            panic!("{operation} failed: errno={result} ({error})");
         }
     }
 
@@ -888,6 +937,7 @@ mod tests {
             0
         );
         if signal {
+            require_sigusr1_unblocked("signal target: SIGUSR1 unblock");
             let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
             action.sa_sigaction = signal_target_handler as *const () as usize;
             action.sa_flags = libc::SA_RESTART;
