@@ -927,7 +927,13 @@ fn gamescope_post_app_owner_is_home_or_session_idle_never_fb0() {
     idle.system.lifecycle = Some(lifecycle.clone());
     idle.system.gamescope = Some(GamescopeSessionLifecycle::SessionIdle);
     idle.tick().unwrap();
-    assert!(matches!(idle.state.phase, Phase::Idle));
+    assert!(matches!(
+        idle.state.phase,
+        Phase::Restoring {
+            rung: RestorationRung::SessionIdle,
+            ..
+        }
+    ));
     assert!(!idle.system.calls.iter().any(|call| call == "owner"));
     assert_eq!(
         idle.state.history[0].post_app_owner,
@@ -1117,7 +1123,13 @@ fn gamescope_target_residency_resident_hold_stays_session_idle() {
 
     authority.tick().unwrap();
 
-    assert!(matches!(authority.state.phase, Phase::Idle));
+    assert!(matches!(
+        authority.state.phase,
+        Phase::Restoring {
+            rung: RestorationRung::SessionIdle,
+            ..
+        }
+    ));
     assert_eq!(
         authority.state.history[0].post_app_owner,
         Some(PostAppOwnerEvidence {
@@ -1144,6 +1156,13 @@ fn gamescope_session_idle_reacts_when_resident_hold_drops_after_commit() {
     // The resident sample is valid and session_idle is committed.
     authority.system.gamescope = Some(GamescopeSessionLifecycle::SessionIdle);
     authority.tick().unwrap();
+    assert!(matches!(
+        authority.state.phase,
+        Phase::Restoring {
+            rung: RestorationRung::SessionIdle,
+            ..
+        }
+    ));
     assert_eq!(
         authority.state.history[0].post_app_owner,
         Some(PostAppOwnerEvidence {
@@ -1154,6 +1173,7 @@ fn gamescope_session_idle_reacts_when_resident_hold_drops_after_commit() {
             ack_latency_ms: None,
         })
     );
+    assert!(authority.state.history[0].receipt.is_none());
 
     // The hold drops immediately after that sample. The target is still active with an empty
     // Job, exactly as in the integration journal, so the authority must keep observing it.

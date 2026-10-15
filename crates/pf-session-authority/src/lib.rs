@@ -299,6 +299,9 @@ impl Phase {
 pub enum RestorationRung {
     UnitInactive,
     TargetReleased,
+    /// Gamescope is resident without a configured home client. This rung deliberately remains
+    /// reactive: a later hold release and target stop resumes the legacy fb0 ladder.
+    SessionIdle,
     OwnerActive,
     PresentationAcknowledged,
 }
@@ -2942,6 +2945,22 @@ impl<S: StateStore, B: SessionSystem, C: Clock> Authority<S, B, C> {
                 },
                 (
                     Phase::Restoring {
+                        rung: RestorationRung::SessionIdle,
+                        ..
+                    },
+                    _,
+                ) => match gamescope.clone() {
+                    Some(GamescopeSessionLifecycle::Transient { diagnostic }) => {
+                        if let Some(diagnostic) = diagnostic {
+                            self.log(&diagnostic);
+                        }
+                        None
+                    }
+                    None if !snapshot.foreground_target_active => Some(Observation::TargetReleased),
+                    _ => None,
+                },
+                (
+                    Phase::Restoring {
                         rung: RestorationRung::OwnerActive,
                         ..
                     },
@@ -3148,15 +3167,17 @@ impl<S: StateStore, B: SessionSystem, C: Clock> Authority<S, B, C> {
             (
                 Phase::Restoring {
                     session_id,
+                    item_id,
                     receipt,
                     rung: RestorationRung::TargetReleased,
-                    ..
                 },
                 Observation::GamescopeSessionIdle,
             ) => {
-                let (id, receipt) = (session_id.clone(), receipt.clone());
+                let session_id = session_id.clone();
+                let item_id = item_id.clone();
+                let receipt = receipt.clone();
                 self.set_post_app_owner(
-                    &id,
+                    &session_id,
                     PostAppOwnerEvidence {
                         owner_tier: OwnerTier::Gamescope,
                         post_app_owner: PostAppOwner::SessionIdle,
@@ -3165,7 +3186,13 @@ impl<S: StateStore, B: SessionSystem, C: Clock> Authority<S, B, C> {
                         ack_latency_ms: None,
                     },
                 );
-                self.complete_restoration(id, receipt)
+                self.state.phase = Phase::Restoring {
+                    session_id,
+                    item_id,
+                    receipt,
+                    rung: RestorationRung::SessionIdle,
+                };
+                self.persist()
             }
             (
                 Phase::Restoring {
@@ -3209,13 +3236,21 @@ impl<S: StateStore, B: SessionSystem, C: Clock> Authority<S, B, C> {
                     session_id,
                     item_id,
                     receipt,
-                    rung: RestorationRung::TargetReleased,
+                    rung: RestorationRung::TargetReleased | RestorationRung::SessionIdle,
                 },
                 Observation::TargetReleased,
             ) => {
                 let session_id = session_id.clone();
                 let item_id = item_id.clone();
                 let receipt = receipt.clone();
+                if let Some(entry) = self
+                    .state
+                    .history
+                    .iter_mut()
+                    .find(|entry| entry.session_id == session_id)
+                {
+                    entry.post_app_owner = None;
+                }
                 if let Err(reason) = self.system.activate_selected_owner() {
                     return self
                         .recover(format!("{}: {reason}", ReasonCode::OwnerNotActive.as_str()));
