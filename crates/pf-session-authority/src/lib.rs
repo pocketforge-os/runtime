@@ -741,6 +741,50 @@ impl<E: CommandExecutor> CommandSystem<E> {
         Ok(output.stdout.trim().to_owned())
     }
 
+    fn active_state_and_job(&mut self, unit: &str) -> Result<(String, Option<String>), String> {
+        let output = self.query(&[
+            "show",
+            "--property",
+            "ActiveState",
+            "--property",
+            "Job",
+            unit,
+        ])?;
+        if output.code != 0 {
+            return Err(format!(
+                "systemctl show ActiveState/Job {unit} exited {}",
+                output.code
+            ));
+        }
+        let mut active_state = None;
+        let mut job = None;
+        for line in output.stdout.lines() {
+            let (property, value) = line
+                .split_once('=')
+                .ok_or_else(|| format!("malformed systemctl property for {unit}: {line:?}"))?;
+            match property {
+                "ActiveState" if active_state.is_none() => active_state = Some(value.to_owned()),
+                "Job" if job.is_none() => {
+                    job = Some((!value.is_empty()).then(|| value.to_owned()));
+                }
+                "ActiveState" | "Job" => {
+                    return Err(format!(
+                        "duplicate systemctl property {property} for {unit}"
+                    ));
+                }
+                _ => {
+                    return Err(format!(
+                        "unexpected systemctl property {property} for {unit}"
+                    ))
+                }
+            }
+        }
+        let active_state =
+            active_state.ok_or_else(|| format!("systemctl omitted ActiveState for {unit}"))?;
+        let job = job.ok_or_else(|| format!("systemctl omitted Job for {unit}"))?;
+        Ok((active_state, job))
+    }
+
     fn is_active(&mut self, unit: &str) -> Result<bool, String> {
         match self.query(&["is-active", "--quiet", unit])?.code {
             0 => Ok(true),
@@ -841,6 +885,8 @@ pub struct SystemLifecycle {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum GamescopeSessionLifecycle {
+    /// The target has a unit job or is deactivating, so ownership is not stable yet.
+    Transitioning,
     SessionIdle,
     HomeClient {
         unit: String,
@@ -873,8 +919,19 @@ impl<E: CommandExecutor> SessionSystem for CommandSystem<E> {
     }
 
     fn gamescope_session_lifecycle(&mut self) -> Result<Option<GamescopeSessionLifecycle>, String> {
-        if !self.is_active("pocketforge-gamescope-session.target")? {
-            return Ok(None);
+        let target = "pocketforge-gamescope-session.target";
+        let (active_state, job) = self.active_state_and_job(target)?;
+        if job.is_some() || active_state == "deactivating" {
+            return Ok(Some(GamescopeSessionLifecycle::Transitioning));
+        }
+        match active_state.as_str() {
+            "active" => {}
+            "inactive" | "failed" => return Ok(None),
+            state => {
+                return Err(format!(
+                    "Gamescope session target {target} has ActiveState {state:?} without a unit job"
+                ));
+            }
         }
         let (Some(unit), Some(signal)) = (
             self.session_owner.home_client_unit.clone(),
@@ -2768,6 +2825,7 @@ impl<S: StateStore, B: SessionSystem, C: Clock> Authority<S, B, C> {
                     },
                     _,
                 ) => match gamescope.clone() {
+                    Some(GamescopeSessionLifecycle::Transitioning) => None,
                     Some(GamescopeSessionLifecycle::SessionIdle) => {
                         Some(Observation::GamescopeSessionIdle)
                     }
