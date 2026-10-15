@@ -156,7 +156,10 @@ dependency atoms ([mapping](https://github.com/systemd/systemd/blob/main/src/cor
 If the explicit resident `BoundBy` pin is absent, an active target with an empty `Job` is still
 transient: reconciliation waits for the target to become inactive, then continues through the
 legacy selected-owner and presentation acknowledgement rungs. A queued unit job or
-`ActiveState=deactivating` is likewise nonterminal.
+`ActiveState=deactivating` is likewise nonterminal. Before returning any terminal-capable
+`session_idle` or home-client observation, the authority re-reads the resident state and the full
+target tuple; either changing between samples yields a nonterminal transition instead of evidence
+assembled from two systemd epochs.
 
 The Gamescope home client is optional configuration: `--home-client-unit` and
 `--home-client-presentation` must be supplied together. The latter names a compositor-owned file

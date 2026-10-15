@@ -945,6 +945,7 @@ pub struct SystemLifecycle {
     pub selected_owner_active: bool,
 }
 
+#[derive(Debug, Eq, PartialEq)]
 struct GamescopeTargetState {
     active_state: String,
     job: Option<String>,
@@ -1019,38 +1020,50 @@ impl<E: CommandExecutor> SessionSystem for CommandSystem<E> {
             });
             return Ok(Some(GamescopeSessionLifecycle::Transient { diagnostic }));
         }
-        let (Some(unit), Some(signal)) = (
+        let lifecycle = match (
             self.session_owner.home_client_unit.clone(),
             self.session_owner.home_client_presentation.clone(),
-        ) else {
-            return Ok(Some(GamescopeSessionLifecycle::SessionIdle));
-        };
-        match self.property(&unit, "LoadState")?.as_str() {
-            "not-found" => return Ok(Some(GamescopeSessionLifecycle::SessionIdle)),
-            "loaded" => {}
-            state => return Err(format!("home client {unit} has LoadState {state:?}")),
-        }
-        let active = self.is_active(&unit)?;
-        let presenting = if active {
-            match fs::read_to_string(&signal) {
-                Ok(value) => value == format!("{unit}\n"),
-                Err(error) if error.kind() == io::ErrorKind::NotFound => false,
-                Err(error) => {
-                    return Err(format!(
-                        "read Gamescope presentation signal {}: {error}",
-                        signal.display()
-                    ))
+        ) {
+            (Some(unit), Some(signal)) => match self.property(&unit, "LoadState")?.as_str() {
+                "not-found" => GamescopeSessionLifecycle::SessionIdle,
+                "loaded" => {
+                    let active = self.is_active(&unit)?;
+                    let presenting = if active {
+                        match fs::read_to_string(&signal) {
+                            Ok(value) => value == format!("{unit}\n"),
+                            Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+                            Err(error) => {
+                                return Err(format!(
+                                    "read Gamescope presentation signal {}: {error}",
+                                    signal.display()
+                                ));
+                            }
+                        }
+                    } else {
+                        false
+                    };
+                    GamescopeSessionLifecycle::HomeClient {
+                        unit,
+                        active,
+                        presenting,
+                        ack_signal: signal.display().to_string(),
+                    }
                 }
-            }
-        } else {
-            false
+                state => return Err(format!("home client {unit} has LoadState {state:?}")),
+            },
+            _ => GamescopeSessionLifecycle::SessionIdle,
         };
-        Ok(Some(GamescopeSessionLifecycle::HomeClient {
-            unit,
-            active,
-            presenting,
-            ack_signal: signal.display().to_string(),
-        }))
+
+        // `systemctl show` is D-Bus-backed but each unit is observed separately. Re-read both
+        // ends of the residency edge after collecting any home-client evidence; a target or
+        // resident transition between the first and second samples must not yield a terminal
+        // Gamescope owner observation assembled from two systemd epochs.
+        let resident_after = self.resident_unit_state()?;
+        let target_after = self.gamescope_target_state()?;
+        if resident_after != resident_state || target_after != target_state {
+            return Ok(Some(GamescopeSessionLifecycle::Transitioning));
+        }
+        Ok(Some(lifecycle))
     }
 
     fn activate_home_client(&mut self, unit: &str) -> Result<(), String> {

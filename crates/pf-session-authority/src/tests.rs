@@ -331,6 +331,19 @@ fn command_system_selects_gamescope_home_or_idle_without_starting_fb0_owner() {
                 code: 0,
                 stdout: String::new(),
             },
+            CommandOutput {
+                code: 0,
+                stdout: "LoadState=loaded\nActiveState=active\n".into(),
+            },
+            CommandOutput {
+                code: 0,
+                stdout: concat!(
+                    "ActiveState=active\n",
+                    "Job=\n",
+                    "BoundBy=pocketforge-gamescope-resident.service\n",
+                )
+                .into(),
+            },
         ]),
         ..FakeExecutor::default()
     };
@@ -398,6 +411,30 @@ fn command_system_selects_gamescope_home_or_idle_without_starting_fb0_owner() {
             ),
             (
                 "systemctl".into(),
+                vec![
+                    "show".into(),
+                    "--property".into(),
+                    "LoadState".into(),
+                    "--property".into(),
+                    "ActiveState".into(),
+                    "pocketforge-gamescope-resident.service".into(),
+                ],
+            ),
+            (
+                "systemctl".into(),
+                vec![
+                    "show".into(),
+                    "--property".into(),
+                    "ActiveState".into(),
+                    "--property".into(),
+                    "Job".into(),
+                    "--property".into(),
+                    "BoundBy".into(),
+                    "pocketforge-gamescope-session.target".into(),
+                ],
+            ),
+            (
+                "systemctl".into(),
                 vec!["start".into(), "pf-shell-gamescope.service".into()],
             ),
         ]
@@ -423,6 +460,19 @@ fn command_system_selects_gamescope_home_or_idle_without_starting_fb0_owner() {
                     code: 0,
                     stdout: "LoadState=loaded\nActiveState=active\n".into(),
                 },
+                CommandOutput {
+                    code: 0,
+                    stdout: "LoadState=loaded\nActiveState=active\n".into(),
+                },
+                CommandOutput {
+                    code: 0,
+                    stdout: concat!(
+                        "ActiveState=active\n",
+                        "Job=\n",
+                        "BoundBy=pocketforge-gamescope-resident.service\n",
+                    )
+                    .into(),
+                },
             ]),
             ..FakeExecutor::default()
         },
@@ -431,7 +481,7 @@ fn command_system_selects_gamescope_home_or_idle_without_starting_fb0_owner() {
         idle.gamescope_session_lifecycle().unwrap(),
         Some(GamescopeSessionLifecycle::SessionIdle)
     );
-    assert_eq!(idle.into_executor().calls.len(), 2);
+    assert_eq!(idle.into_executor().calls.len(), 4);
 
     let mut transient = CommandSystem::with_executor(
         CommandTemplates::default(),
@@ -528,6 +578,19 @@ fn command_system_selects_gamescope_home_or_idle_without_starting_fb0_owner() {
                     code: 0,
                     stdout: "not-found\n".into(),
                 },
+                CommandOutput {
+                    code: 0,
+                    stdout: "LoadState=loaded\nActiveState=active\n".into(),
+                },
+                CommandOutput {
+                    code: 0,
+                    stdout: concat!(
+                        "ActiveState=active\n",
+                        "Job=\n",
+                        "BoundBy=pocketforge-gamescope-resident.service\n",
+                    )
+                    .into(),
+                },
             ]),
             ..FakeExecutor::default()
         },
@@ -540,7 +603,7 @@ fn command_system_selects_gamescope_home_or_idle_without_starting_fb0_owner() {
         missing.gamescope_session_lifecycle().unwrap(),
         Some(GamescopeSessionLifecycle::SessionIdle)
     );
-    assert_eq!(missing.into_executor().calls.len(), 3);
+    assert_eq!(missing.into_executor().calls.len(), 5);
 
     let mut fb0 = CommandSystem::with_executor(
         CommandTemplates::default(),
@@ -651,9 +714,7 @@ fn command_system_revalidates_residency_before_terminal_gamescope_observations()
         },
     );
     assert_eq!(
-        idle_resident_changed
-            .gamescope_session_lifecycle()
-            .unwrap(),
+        idle_resident_changed.gamescope_session_lifecycle().unwrap(),
         Some(GamescopeSessionLifecycle::Transitioning)
     );
 
@@ -691,9 +752,7 @@ fn command_system_revalidates_residency_before_terminal_gamescope_observations()
         config(),
     );
     assert_eq!(
-        home_target_changed
-            .gamescope_session_lifecycle()
-            .unwrap(),
+        home_target_changed.gamescope_session_lifecycle().unwrap(),
         Some(GamescopeSessionLifecycle::Transitioning)
     );
 
@@ -713,9 +772,7 @@ fn command_system_revalidates_residency_before_terminal_gamescope_observations()
         config(),
     );
     assert_eq!(
-        home_resident_changed
-            .gamescope_session_lifecycle()
-            .unwrap(),
+        home_resident_changed.gamescope_session_lifecycle().unwrap(),
         Some(GamescopeSessionLifecycle::Transitioning)
     );
 
