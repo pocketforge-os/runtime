@@ -841,6 +841,8 @@ pub struct SystemLifecycle {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum GamescopeSessionLifecycle {
+    /// The target is still active while systemd is completing its own stop job.
+    Stopping,
     SessionIdle,
     HomeClient {
         unit: String,
@@ -2768,6 +2770,11 @@ impl<S: StateStore, B: SessionSystem, C: Clock> Authority<S, B, C> {
                     },
                     _,
                 ) => match gamescope.clone() {
+                    // Test-first scaffolding: this deliberately preserves the current
+                    // misclassification until the production snapshot distinguishes the job.
+                    Some(GamescopeSessionLifecycle::Stopping) => {
+                        Some(Observation::GamescopeSessionIdle)
+                    }
                     Some(GamescopeSessionLifecycle::SessionIdle) => {
                         Some(Observation::GamescopeSessionIdle)
                     }
