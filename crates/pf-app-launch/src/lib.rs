@@ -36,15 +36,24 @@ impl Exec for ProcessExec {
         working_directory: &Path,
         environment: &[(String, String)],
     ) -> io::Result<()> {
-        let error = Command::new(executable)
-            .current_dir(working_directory)
-            // DISPLAY is never ambient: every child starts with it removed and only the
-            // manifest-derived projection below can add the validated value back.
-            .env_remove("DISPLAY")
-            .envs(environment.iter().cloned())
-            .exec();
+        let error = execution_command(executable, working_directory, environment).exec();
         Err(error)
     }
+}
+
+fn execution_command(
+    executable: &Path,
+    working_directory: &Path,
+    environment: &[(String, String)],
+) -> Command {
+    let mut command = Command::new(executable);
+    command
+        .current_dir(working_directory)
+        // DISPLAY is never ambient: every child starts with it removed and only the
+        // manifest-derived projection below can add the validated value back.
+        .env_remove("DISPLAY")
+        .envs(environment.iter().cloned());
+    command
 }
 
 #[derive(Debug)]
@@ -380,6 +389,25 @@ mod tests {
         assert_eq!(
             load_environment(&policy).unwrap(),
             [("DISPLAY".to_owned(), ":0".to_owned())]
+        );
+        let plain_command = execution_command(Path::new("/usr/bin/env"), &dir, &[]);
+        assert_eq!(
+            plain_command
+                .get_envs()
+                .find(|(name, _)| *name == "DISPLAY"),
+            Some((std::ffi::OsStr::new("DISPLAY"), None))
+        );
+        let x11_command = execution_command(
+            Path::new("/usr/bin/env"),
+            &dir,
+            &[("DISPLAY".to_owned(), ":0".to_owned())],
+        );
+        assert_eq!(
+            x11_command.get_envs().find(|(name, _)| *name == "DISPLAY"),
+            Some((
+                std::ffi::OsStr::new("DISPLAY"),
+                Some(std::ffi::OsStr::new(":0"))
+            ))
         );
 
         for malformed in [
