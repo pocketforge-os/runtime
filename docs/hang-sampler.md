@@ -42,7 +42,9 @@ heuristic stack scan.
 
 At most two successful samples contribute to a hang. Empty attempts are not represented by a
 non-positive sample count. `encode_hang_report` validates and canonically encodes the result
-through `pf-problem-report`; a recovery produces no payload.
+through `pf-problem-report`; a recovery produces no payload. The in-memory episode ledger retains
+at most 128 distinct episode keys, evicting the oldest completed samples, recovery tombstones, and
+finalization markers together so long-running service memory remains bounded.
 
 ## Data minimization
 

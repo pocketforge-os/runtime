@@ -1,7 +1,7 @@
 //! Bounded, authenticated hang sampling primitives.
 
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::{self, Read, Write};
 use std::os::fd::{FromRawFd, OwnedFd};
 use std::time::Duration;
@@ -14,6 +14,7 @@ pub mod transport;
 mod unwind;
 
 pub const SAMPLE_DEADLINE: Duration = Duration::from_millis(300);
+const MAX_RETAINED_EPISODES: usize = 128;
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub struct EpisodeKey {
@@ -43,12 +44,28 @@ pub struct EpisodeStore {
     completed: BTreeMap<EpisodeKey, Vec<Vec<Frame>>>,
     recovered: BTreeSet<EpisodeKey>,
     finalized: BTreeSet<EpisodeKey>,
+    order: VecDeque<EpisodeKey>,
 }
 
 impl EpisodeStore {
+    fn track_new(&mut self, key: EpisodeKey) {
+        self.order.push_back(key);
+        while self.order.len() > MAX_RETAINED_EPISODES {
+            let Some(expired) = self.order.pop_front() else {
+                break;
+            };
+            self.completed.remove(&expired);
+            self.recovered.remove(&expired);
+            self.finalized.remove(&expired);
+        }
+    }
+
     pub fn complete(&mut self, key: EpisodeKey, frames: Vec<Frame>) {
         if self.recovered.contains(&key) {
             return;
+        }
+        if !self.completed.contains_key(&key) && !self.finalized.contains(&key) {
+            self.track_new(key.clone());
         }
         let samples = self.completed.entry(key).or_default();
         if samples.len() < 2 {
@@ -57,6 +74,9 @@ impl EpisodeStore {
     }
 
     pub fn recover(&mut self, key: &EpisodeKey) {
+        if !self.contains(key) && !self.finalized.contains(key) {
+            self.track_new(key.clone());
+        }
         self.recovered.insert(key.clone());
         self.completed.remove(key);
     }
@@ -331,6 +351,26 @@ mod tests {
         let hung = key(2);
         store.complete(hung.clone(), vec![]);
         assert_eq!(store.samples(&hung).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn episode_store_bounds_completed_recovered_and_finalized_state() {
+        let mut store = EpisodeStore::default();
+        for nonce in 0..256 {
+            store.complete(key(nonce), vec![]);
+        }
+        for nonce in 256..512 {
+            store.recover(&key(nonce));
+        }
+        for nonce in 512..768 {
+            let episode = key(nonce);
+            store.complete(episode.clone(), vec![]);
+            assert!(store.finalize(&episode).is_some());
+        }
+
+        assert!(store.completed.len() <= 128);
+        assert!(store.recovered.len() <= 128);
+        assert!(store.finalized.len() <= 128);
     }
 
     #[test]
