@@ -7,8 +7,8 @@ use pf_session_authority::orientation_source::{
 };
 use pf_session_authority::{
     run_service_loop, spawn_front_acceptor, spawn_rpc_acceptor_with_orientation, Authority,
-    CommandSystem, CommandTemplates, FileStore, FixedUrlHandler, FrontPolicy, PendingRpc,
-    SessionOwnerConfig, ShellPolicy, DEFAULT_CONNECTION_LIMITS, DEFAULT_GRACE_PERIOD,
+    CommandSystem, CommandTemplates, EscalationNotifier, FileStore, FixedUrlHandler, FrontPolicy,
+    PendingRpc, SessionOwnerConfig, ShellPolicy, DEFAULT_CONNECTION_LIMITS, DEFAULT_GRACE_PERIOD,
     DEFAULT_PRESENTATION_TIMEOUT, DEFAULT_TICK_INTERVAL,
 };
 use std::env;
@@ -18,6 +18,7 @@ use std::os::unix::fs::FileTypeExt;
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
+use std::thread;
 use std::time::{Duration, Instant};
 
 struct SystemClock(Instant);
@@ -47,6 +48,7 @@ struct Args {
     /// The URL handler item id until pf-prefsd's default-handler key lands (tsp-mv7zn).
     url_handler: Option<String>,
     grace: Duration,
+    hang_sampler_socket: PathBuf,
 }
 
 #[derive(Debug)]
@@ -80,6 +82,58 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         args.broker_unit.clone(),
         args.compositor_unit.clone(),
     )?;
+    let (hang_notifier, hang_requests) = EscalationNotifier::bounded(8);
+    let hang_sampler_socket = args.hang_sampler_socket.clone();
+    thread::Builder::new()
+        .name("hang-sampler-notifier".to_owned())
+        .spawn(move || {
+            while let Ok(notice) = hang_requests.recv() {
+                match notice {
+                    pf_session_authority::EscalationNotice::Prepare {
+                        session_id,
+                        item_id,
+                        grace,
+                    } => {
+                        let _ = pf_hang_sampler::client::send_prepare(
+                            &hang_sampler_socket,
+                            &item_id,
+                            &session_id,
+                            grace,
+                        );
+                    }
+                    pf_session_authority::EscalationNotice::ForceStop {
+                        session_id,
+                        item_id,
+                        reason,
+                    } => {
+                        let reason = match reason {
+                            pf_session_authority::ForceStopReason::StopTimeout => {
+                                pf_hang_sampler::protocol::ForceStopReason::StopTimeout
+                            }
+                            pf_session_authority::ForceStopReason::StopRequestFailed => {
+                                pf_hang_sampler::protocol::ForceStopReason::StopRequestFailed
+                            }
+                        };
+                        let _ = pf_hang_sampler::client::send_force_stop(
+                            &hang_sampler_socket,
+                            &item_id,
+                            &session_id,
+                            reason,
+                        );
+                    }
+                    pf_session_authority::EscalationNotice::Discard {
+                        session_id,
+                        item_id,
+                    } => {
+                        let _ = pf_hang_sampler::client::send_discard(
+                            &hang_sampler_socket,
+                            &item_id,
+                            &session_id,
+                        );
+                    }
+                }
+            }
+        })?;
     let mut authority = Authority::open(
         FileStore::new(args.state_dir.join("authority.json")),
         CommandSystem::new_with_session_owner(
@@ -94,7 +148,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         32,
         args.grace,
     )?
-    .with_presentation_timeout(DEFAULT_PRESENTATION_TIMEOUT);
+    .with_presentation_timeout(DEFAULT_PRESENTATION_TIMEOUT)
+    .with_escalation_notifier(hang_notifier);
     if let Some(handler) = args.url_handler {
         authority = authority.with_url_handler(FixedUrlHandler(handler));
     }
@@ -234,9 +289,11 @@ Options:
   --command-preset PRESET          Command templates to use: device (default), desktop-sim
                                    desktop-sim maintains sessions/{session_id}.running and
                                    shell-selected markers below --state-dir
-  --grace-period-ms MS             Graceful-stop window before self-escalation (default 1500;
-                                   keep it plus the hang sampler's budget inside the app
-                                   unit's TimeoutStopSec)
+  --grace-period-ms MS             Graceful-stop window before self-escalation (default 1500,
+                                   maximum 300000;
+                                   sampler notification never delays termination)
+  --hang-sampler-socket PATH       Best-effort sampler trigger socket
+                                   (default /run/pocketforge/hang-sampler.sock)
   --start-command COMMAND          Override the preset's launch command
   --graceful-stop-command COMMAND  Override the preset's graceful-stop command
   --terminate-command COMMAND      Override the preset's forced-termination command
@@ -276,6 +333,7 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
     let mut orientation_live = true;
     let mut preset = "device".to_owned();
     let mut grace = DEFAULT_GRACE_PERIOD;
+    let mut hang_sampler_socket = PathBuf::from("/run/pocketforge/hang-sampler.sock");
     let mut start = None;
     let mut graceful = None;
     let mut terminate = None;
@@ -310,8 +368,15 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
                 grace =
                     Duration::from_millis(value.parse::<u64>().map_err(|error| {
                         format!("--grace-period-ms expects milliseconds: {error}")
-                    })?)
+                    })?);
+                if grace > pf_hang_sampler::MAX_PREPARED_GRACE {
+                    return Err(format!(
+                        "--grace-period-ms exceeds {} milliseconds",
+                        pf_hang_sampler::MAX_PREPARED_GRACE.as_millis()
+                    ));
+                }
             }
+            "--hang-sampler-socket" => hang_sampler_socket = value.into(),
             "--start-command" => start = Some(value),
             "--graceful-stop-command" => graceful = Some(value),
             "--terminate-command" => terminate = Some(value),
@@ -382,6 +447,7 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
         front,
         url_handler,
         grace,
+        hang_sampler_socket,
     })
 }
 
@@ -527,8 +593,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(args.grace, DEFAULT_GRACE_PERIOD);
-        // Budget: grace (1500 ms) + root sampler (≤300 ms) stays inside the app unit's own
-        // TimeoutStopSec=2 s, so the authority escalates before the systemd backstop fires.
+        // Sampling is now off the critical path; the authority owns only this grace period.
         assert_eq!(DEFAULT_GRACE_PERIOD, Duration::from_millis(1500));
 
         let args = parse_args(
@@ -545,6 +610,21 @@ mod tests {
         )
         .unwrap();
         assert_eq!(args.grace, Duration::from_millis(2500));
+
+        let error = parse_args(
+            [
+                "--state-dir",
+                "/tmp/pf",
+                "--socket",
+                "/tmp/pf.sock",
+                "--grace-period-ms",
+                "300001",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        )
+        .unwrap_err();
+        assert!(error.contains("exceeds"), "{error}");
 
         let error = parse_args(
             [

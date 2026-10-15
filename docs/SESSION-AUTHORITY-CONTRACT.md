@@ -110,21 +110,24 @@ any unknown state; downgrading mid-close is not supported.
 The authority escalates by itself; the menu shows progress only and never takes a second
 decision (every-menu-spec Q3). One close sequence:
 
-1. `safe_return` → `systemctl stop --no-block pf-app@<item>.service` →
-   `stopping_gracefully`. Non-blocking so the authority keeps ticking while the unit stops;
+1. `safe_return` → bounded `try_send(Prepare {session_id, item_id, grace})` →
+   `systemctl stop --no-block pf-app@<item>.service` → `stopping_gracefully`. Non-blocking so the
+   authority keeps ticking while the unit stops;
    the unit's own `TimeoutStopSec` (2 s in the image) remains the backstop for the process
    group.
-2. If systemd reports the unit inactive during the grace window, the close completes as
-   `returned` — even when the unit result is `timeout` (systemd's own SIGKILL beat the
-   authority; no second kill is sent).
-3. If the grace period (`--grace-period-ms`, default `DEFAULT_GRACE_PERIOD` = 1500 ms)
-   expires first, the authority escalates: `force_stopping {reason: stop_timeout}` after
-   `systemctl kill --kill-who=all`. Budget: 1500 ms grace + ≤300 ms hang-sampler + kill spawn
-   must stay inside the unit's 2 s backstop. A daemon restart loses the monotonic deadline; a
+2. If systemd reports the unit inactive during the grace window, the authority performs bounded
+   `try_send(Discard {session_id, item_id})` and the close completes as `returned` — even when the
+   unit result is `timeout` (systemd's own SIGKILL beat the authority; no second kill is sent).
+3. If the grace period (`--grace-period-ms`, default `DEFAULT_GRACE_PERIOD` = 1500 ms,
+   production maximum 300000 ms)
+   expires first, the authority performs bounded `try_send(ForceStop)` and immediately invokes
+   `systemctl kill --kill-who=all`, then publishes `force_stopping {reason: stop_timeout}`. The
+   sampler's ≤300 ms work is concurrent and is not in the authority or unit-stop budget. A daemon
+   restart loses the monotonic deadline; a
    reopened `stopping_gracefully` session re-reads the unit before acting: still active →
-   immediate escalation (`stop_timeout`), already inactive → the close completes as `returned`
-   with no second kill and no sampler run, unknown state → typed `systemd_state_unknown`
-   recovery.
+   immediate escalation (`stop_timeout`) with an intentionally unprepared/empty sample, already
+   inactive → the close completes as `returned` with no second kill and no sampler run, unknown
+   state → typed `systemd_state_unknown` recovery.
 4. If the stop request itself failed in step 1, escalation is immediate with
    `force_stopping {reason: stop_request_failed}`.
 5. If the kill fails, the close is `stop_failed` (durable, logged, retryable) — never a
@@ -184,13 +187,22 @@ monotonic acknowledgement latency. Stopping the Gamescope target returns reconci
 existing foreground-target / selected-owner path; entries on that legacy path omit the additive
 `post_app_owner` field and retain their previous serialized shape.
 
-### Escalation hook
+### Escalation notifier
 
-`Authority::with_escalation_hook` attaches a sampler (the crash collector's hang sampler,
-`cr-collect`) that runs synchronously immediately before every close-path
-`enforce_termination`, with `EscalationContext { session_id, item_id, reason }`. The hook must
-self-bound (the design budget is 300 ms); the authority adds no timeout of its own. With no
-hook attached, escalation is a single branch — pinned by a timing test with a sleeping-hook
-negative control. The hook does not fire when systemd beats the deadline or when the unit is
-already inactive across a daemon restart (no kill is sent in either case) or outside close
-paths.
+`Authority::with_escalation_notifier` attaches a bounded producer for the hang sampler. Beginning
+a graceful stop performs one `SyncSender::try_send(Prepare { session_id, item_id, grace })` before
+the stop request. The receiving thread resolves and pins the target and performs read-only
+preparation; the sampler retains it for that grace plus three seconds of slack. The authority never
+waits for that work. Every escalation then performs exactly one
+`try_send(ForceStop { session_id, item_id, reason })` and immediately calls
+`enforce_termination`. A graceful `UnitInactive` performs one `try_send(Discard)`. Full or
+disconnected queues only lose the best-effort diagnostic; they cannot delay, fail, or reorder the
+close ladder. Target discovery, socket I/O, ptrace and unwind all run on the receiving thread or
+sampler worker.
+
+A restart over an already-inactive unit sends Discard (to remove preparation left in the sampler)
+but no ForceStop or kill. Outside close paths the notifier does not fire. A restart that finds the
+unit still active has no Prepare from this daemon lifetime and sends only ForceStop; it may use a
+matching still-live sampler preparation, but otherwise returns the documented empty outcome. The
+timing test compares the same authority call and event sequence with no notifier and with a
+consumer that sleeps for 150 ms after Prepare; both close paths complete under the same bound.
