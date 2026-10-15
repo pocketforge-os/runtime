@@ -904,6 +904,10 @@ fn restore(a: &mut Authority<MemoryStore, FakeSystem, TestClock>) {
     let current = a.session_id().unwrap();
     a.observe(Observation::TargetReleased).unwrap();
     a.observe(Observation::SelectedOwnerActive).unwrap();
+    assert_eq!(
+        a.time_until_next_deadline(),
+        Some(DEFAULT_PRESENTATION_TIMEOUT)
+    );
     assert!(!a.events_for("test").iter().any(|(_, e)| match e {
         SessionEvent::Terminal(TerminalReceipt::Returned { session_id })
         | SessionEvent::Terminal(TerminalReceipt::ForcedClose { session_id })
@@ -1309,6 +1313,48 @@ fn resident_monitor_presentation_deadline_is_the_next_service_wakeup() {
             .map(|monitor| monitor.rung),
         Some(ResidentMonitorRung::PresentationAcknowledged)
     );
+    assert_eq!(
+        authority.time_until_next_deadline(),
+        Some(DEFAULT_PRESENTATION_TIMEOUT)
+    );
+
+    let (store, system, clock) = authority.into_parts();
+    let mut restarted =
+        Authority::open(store, system, clock, 3, Duration::from_millis(10)).unwrap();
+    assert_eq!(restarted.time_until_next_deadline(), None);
+    restarted.tick().unwrap();
+    assert_eq!(
+        restarted.time_until_next_deadline(),
+        Some(DEFAULT_PRESENTATION_TIMEOUT)
+    );
+}
+
+#[test]
+fn gamescope_home_wait_deadline_is_the_next_service_wakeup() {
+    let mut authority = authority();
+    launch_running(&mut authority);
+    authority
+        .observe(Observation::SessionExitedCleanly)
+        .unwrap();
+    authority.observe(Observation::UnitInactive).unwrap();
+    authority.observe(Observation::TargetReleased).unwrap();
+    assert_eq!(authority.time_until_next_deadline(), None);
+
+    authority.system.lifecycle = Some(SystemLifecycle {
+        app: AppUnitState::InactiveSuccess,
+        foreground_target_active: false,
+        selected_owner_active: false,
+    });
+    authority.system.gamescope = Some(gamescope_home("pf-shell-gamescope.service", false, false));
+    authority.tick().unwrap();
+
+    assert!(matches!(
+        authority.state.phase,
+        Phase::Restoring {
+            rung: RestorationRung::OwnerActive,
+            ..
+        }
+    ));
     assert_eq!(
         authority.time_until_next_deadline(),
         Some(DEFAULT_PRESENTATION_TIMEOUT)
@@ -2613,6 +2659,10 @@ fn gamescope_home_timed_out(
         authority.state.phase,
         Phase::Restoring { rung, .. } if rung == expected_rung
     ));
+    assert_eq!(
+        authority.time_until_next_deadline(),
+        Some(DEFAULT_PRESENTATION_TIMEOUT)
+    );
     authority.clock.advance(DEFAULT_PRESENTATION_TIMEOUT);
     authority.tick().unwrap();
     assert!(matches!(
@@ -2721,6 +2771,10 @@ fn restarted_daemon_rearms_a_full_presentation_deadline() {
         .with_log_sink(move |line| sink.lock().unwrap().push(line.to_owned()));
     reopened.tick().unwrap();
     assert!(matches!(reopened.state.phase, Phase::Restoring { .. }));
+    assert_eq!(
+        reopened.time_until_next_deadline(),
+        Some(DEFAULT_PRESENTATION_TIMEOUT)
+    );
     reopened.clock.advance(DEFAULT_PRESENTATION_TIMEOUT);
     reopened.tick().unwrap();
     assert!(matches!(
