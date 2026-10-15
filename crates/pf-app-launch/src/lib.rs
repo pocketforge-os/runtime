@@ -8,9 +8,12 @@ use crate::policy::{
     derive_policy, PolicyDecision, PolicyError, PolicyInputs, PolicyResourceInventory,
 };
 use pf_app_manifest::{ReasonCode, ResolveError, Resolver};
+use std::ffi::CString;
 use std::fmt;
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, OpenOptionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -180,16 +183,11 @@ fn load_environment(policy: &PolicyDecision) -> Result<Vec<(String, String)>, Po
                 .iter()
                 .find(|mapping| mapping.destination == Path::new(policy::X11_SOCKET_DESTINATION))
                 .ok_or_else(|| PolicyError("x11 DISPLAY has no socket projection".to_owned()))?;
-            let socket_file = OpenOptions::new()
-                .read(true)
-                .custom_flags(libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-                .open(&socket.source)
-                .map_err(|error| {
-                    PolicyError(format!(
-                        "inspect x11 socket {}: {error}",
-                        socket.source.display()
-                    ))
-                })?;
+            let socket_file = open_without_symlinks(
+                &socket.source,
+                libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                "inspect x11 socket",
+            )?;
             let metadata = socket_file.metadata().map_err(|error| {
                 PolicyError(format!(
                     "inspect x11 socket {}: {error}",
@@ -209,21 +207,11 @@ fn load_environment(policy: &PolicyDecision) -> Result<Vec<(String, String)>, Po
                 )));
             }
         }
-        let mut source_file = OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
-            .open(&projection.source)
-            .map_err(|error| {
-                let detail = if error.raw_os_error() == Some(libc::ELOOP) {
-                    "is an alias".to_owned()
-                } else {
-                    error.to_string()
-                };
-                PolicyError(format!(
-                    "read capability environment {}: {detail}",
-                    projection.source.display()
-                ))
-            })?;
+        let mut source_file = open_without_symlinks(
+            &projection.source,
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
+            "read capability environment",
+        )?;
         if !source_file
             .metadata()
             .map_err(|error| {
@@ -257,6 +245,80 @@ fn load_environment(policy: &PolicyDecision) -> Result<Vec<(String, String)>, Po
         environment.push((projection.name.clone(), projection.expected_value.clone()));
     }
     Ok(environment)
+}
+
+fn open_without_symlinks(
+    path: &Path,
+    final_flags: i32,
+    operation: &str,
+) -> Result<File, PolicyError> {
+    let mut components = path.components();
+    if !matches!(components.next(), Some(std::path::Component::RootDir)) {
+        return Err(PolicyError(format!(
+            "{operation} {}: path is not absolute",
+            path.display()
+        )));
+    }
+    let components = components.collect::<Vec<_>>();
+    if components.is_empty() {
+        return Err(PolicyError(format!(
+            "{operation} {}: path has no object component",
+            path.display()
+        )));
+    }
+
+    let root = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC)
+        .open("/")
+        .map_err(|error| PolicyError(format!("{operation} {}: {error}", path.display())))?;
+    let mut directory = OwnedFd::from(root);
+
+    for (index, component) in components.iter().enumerate() {
+        let std::path::Component::Normal(name) = component else {
+            return Err(PolicyError(format!(
+                "{operation} {}: path contains an alias or invalid component",
+                path.display()
+            )));
+        };
+        let name = CString::new(name.as_bytes()).map_err(|_| {
+            PolicyError(format!(
+                "{operation} {}: path contains an invalid component",
+                path.display()
+            ))
+        })?;
+        let final_component = index + 1 == components.len();
+        let flags = if final_component {
+            final_flags
+        } else {
+            libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC
+        };
+        // SAFETY: `directory` and `name` remain live for the call, and a successful returned
+        // descriptor is immediately moved into `OwnedFd` for single-owner close semantics.
+        let raw_fd = unsafe { libc::openat(directory.as_raw_fd(), name.as_ptr(), flags) };
+        if raw_fd < 0 {
+            let error = io::Error::last_os_error();
+            let detail = if matches!(
+                error.raw_os_error(),
+                Some(code) if code == libc::ELOOP || code == libc::ENOTDIR
+            ) {
+                "path contains an alias or non-directory component".to_owned()
+            } else {
+                error.to_string()
+            };
+            return Err(PolicyError(format!(
+                "{operation} {}: {detail}",
+                path.display()
+            )));
+        }
+        // SAFETY: `openat` returned a new owned descriptor above.
+        let opened = unsafe { OwnedFd::from_raw_fd(raw_fd) };
+        if final_component {
+            return Ok(File::from(opened));
+        }
+        directory = opened;
+    }
+    unreachable!("non-empty path components return from the final iteration")
 }
 
 pub fn required_launch_paths(app_id: &str) -> Result<LaunchPaths, LaunchError> {
@@ -451,6 +513,21 @@ mod tests {
         let environment_alias = dir.join("environment-alias");
         symlink(&environment, &environment_alias).unwrap();
         policy.environment[0].source = environment_alias;
+        assert!(load_environment(&policy)
+            .unwrap_err()
+            .to_string()
+            .contains("alias"));
+        policy.environment[0].source = environment.clone();
+
+        let parent_alias = dir.join("x11-parent-alias");
+        symlink(&dir, &parent_alias).unwrap();
+        policy.unit.bind_read_write_mappings[0].source = parent_alias.join("X0");
+        assert!(load_environment(&policy)
+            .unwrap_err()
+            .to_string()
+            .contains("alias"));
+        policy.unit.bind_read_write_mappings[0].source = socket.clone();
+        policy.environment[0].source = parent_alias.join("environment");
         assert!(load_environment(&policy)
             .unwrap_err()
             .to_string()
