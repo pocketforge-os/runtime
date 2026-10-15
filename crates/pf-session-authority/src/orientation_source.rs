@@ -359,6 +359,9 @@ impl LinuxOrientationSource {
             inputs.tablet_mode = states
                 .iter()
                 .find_map(|device| device.switch(SW_TABLET_MODE));
+        } else {
+            inputs.rotate_locks = vec![true];
+            inputs.tablet_mode = Some(false);
         }
         inputs.tablet_mode_is_posture = false;
 
