@@ -1274,6 +1274,48 @@ fn gamescope_session_idle_reacts_when_resident_hold_drops_after_commit() {
 }
 
 #[test]
+fn resident_monitor_presentation_deadline_is_the_next_service_wakeup() {
+    let mut authority = authority();
+    launch_running(&mut authority);
+    authority.system.lifecycle = Some(SystemLifecycle {
+        app: AppUnitState::InactiveSuccess,
+        foreground_target_active: false,
+        selected_owner_active: false,
+    });
+    authority.system.gamescope = Some(GamescopeSessionLifecycle::SessionIdle);
+    authority.tick().unwrap();
+
+    // A resident monitor without an armed presentation rung must not invent a wakeup.
+    assert_eq!(authority.time_until_next_deadline(), None);
+
+    authority.system.gamescope = Some(GamescopeSessionLifecycle::Transient { diagnostic: None });
+    authority.tick().unwrap();
+    authority.system.gamescope = None;
+    authority.tick().unwrap();
+    authority
+        .system
+        .lifecycle
+        .as_mut()
+        .unwrap()
+        .selected_owner_active = true;
+    authority.tick().unwrap();
+
+    assert!(matches!(authority.state.phase, Phase::Idle));
+    assert_eq!(
+        authority
+            .state
+            .resident_monitor
+            .as_ref()
+            .map(|monitor| monitor.rung),
+        Some(ResidentMonitorRung::PresentationAcknowledged)
+    );
+    assert_eq!(
+        authority.time_until_next_deadline(),
+        Some(DEFAULT_PRESENTATION_TIMEOUT)
+    );
+}
+
+#[test]
 fn gamescope_home_outcomes_converge_after_the_resident_sample_goes_stale() {
     for (active, presenting) in [(false, false), (true, false), (true, true)] {
         let mut authority = authority();
