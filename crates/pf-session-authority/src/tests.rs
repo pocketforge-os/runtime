@@ -1144,6 +1144,35 @@ fn gamescope_target_residency_resident_hold_stays_session_idle() {
 }
 
 #[test]
+fn gamescope_session_idle_completes_and_releases_the_next_launch_slot() {
+    let mut authority = authority();
+    let completed_id = launch_running(&mut authority);
+    authority.system.lifecycle = Some(SystemLifecycle {
+        app: AppUnitState::InactiveSuccess,
+        foreground_target_active: false,
+        selected_owner_active: false,
+    });
+    authority.system.gamescope = Some(GamescopeSessionLifecycle::SessionIdle);
+
+    authority.tick().unwrap();
+
+    assert!(matches!(authority.state.phase, Phase::Idle));
+    assert_eq!(
+        authority.state.history[0].receipt,
+        Some(Receipt::Returned)
+    );
+    assert_eq!(authority.state.history[0].session_id, completed_id);
+    assert!(matches!(
+        authority
+            .launch(LaunchRequest {
+                item_id: APP_ID.to_owned(),
+            })
+            .unwrap(),
+        LaunchResult::Accepted { .. }
+    ));
+}
+
+#[test]
 fn gamescope_session_idle_reacts_when_resident_hold_drops_after_commit() {
     let mut authority = authority();
     launch_running(&mut authority);
