@@ -312,7 +312,16 @@ fn command_system_selects_gamescope_home_or_idle_without_starting_fb0_owner() {
         outputs: VecDeque::from([
             CommandOutput {
                 code: 0,
-                stdout: "ActiveState=active\nJob=\n".into(),
+                stdout: concat!(
+                    "ActiveState=active\n",
+                    "Job=\n",
+                    "BoundBy=pocketforge-gamescope-resident.service\n",
+                )
+                .into(),
+            },
+            CommandOutput {
+                code: 0,
+                stdout: "LoadState=loaded\nActiveState=active\n".into(),
             },
             CommandOutput {
                 code: 0,
@@ -353,7 +362,20 @@ fn command_system_selects_gamescope_home_or_idle_without_starting_fb0_owner() {
                     "ActiveState".into(),
                     "--property".into(),
                     "Job".into(),
+                    "--property".into(),
+                    "BoundBy".into(),
                     "pocketforge-gamescope-session.target".into(),
+                ],
+            ),
+            (
+                "systemctl".into(),
+                vec![
+                    "show".into(),
+                    "--property".into(),
+                    "LoadState".into(),
+                    "--property".into(),
+                    "ActiveState".into(),
+                    "pocketforge-gamescope-resident.service".into(),
                 ],
             ),
             (
@@ -387,10 +409,21 @@ fn command_system_selects_gamescope_home_or_idle_without_starting_fb0_owner() {
     let mut idle = CommandSystem::with_executor(
         CommandTemplates::default(),
         FakeExecutor {
-            outputs: VecDeque::from([CommandOutput {
-                code: 0,
-                stdout: "ActiveState=active\nJob=\n".into(),
-            }]),
+            outputs: VecDeque::from([
+                CommandOutput {
+                    code: 0,
+                    stdout: concat!(
+                        "ActiveState=active\n",
+                        "Job=\n",
+                        "BoundBy=pocketforge-gamescope-resident.service\n",
+                    )
+                    .into(),
+                },
+                CommandOutput {
+                    code: 0,
+                    stdout: "LoadState=loaded\nActiveState=active\n".into(),
+                },
+            ]),
             ..FakeExecutor::default()
         },
     );
@@ -398,14 +431,58 @@ fn command_system_selects_gamescope_home_or_idle_without_starting_fb0_owner() {
         idle.gamescope_session_lifecycle().unwrap(),
         Some(GamescopeSessionLifecycle::SessionIdle)
     );
-    assert_eq!(idle.into_executor().calls.len(), 1);
+    assert_eq!(idle.into_executor().calls.len(), 2);
+
+    let mut transient = CommandSystem::with_executor(
+        CommandTemplates::default(),
+        FakeExecutor {
+            outputs: VecDeque::from([
+                CommandOutput {
+                    code: 0,
+                    stdout: "ActiveState=active\nJob=\nBoundBy=\n".into(),
+                },
+                CommandOutput {
+                    code: 0,
+                    stdout: "LoadState=loaded\nActiveState=inactive\n".into(),
+                },
+            ]),
+            ..FakeExecutor::default()
+        },
+    );
+    assert!(matches!(
+        transient.gamescope_session_lifecycle().unwrap(),
+        Some(GamescopeSessionLifecycle::Transient { diagnostic: None })
+    ));
+
+    let mut misconfigured = CommandSystem::with_executor(
+        CommandTemplates::default(),
+        FakeExecutor {
+            outputs: VecDeque::from([
+                CommandOutput {
+                    code: 0,
+                    stdout: "ActiveState=active\nJob=\nBoundBy=\n".into(),
+                },
+                CommandOutput {
+                    code: 0,
+                    stdout: "LoadState=loaded\nActiveState=active\n".into(),
+                },
+            ]),
+            ..FakeExecutor::default()
+        },
+    );
+    assert!(matches!(
+        misconfigured.gamescope_session_lifecycle().unwrap(),
+        Some(GamescopeSessionLifecycle::Transient {
+            diagnostic: Some(ref diagnostic),
+        }) if diagnostic.contains("active_without_bound_by")
+    ));
 
     let mut transitioning = CommandSystem::with_executor(
         CommandTemplates::default(),
         FakeExecutor {
             outputs: VecDeque::from([CommandOutput {
                 code: 0,
-                stdout: "ActiveState=active\nJob=421\n".into(),
+                stdout: "ActiveState=active\nJob=421\nBoundBy=\n".into(),
             }]),
             ..FakeExecutor::default()
         },
@@ -421,7 +498,16 @@ fn command_system_selects_gamescope_home_or_idle_without_starting_fb0_owner() {
             outputs: VecDeque::from([
                 CommandOutput {
                     code: 0,
-                    stdout: "ActiveState=active\nJob=\n".into(),
+                    stdout: concat!(
+                        "ActiveState=active\n",
+                        "Job=\n",
+                        "BoundBy=pocketforge-gamescope-resident.service\n",
+                    )
+                    .into(),
+                },
+                CommandOutput {
+                    code: 0,
+                    stdout: "LoadState=loaded\nActiveState=active\n".into(),
                 },
                 CommandOutput {
                     code: 0,
@@ -439,14 +525,14 @@ fn command_system_selects_gamescope_home_or_idle_without_starting_fb0_owner() {
         missing.gamescope_session_lifecycle().unwrap(),
         Some(GamescopeSessionLifecycle::SessionIdle)
     );
-    assert_eq!(missing.into_executor().calls.len(), 2);
+    assert_eq!(missing.into_executor().calls.len(), 3);
 
     let mut fb0 = CommandSystem::with_executor(
         CommandTemplates::default(),
         FakeExecutor {
             outputs: VecDeque::from([CommandOutput {
                 code: 0,
-                stdout: "ActiveState=inactive\nJob=\n".into(),
+                stdout: "ActiveState=inactive\nJob=\nBoundBy=\n".into(),
             }]),
             ..FakeExecutor::default()
         },
@@ -726,9 +812,9 @@ fn gamescope_target_residency_transient_stop_waits_for_fb0_fallback() {
         foreground_target_active: false,
         selected_owner_active: false,
     });
-    // Exact integration ordering: the app is already inactive, but the StopWhenUnneeded
-    // Gamescope target is still active with its own stop job pending.
-    authority.system.gamescope = Some(GamescopeSessionLifecycle::Transitioning);
+    // Exact integration ordering from job 116374400439: the app is already inactive, but the
+    // StopWhenUnneeded target remains active with an empty Job and no independent resident pin.
+    authority.system.gamescope = Some(GamescopeSessionLifecycle::Transient { diagnostic: None });
     authority.tick().unwrap();
 
     assert!(matches!(
@@ -741,8 +827,8 @@ fn gamescope_target_residency_transient_stop_waits_for_fb0_fallback() {
     assert!(authority.state.history[0].receipt.is_none());
     assert!(!authority.system.calls.iter().any(|call| call == "owner"));
 
-    // The live journal observed this transition about 50 ms later.
-    authority.clock.advance(Duration::from_millis(50));
+    // The live journal observed this transition about 557 ms later.
+    authority.clock.advance(Duration::from_millis(557));
     authority.system.gamescope = None;
     authority.tick().unwrap();
     assert!(authority.system.calls.iter().any(|call| call == "owner"));
