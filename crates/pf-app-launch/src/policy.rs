@@ -11,6 +11,9 @@ use std::path::{Component, Path, PathBuf};
 
 pub const POLICY_SCHEMA_VERSION: u32 = 1;
 const DNS_PORT: u16 = 53;
+pub const X11_SOCKET: &str = "/run/pocketforge/session/capabilities/x11/X0";
+pub const X11_SOCKET_DESTINATION: &str = "/tmp/.X11-unix/X0";
+pub const X11_ENVIRONMENT: &str = "/run/pocketforge/session/capabilities/x11/environment";
 
 #[derive(Clone, Copy)]
 enum DisplayResourceGrant {
@@ -180,6 +183,19 @@ pub struct DeviceGrant {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct BindMapping {
+    pub source: PathBuf,
+    pub destination: PathBuf,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct EnvironmentProjection {
+    pub source: PathBuf,
+    pub name: String,
+    pub expected_value: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct UnitProperties {
     pub supplementary_groups: Vec<String>,
     pub restrict_namespaces: Vec<String>,
@@ -188,6 +204,8 @@ pub struct UnitProperties {
     pub inaccessible_paths: Vec<PathBuf>,
     pub bind_read_only: Vec<PathBuf>,
     pub bind_read_write: Vec<PathBuf>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub bind_read_write_mappings: Vec<BindMapping>,
     pub device_allow: Vec<DeviceGrant>,
 }
 
@@ -200,6 +218,8 @@ pub struct PolicyDecision {
     pub landlock: LandlockDecision,
     pub network: NetworkDecision,
     pub endpoints: Vec<MediatedEndpoint>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub environment: Vec<EnvironmentProjection>,
     pub unit: UnitProperties,
 }
 
@@ -318,6 +338,9 @@ pub fn derive_policy(
 
     let mut read_only_paths = BTreeSet::new();
     let mut socket_paths = BTreeSet::new();
+    let mut landlock_only_socket_paths = BTreeSet::new();
+    let mut bind_read_write_mappings = Vec::new();
+    let mut environment = Vec::new();
     let mut devices: BTreeMap<PathBuf, String> = BTreeMap::new();
     let mut groups = BTreeSet::new();
     let mut uses_input_broker = false;
@@ -345,6 +368,38 @@ pub fn derive_policy(
         }
         Ok(())
     };
+
+    if capability_bases.contains("x11") {
+        for (name, expected) in [
+            ("x11-socket", X11_SOCKET),
+            ("x11-environment", X11_ENVIRONMENT),
+        ] {
+            match inputs.resources.get(name) {
+                Some(paths) if paths == &[PathBuf::from(expected)] => {}
+                Some(_) => {
+                    return Err(PolicyError(format!(
+                        "required x11 resource {name} is not the canonical path {expected}"
+                    )))
+                }
+                None => {
+                    return Err(PolicyError(format!(
+                        "required x11 resource {name} is missing"
+                    )))
+                }
+            }
+        }
+        let socket = PathBuf::from(X11_SOCKET);
+        landlock_only_socket_paths.insert(socket.clone());
+        bind_read_write_mappings.push(BindMapping {
+            source: socket,
+            destination: PathBuf::from(X11_SOCKET_DESTINATION),
+        });
+        environment.push(EnvironmentProjection {
+            source: PathBuf::from(X11_ENVIRONMENT),
+            name: "DISPLAY".to_owned(),
+            expected_value: ":0".to_owned(),
+        });
+    }
 
     if launch.takes_display {
         groups.insert("video".to_owned());
@@ -493,6 +548,15 @@ pub fn derive_policy(
             path,
             access: FsAccess::UnixConnect,
         }));
+        filesystem.extend(
+            landlock_only_socket_paths
+                .iter()
+                .cloned()
+                .map(|path| FsRule {
+                    path,
+                    access: FsAccess::UnixConnect,
+                }),
+        );
         filesystem.extend(devices.iter().map(|(path, mode)| FsRule {
             path: path.clone(),
             access: if mode == "rw" {
@@ -597,6 +661,7 @@ pub fn derive_policy(
             dns: networked,
         },
         endpoints,
+        environment,
         unit: UnitProperties {
             supplementary_groups,
             restrict_namespaces: if class == AppClass::NestedUserns {
@@ -612,6 +677,7 @@ pub fn derive_policy(
             inaccessible_paths: vec![PathBuf::from("/run/dbus/system_bus_socket")],
             bind_read_only: read_only_paths.into_iter().collect(),
             bind_read_write: socket_paths.into_iter().collect(),
+            bind_read_write_mappings,
             device_allow,
         },
     })
@@ -659,6 +725,13 @@ pub fn render_systemd_dropin(policy: &PolicyDecision) -> String {
     }
     for path in &policy.unit.bind_read_write {
         lines.push(format!("BindPaths={}", path.display()));
+    }
+    for mapping in &policy.unit.bind_read_write_mappings {
+        lines.push(format!(
+            "BindPaths={}:{}",
+            mapping.source.display(),
+            mapping.destination.display()
+        ));
     }
     for grant in &policy.unit.device_allow {
         lines.push(format!(

@@ -390,7 +390,10 @@ fn x11_is_an_exact_capability_name() {
 
     for invalid in ["x11:0", "x11?", "x11-abstract"] {
         let error = parse_manifest(&capability_manifest(&[invalid])).unwrap_err();
-        assert_eq!(error.message, "invalid or duplicate capability", "{invalid}");
+        assert_eq!(
+            error.message, "invalid or duplicate capability",
+            "{invalid}"
+        );
     }
 }
 

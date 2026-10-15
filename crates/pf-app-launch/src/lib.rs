@@ -11,22 +11,37 @@ use pf_app_manifest::{ReasonCode, ResolveError, Resolver};
 use std::fmt;
 use std::fs;
 use std::io;
+use std::os::unix::fs::FileTypeExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 pub trait Exec {
     /// Replace the current process. A successful production call never returns.
-    fn exec(&mut self, executable: &Path, working_directory: &Path) -> io::Result<()>;
+    fn exec(
+        &mut self,
+        executable: &Path,
+        working_directory: &Path,
+        environment: &[(String, String)],
+    ) -> io::Result<()>;
 }
 
 #[derive(Default)]
 pub struct ProcessExec;
 
 impl Exec for ProcessExec {
-    fn exec(&mut self, executable: &Path, working_directory: &Path) -> io::Result<()> {
+    fn exec(
+        &mut self,
+        executable: &Path,
+        working_directory: &Path,
+        environment: &[(String, String)],
+    ) -> io::Result<()> {
         let error = Command::new(executable)
             .current_dir(working_directory)
+            // DISPLAY is never ambient: every child starts with it removed and only the
+            // manifest-derived projection below can add the validated value back.
+            .env_remove("DISPLAY")
+            .envs(environment.iter().cloned())
             .exec();
         Err(error)
     }
@@ -137,12 +152,54 @@ pub fn launch_with<E: Exec, P: PolicyEnforcer>(
         },
     )
     .map_err(LaunchError::Policy)?;
+    let environment = load_environment(&policy).map_err(LaunchError::Policy)?;
     enforcer
         .enforce_policy(&policy)
         .map_err(LaunchError::Landlock)?;
     executor
-        .exec(&resolved.executable, &resolved.app_dir)
+        .exec(&resolved.executable, &resolved.app_dir, &environment)
         .map_err(LaunchError::Exec)
+}
+
+fn load_environment(policy: &PolicyDecision) -> Result<Vec<(String, String)>, PolicyError> {
+    let mut environment = Vec::new();
+    for projection in &policy.environment {
+        if projection.name == "DISPLAY" {
+            let socket = policy
+                .unit
+                .bind_read_write_mappings
+                .iter()
+                .find(|mapping| mapping.destination == Path::new(policy::X11_SOCKET_DESTINATION))
+                .ok_or_else(|| PolicyError("x11 DISPLAY has no socket projection".to_owned()))?;
+            let metadata = fs::metadata(&socket.source).map_err(|error| {
+                PolicyError(format!(
+                    "inspect x11 socket {}: {error}",
+                    socket.source.display()
+                ))
+            })?;
+            if !metadata.file_type().is_socket() {
+                return Err(PolicyError(format!(
+                    "x11 socket {} is not a filesystem socket",
+                    socket.source.display()
+                )));
+            }
+        }
+        let source = fs::read_to_string(&projection.source).map_err(|error| {
+            PolicyError(format!(
+                "read capability environment {}: {error}",
+                projection.source.display()
+            ))
+        })?;
+        let expected = format!("{}={}\n", projection.name, projection.expected_value);
+        if source != expected {
+            return Err(PolicyError(format!(
+                "capability environment {} is malformed",
+                projection.source.display()
+            )));
+        }
+        environment.push((projection.name.clone(), projection.expected_value.clone()));
+    }
+    Ok(environment)
 }
 
 pub fn required_launch_paths(app_id: &str) -> Result<LaunchPaths, LaunchError> {
@@ -191,17 +248,25 @@ mod tests {
     use super::*;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::net::UnixListener;
 
     #[derive(Default)]
     struct FakeExec {
         executable: Option<PathBuf>,
         working_directory: Option<PathBuf>,
+        environment: Vec<(String, String)>,
     }
 
     impl Exec for FakeExec {
-        fn exec(&mut self, executable: &Path, working_directory: &Path) -> io::Result<()> {
+        fn exec(
+            &mut self,
+            executable: &Path,
+            working_directory: &Path,
+            environment: &[(String, String)],
+        ) -> io::Result<()> {
             self.executable = Some(executable.to_owned());
             self.working_directory = Some(working_directory.to_owned());
+            self.environment = environment.to_vec();
             Ok(())
         }
     }
@@ -225,6 +290,36 @@ mod tests {
         }
     }
 
+    fn resolved_fixture(root: &Path, capabilities: &[&str]) -> pf_app_manifest::ResolvedApp {
+        let capabilities = capabilities
+            .iter()
+            .map(|capability| format!("{capability:?}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let manifest = pf_app_manifest::parse_manifest(&format!(
+            "[app]\nid = \"org.example.app\"\nuse = [{capabilities}]\n\
+             [runtime]\nfamily = \"pocketforge/a133-powervr\"\nabi = \"1\"\n\
+             platform-version = \"20\"\n[launch]\nexec = \"bin/app\"\n"
+        ))
+        .unwrap();
+        let platform = pf_app_manifest::parse_platform_contract(&format!(
+            "schema_version = 1\nruntime_family = \"pocketforge/a133-powervr\"\n\
+             runtime_abi = \"1\"\nplatform_version = \"20\"\n\
+             supported_capabilities = [{capabilities}]\nproduction = true\n\
+             landlock_mode = \"required\"\nlandlock_full_min_abi = 10\n\
+             landlock_browser_min_abi = 6\n"
+        ))
+        .unwrap();
+        pf_app_manifest::ResolvedApp {
+            id: "org.example.app".to_owned(),
+            app_dir: root.join("app"),
+            executable: root.join("app/bin/app"),
+            manifest,
+            manifest_sha256: "fixture".to_owned(),
+            platform,
+        }
+    }
+
     #[test]
     fn device_regression_platform_library_is_in_read_execute_set() {
         let paths = platform_resource_paths();
@@ -244,6 +339,80 @@ mod tests {
                 Some(libc::EACCES)
             );
         }
+    }
+
+    #[test]
+    fn x11_environment_is_validated_and_explicitly_scoped_to_exec() {
+        let dir = std::env::temp_dir().join(format!(
+            "pf-app-launch-x11-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let socket = dir.join("X0");
+        let environment = dir.join("environment");
+        let _listener = UnixListener::bind(&socket).unwrap();
+        fs::write(&environment, b"DISPLAY=:0\n").unwrap();
+
+        let root = PathBuf::from("/fixture");
+        let app = resolved_fixture(&root, &["x11"]);
+        let mut inputs = PolicyInputs {
+            platform_runtime: root.join("runtime"),
+            xdg_config: root.join("config"),
+            xdg_state: root.join("state"),
+            xdg_cache: root.join("cache"),
+            resource_paths: Vec::new(),
+            resources: std::collections::BTreeMap::from([
+                (
+                    "x11-socket".to_owned(),
+                    vec![PathBuf::from(policy::X11_SOCKET)],
+                ),
+                (
+                    "x11-environment".to_owned(),
+                    vec![PathBuf::from(policy::X11_ENVIRONMENT)],
+                ),
+            ]),
+        };
+        let mut policy = derive_policy(&app, &inputs).unwrap();
+        policy.unit.bind_read_write_mappings[0].source = socket.clone();
+        policy.environment[0].source = environment.clone();
+        assert_eq!(
+            load_environment(&policy).unwrap(),
+            [("DISPLAY".to_owned(), ":0".to_owned())]
+        );
+
+        for malformed in [
+            "DISPLAY=:1\n",
+            "DISPLAY=@/tmp/.X11-unix/X0\n",
+            "DISPLAY=:0\nLD_PRELOAD=/foreign.so\n",
+            "DISPLAY=:0",
+        ] {
+            fs::write(&environment, malformed).unwrap();
+            assert!(load_environment(&policy)
+                .unwrap_err()
+                .to_string()
+                .contains("malformed"));
+        }
+        fs::remove_file(&environment).unwrap();
+        assert!(load_environment(&policy)
+            .unwrap_err()
+            .to_string()
+            .contains("read capability environment"));
+
+        let abstract_name = dir.join("@X0");
+        fs::write(&abstract_name, b"not a socket").unwrap();
+        fs::write(&environment, b"DISPLAY=:0\n").unwrap();
+        policy.unit.bind_read_write_mappings[0].source = abstract_name;
+        assert!(load_environment(&policy)
+            .unwrap_err()
+            .to_string()
+            .contains("not a filesystem socket"));
+
+        inputs.resources.clear();
+        let plain = derive_policy(&resolved_fixture(&root, &[]), &inputs).unwrap();
+        assert!(load_environment(&plain).unwrap().is_empty());
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

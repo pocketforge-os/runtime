@@ -124,15 +124,20 @@ fn x11_projection_is_exact_manifest_scoped_and_fail_closed() {
     let x11 = derive_policy(&resolved(&root, &["x11"], false, true), &inputs(&root)).unwrap();
     let rendered = render_systemd_dropin(&x11);
     assert_eq!(rendered.lines().filter(|line| *line == mapping).count(), 1);
-    assert!(x11.landlock.filesystem.iter().any(|rule| {
-        rule.path == socket && rule.access == FsAccess::UnixConnect
-    }));
+    assert!(x11
+        .landlock
+        .filesystem
+        .iter()
+        .any(|rule| { rule.path == socket && rule.access == FsAccess::UnixConnect }));
     assert!(!rendered.contains("@/tmp/.X11-unix/X0"));
 
     let plain = derive_policy(&resolved(&root, &[], false, true), &inputs(&root)).unwrap();
     let plain_rendered = render_systemd_dropin(&plain);
     assert!(!plain_rendered.contains("capabilities/x11"));
     assert!(!plain_rendered.contains("/tmp/.X11-unix/X0"));
+    assert!(!serde_json::to_string(&plain)
+        .unwrap()
+        .contains("capabilities/x11"));
     assert!(!plain
         .landlock
         .filesystem
@@ -151,17 +156,22 @@ fn x11_projection_is_exact_manifest_scoped_and_fail_closed() {
     }
 
     for (class, path) in [
-        ("x11-socket", "/run/pocketforge/session/capabilities/x11/@X0"),
+        (
+            "x11-socket",
+            "/run/pocketforge/session/capabilities/x11/@X0",
+        ),
         ("x11-environment", "/run/pocketforge/session/environment"),
     ] {
         let mut malformed = inputs(&root);
         malformed
             .resources
             .insert(class.into(), vec![PathBuf::from(path)]);
-        assert!(derive_policy(&resolved(&root, &["x11"], false, true), &malformed)
-            .unwrap_err()
-            .to_string()
-            .contains("canonical"));
+        assert!(
+            derive_policy(&resolved(&root, &["x11"], false, true), &malformed)
+                .unwrap_err()
+                .to_string()
+                .contains("canonical")
+        );
     }
 }
 
