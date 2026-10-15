@@ -4271,6 +4271,9 @@ impl<S: StateStore, B: SessionSystem, C: Clock> Authority<S, B, C> {
         let graceful = self
             .graceful_deadline
             .filter(|_| matches!(self.state.phase, Phase::StoppingGracefully { .. }));
+        // Mirror every state in enforce_presentation_deadline() that can consume an armed
+        // deadline: the ordinary restoration rung, a Gamescope home becoming active, and the
+        // app-less resident fallback monitor.
         let presentation = self.presentation_deadline.filter(|_| {
             matches!(
                 self.state.phase,
@@ -4278,7 +4281,17 @@ impl<S: StateStore, B: SessionSystem, C: Clock> Authority<S, B, C> {
                     rung: RestorationRung::PresentationAcknowledged,
                     ..
                 }
-            )
+            ) || (matches!(
+                self.state.phase,
+                Phase::Restoring {
+                    rung: RestorationRung::OwnerActive,
+                    ..
+                }
+            ) && self.home_ack_started.is_some())
+                || (matches!(self.state.phase, Phase::Idle)
+                    && self.state.resident_monitor.as_ref().is_some_and(|monitor| {
+                        monitor.rung == ResidentMonitorRung::PresentationAcknowledged
+                    }))
         });
         [graceful, presentation]
             .into_iter()
