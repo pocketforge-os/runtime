@@ -4,6 +4,21 @@
 its dedicated user, socket group and unit-scoped `CAP_SYS_PTRACE`; no other service receives that
 capability.
 
+## Listener activation
+
+Production starts the daemon with `--systemd-socket`. The daemon implements the native
+`sd_listen_fds` environment protocol without linking libsystemd: `LISTEN_PID` must equal its PID,
+`LISTEN_FDS` must be exactly one, and descriptor 3 must report `AF_UNIX`, `SOCK_SEQPACKET`, and a
+listening state through `getsockopt`. It removes every `LISTEN_*` variable before validation and
+marks the adopted descriptor close-on-exec. Any missing, malformed, mismatched, wrong-type, or
+non-listening activation input is a typed startup failure; production never falls back to creating
+its own socket. The accepted listener remains the direct systemd-created socket, so connection
+authentication continues to use each caller's unchanged `SO_PEERCRED`.
+
+`--socket PATH` is a separate, mutually exclusive mode retained for tests and development. Image
+units must not use it: only socket activation lets systemd create the production endpoint as
+`0660 root:pf-hang-trigger` while the daemon runs as the unprivileged `pf-hang-sampler` user.
+
 ## Trigger API
 
 The closed JSON request is one `AF_UNIX/SOCK_SEQPACKET` packet. Requests that establish a target
