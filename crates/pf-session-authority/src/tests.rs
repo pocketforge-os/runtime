@@ -596,6 +596,133 @@ fn command_system_selects_gamescope_home_or_idle_without_starting_fb0_owner() {
 }
 
 #[test]
+fn command_system_revalidates_residency_before_terminal_gamescope_observations() {
+    let target_active = || CommandOutput {
+        code: 0,
+        stdout: concat!(
+            "ActiveState=active\n",
+            "Job=\n",
+            "BoundBy=pocketforge-gamescope-resident.service\n",
+        )
+        .into(),
+    };
+    let target_inactive = || CommandOutput {
+        code: 0,
+        stdout: "ActiveState=inactive\nJob=\nBoundBy=\n".into(),
+    };
+    let resident_active = || CommandOutput {
+        code: 0,
+        stdout: "LoadState=loaded\nActiveState=active\n".into(),
+    };
+    let resident_inactive = || CommandOutput {
+        code: 0,
+        stdout: "LoadState=loaded\nActiveState=inactive\n".into(),
+    };
+
+    // Target changes after its first sample but before BindsTo propagation reaches the resident.
+    let mut idle_target_changed = CommandSystem::with_executor(
+        CommandTemplates::default(),
+        FakeExecutor {
+            outputs: VecDeque::from([
+                target_active(),
+                resident_active(),
+                resident_active(),
+                target_inactive(),
+            ]),
+            ..FakeExecutor::default()
+        },
+    );
+    assert_eq!(
+        idle_target_changed.gamescope_session_lifecycle().unwrap(),
+        Some(GamescopeSessionLifecycle::Transitioning)
+    );
+
+    // BindsTo propagation reaches the resident between its first and second samples.
+    let mut idle_resident_changed = CommandSystem::with_executor(
+        CommandTemplates::default(),
+        FakeExecutor {
+            outputs: VecDeque::from([
+                target_active(),
+                resident_active(),
+                resident_inactive(),
+                target_active(),
+            ]),
+            ..FakeExecutor::default()
+        },
+    );
+    assert_eq!(
+        idle_resident_changed
+            .gamescope_session_lifecycle()
+            .unwrap(),
+        Some(GamescopeSessionLifecycle::Transitioning)
+    );
+
+    let dir = scratch("gamescope-residency-revalidation");
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    let signal = dir.join("focused-home-unit");
+    fs::write(&signal, b"pf-shell-gamescope.service\n").unwrap();
+    let config = || SessionOwnerConfig {
+        home_client_unit: Some("pf-shell-gamescope.service".to_owned()),
+        home_client_presentation: Some(signal.clone()),
+    };
+    let home_loaded = || CommandOutput {
+        code: 0,
+        stdout: "loaded\n".into(),
+    };
+    let home_active = || CommandOutput {
+        code: 0,
+        stdout: String::new(),
+    };
+
+    let mut home_target_changed = CommandSystem::with_executor_and_session_owner(
+        CommandTemplates::default(),
+        FakeExecutor {
+            outputs: VecDeque::from([
+                target_active(),
+                resident_active(),
+                home_loaded(),
+                home_active(),
+                resident_active(),
+                target_inactive(),
+            ]),
+            ..FakeExecutor::default()
+        },
+        config(),
+    );
+    assert_eq!(
+        home_target_changed
+            .gamescope_session_lifecycle()
+            .unwrap(),
+        Some(GamescopeSessionLifecycle::Transitioning)
+    );
+
+    let mut home_resident_changed = CommandSystem::with_executor_and_session_owner(
+        CommandTemplates::default(),
+        FakeExecutor {
+            outputs: VecDeque::from([
+                target_active(),
+                resident_active(),
+                home_loaded(),
+                home_active(),
+                resident_inactive(),
+                target_active(),
+            ]),
+            ..FakeExecutor::default()
+        },
+        config(),
+    );
+    assert_eq!(
+        home_resident_changed
+            .gamescope_session_lifecycle()
+            .unwrap(),
+        Some(GamescopeSessionLifecycle::Transitioning)
+    );
+
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn desktop_sim_templates_create_and_remove_session_markers() {
     let dir = scratch("desktop-sim");
     let _ = fs::remove_dir_all(&dir);
