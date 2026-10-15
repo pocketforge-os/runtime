@@ -171,12 +171,18 @@ screen_rotation = { screen_main="cw90" }
     assert_eq!(recovered.tablet_mode, second.tablet_mode);
     assert_eq!(recovered.screen_posture, second.screen_posture);
 
-    for (label, input_class) in [
-        ("enumerate", root.join("missing-input-class")),
-        ("open", root.join("unopenable-input-class")),
-    ] {
-        if label == "open" {
+    for label in ["enumerate", "capabilities", "snapshot"] {
+        let input_class = root.join(format!("{label}-input-class"));
+        let input_devices = root.join(format!("{label}-input-devices"));
+        if label == "capabilities" {
             write(input_class.join("event0/device/name"), "Buttons\n");
+        } else if label == "snapshot" {
+            write(
+                input_class.join("event0/device/capabilities/sw"),
+                "1000\n",
+            );
+            write(input_class.join("event0/device/name"), "Buttons\n");
+            write(input_devices.join("event0"), "not an evdev node\n");
         }
         let mut failing = LinuxOrientationSource::open(LinuxOrientationPaths {
             descriptor: descriptor.clone(),
@@ -185,17 +191,20 @@ screen_rotation = { screen_main="cw90" }
             drm_class: root.join("drm"),
             device_tree: root.join("dt"),
             input_class,
-            input_devices: root.join("missing-input-devices"),
+            input_devices,
             iio_devices: root.join("iio"),
             sensor_orientation_file: Some(root.join("sensor-orientation")),
             switch_state_file: None,
         })
         .unwrap();
+        let mut conservative_previous = second.clone();
+        conservative_previous.rotate_locks = vec![true];
+        conservative_previous.tablet_mode = Some(false);
         let snapshot = failing
-            .snapshot(Some("org.example.game"), &second)
+            .snapshot(Some("org.example.game"), &conservative_previous)
             .unwrap_or_else(|error| panic!("{label}: missing evdev paths were fatal: {error}"));
-        assert!(snapshot.rotate_locks.is_empty(), "{label}");
-        assert_eq!(snapshot.tablet_mode, None, "{label}");
+        assert_eq!(snapshot.rotate_locks, [true], "{label}");
+        assert_eq!(snapshot.tablet_mode, Some(false), "{label}");
         assert_eq!(snapshot.screen_posture, QuarterTurn::Normal, "{label}");
     }
 

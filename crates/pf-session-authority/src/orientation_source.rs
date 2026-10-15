@@ -976,6 +976,20 @@ mod tests {
     }
 
     #[test]
+    fn switch_discovery_records_a_missing_input_root() {
+        let root = switch_discovery_root("missing-root");
+
+        let discovery = discover_test_switches(&root);
+        assert!(discovery.devices.is_empty());
+        assert_eq!(discovery.failures.len(), 1);
+        assert!(discovery.failures[0]
+            .reason
+            .starts_with("input_root_unavailable:"));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn switch_discovery_does_not_open_a_non_switch_device() {
         let root = switch_discovery_root("non-switch");
         write_switch_capability(&root, "event0", "0\n");
