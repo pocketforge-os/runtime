@@ -194,15 +194,26 @@ screen_rotation = { screen_main="cw90" }
             switch_state_file: None,
         })
         .unwrap();
-        let mut conservative_previous = second.clone();
-        conservative_previous.rotate_locks = vec![true];
-        conservative_previous.tablet_mode = Some(false);
-        let snapshot = failing
-            .snapshot(Some("org.example.game"), &conservative_previous)
-            .unwrap_or_else(|error| panic!("{label}: missing evdev paths were fatal: {error}"));
-        assert_eq!(snapshot.rotate_locks, [true], "{label}");
-        assert_eq!(snapshot.tablet_mode, Some(false), "{label}");
-        assert_eq!(snapshot.screen_posture, QuarterTurn::Normal, "{label}");
+        let mut permissive_previous = second.clone();
+        permissive_previous.rotate_locks = vec![false];
+        permissive_previous.tablet_mode = Some(true);
+        for (prior_label, previous) in [
+            ("startup", OrientationInputs::default()),
+            ("permissive", permissive_previous),
+        ] {
+            let snapshot = failing
+                .snapshot(Some("org.example.game"), &previous)
+                .unwrap_or_else(|error| {
+                    panic!("{label}/{prior_label}: missing evdev paths were fatal: {error}")
+                });
+            assert_eq!(snapshot.rotate_locks, [true], "{label}/{prior_label}");
+            assert_eq!(snapshot.tablet_mode, Some(false), "{label}/{prior_label}");
+            assert_eq!(
+                snapshot.screen_posture,
+                QuarterTurn::Normal,
+                "{label}/{prior_label}"
+            );
+        }
     }
 
     for (label, unavailable_switch) in [
