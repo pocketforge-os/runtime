@@ -1326,6 +1326,128 @@ fn gamescope_home_outcomes_converge_after_the_resident_sample_goes_stale() {
     );
 }
 
+fn assert_resident_monitor_waits_for_foreground_release(
+    mut authority: Authority<MemoryStore, FakeSystem, TestClock>,
+    expected_receipt: Receipt,
+) {
+    assert!(authority.state.resident_monitor.is_some());
+    let owner_calls_before = authority
+        .system
+        .calls
+        .iter()
+        .filter(|call| call.as_str() == "owner")
+        .count();
+
+    authority.system.gamescope = Some(GamescopeSessionLifecycle::Transient { diagnostic: None });
+    authority.tick().unwrap();
+    assert_eq!(
+        authority
+            .state
+            .resident_monitor
+            .as_ref()
+            .map(|monitor| monitor.rung),
+        Some(ResidentMonitorRung::TargetReleased)
+    );
+
+    // Gamescope is gone, but the ordinary TargetReleased gate still owns the framebuffer.
+    // Repeated ticks must neither activate nor duplicate the selected owner.
+    authority.system.gamescope = None;
+    authority
+        .system
+        .lifecycle
+        .as_mut()
+        .unwrap()
+        .foreground_target_active = true;
+    for _ in 0..3 {
+        authority.tick().unwrap();
+    }
+    assert_eq!(
+        authority
+            .system
+            .calls
+            .iter()
+            .filter(|call| call.as_str() == "owner")
+            .count(),
+        owner_calls_before
+    );
+
+    authority
+        .system
+        .lifecycle
+        .as_mut()
+        .unwrap()
+        .foreground_target_active = false;
+    authority.tick().unwrap();
+    assert_eq!(
+        authority
+            .system
+            .calls
+            .iter()
+            .filter(|call| call.as_str() == "owner")
+            .count(),
+        owner_calls_before + 1
+    );
+
+    authority
+        .system
+        .lifecycle
+        .as_mut()
+        .unwrap()
+        .selected_owner_active = true;
+    authority.tick().unwrap();
+    authority
+        .observe(Observation::PresentationAcknowledged)
+        .unwrap();
+    assert!(matches!(authority.state.phase, Phase::Idle));
+    assert!(authority.state.resident_monitor.is_none());
+    assert_eq!(authority.state.history[0].receipt, Some(expected_receipt));
+}
+
+#[test]
+fn resident_monitor_reuses_the_foreground_target_release_gate_for_every_source() {
+    let resident_lifecycle = SystemLifecycle {
+        app: AppUnitState::InactiveSuccess,
+        foreground_target_active: true,
+        selected_owner_active: false,
+    };
+
+    let mut session_idle = authority();
+    launch_running(&mut session_idle);
+    session_idle.system.lifecycle = Some(resident_lifecycle.clone());
+    session_idle.system.gamescope = Some(GamescopeSessionLifecycle::SessionIdle);
+    session_idle.tick().unwrap();
+    assert_resident_monitor_waits_for_foreground_release(session_idle, Receipt::Returned);
+
+    for (active, presenting) in [(false, false), (true, false), (true, true)] {
+        let mut home = authority();
+        launch_running(&mut home);
+        home.system.lifecycle = Some(resident_lifecycle.clone());
+        home.system.gamescope = Some(gamescope_home(
+            "pf-shell-gamescope.service",
+            active,
+            presenting,
+        ));
+        home.tick().unwrap();
+        assert_resident_monitor_waits_for_foreground_release(home, Receipt::Returned);
+    }
+
+    let (mut late_home, _) = gamescope_home_timed_out(true);
+    late_home.system.gamescope = Some(gamescope_home("pf-shell-gamescope.service", true, true));
+    late_home.tick().unwrap();
+    late_home
+        .system
+        .lifecycle
+        .as_mut()
+        .unwrap()
+        .foreground_target_active = true;
+    assert_resident_monitor_waits_for_foreground_release(
+        late_home,
+        Receipt::Crash {
+            summary: "systemd result: exit-code".to_owned(),
+        },
+    );
+}
+
 #[test]
 fn gamescope_resident_monitor_latches_stop_restart_aba() {
     let mut authority = authority();
