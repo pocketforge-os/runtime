@@ -1,10 +1,30 @@
-use crate::protocol::{proc_start_time, ForceStopReason, TargetIdentity, TriggerRequest};
 use crate::transport;
+use crate::{proc_start_time, ForceStopReason, TargetIdentity, TriggerRequest, MAX_PREPARED_GRACE};
 use std::io;
-use std::os::fd::{AsFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
+
+fn valid_app_id(id: &str) -> bool {
+    fn valid_label(label: &str) -> bool {
+        let bytes = label.as_bytes();
+        let edge = |byte: u8| byte.is_ascii_lowercase() || byte.is_ascii_digit();
+        !bytes.is_empty()
+            && edge(bytes[0])
+            && edge(bytes[bytes.len() - 1])
+            && bytes
+                .iter()
+                .all(|byte| edge(*byte) || matches!(*byte, b'_' | b'-'))
+    }
+
+    if !(3..=200).contains(&id.len()) || !id.is_ascii() {
+        return false;
+    }
+    let mut labels = id.split('.');
+    matches!((labels.next(), labels.next()), (Some(first), Some(second))
+        if valid_label(first) && valid_label(second) && labels.all(valid_label))
+}
 
 fn process_handle(pid: i32) -> io::Result<OwnedFd> {
     let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) as i32 };
@@ -43,15 +63,46 @@ fn main_pid(unit: &str) -> io::Result<i32> {
     Ok(pid)
 }
 
+fn validate_item_id(item_id: &str) -> io::Result<()> {
+    if valid_app_id(item_id) {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid application id",
+        ))
+    }
+}
+
+pub fn send_suspect_no_reply(
+    socket: &Path,
+    target: TargetIdentity,
+    hang_nonce: u64,
+    process: BorrowedFd<'_>,
+) -> io::Result<()> {
+    transport::send_request(
+        socket,
+        &TriggerRequest::SuspectNoReply { target, hang_nonce },
+        Some(process),
+    )
+}
+
+pub fn send_recovered(socket: &Path, target: TargetIdentity, hang_nonce: u64) -> io::Result<()> {
+    transport::send_request(
+        socket,
+        &TriggerRequest::Recovered { target, hang_nonce },
+        None,
+    )
+}
+
 pub fn send_prepare(
     socket: &Path,
     item_id: &str,
     session_id: &str,
     grace: Duration,
 ) -> io::Result<()> {
-    pf_app_manifest::validate_app_id(item_id)
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid application id"))?;
-    if grace > crate::MAX_PREPARED_GRACE {
+    validate_item_id(item_id)?;
+    if grace > MAX_PREPARED_GRACE {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "grace period exceeds hang-sampler limit",
@@ -82,19 +133,20 @@ pub fn send_force_stop(
     session_id: &str,
     reason: ForceStopReason,
 ) -> io::Result<()> {
-    pf_app_manifest::validate_app_id(item_id)
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid application id"))?;
-    let request = TriggerRequest::ForceStop {
-        item_id: item_id.to_owned(),
-        session_id: session_id.to_owned(),
-        reason,
-    };
-    transport::send_request(socket, &request, None)
+    validate_item_id(item_id)?;
+    transport::send_request(
+        socket,
+        &TriggerRequest::ForceStop {
+            item_id: item_id.to_owned(),
+            session_id: session_id.to_owned(),
+            reason,
+        },
+        None,
+    )
 }
 
 pub fn send_discard(socket: &Path, item_id: &str, session_id: &str) -> io::Result<()> {
-    pf_app_manifest::validate_app_id(item_id)
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid application id"))?;
+    validate_item_id(item_id)?;
     transport::send_request(
         socket,
         &TriggerRequest::DiscardPrepared {
@@ -103,4 +155,19 @@ pub fn send_discard(socket: &Path, item_id: &str, session_id: &str) -> io::Resul
         },
         None,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn item_id_validation_matches_the_trigger_contract() {
+        for valid in ["org.example.game", "a.b", "org.example.game-2"] {
+            assert!(validate_item_id(valid).is_ok(), "{valid}");
+        }
+        for invalid in ["org", "Org.example", "org..game", "org.example/"] {
+            assert!(validate_item_id(invalid).is_err(), "{invalid}");
+        }
+    }
 }

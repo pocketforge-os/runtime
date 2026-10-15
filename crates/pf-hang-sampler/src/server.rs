@@ -1,9 +1,9 @@
 use crate::protocol::{
-    authorize_target, caller_allowed, decode_request, AuditOutcome, TargetIdentity, TriggerRequest,
-    AUTHORITY_UNIT, MAX_REQUEST_BYTES, MENU_SIDE_UNIT,
+    authorize_target, caller_allowed, AuditOutcome, AUTHORITY_UNIT, MENU_SIDE_UNIT,
 };
 use crate::report::HangHow;
 use crate::{prepared_worker_ttl, sample_target, EpisodeKey, EpisodeStore, Frame, PreparedSample};
+use pf_hang_trigger::{decode_request, TargetIdentity, TriggerRequest, MAX_REQUEST_BYTES};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
@@ -260,7 +260,8 @@ impl Sampler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::{caller_allowed, AuditOutcome, ForceStopReason};
+    use crate::protocol::{caller_allowed, AuditOutcome};
+    use pf_hang_trigger::ForceStopReason;
 
     #[test]
     fn force_stop_without_prepare_has_no_pinned_target_and_is_empty() {
@@ -315,7 +316,7 @@ mod tests {
             let request = format!(
                 "{{\"op\":\"recovered\",\"target\":{{\"unit\":\"pf-app@org.example.hung.service\",\"pid\":1,\"start_time\":2}},\"hang_nonce\":3,\"{forbidden}\":\"stack-bytes-secret\"}}"
             );
-            assert!(crate::protocol::decode_request(request.as_bytes()).is_err());
+            assert!(pf_hang_trigger::decode_request(request.as_bytes()).is_err());
         }
     }
 }

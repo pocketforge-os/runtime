@@ -17,6 +17,7 @@ bash scripts/check-vendor.sh
 bash scripts/test-check-vendor.sh
 bash scripts/test-clean-ci-cross-artifacts.sh
 cargo metadata --offline --locked --format-version 1 > /dev/null
+bash scripts/check-session-authority-deps.sh
 echo '::endgroup::'
 echo '::group::Whole workspace with real platform fixtures'
 cargo test --locked --workspace --offline --no-fail-fast -- --nocapture
