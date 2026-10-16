@@ -1646,6 +1646,27 @@ def analyze_workflow(rel, text, findings, jobs_out, contract):
                     if isinstance(child, YNode) and child.value is not None \
                             and not GITHUB_EXPR.search(str(child.value)):
                         resolver.record(str(name), str(child.value))
+        job_boundary = Boundary(rel, "workflow", resolver=resolver, text=text)
+        job_env = job.get("env")
+        if isinstance(job_env, YNode) and isinstance(job_env.value, dict):
+            for name, child in job_env.value.items():
+                if str(name) in DISPLAY_VARS and isinstance(child, YNode) \
+                        and child.value is not None:
+                    value = str(child.value)
+                    if GITHUB_EXPR.search(value):
+                        findings.append(Finding("host_display_projection", "display_inherited",
+                                                rel, child.line, text_of(child.line)))
+                    else:
+                        check_display_assignment(str(name), value, job_boundary, findings,
+                                                 child.line, text_of(child.line))
+        job_container = job.get("container")
+        if isinstance(job_container, YNode):
+            _scan_step_container(job_container, job_boundary, findings, text_of)
+        services = job.get("services")
+        if isinstance(services, YNode) and isinstance(services.value, dict):
+            for service in services.value.values():
+                if isinstance(service, YNode):
+                    _scan_step_container(service, job_boundary, findings, text_of)
         steps = job.get("steps")
         if isinstance(steps, YNode) and isinstance(steps.value, list):
             for step in steps.value:
