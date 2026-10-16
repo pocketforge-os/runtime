@@ -138,10 +138,16 @@ compose `environment`. A coreutils `env` invocation running a host process
 (`env -u NAME ...`, `env -i PATH=... ...`, `env "${arr[@]}" ...`) is not a
 projection: bare names, flags and dynamic non-assignment arguments are not
 findings there. The scanner parses the `env` command line the way coreutils
-does: options and their operands (`-u`/`--unset`/`-C`/`--chdir` consume a
-separate operand; `--` ends the assignment prefix) come first, then
-`NAME=VALUE` assignments, and parsing of assignments stops at the first
-non-assignment word — the utility being run. Only `NAME=VALUE` assignments of
+does: options and their operands come first, then `NAME=VALUE` assignments,
+and parsing of assignments stops at the first non-assignment word — the
+utility being run. Every supported option spelling is parsed (#150 review
+round 2): `-u`/`--unset`/`-C`/`--chdir` consume a separate operand or an
+inline `=` value; short-option clusters consume the rest of the cluster, or
+the next operand when a trailing `u`/`C` needs one
+(`env -iu DISPLAY DISPLAY=$DISPLAY cmd` is red); a bare `-` is the `-i`
+alias, not the utility (`env - DISPLAY=$DISPLAY cmd` is red); `--` ends the
+assignment prefix; and `-S`/`--split-string` operands are re-parsed as
+options plus assignments (`env -S '-u DISPLAY DISPLAY=$DISPLAY cmd'` is red). Only `NAME=VALUE` assignments of
 `DISPLAY`, `WAYLAND_DISPLAY` or `XAUTHORITY` inside the assignment prefix are
 checked, so tokens after the utility (`env printf DISPLAY=$DISPLAY`), after
 `--` (`env -- printf DISPLAY=$DISPLAY`) and option operands
@@ -220,11 +226,17 @@ file. The row is an `invalid_exception` unless all of these hold (#150
 review): the cited path is repository-relative and, after symlink resolution,
 still inside the repository (no absolute path, no `..` segment, no symlink
 escape); the file exists and is non-empty; it carries the
-`host_clipboard_disabled` gate marker; it *defines* a clipboard primitive
+`host_clipboard_disabled` gate marker (checked in the raw text — the marker
+is a comment by design); it *defines* a clipboard primitive
 (`fn`/`def`/`func`/`function`/`sub` immediately followed by `copy_text` or
-`copy_image` — a substring mention in a comment or string is not a
-definition); and the occurrence file is evidence-bound to it (it mentions the
-cited adapter's file stem, e.g. via a `use`/import of the adapter module).
+`copy_image`) after comments and string literals are stripped, so a
+`// fn copy_text is planned` comment is not a definition; and the occurrence
+file is evidence-bound to it: outside comments and strings it must contain a
+`use`/import/`from`/`require`/`include` of the cited adapter's file stem, and
+the exception fails closed if the occurrence file also imports a direct
+clipboard framework (`arboard`, `copypasta`, `x11-clipboard`,
+`wl-clipboard-rs`, `gtk::Clipboard`) — a text scanner cannot resolve which
+receiver a call targets, so importing both is refused (#150 review round 2).
 Direct framework calls cannot satisfy the evidence-binding and definition
 conditions and stay unclassifiable (red). Rows without `adapter=` keep the
 original behaviour (the occurrence file itself carries the gate marker).

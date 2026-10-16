@@ -876,6 +876,46 @@ CLIPBOARD_API = re.compile(r"\bcopy_text\s*\(|\bcopy_image\s*\(")
 # A clipboard adapter must DEFINE a primitive, not merely mention one in a
 # comment or string (#150 review): fn/def/func/function/sub spellings cover
 # the languages used across the repos this spec ports to.
+COMMENT_BLOCK_RE = re.compile(r"/\*.*?\*/", re.S)
+
+
+def strip_comments_and_strings(text):
+    """Strip comments and string-literal contents from source text.
+
+    Used for the adapter definition check and its import evidence-binding
+    (#150 review round 2): `// fn copy_text is planned` or a stem mention
+    inside a comment or string is neither a definition nor an import.
+    Handles /*...*/ blocks, // and # line comments outside quotes, and
+    replaces '...' and "..." literal contents with the empty literal.
+    """
+    text = COMMENT_BLOCK_RE.sub(" ", text)
+    out = []
+    for line in text.split("\n"):
+        res = []
+        i = 0
+        n = len(line)
+        while i < n:
+            c = line[i]
+            if c == "/" and i + 1 < n and line[i + 1] == "/":
+                break
+            if c == "#":
+                break
+            if c in "\"'":
+                q = c
+                i += 1
+                while i < n and line[i] != q:
+                    if line[i] == "\\":
+                        i += 1
+                    i += 1
+                i += 1
+                res.append(q + q)
+                continue
+            res.append(c)
+            i += 1
+        out.append("".join(res))
+    return "\n".join(out)
+
+
 CLIPBOARD_ADAPTER_DEF = re.compile(
     r"\b(?:fn|def|func|function|sub)\s+(?:copy_text|copy_image)\b")
 DEV_UINPUT = re.compile(r"^/dev/uinput$")
@@ -1396,6 +1436,82 @@ def collect_command_evidence(toks, boundary):
                 boundary.evidence.weston_headless = True
 
 
+def env_assignment_tokens(args):
+    """Return the DISPLAY-related assignments in a coreutils env prefix.
+
+    Parses every option spelling coreutils accepts (#150 review round 2):
+    `--` ends the prefix (the next word is the utility), a bare `-` is the
+    -i alias, short-option clusters whose final u/C consumes the rest of
+    the cluster or the following operand, and -S/--split-string whose
+    operand is itself re-parsed as options and assignments. After the
+    options, NAME=VALUE tokens are collected until the first
+    non-assignment word (the utility); only DISPLAY, WAYLAND_DISPLAY and
+    XAUTHORITY assignments are returned for checking.
+    """
+    toks = list(args)
+    i = 0
+    while i < len(toks):
+        t = toks[i]
+        if t == "--":
+            return []
+        if t == "-":
+            i += 1
+            continue
+        if not t.startswith("-"):
+            break
+        if t.startswith("--"):
+            flag, inline = t.split("=", 1) if "=" in t else (t, None)
+            if flag == "--split-string":
+                operand = inline if inline is not None else (
+                    toks[i + 1] if i + 1 < len(toks) else "")
+                del toks[i:i + (1 if inline is not None else 2)]
+                try:
+                    toks[i:i] = shlex.split(operand)
+                except ValueError:
+                    toks[i:i] = operand.split()
+                continue
+            if flag in {"--unset", "--chdir"} and inline is None:
+                i += 2
+            else:
+                i += 1
+            continue
+        cluster = t[1:]
+        ci = 0
+        consumed = False
+        while ci < len(cluster):
+            c = cluster[ci]
+            rest = cluster[ci + 1:]
+            if c == "S":
+                operand = rest if rest else (
+                    toks[i + 1] if i + 1 < len(toks) else "")
+                del toks[i:i + (1 if rest else 2)]
+                try:
+                    toks[i:i] = shlex.split(operand)
+                except ValueError:
+                    toks[i:i] = operand.split()
+                consumed = True
+                break
+            if c in "uC":
+                del toks[i:i + (1 if rest else 2)]
+                consumed = True
+                break
+            ci += 1
+        if not consumed:
+            del toks[i]  # pure boolean cluster such as -i or -iv
+    out = []
+    while i < len(toks):
+        t = toks[i]
+        if "=" not in t:
+            break  # utility reached; the rest are its args
+        name = t.split("=", 1)[0]
+        if not ASSIGN_NAME.match(name):
+            break
+        if name in DISPLAY_VARS:
+            out.append(t)
+        i += 1
+    return out
+
+
 def match_shell_commands(commands, boundary, findings, text_of, heredocs=()):
     """Pass 2: flag host routes inside parsed shell commands."""
     for start_line, toks in commands:
@@ -1422,40 +1538,18 @@ def match_shell_commands(commands, boundary, findings, text_of, heredocs=()):
         prog = words[idx].rsplit("/", 1)[-1]
         args = words[idx + 1:]
         if prog == "env":
-            # Canonical-spec amendment ruling 2: coreutils env running a
-            # host process is not a projection. Only NAME=VALUE operands in
-            # env's own assignment prefix are checked; tokens after the
-            # utility name (or after `--`, or consumed as option operands
-            # such as `-u NAME` / `-C DIR`) are arguments, not projections
-            # (#150 review). Container env options are handled by
-            # match_container_tokens/compose.
-            ai = 0
-            assignments = True
-            while ai < len(args):
-                value = args[ai]
-                if value == "--":
-                    # Everything after `--` is the utility and its args.
-                    assignments = False
-                    break
-                if value.startswith("-") and value != "-":
-                    flag = value.split("=", 1)[0]
-                    if (flag in {"-u", "--unset", "-C", "--chdir"}
-                            and "=" not in value):
-                        ai += 2  # option with a separate operand
-                    else:
-                        ai += 1  # boolean flag or inline --unset=/--chdir=
-                    continue
-                break  # first non-option: assignment prefix begins
-            if assignments:
-                while ai < len(args):
-                    value = args[ai]
-                    if "=" not in value:
-                        break  # utility reached; the rest are its args
-                    name, val2 = value.split("=", 1)
-                    if ASSIGN_NAME.match(name) and name in DISPLAY_VARS:
-                        check_display_assignment(name, val2, boundary, findings,
-                                                 start_line, text)
-                    ai += 1
+            # Canonical-spec amendment ruling 2, parsed with the full
+            # coreutils option grammar (#150 review round 2): env running a
+            # host process is not a projection. env_assignment_tokens
+            # parses clusters, the bare `-` alias and -S/--split-string
+            # operands and returns only the DISPLAY/WAYLAND_DISPLAY/
+            # XAUTHORITY assignments that precede the utility; tokens
+            # after the utility or after `--` are arguments. Container env
+            # options are handled by match_container_tokens/compose.
+            for value in env_assignment_tokens(args):
+                name, val2 = value.split("=", 1)
+                check_display_assignment(name, val2, boundary, findings,
+                                         start_line, text)
             continue
         if prog in DISPLAY_TOOLS:
             findings.append(Finding("host_display_projection", "display_tool", boundary.path,
@@ -2162,12 +2256,35 @@ def load_host_manifest(root, policy, failures, file_texts):
                             bad = "missing adapter file"
                         elif policy.clipboard_gate_marker not in adapter_text:
                             bad = f"adapter lacks the {policy.clipboard_gate_marker} gate marker"
-                        elif not CLIPBOARD_ADAPTER_DEF.search(adapter_text):
-                            bad = "adapter does not define copy_text/copy_image"
-                        elif ap.stem not in file_texts.get(rel_path, ""):
-                            bad = ("occurrence is not evidence-bound to the "
-                                   "cited adapter (no reference to "
-                                   f"{ap.stem!r} in {rel_path})")
+                        elif not CLIPBOARD_ADAPTER_DEF.search(
+                                strip_comments_and_strings(adapter_text)):
+                            bad = ("adapter does not define copy_text/copy_image "
+                                   "(a comment or string mention is not a "
+                                   "definition)")
+                        else:
+                            # Evidence-binding (#150 review round 2): the
+                            # occurrence file must import/use the cited
+                            # adapter module outside comments and strings,
+                            # and must not also import a direct clipboard
+                            # framework. A text scanner cannot resolve the
+                            # receiver type of the call, so a file that
+                            # imports both the adapter and a direct
+                            # framework fails closed instead of guessing.
+                            stripped_occ = strip_comments_and_strings(
+                                file_texts.get(rel_path, ""))
+                            import_re = re.compile(
+                                r"\b(?:use|import|from|require|include)\b"
+                                r"[^\n]*\b" + re.escape(ap.stem) + r"\b")
+                            if not import_re.search(stripped_occ):
+                                bad = ("occurrence is not evidence-bound to "
+                                       "the cited adapter (no import/use of "
+                                       f"{ap.stem!r} in {rel_path} outside "
+                                       "comments/strings)")
+                            elif any(lib in stripped_occ
+                                     for lib in CLIPBOARD_LIBS):
+                                bad = ("occurrence file also imports a direct "
+                                       "clipboard framework; the call target "
+                                       f"cannot be proven to be {adapter!r}")
                 if bad:
                     failures.append(Finding("dynamic_route", "invalid_exception", MANIFEST_RELPATH,
                                             line_no, f"adapter {adapter!r} for {rel_path}: {bad}"))
