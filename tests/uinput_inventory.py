@@ -873,6 +873,11 @@ DISPLAY_TOOLS = ("xdotool", "xhost", "xwd")
 CLIPBOARD_TOOLS = ("wl-copy", "xclip", "xsel")
 CLIPBOARD_LIBS = ("arboard", "copypasta", "x11-clipboard", "wl-clipboard-rs", "gtk::Clipboard")
 CLIPBOARD_API = re.compile(r"\bcopy_text\s*\(|\bcopy_image\s*\(")
+# A clipboard adapter must DEFINE a primitive, not merely mention one in a
+# comment or string (#150 review): fn/def/func/function/sub spellings cover
+# the languages used across the repos this spec ports to.
+CLIPBOARD_ADAPTER_DEF = re.compile(
+    r"\b(?:fn|def|func|function|sub)\s+(?:copy_text|copy_image)\b")
 DEV_UINPUT = re.compile(r"^/dev/uinput$")
 DEV_INPUT = re.compile(r"^/dev/input(/|$)")
 HOST_PATHS = [
@@ -1418,16 +1423,39 @@ def match_shell_commands(commands, boundary, findings, text_of, heredocs=()):
         args = words[idx + 1:]
         if prog == "env":
             # Canonical-spec amendment ruling 2: coreutils env running a
-            # host process is not a projection. Only NAME=VALUE assignments
-            # naming a display variable are checked here; container env
-            # options are handled by match_container_tokens/compose.
-            for value in args:
-                if value.startswith("-") or "=" not in value:
+            # host process is not a projection. Only NAME=VALUE operands in
+            # env's own assignment prefix are checked; tokens after the
+            # utility name (or after `--`, or consumed as option operands
+            # such as `-u NAME` / `-C DIR`) are arguments, not projections
+            # (#150 review). Container env options are handled by
+            # match_container_tokens/compose.
+            ai = 0
+            assignments = True
+            while ai < len(args):
+                value = args[ai]
+                if value == "--":
+                    # Everything after `--` is the utility and its args.
+                    assignments = False
+                    break
+                if value.startswith("-") and value != "-":
+                    flag = value.split("=", 1)[0]
+                    if (flag in {"-u", "--unset", "-C", "--chdir"}
+                            and "=" not in value):
+                        ai += 2  # option with a separate operand
+                    else:
+                        ai += 1  # boolean flag or inline --unset=/--chdir=
                     continue
-                name, val2 = value.split("=", 1)
-                if ASSIGN_NAME.match(name) and name in DISPLAY_VARS:
-                    check_display_assignment(name, val2, boundary, findings,
-                                             start_line, text)
+                break  # first non-option: assignment prefix begins
+            if assignments:
+                while ai < len(args):
+                    value = args[ai]
+                    if "=" not in value:
+                        break  # utility reached; the rest are its args
+                    name, val2 = value.split("=", 1)
+                    if ASSIGN_NAME.match(name) and name in DISPLAY_VARS:
+                        check_display_assignment(name, val2, boundary, findings,
+                                                 start_line, text)
+                    ai += 1
             continue
         if prog in DISPLAY_TOOLS:
             findings.append(Finding("host_display_projection", "display_tool", boundary.path,
@@ -2110,23 +2138,39 @@ def load_host_manifest(root, policy, failures, file_texts):
             if adapter:
                 # Canonical-spec amendment ruling 4: a caller of the
                 # capability-checked adapter cites the adapter file, which
-                # must exist, carry the gate marker and define a clipboard
-                # primitive. Direct framework/platform calls cannot cite a
-                # gating adapter and stay unclassifiable.
-                try:
-                    adapter_text = (root / adapter).read_text(
-                        encoding="utf-8", errors="replace")
-                except OSError:
-                    adapter_text = ""
-                if (not adapter_text
-                        or policy.clipboard_gate_marker not in adapter_text
-                        or ("copy_text" not in adapter_text
-                            and "copy_image" not in adapter_text)):
+                # must be contained in the reviewed repository (lexically
+                # and after symlink resolution), carry the gate marker,
+                # DEFINE a clipboard primitive, and be named by the
+                # occurrence file (#150 review: substring mentions and
+                # unrelated adapters must not excuse a direct
+                # framework/platform call).
+                ap = Path(adapter)
+                bad = None
+                if ap.is_absolute() or ".." in ap.parts:
+                    bad = "path escapes the repository"
+                else:
+                    target = (root / ap).resolve()
+                    if not target.is_relative_to(root.resolve()):
+                        bad = "resolved path escapes the repository"
+                    else:
+                        try:
+                            adapter_text = target.read_text(
+                                encoding="utf-8", errors="replace")
+                        except OSError:
+                            adapter_text = ""
+                        if not adapter_text:
+                            bad = "missing adapter file"
+                        elif policy.clipboard_gate_marker not in adapter_text:
+                            bad = f"adapter lacks the {policy.clipboard_gate_marker} gate marker"
+                        elif not CLIPBOARD_ADAPTER_DEF.search(adapter_text):
+                            bad = "adapter does not define copy_text/copy_image"
+                        elif ap.stem not in file_texts.get(rel_path, ""):
+                            bad = ("occurrence is not evidence-bound to the "
+                                   "cited adapter (no reference to "
+                                   f"{ap.stem!r} in {rel_path})")
+                if bad:
                     failures.append(Finding("dynamic_route", "invalid_exception", MANIFEST_RELPATH,
-                                            line_no, f"adapter {adapter!r} for {rel_path} is not a "
-                                            f"capability-checked clipboard adapter (missing file, "
-                                            f"{policy.clipboard_gate_marker} gate marker, or "
-                                            "copy_text/copy_image definition)"))
+                                            line_no, f"adapter {adapter!r} for {rel_path}: {bad}"))
                     continue
             else:
                 text = file_texts.get(rel_path, "")

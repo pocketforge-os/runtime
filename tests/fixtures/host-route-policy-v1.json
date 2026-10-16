@@ -91,7 +91,7 @@
     },
     "product_clipboard_adapter": {
       "gate_marker": "host_clipboard_disabled",
-      "adapter_caller": "An occurrence that CALLS a capability-checked adapter (e.g. shell.copy_text(...)) cannot be distinguished from a raw framework call at the call site, so the inventory row may carry an optional adapter=<repo-relative path> field. The adapter file must exist, contain the gate_marker and contain copy_text or copy_image, proving it is the gating adapter; otherwise the row is invalid_exception. Direct framework/platform calls have no adapter to cite and stay unclassifiable (red). Without adapter=, the occurrence file itself must contain the gate_marker (pre-amendment behaviour).",
+      "adapter_caller": "An occurrence that CALLS a capability-checked adapter (e.g. shell.copy_text(...)) cannot be distinguished from a raw framework call at the call site, so the inventory row may carry an optional adapter=<repo-relative path> field. The row is invalid_exception unless the cited path is repository-relative and still inside the repository after symlink resolution (no absolute path, no .. segment, no symlink escape), the file exists and is non-empty, it contains the gate_marker, it DEFINES a clipboard primitive (fn/def/func/function/sub immediately followed by copy_text or copy_image; a substring mention is not a definition), and the occurrence file is evidence-bound to it (mentions the adapter file stem). Direct framework/platform calls have no adapter to cite and stay unclassifiable (red). Without adapter=, the occurrence file itself must contain the gate_marker (pre-amendment behaviour).",
       "requires": ["gate marker present in the occurrence file"]
     }
   },
@@ -116,7 +116,7 @@
       "static_sources_unchanged": "/dev, /tmp/.X11-unix, XDG runtime dirs, Xauthority and Wayland socket sources keep their existing rules and stay red"
     },
     "coreutils_env_narrowing": {
-      "rule": "dynamic_route/unresolved_env_name applies only to container env options (docker|podman run/create/exec -e/--env/--env-file, compose environment). A coreutils env invocation running a host process is not a projection; only NAME=VALUE assignments of DISPLAY/WAYLAND_DISPLAY/XAUTHORITY are checked there, so env DISPLAY=$DISPLAY docker run ... stays red (host_display_projection/display_inherited)."
+      "rule": "dynamic_route/unresolved_env_name applies only to container env options (docker|podman run/create/exec -e/--env/--env-file, compose environment). A coreutils env invocation running a host process is not a projection; the env command line is parsed like coreutils: options and their operands (-u/--unset/-C/--chdir consume a separate operand; -- ends the assignment prefix) come first, then NAME=VALUE assignments, and assignment parsing stops at the utility; only DISPLAY/WAYLAND_DISPLAY/XAUTHORITY assignments inside the assignment prefix are checked, so env DISPLAY=$DISPLAY docker run ... stays red (host_display_projection/display_inherited)."
     },
     "shell_tokenizer": {
       "rule": "malformed_file must not fire on shell that passes bash -n: command substitution $(...) and backtick spans inside double quotes are skipped as balanced spans (their inner quotes belong to the substitution), a backslash outside quotes escapes the next character inside $(...), and ANSI-C $'...' strings are single tokens."

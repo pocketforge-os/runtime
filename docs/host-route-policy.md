@@ -137,8 +137,15 @@ options: `docker`/`podman` `run`/`create`/`exec` `-e`/`--env`/`--env-file` and
 compose `environment`. A coreutils `env` invocation running a host process
 (`env -u NAME ...`, `env -i PATH=... ...`, `env "${arr[@]}" ...`) is not a
 projection: bare names, flags and dynamic non-assignment arguments are not
-findings there. Only `NAME=VALUE` assignments of `DISPLAY`,
-`WAYLAND_DISPLAY` or `XAUTHORITY` inside an `env` invocation are checked, so
+findings there. The scanner parses the `env` command line the way coreutils
+does: options and their operands (`-u`/`--unset`/`-C`/`--chdir` consume a
+separate operand; `--` ends the assignment prefix) come first, then
+`NAME=VALUE` assignments, and parsing of assignments stops at the first
+non-assignment word — the utility being run. Only `NAME=VALUE` assignments of
+`DISPLAY`, `WAYLAND_DISPLAY` or `XAUTHORITY` inside the assignment prefix are
+checked, so tokens after the utility (`env printf DISPLAY=$DISPLAY`), after
+`--` (`env -- printf DISPLAY=$DISPLAY`) and option operands
+(`env -C DISPLAY=$DISPLAY pwd`) are not projections, while
 `env DISPLAY=$DISPLAY docker run ...` stays red
 (`host_display_projection`/`display_inherited`).
 
@@ -209,11 +216,18 @@ framework/platform clipboard call, so the raw-API detector cannot distinguish
 them; narrowing the regex would blind the rule instead. The chosen design is a
 typed exception at the *manifest* layer: a `product_clipboard_adapter` row may
 carry an optional `adapter=<repo-relative path>` field citing the adapter
-file. The row is an `invalid_exception` unless that file exists, carries the
-`host_clipboard_disabled` gate marker and contains `copy_text` or `copy_image`
-— proving the cited file is a gating adapter. Direct framework calls have no
-adapter to cite and stay unclassifiable (red). Rows without `adapter=` keep
-the original behaviour (the occurrence file itself carries the gate marker).
+file. The row is an `invalid_exception` unless all of these hold (#150
+review): the cited path is repository-relative and, after symlink resolution,
+still inside the repository (no absolute path, no `..` segment, no symlink
+escape); the file exists and is non-empty; it carries the
+`host_clipboard_disabled` gate marker; it *defines* a clipboard primitive
+(`fn`/`def`/`func`/`function`/`sub` immediately followed by `copy_text` or
+`copy_image` — a substring mention in a comment or string is not a
+definition); and the occurrence file is evidence-bound to it (it mentions the
+cited adapter's file stem, e.g. via a `use`/import of the adapter module).
+Direct framework calls cannot satisfy the evidence-binding and definition
+conditions and stay unclassifiable (red). Rows without `adapter=` keep the
+original behaviour (the occurrence file itself carries the gate marker).
 
 ## 4. Inventory (manifest)
 
