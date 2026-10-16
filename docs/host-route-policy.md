@@ -85,8 +85,15 @@ assignment-folding or proven-variable exception for dynamic container values:
   dynamic operand in the tainted `run`/`create` command is `dynamic_route`
   (detail `dynamic_image_operand`). Use inline `--opt=value` forms for options
   the scanner does not know to keep the command scannable. In the `run`
-  context `-t`/`-i`/`-d` (and clusters such as `-it`) are booleans, and
-  `--pull` takes its value only inline.
+  context `-t`/`-i`/`-d` (and clusters such as `-it`) are booleans; `--pull`
+  is string-valued for both `run` and `create` (docker and podman declare
+  `--pull string`) and consumes a split or inline value (#147 review round 2).
+  An unknown *global* option taints and its following non-subcommand word is
+  treated as its possible split value, so a later `run`/`create` is still
+  reached (`podman --root /tmp run "$IMAGE"` stays red). The taint fail-closed
+  applies inside `run`/`create` only: a non-`run`/`create` subcommand after an
+  unknown global option carries no image operand, so it reports nothing
+  (`podman --root /tmp inspect "$CONTAINER"` is green).
 
 Assignment folding survives only where it can never excuse anything: the typed
 `private_compositor` creation-evidence exception (§3.1), and folding that

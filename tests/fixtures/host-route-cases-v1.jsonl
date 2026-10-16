@@ -81,3 +81,11 @@
 {"id": "green-static-image-tainted-option", "expect": "green", "files": {"scripts/case.sh": "docker run --mystery-flag value alpine:latest cargo test\n"}}
 {"id": "red-dynamic-image-tty-flag", "expect": "red", "rule": "dynamic_route", "detail": "dynamic_image_operand", "files": {"scripts/case.sh": "docker run -t \"$IMAGE\" cargo test\n"}}
 {"id": "green-static-image-tty-cluster", "expect": "green", "files": {"scripts/case.sh": "docker run -it --rm alpine:latest cargo test\n"}}
+{"id": "red-dynamic-image-pull-split", "expect": "red", "rule": "dynamic_route", "detail": "dynamic_image_operand", "files": {"scripts/case.sh": "docker run --pull always \"$IMAGE\" cargo test\n"}}
+{"id": "red-dynamic-image-create-pull-split", "expect": "red", "rule": "dynamic_route", "detail": "dynamic_image_operand", "files": {"scripts/case.sh": "docker create --pull always \"$IMAGE\"\n"}}
+{"id": "red-dynamic-image-podman-pull-split", "expect": "red", "rule": "dynamic_route", "detail": "dynamic_image_operand", "files": {"scripts/case.sh": "podman run --pull newer \"$IMAGE\" cargo test\n"}}
+{"id": "green-dynamic-image-pull-inline-delim", "expect": "green", "files": {"scripts/case.sh": "IMAGE=\"${1:?usage}\"\ndocker run --pull=always -- \"$IMAGE\" cargo test\n"}}
+{"id": "green-podman-inspect-dynamic", "expect": "green", "files": {"scripts/case.sh": "podman --root /tmp/podman-root inspect \"$CONTAINER\"\n"}}
+{"id": "green-podman-images-format", "expect": "green", "files": {"scripts/case.sh": "podman --root /tmp/podman-root images --format \"$FORMAT\"\n"}}
+{"id": "red-dynamic-image-unknown-global-run", "expect": "red", "rule": "dynamic_route", "detail": "dynamic_image_operand", "files": {"scripts/case.sh": "podman --root /tmp/podman-root run \"$IMAGE\" cargo test\n"}}
+{"id": "red-dynamic-image-unknown-bool-global-run", "expect": "red", "rule": "dynamic_route", "detail": "dynamic_image_operand", "files": {"scripts/case.sh": "podman --mystery run \"$IMAGE\" cargo test\n"}}
