@@ -824,6 +824,35 @@ SOURCE_SETENV = re.compile(
 SKIP_VALUE_FLAGS = {"--env-file", "--label", "-l", "--name", "--user", "-u", "--workdir", "-w",
                     "--entrypoint", "--network", "--pid", "--ipc", "--cpus", "--memory", "-m",
                     "--shm-size", "--tmpfs", "--stop-signal", "--platform", "--pull", "-t", "--tag"}
+# Docker/podman global options (before the subcommand) and run/create option
+# arities. A text scan cannot prove the arity of an option it does not know, so
+# known arities are parsed and unknown options taint the rest of the command:
+# the parser keeps scanning and fails closed on any dynamic operand (#147
+# review: an unknown split-value option let the value be mistaken for the
+# image, hiding the real image operand).
+CONTAINER_GLOBAL_VALUE_FLAGS = {"--config", "--context", "-c", "--host", "-H", "--log-level",
+                                "--tlscacert", "--tlscert", "--tlskey", "--tlsversion"}
+CONTAINER_GLOBAL_BOOL_FLAGS = {"-D", "--debug", "--tls", "--tlsverify"}
+# run/create booleans; note -t is --tty here (not --tag) and --pull carries its
+# optional value only inline (--pull=always), never as a separate token.
+RUN_BOOL_FLAGS = {"--rm", "--init", "-d", "--detach", "-i", "--interactive", "-t", "--tty",
+                  "--privileged", "--read-only", "--no-healthcheck", "-P", "--publish-all",
+                  "-q", "--quiet", "--sig-proxy", "--oom-kill-disable", "--pull"}
+RUN_SHORT_BOOL_CHARS = set("itd")
+RUN_VALUE_FLAGS = (SKIP_VALUE_FLAGS | {
+    "--hostname", "-h", "--add-host", "--runtime", "--cap-add", "--cap-drop", "--dns",
+    "--dns-option", "--dns-search", "--domainname", "--expose", "--publish", "-p",
+    "--restart", "--sysctl", "--ulimit", "--security-opt", "--log-driver", "--log-opt",
+    "--gpus", "--group-add", "--link", "--link-local-ip", "--net", "--net-alias",
+    "--mac-address", "--ip", "--ip6", "--cpuset-cpus", "--cpuset-mems", "--cpu-shares",
+    "--cpu-period", "--cpu-quota", "--cpu-rt-period", "--cpu-rt-runtime",
+    "--cgroup-parent", "--cidfile", "--label-file", "--memory-reservation",
+    "--memory-swap", "--memory-swappiness", "--blkio-weight", "--detach-keys",
+    "--health-cmd", "--health-interval", "--health-retries", "--health-start-period",
+    "--health-timeout", "--isolation", "--kernel-memory", "--oom-score-adj",
+    "--pids-limit", "--stop-timeout", "--storage-opt", "--userns", "--uts",
+    "--volume-driver", "--volumes-from", "--device-read-bps", "--device-read-iops",
+    "--device-write-bps", "--device-write-iops", "--annotation"}) - {"-t", "--tag", "--pull"}
 
 
 class Resolver:
@@ -1039,27 +1068,60 @@ def match_container_tokens(toks, boundary, findings, start_line, text):
             continue
         idx += 1
         run_create = False
-        if idx < n and toks[idx].text in {"run", "create"}:
-            idx += 1
-            run_create = True
+        tainted = False
+        # Global options may precede the subcommand (`docker --context ctx run
+        # ...`). Known arities are consumed; an unknown global option makes the
+        # command unparsable, so any dynamic operand fails closed (#147 review).
+        while idx < n:
+            t = toks[idx].text
+            if t in {"run", "create"}:
+                run_create = True
+                idx += 1
+                break
+            if t.startswith("-") and t != "--":
+                flag = t.split("=", 1)[0]
+                if "=" in t:
+                    idx += 1
+                elif flag in CONTAINER_GLOBAL_VALUE_FLAGS:
+                    idx += 2
+                elif flag in CONTAINER_GLOBAL_BOOL_FLAGS:
+                    idx += 1
+                else:
+                    tainted = True
+                    idx += 1
+                continue
+            break
+        if tainted and any(is_dynamic_value(tok.text) for tok in toks[idx:]):
+            findings.append(Finding("dynamic_route", "dynamic_image_operand",
+                                    boundary.path, start_line, text))
         seen_image = False
         after_delim = False
         while idx < n:
             tok = toks[idx]
             t = tok.text
-            if t == "--":
+            if t == "--" and not tainted:
                 # End of options: the next positional is the image operand and
                 # can no longer be reinterpreted as a flag (pf-hwprobe#23).
+                # After an unknown-arity option the delimiter itself may be an
+                # option value, so it is not trusted (#147 review).
                 after_delim = True
                 idx += 1
                 continue
             if not t.startswith("-"):
-                # First positional token is the image; docker flags cannot follow it.
-                # A dynamic image operand is allowed only immediately after `--`;
-                # assignment folding never proves its runtime value.
+                # A dynamic image operand is allowed only immediately after a
+                # trusted `--`; assignment folding never proves its runtime
+                # value. With a tainted parse no positional can be proven to be
+                # the image, so scanning continues to the end of the command.
                 if run_create and after_delim is False and is_dynamic_value(t):
                     findings.append(Finding("dynamic_route", "dynamic_image_operand",
                                             boundary.path, start_line, text))
+                if after_delim:
+                    seen_image = True
+                    idx += 1
+                    break
+                if run_create and tainted:
+                    idx += 1
+                    continue
                 seen_image = True
                 idx += 1
                 break
@@ -1102,6 +1164,20 @@ def match_container_tokens(toks, boundary, findings, start_line, text):
                 elif MAJOR13.match(val.strip()):
                     findings.append(Finding("input_major_wildcard", "cgroup_major13", boundary.path,
                                             start_line, text))
+            elif run_create and flag in RUN_BOOL_FLAGS:
+                idx += 1
+            elif run_create and (flag in RUN_VALUE_FLAGS or inline is not None):
+                value()
+            elif (run_create and len(flag) > 2 and flag[0] == "-" and flag[1] != "-"
+                    and all(ch in RUN_SHORT_BOOL_CHARS for ch in flag[1:])):
+                # Boolean short-flag cluster such as -it or -dit.
+                idx += 1
+            elif run_create:
+                # Unknown option: a text scan cannot prove its arity, so the
+                # rest of the command is parsed untrusted and any dynamic
+                # operand fails closed (#147 review).
+                tainted = True
+                idx += 1
             elif flag in SKIP_VALUE_FLAGS:
                 value()
             else:

@@ -70,3 +70,14 @@
 {"id": "red-image-option-after-delimiter", "expect": "red", "rule": "dynamic_route", "detail": "option_after_end_of_options", "files": {"scripts/case.sh": "IMAGE=app:test\ndocker run -- --privileged \"$IMAGE\"\n"}}
 {"id": "green-dynamic-image-delimiter", "expect": "green", "files": {"scripts/case.sh": "IMAGE=\"${1:?usage}\"\ndocker run --rm --network none -- \"$IMAGE\" cargo test\n"}}
 {"id": "green-static-image", "expect": "green", "files": {"scripts/case.sh": "docker run --rm alpine:latest cargo test\n"}}
+{"id": "red-dynamic-image-unknown-option", "expect": "red", "rule": "dynamic_route", "detail": "dynamic_image_operand", "files": {"scripts/case.sh": "IMAGE=alpine:latest\ndocker run --hostname buildbox \"$IMAGE\" cargo test\n"}}
+{"id": "red-dynamic-image-create-add-host", "expect": "red", "rule": "dynamic_route", "detail": "dynamic_image_operand", "files": {"scripts/case.sh": "docker create --add-host db:127.0.0.1 \"$IMAGE\"\n"}}
+{"id": "red-dynamic-image-runtime-nodelim", "expect": "red", "rule": "dynamic_route", "detail": "dynamic_image_operand", "files": {"scripts/case.sh": "docker run --runtime runc \"$IMAGE\" cargo test\n"}}
+{"id": "green-dynamic-image-runtime-delim", "expect": "green", "files": {"scripts/case.sh": "IMAGE=\"${1:?usage}\"\ndocker run --runtime runc -- \"$IMAGE\" cargo test\n"}}
+{"id": "red-dynamic-image-global-option", "expect": "red", "rule": "dynamic_route", "detail": "dynamic_image_operand", "files": {"scripts/case.sh": "docker --context ctx run \"$IMAGE\" cargo test\n"}}
+{"id": "red-dynamic-image-podman-unknown-option", "expect": "red", "rule": "dynamic_route", "detail": "dynamic_image_operand", "files": {"scripts/case.sh": "podman run --hostname buildbox \"$IMAGE\" cargo test\n"}}
+{"id": "red-dynamic-image-tainted-option", "expect": "red", "rule": "dynamic_route", "detail": "dynamic_image_operand", "files": {"scripts/case.sh": "docker run --mystery-flag value \"$IMAGE\" cargo test\n"}}
+{"id": "red-dynamic-image-tainted-delim", "expect": "red", "rule": "dynamic_route", "detail": "dynamic_image_operand", "files": {"scripts/case.sh": "docker run --mystery-flag value -- \"$IMAGE\"\n"}}
+{"id": "green-static-image-tainted-option", "expect": "green", "files": {"scripts/case.sh": "docker run --mystery-flag value alpine:latest cargo test\n"}}
+{"id": "red-dynamic-image-tty-flag", "expect": "red", "rule": "dynamic_route", "detail": "dynamic_image_operand", "files": {"scripts/case.sh": "docker run -t \"$IMAGE\" cargo test\n"}}
+{"id": "green-static-image-tty-cluster", "expect": "green", "files": {"scripts/case.sh": "docker run -it --rm alpine:latest cargo test\n"}}

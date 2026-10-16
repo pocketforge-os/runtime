@@ -77,6 +77,16 @@ assignment-folding or proven-variable exception for dynamic container values:
 - A static literal image needs no delimiter.
 - `--` followed by an option-shaped word is still red (`dynamic_route`, detail
   `option_after_end_of_options`).
+- To find the image operand reliably, the scanner parses supported CLI option
+  arities: known docker/podman global options (for example `--context`) and
+  known `run`/`create` options consume their split values. An *unknown* option
+  taints the command, because its arity cannot be proven: the `--` delimiter
+  is no longer trusted, no positional operand is trusted as the image, and any
+  dynamic operand in the tainted `run`/`create` command is `dynamic_route`
+  (detail `dynamic_image_operand`). Use inline `--opt=value` forms for options
+  the scanner does not know to keep the command scannable. In the `run`
+  context `-t`/`-i`/`-d` (and clusters such as `-it`) are booleans, and
+  `--pull` takes its value only inline.
 
 Assignment folding survives only where it can never excuse anything: the typed
 `private_compositor` creation-evidence exception (§3.1), and folding that
