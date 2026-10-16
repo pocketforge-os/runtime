@@ -1,0 +1,131 @@
+{
+  "schema_version": 1,
+  "policy_id": "host-route-policy-v1",
+  "normative_doc": "docs/host-route-policy.md",
+  "origin": {
+    "bead": "tsp-ihne1.56.5",
+    "incident": "tsp-ihne1.56",
+    "design": "design-plan.md pft-b9c90522 sections 3-4"
+  },
+  "rules": [
+    {
+      "id": "host_uinput_device",
+      "summary": "Opening, binding or passing /dev/uinput or /dev/input/* to a container or process (device flags, compose devices, direct paths)."
+    },
+    {
+      "id": "host_input_bind",
+      "summary": "Bind-mounting host input, X11 socket, Xauthority or Wayland socket paths into a container or sandbox (including ${XDG_RUNTIME_DIR}/${WAYLAND_DISPLAY} spellings)."
+    },
+    {
+      "id": "input_major_wildcard",
+      "summary": "Device-cgroup rules granting major 13 (input) with any minor, e.g. 'c 13:* rwm' or 'a 13:* rwm'."
+    },
+    {
+      "id": "host_uinput_permission",
+      "summary": "Loading or permissioning the host uinput route: modprobe/insmod uinput, chmod/chgrp/chown/setfacl/mknod on /dev/uinput or /dev/input, sg/newgrp input, systemd DeviceAllow, modules-load.d uinput entries."
+    },
+    {
+      "id": "host_display_projection",
+      "summary": "Projecting a host display: inheriting ${DISPLAY}/${WAYLAND_DISPLAY}/${XAUTHORITY}, exporting or setting a display without same-boundary private creation, bare /tmp/.X11-unix or .Xauthority paths, xdotool/xhost/xwd, source set_var(\"DISPLAY\"|\"WAYLAND_DISPLAY\"|\"XAUTHORITY\")."
+    },
+    {
+      "id": "host_clipboard_write",
+      "summary": "Writing the host clipboard: wl-copy/xclip/xsel, arboard/copypasta/x11-clipboard/wl-clipboard-rs/gtk::Clipboard deps, copy_text()/copy_image() APIs."
+    },
+    {
+      "id": "dynamic_route",
+      "summary": "Fail closed: a value that could not be resolved statically (container device/volume/env values, runs-on expressions, malformed shell/YAML/host-map, contract violations such as stale or duplicate inventory rows)."
+    }
+  ],
+  "inventory": {
+    "manifest": "tests/uinput-inventory.txt",
+    "line_format": "<path>\\t<sha256(rule + '\\n' + stripped_line)>\\t# host-route rule=<rule-id> class=<class> [caller=<path>] [wave2=<bead>]",
+    "classes": {
+      "dormant-k-consumer": {
+        "required_fields": ["wave2"],
+        "summary": "Kernel-fidelity (K) consumer that is stopped on runner hosts in wave 1; removal is scheduled by the named wave-2 bead."
+      },
+      "product-reference": {
+        "required_fields": [],
+        "summary": "Product source that references host paths as data (policy constants, validation), never executed against the host in CI."
+      },
+      "product-session-fixture": {
+        "required_fields": [],
+        "summary": "Test fixture asserting on product session values (broker sockets, display env spellings) without touching the host."
+      },
+      "guest_internal": {
+        "required_fields": ["caller"],
+        "summary": "Occurrence only reachable inside a pfvd guest; the caller= entry point must exist, match guest_entry_points and reference the occurrence file."
+      },
+      "product_clipboard_adapter": {
+        "required_fields": [],
+        "summary": "Product clipboard adapter whose host route is gated off in CI; the occurrence file must carry the gate marker."
+      }
+    }
+  },
+  "typed_exceptions": {
+    "private_compositor": {
+      "forms": [
+        "xvfb-run",
+        "Xvfb :N started in the boundary with literal DISPLAY=:N and owned cleanup (trap/kill)",
+        "weston --backend=headless* with a generated socket under a run-private XDG_RUNTIME_DIR"
+      ],
+      "inherited_never_excused": [
+        "${DISPLAY}",
+        "${WAYLAND_DISPLAY}",
+        "${XAUTHORITY}",
+        "$HOME/.Xauthority",
+        "/tmp/.X11-unix"
+      ],
+      "summary": "Creation and consumption must appear in the same test boundary (one shell file, one workflow run block). There is no free-form allowlist."
+    },
+    "guest_internal": {
+      "guest_entry_points": ["*/run-guest.sh", "run-guest.sh", "*/guest/*"],
+      "requires": ["caller"]
+    },
+    "product_session_capability": {
+      "broker_x11_source": "/run/pocketforge/session/capabilities/x11/X0",
+      "requires": ["source-kind file that literally carries the broker X11 source path"],
+      "summary": "Excuses the bare /tmp/.X11-unix destination spelling only inside product source files that carry the broker-owned capability source; never workflows, shell scripts or systemd units."
+    },
+    "product_clipboard_adapter": {
+      "gate_marker": "host_clipboard_disabled",
+      "requires": ["gate marker present in the occurrence file"]
+    }
+  },
+  "scan_scope": {
+    "kinds": {
+      "workflow": [".github/workflows/*.yml", ".github/workflows/*.yaml", "*.yml.in", "*.yaml.in"],
+      "yaml": ["other *.yml/*.yaml (compose)"],
+      "shell": ["*.sh", "*.bash", "Makefile", "Dockerfile", "Containerfile", "#!sh|bash|dash scripts"],
+      "systemd": ["*.service", "*.socket", "*.mount", "*.target", "*.conf"],
+      "source": ["*.py", "*.rs", "*.c", "*.h", "*.toml", "#!python scripts"]
+    },
+    "never_scanned": ["docs (*.md)", "data fixtures (*.json, *.jsonl, *.tsv, *.txt)", "tests/fixtures/**", "the scanner and manifest themselves"]
+  },
+  "runner_label_map": {
+    "path": "tests/fixtures/input-runner-host-map-v1.json",
+    "schema": "tests/fixtures/input-runner-host-map-v1.schema.json",
+    "source_file": "tests/fixtures/input-runner-host-map-v1.SOURCE",
+    "authoritative_source": "pocketforge-automation config/input-runner-host-map-v1.json",
+    "matching": "GitHub subset: a job's label set matches an entry when it is a subset of the entry's complete labels, or every label fnmatches one of the entry's label_patterns. Reusable-workflow calls (uses: without runs-on) are evaluated in the callee file.",
+    "consumer_policy": "A job carrying any host-input/display/clipboard finding that matches at least one committed host fails with host_consumer_job; a consumer matching none fails with no_eligible_host; dynamic runs-on fails with dynamic_runs_on."
+  },
+  "failure_contract": {
+    "output": "host_route_inventory=FAIL reason=<rule> path=<path> line=<line> rule=<rule> detail=<detail> text=<stripped line>",
+    "contract_reasons": [
+      "stale_inventory",
+      "duplicate_inventory_row",
+      "malformed_inventory_row",
+      "invalid_exception",
+      "malformed_file",
+      "malformed_host_map",
+      "missing_host_map",
+      "source_sha_mismatch",
+      "dynamic_runs_on",
+      "host_consumer_job",
+      "no_eligible_host",
+      "policy_mismatch"
+    ]
+  }
+}

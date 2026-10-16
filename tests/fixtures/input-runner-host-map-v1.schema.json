@@ -1,0 +1,91 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "input-runner-host-map-v1.schema.json",
+  "title": "input-runner-host-map-v1",
+  "description": "Committed runner-host inventory consumed by the host-route runs-on evaluator (tsp-ihne1.56.5 design section 4). The authoritative map is generated in pocketforge-automation from committed provisioning facts and vendored here with a .SOURCE pin.",
+  "type": "object",
+  "required": ["schema_version", "map_id", "generated_from", "entries"],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {"const": 1},
+    "map_id": {"type": "string", "minLength": 1},
+    "note": {"type": "string"},
+    "generated_from": {
+      "type": "object",
+      "description": "Provenance of the generation inputs in pocketforge-automation.",
+      "required": ["repo", "commit"],
+      "properties": {
+        "repo": {"type": "string"},
+        "commit": {"type": "string"}
+      }
+    },
+    "entries": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"$ref": "#/definitions/entry"}
+    }
+  },
+  "definitions": {
+    "entry": {
+      "type": "object",
+      "required": [
+        "runner",
+        "host_class",
+        "ephemeral",
+        "seat_policy",
+        "provisioning_sources",
+        "may_launch_pfvd_guest"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "runner": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Stable runner/host id; unique across entries."
+        },
+        "name_pattern": {
+          "type": "string",
+          "description": "fnmatch pattern for runner instance names (e.g. mm-eph-build*)."
+        },
+        "labels": {
+          "type": "array",
+          "items": {"type": "string", "minLength": 1},
+          "minItems": 1,
+          "description": "Complete label set carried by the runner (GitHub subset matching: job labels must be a subset)."
+        },
+        "label_patterns": {
+          "type": "array",
+          "items": {"type": "string", "minLength": 1},
+          "minItems": 1,
+          "description": "Alternative to labels: every job label must fnmatch one pattern."
+        },
+        "physical_host": {
+          "type": "string",
+          "description": "Physical machine hosting the runner, when known."
+        },
+        "host_class": {
+          "enum": ["github-hosted", "vm", "bare-metal"],
+          "description": "vm = virtualised guest on company hardware; bare-metal = the physical host itself."
+        },
+        "ephemeral": {
+          "type": "boolean",
+          "description": "Runner is torn down after each job."
+        },
+        "seat_policy": {
+          "enum": ["forbidden", "present", "unknown"],
+          "description": "forbidden = no login seat may exist (headless provisioning); present = a live desktop seat exists; unknown = untrusted/uncorroborated (GitHub-hosted). A map with seat_policy=unknown for a self-hosted class fails generation."
+        },
+        "provisioning_sources": {
+          "type": "array",
+          "items": {"type": "string", "minLength": 1},
+          "minItems": 1,
+          "description": "Committed provisioning files corroborating this entry (repo-relative paths)."
+        },
+        "may_launch_pfvd_guest": {
+          "type": "boolean",
+          "description": "Whether this host may launch a pfvd guest (guard domain a)."
+        }
+      }
+    }
+  }
+}
