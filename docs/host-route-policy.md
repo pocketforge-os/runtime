@@ -2,10 +2,13 @@
 
 Status: normative. This document is the canonical host-route specification
 referenced by `tests/fixtures/host-route-policy-v1.json` (`policy_id
-host-route-policy-v1`, `schema_version 2` — bumped for §2.1, the
-dynamic-container-value and image-operand rule from the pf-hwprobe#23
-adjudication; the case JSONL object schema is unchanged, and the filenames
-stay `*-v1*` because ports pin paths and sha256s). Ports in other repositories
+host-route-policy-v1`, `schema_version 3` — bumped for the 2026-10-16
+amendments after worker C's census (anchored bind sources §2.2, coreutils-`env`
+narrowing §2.3, nested-quote lexing §2.4, clipboard adapter callers §3.4);
+`schema_version 2` covered §2.1, the dynamic-container-value and image-operand
+rule from the pf-hwprobe#23 adjudication. The case JSONL object schema is
+unchanged except that inventory entries gained the optional `adapter=` field;
+the filenames stay `*-v1*` because ports pin paths and sha256s). Ports in other repositories
 vendor the policy JSON, the case JSONL and the runner host map from this
 repository and pin them with a `.SOURCE` file; they must not restate or fork
 the rules.
@@ -100,6 +103,55 @@ Assignment folding survives only where it can never excuse anything: the typed
 *indicts* a non-container `--device` argument whose recorded value is a
 literal `/dev/uinput` or `/dev/input/*` path.
 
+### 2.2 Anchored dynamic bind sources (2026-10-16 amendment)
+
+Worker C's census (pfvd 50 findings, image 21, qemu-tsp 1) showed the flat
+"any dynamic bind source is `dynamic_route`" rule failed closed on legitimate
+container-based CI with no available fix, because workflow occurrences cannot
+be classified in the manifest at all. Under the accidents-not-adversaries
+threat model for static CI checks, a dynamic `-v`/`--volume`/`--mount` source
+is allowed **iff it is anchored at a runner workspace root**:
+
+- it begins with `$GITHUB_WORKSPACE`, `${GITHUB_WORKSPACE}`, `$RUNNER_TEMP`,
+  `${RUNNER_TEMP}`, `${{ github.workspace }}` or `${{ runner.temp }}`;
+- the anchor is followed by end of word or `/` (so `$GITHUB_WORKSPACE_EVIL`
+  and `${GITHUB_WORKSPACE}x` are *not* anchored);
+- it contains no literal `..` path segment (so
+  `$GITHUB_WORKSPACE/../dev/input` stays red).
+
+These roots are provisioned per job by the runner and cannot name a host
+device, display or clipboard socket. The anchored form is allowed in workflows
+*and* scripts with **no manifest row**. Everything else dynamic stays
+`dynamic_route` (detail `unresolved_value`): `$PWD`, `$(pwd)`, `$HOME`,
+unanchored variables, and whole-argv variables such as
+`docker run $CI_DOCKER_RUN`. Consumers rewrite those: `$PWD` becomes
+`$GITHUB_WORKSPACE`; argv variables become literal flags or a committed wrapper
+whose docker argv is literal. Static sources keep their existing rules:
+`/dev*`, `/tmp/.X11-unix`, XDG runtime dirs, `.Xauthority` and Wayland socket
+sources are always red.
+
+### 2.3 Coreutils `env` is not a container projection (2026-10-16 amendment)
+
+`dynamic_route` detail `unresolved_env_name` applies only to *container* env
+options: `docker`/`podman` `run`/`create`/`exec` `-e`/`--env`/`--env-file` and
+compose `environment`. A coreutils `env` invocation running a host process
+(`env -u NAME ...`, `env -i PATH=... ...`, `env "${arr[@]}" ...`) is not a
+projection: bare names, flags and dynamic non-assignment arguments are not
+findings there. Only `NAME=VALUE` assignments of `DISPLAY`,
+`WAYLAND_DISPLAY` or `XAUTHORITY` inside an `env` invocation are checked, so
+`env DISPLAY=$DISPLAY docker run ...` stays red
+(`host_display_projection`/`display_inherited`).
+
+### 2.4 Tokenizer fidelity (2026-10-16 amendment)
+
+`malformed_file` must not fire on shell that passes `bash -n`. The lexer
+therefore treats a command substitution `$(...)` or a backtick span *inside a
+double-quoted string* as one balanced span (quotes inside the substitution
+belong to it), skips `\`-escaped characters (including line continuations)
+while depth-counting a substitution, and treats ANSI-C `$'...'` strings as one
+token. Truly unbalanced input (an unclosed quote, substitution, backtick or
+`$'...'` string) still fails closed as `dynamic_route`/`malformed_file`.
+
 ## 3. Typed exceptions
 
 Exceptions are typed and evidence-bound. There is no free-form allowlist of
@@ -150,6 +202,18 @@ and never excuses a bind whose source is not producer-owned.
 Product clipboard adapters whose host route is gated off in CI. The occurrence
 file must carry the gate marker `host_clipboard_disabled`; otherwise the
 inventory row is an `invalid_exception`.
+
+**Adapter callers (2026-10-16 amendment).** A call site of a capability-checked
+adapter (`shell.copy_text(...)`) is textually identical to a direct
+framework/platform clipboard call, so the raw-API detector cannot distinguish
+them; narrowing the regex would blind the rule instead. The chosen design is a
+typed exception at the *manifest* layer: a `product_clipboard_adapter` row may
+carry an optional `adapter=<repo-relative path>` field citing the adapter
+file. The row is an `invalid_exception` unless that file exists, carries the
+`host_clipboard_disabled` gate marker and contains `copy_text` or `copy_image`
+— proving the cited file is a gating adapter. Direct framework calls have no
+adapter to cite and stay unclassifiable (red). Rows without `adapter=` keep
+the original behaviour (the occurrence file itself carries the gate marker).
 
 ## 4. Inventory (manifest)
 

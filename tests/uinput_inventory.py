@@ -153,6 +153,51 @@ class Tok:
 SEPARATORS = {";", "|", "&&", "||", "&", "\n"}
 
 
+def skip_command_substitution(text, i, line):
+    """Skip a $( ... ) span starting at text[i] ('$' at i, '(' at i + 1).
+
+    Returns (index just past the closing paren, updated line counter).
+    Quote spans inside the substitution are skipped, and a backslash outside
+    a quote escapes the next character, so nested or literal quotes cannot
+    unbalance the scan (canonical-spec amendment ruling 3: image
+    test-kbd-layout-env.sh:193 and test-shell-fonts.sh:87 spellings).
+    """
+    n = len(text)
+    depth = 0
+    j = i + 1
+    while j < n:
+        c = text[j]
+        if c == "(":
+            depth += 1
+        elif c == ")":
+            depth -= 1
+            if depth == 0:
+                return j + 1, line
+        elif c == "\\":
+            if j + 1 < n and text[j + 1] == "\n":
+                line += 1
+            j += 2
+            continue
+        elif c == "'":
+            j += 1
+            while j < n and text[j] != "'":
+                if text[j] == "\n":
+                    line += 1
+                j += 1
+        elif c == '"':
+            j += 1
+            while j < n and text[j] != '"':
+                if text[j] == "\\":
+                    j += 1
+                if j < n and text[j] == "\n":
+                    line += 1
+                j += 1
+        elif c == "\n":
+            line += 1
+        j += 1
+    raise MalformedFile(f"unbalanced command substitution at line {line}")
+
+
 def lex_shell_text(text, base_line=1):
     """Tokenise shell text into logical commands.
 
@@ -263,6 +308,22 @@ def lex_shell_text(text, base_line=1):
                         buf.append(nxt)
                         i += 2
                         continue
+                if text[i] == "$" and i + 1 < n and text[i + 1] == "(":
+                    # Command substitution inside double quotes: nested
+                    # quotes belong to the substitution, not to this string
+                    # (canonical-spec amendment ruling 3).
+                    j, line = skip_command_substitution(text, i, line)
+                    buf.append(text[i:j])
+                    i = j
+                    continue
+                if text[i] == "`":
+                    j = text.find("`", i + 1)
+                    if j < 0:
+                        raise MalformedFile(f"unbalanced backtick at line {line}")
+                    buf.append(text[i:j + 1])
+                    line += text.count("\n", i, j + 1)
+                    i = j + 1
+                    continue
                 if text[i] == "\n":
                     line += 1
                 buf.append(text[i])
@@ -281,38 +342,35 @@ def lex_shell_text(text, base_line=1):
         if ch == "$" and i + 1 < n and text[i + 1] == "(":
             if not buf:
                 buf_start = line
-            depth = 0
-            j = i + 1
+            j, line = skip_command_substitution(text, i, line)
+            buf.append(text[i:j])
+            i = j
+            continue
+        if ch == "$" and i + 1 < n and text[i + 1] == "'":
+            # ANSI-C quote $'...': backslash escapes the next character, so
+            # $'it\'s' is one balanced token (canonical-spec amendment
+            # ruling 3).
+            if not buf:
+                buf_start = line
+            buf_quoted[0] = True
+            j = i + 2
             closed = False
             while j < n:
                 c = text[j]
-                if c == "(":
-                    depth += 1
-                elif c == ")":
-                    depth -= 1
-                    if depth == 0:
-                        j += 1
-                        closed = True
-                        break
-                elif c == "'":
+                if c == "\\":
+                    if j + 1 < n and text[j + 1] == "\n":
+                        line += 1
+                    j += 2
+                    continue
+                if c == "'":
                     j += 1
-                    while j < n and text[j] != "'":
-                        if text[j] == "\n":
-                            line += 1
-                        j += 1
-                elif c == '"':
-                    j += 1
-                    while j < n and text[j] != '"':
-                        if text[j] == "\\":
-                            j += 1
-                        if j < n and text[j] == "\n":
-                            line += 1
-                        j += 1
-                elif c == "\n":
+                    closed = True
+                    break
+                if c == "\n":
                     line += 1
                 j += 1
             if not closed:
-                raise MalformedFile(f"unbalanced command substitution at line {line}")
+                raise MalformedFile(f"unbalanced ANSI-C quote at line {line}")
             buf.append(text[i:j])
             i = j
             continue
@@ -985,6 +1043,33 @@ def check_device_value(val, boundary, findings, line, text, container_ctx=True):
         findings.append(Finding("host_uinput_device", "device_flag", boundary.path, line, text))
 
 
+WORKSPACE_ANCHORS = (
+    "$GITHUB_WORKSPACE", "${GITHUB_WORKSPACE}",
+    "$RUNNER_TEMP", "${RUNNER_TEMP}",
+    "${{ github.workspace }}", "${{ runner.temp }}",
+)
+
+
+def workspace_anchored(src):
+    """True when a dynamic bind source is anchored at a runner workspace root.
+
+    Canonical-spec amendment ruling 1: $GITHUB_WORKSPACE/$RUNNER_TEMP (and
+    their ${{ ... }} workflow-expression forms) are provisioned per job and
+    torn down with it, so a bind source that begins at one of these roots --
+    followed by end of word or `/`, with no literal `..` segment anywhere --
+    cannot reach a host input, display or clipboard route. Every other
+    dynamic source stays dynamic_route.
+    """
+    if any(segment == ".." for segment in src.split("/")):
+        return False
+    for anchor in WORKSPACE_ANCHORS:
+        if src == anchor:
+            return True
+        if src.startswith(anchor) and src[len(anchor):].startswith("/"):
+            return True
+    return False
+
+
 def check_volume_value(val, boundary, findings, line, text):
     if val is None:
         return
@@ -993,7 +1078,11 @@ def check_volume_value(val, boundary, findings, line, text):
         return
     src = val.split(":")[0]
     if is_dynamic_value(src):
-        findings.append(Finding("dynamic_route", "unresolved_value", boundary.path, line, text))
+        # Canonical-spec amendment ruling 1: a dynamic bind source anchored
+        # at a runner workspace root is allowed with no manifest row; every
+        # other dynamic source stays dynamic_route.
+        if not workspace_anchored(src):
+            findings.append(Finding("dynamic_route", "unresolved_value", boundary.path, line, text))
         return
     if is_host_path(src):
         findings.append(Finding("host_input_bind", "bind_source", boundary.path, line, text))
@@ -1014,7 +1103,11 @@ def check_mount_value(val, boundary, findings, line, text):
     if src is None:
         return
     if is_dynamic_value(src):
-        findings.append(Finding("dynamic_route", "unresolved_value", boundary.path, line, text))
+        # Canonical-spec amendment ruling 1: a dynamic bind source anchored
+        # at a runner workspace root is allowed with no manifest row; every
+        # other dynamic source stays dynamic_route.
+        if not workspace_anchored(src):
+            findings.append(Finding("dynamic_route", "unresolved_value", boundary.path, line, text))
         return
     if is_host_path(src):
         findings.append(Finding("host_input_bind", "bind_source", boundary.path, line, text))
@@ -1324,10 +1417,17 @@ def match_shell_commands(commands, boundary, findings, text_of, heredocs=()):
         prog = words[idx].rsplit("/", 1)[-1]
         args = words[idx + 1:]
         if prog == "env":
+            # Canonical-spec amendment ruling 2: coreutils env running a
+            # host process is not a projection. Only NAME=VALUE assignments
+            # naming a display variable are checked here; container env
+            # options are handled by match_container_tokens/compose.
             for value in args:
-                if value.startswith("-"):
+                if value.startswith("-") or "=" not in value:
                     continue
-                check_env_value(value, boundary, findings, start_line, text)
+                name, val2 = value.split("=", 1)
+                if ASSIGN_NAME.match(name) and name in DISPLAY_VARS:
+                    check_display_assignment(name, val2, boundary, findings,
+                                             start_line, text)
             continue
         if prog in DISPLAY_TOOLS:
             findings.append(Finding("host_display_projection", "display_tool", boundary.path,
@@ -2006,12 +2106,35 @@ def load_host_manifest(root, policy, failures, file_texts):
                                         "guest entry point that references the occurrence"))
                 continue
         if klass == "product_clipboard_adapter":
-            text = file_texts.get(rel_path, "")
-            if policy.clipboard_gate_marker not in text:
-                failures.append(Finding("dynamic_route", "invalid_exception", MANIFEST_RELPATH,
-                                        line_no, f"{rel_path} lacks the "
-                                        f"{policy.clipboard_gate_marker} gate marker"))
-                continue
+            adapter = fields.get("adapter")
+            if adapter:
+                # Canonical-spec amendment ruling 4: a caller of the
+                # capability-checked adapter cites the adapter file, which
+                # must exist, carry the gate marker and define a clipboard
+                # primitive. Direct framework/platform calls cannot cite a
+                # gating adapter and stay unclassifiable.
+                try:
+                    adapter_text = (root / adapter).read_text(
+                        encoding="utf-8", errors="replace")
+                except OSError:
+                    adapter_text = ""
+                if (not adapter_text
+                        or policy.clipboard_gate_marker not in adapter_text
+                        or ("copy_text" not in adapter_text
+                            and "copy_image" not in adapter_text)):
+                    failures.append(Finding("dynamic_route", "invalid_exception", MANIFEST_RELPATH,
+                                            line_no, f"adapter {adapter!r} for {rel_path} is not a "
+                                            f"capability-checked clipboard adapter (missing file, "
+                                            f"{policy.clipboard_gate_marker} gate marker, or "
+                                            "copy_text/copy_image definition)"))
+                    continue
+            else:
+                text = file_texts.get(rel_path, "")
+                if policy.clipboard_gate_marker not in text:
+                    failures.append(Finding("dynamic_route", "invalid_exception", MANIFEST_RELPATH,
+                                            line_no, f"{rel_path} lacks the "
+                                            f"{policy.clipboard_gate_marker} gate marker"))
+                    continue
         if key in allowed:
             failures.append(Finding("dynamic_route", "duplicate_inventory_row",
                                     MANIFEST_RELPATH, line_no, f"duplicate row for {key}"))
@@ -2168,6 +2291,8 @@ def _manifest_row(entry):
     fields = [f"rule={rule}", f"class={entry['class']}"]
     if entry.get("caller"):
         fields.append(f"caller={entry['caller']}")
+    if entry.get("adapter"):
+        fields.append(f"adapter={entry['adapter']}")
     if entry.get("wave2"):
         fields.append(f"wave2={entry['wave2']}")
     return f"{entry['path']}\t{sha}\t# host-route " + " ".join(fields)
