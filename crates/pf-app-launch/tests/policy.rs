@@ -1,6 +1,6 @@
 use pf_app_launch::policy::{
     derive_policy, render_systemd_dropin, AppClass, FsAccess, MediatedEndpoint, NetAccess,
-    PolicyInputs, PolicyResourceInventory,
+    PolicyInputs, PolicyResourceInventory, X11_SOCKET_DESTINATION,
 };
 use pf_app_manifest::{parse_manifest, parse_platform_contract, ResolvedApp};
 use std::collections::BTreeMap;
@@ -130,7 +130,7 @@ fn x11_projection_is_exact_manifest_scoped_and_fail_closed() {
     let plain = derive_policy(&resolved(&root, &[], false, true), &inputs(&root)).unwrap();
     let plain_rendered = render_systemd_dropin(&plain);
     assert!(!plain_rendered.contains("/run/pocketforge/x11"));
-    assert!(!plain_rendered.contains("/tmp/.X11-unix/X0"));
+    assert!(!plain_rendered.contains(X11_SOCKET_DESTINATION));
     assert!(!serde_json::to_string(&plain)
         .unwrap()
         .contains("/run/pocketforge/x11"));

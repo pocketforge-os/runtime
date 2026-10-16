@@ -138,12 +138,12 @@ file by name.
 
 The product routes X11 through the producer-owned real capability source
 `/run/pocketforge/x11/.X11-unix/X0` (see
-`crates/pf-app-launch/src/policy.rs`). A *source-kind* file that literally
+`crates/pf-app-launch/src/policy.rs`). A *source-kind* occurrence that literally
 carries that producer source path may also carry the `/tmp/.X11-unix/X0`
-destination spelling; the scanner excuses `host_display_projection` findings
-with detail `x11_socket_path` only in such files. This exception never applies
-to workflows, shell scripts or systemd units, and never excuses a bind whose
-source is not producer-owned.
+destination spelling; the scanner excuses that occurrence's
+`host_display_projection` finding with detail `x11_socket_path`. The exception
+is never file-wide, never applies to workflows, shell scripts or systemd units,
+and never excuses a bind whose source is not producer-owned.
 
 ### 3.4 product_clipboard_adapter
 

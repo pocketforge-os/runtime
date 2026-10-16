@@ -1891,17 +1891,16 @@ def attribute_jobs(findings, jobs, path):
 
 # --- Exceptions, manifest and driver -----------------------------------------
 
-def apply_product_session_capability(findings, file_texts, policy):
+def apply_product_session_capability(findings, policy):
     """product_session_capability: the producer-owned X11 capability source is
-    the product's own session plumbing. It only excuses source files that
-    literally carry the producer source path; never workflows, shell or units."""
+    the product's own session plumbing. It only excuses the individual source
+    occurrence that carries both route endpoints; never workflows, shell or units."""
     for finding in findings:
         if finding.excused or "product_session_capability" not in finding.excusable:
             continue
         if finding.kind != "source":
             continue
-        text = file_texts.get(finding.path)
-        if text is not None and policy.producer_x11_source in text:
+        if policy.producer_x11_source in finding.text:
             finding.excused = True
 
 
@@ -2092,7 +2091,7 @@ def scan_host_routes(root, use_manifest=True, quiet=False):
             finding.kind = kind
     for path, jobs in workflow_jobs.items():
         attribute_jobs(all_findings, jobs, path)
-    apply_product_session_capability(all_findings, file_texts, policy)
+    apply_product_session_capability(all_findings, policy)
     dedup = {}
     for finding in all_findings:
         sig = (finding.path, finding.line, finding.rule, finding.detail)
