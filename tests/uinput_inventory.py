@@ -760,7 +760,7 @@ CANONICAL_CLASSES = {
 }
 DEFAULT_GUEST_ENTRY_POINTS = ["*/run-guest.sh", "run-guest.sh", "*/guest/*"]
 DEFAULT_CLIPBOARD_GATE = "host_clipboard_disabled"
-DEFAULT_BROKER_X11_SOURCE = "/run/pocketforge/session/capabilities/x11/X0"
+DEFAULT_PRODUCER_X11_SOURCE = "/run/pocketforge/x11/.X11-unix/X0"
 
 
 class Policy:
@@ -782,8 +782,8 @@ class Policy:
             "guest_entry_points", DEFAULT_GUEST_ENTRY_POINTS)
         self.clipboard_gate_marker = typed.get("product_clipboard_adapter", {}).get(
             "gate_marker", DEFAULT_CLIPBOARD_GATE)
-        self.broker_x11_source = typed.get("product_session_capability", {}).get(
-            "broker_x11_source", DEFAULT_BROKER_X11_SOURCE)
+        self.producer_x11_source = typed.get("product_session_capability", {}).get(
+            "producer_x11_source", DEFAULT_PRODUCER_X11_SOURCE)
 
 
 def load_policy(root, failures):
@@ -1892,16 +1892,16 @@ def attribute_jobs(findings, jobs, path):
 # --- Exceptions, manifest and driver -----------------------------------------
 
 def apply_product_session_capability(findings, file_texts, policy):
-    """product_session_capability: the broker-owned X11 capability source is
+    """product_session_capability: the producer-owned X11 capability source is
     the product's own session plumbing. It only excuses source files that
-    literally carry the broker source path; never workflows, shell or units."""
+    literally carry the producer source path; never workflows, shell or units."""
     for finding in findings:
         if finding.excused or "product_session_capability" not in finding.excusable:
             continue
         if finding.kind != "source":
             continue
         text = file_texts.get(finding.path)
-        if text is not None and policy.broker_x11_source in text:
+        if text is not None and policy.producer_x11_source in text:
             finding.excused = True
 
 

@@ -84,9 +84,9 @@
       "requires": ["caller"]
     },
     "product_session_capability": {
-      "broker_x11_source": "/run/pocketforge/session/capabilities/x11/X0",
-      "requires": ["source-kind file that literally carries the broker X11 source path"],
-      "summary": "Excuses the bare /tmp/.X11-unix destination spelling only inside product source files that carry the broker-owned capability source; never workflows, shell scripts or systemd units."
+      "producer_x11_source": "/run/pocketforge/x11/.X11-unix/X0",
+      "requires": ["source-kind file that literally carries the producer X11 source path"],
+      "summary": "Excuses the bare /tmp/.X11-unix destination spelling only inside product source files that carry the producer-owned capability source; never workflows, shell scripts or systemd units."
     },
     "product_clipboard_adapter": {
       "gate_marker": "host_clipboard_disabled",
