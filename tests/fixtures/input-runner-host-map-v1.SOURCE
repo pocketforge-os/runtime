@@ -1,0 +1,8 @@
+# Vendored runner-label host map (canonical host-route spec, docs/host-route-policy.md section 5).
+# The authoritative map is generated in pocketforge-automation from committed
+# provisioning only; this copy is pinned by sha256 and the check fails closed
+# on any drift (reason=source_sha_mismatch).
+source_repo=pocketforge-automation
+source_commit=e064842f7e514fd525290da6ff4352b2c1c02573
+source_path=config/input-runner-host-map-v1.json
+fixture_sha256=f71973077947c1d9fb780cbe8b9006442910fbaf0cec82fd1887cfb211a1ae57
