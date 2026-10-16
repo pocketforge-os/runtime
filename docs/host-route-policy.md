@@ -136,8 +136,8 @@ file by name.
 
 ### 3.3 product_session_capability
 
-The product routes X11 through the broker-owned capability source
-`/run/pocketforge/session/capabilities/x11/X0` (see
+The product routes X11 through the producer-owned real capability source
+`/run/pocketforge/x11/.X11-unix/X0` (see
 `crates/pf-app-launch/src/policy.rs`). A *source-kind* file that literally
 carries that broker source path may also carry the `/tmp/.X11-unix/X0`
 destination spelling; the scanner excuses `host_display_projection` findings

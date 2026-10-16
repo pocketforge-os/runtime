@@ -11,9 +11,9 @@ use std::path::{Component, Path, PathBuf};
 
 pub const POLICY_SCHEMA_VERSION: u32 = 1;
 const DNS_PORT: u16 = 53;
-pub const X11_SOCKET: &str = "/run/pocketforge/session/capabilities/x11/X0";
+pub const X11_SOCKET: &str = "/run/pocketforge/x11/.X11-unix/X0";
 pub const X11_SOCKET_DESTINATION: &str = "/tmp/.X11-unix/X0";
-pub const X11_ENVIRONMENT: &str = "/run/pocketforge/session/capabilities/x11/environment";
+pub const X11_ENVIRONMENT: &str = "/run/pocketforge/x11/policy/environment";
 
 #[derive(Clone, Copy)]
 enum DisplayResourceGrant {

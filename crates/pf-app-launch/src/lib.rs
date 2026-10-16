@@ -588,6 +588,88 @@ mod tests {
     }
 
     #[test]
+    fn x11_policy_uses_real_producer_paths_and_refuses_b15_session_alias() {
+        assert_eq!(policy::X11_SOCKET, "/run/pocketforge/x11/.X11-unix/X0");
+        assert_eq!(
+            policy::X11_ENVIRONMENT,
+            "/run/pocketforge/x11/policy/environment"
+        );
+
+        let dir = std::env::temp_dir().join(format!(
+            "pf-app-launch-b15-x11-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let producer = dir.join("run/pocketforge/x11");
+        fs::create_dir_all(producer.join(".X11-unix")).unwrap();
+        let socket = producer.join(".X11-unix/X0");
+        let environment = producer.join("environment");
+        let _listener = UnixListener::bind(&socket).unwrap();
+        fs::write(&environment, b"DISPLAY=:0\n").unwrap();
+
+        let generation = dir.join("run/pocketforge/.session-generations/1");
+        fs::create_dir_all(generation.join("capabilities/x11")).unwrap();
+        symlink(&socket, generation.join("capabilities/x11/X0")).unwrap();
+        symlink(
+            &environment,
+            generation.join("capabilities/x11/environment"),
+        )
+        .unwrap();
+        let session = dir.join("run/pocketforge/session");
+        symlink(&generation, &session).unwrap();
+
+        let root = PathBuf::from("/fixture");
+        let app = resolved_fixture(&root, &["x11"]);
+        let inputs = PolicyInputs {
+            platform_runtime: root.join("runtime"),
+            xdg_config: root.join("config"),
+            xdg_state: root.join("state"),
+            xdg_cache: root.join("cache"),
+            resource_paths: Vec::new(),
+            resources: std::collections::BTreeMap::from([
+                (
+                    "x11-socket".to_owned(),
+                    vec![PathBuf::from(policy::X11_SOCKET)],
+                ),
+                (
+                    "x11-environment".to_owned(),
+                    vec![PathBuf::from(policy::X11_ENVIRONMENT)],
+                ),
+            ]),
+        };
+        let mut policy = derive_policy(&app, &inputs).unwrap();
+
+        // This is the exact Build 15 shape: the public session path has a symlink
+        // parent and its X11 leaves are aliases. Strict descriptor traversal must
+        // continue to reject it.
+        policy.unit.bind_read_write_mappings[0].source = session.join("capabilities/x11/X0");
+        policy.environment[0].source = session.join("capabilities/x11/environment");
+        assert!(load_environment(&policy)
+            .unwrap_err()
+            .to_string()
+            .contains("alias"));
+
+        policy.unit.bind_read_write_mappings[0].source = socket;
+        policy.environment[0].source = environment;
+        assert_eq!(
+            load_environment(&policy).unwrap(),
+            [("DISPLAY".to_owned(), ":0".to_owned())]
+        );
+
+        let foreign = dir.join("foreign");
+        fs::create_dir_all(&foreign).unwrap();
+        let parent_alias = producer.join("foreign-parent");
+        symlink(&foreign, &parent_alias).unwrap();
+        policy.unit.bind_read_write_mappings[0].source = parent_alias.join("X0");
+        assert!(load_environment(&policy)
+            .unwrap_err()
+            .to_string()
+            .contains("alias"));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn resolves_again_creates_xdg_directories_and_executes_without_arguments() {
         let dir = std::env::temp_dir().join(format!(
             "pf-app-launch-{}-{:?}",
