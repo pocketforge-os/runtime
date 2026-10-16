@@ -912,15 +912,34 @@ def is_host_path(path):
     return any(pattern.search(path) for pattern, _ in HOST_PATHS)
 
 
+def is_dynamic_value(val):
+    """True when val contains a shell expansion ($ or backtick).
+
+    pf-hwprobe#23 round-4 adjudication: a text scan cannot prove a shell
+    variable's runtime value. printf -v, read, eval, sourced scripts and
+    $GITHUB_ENV writes all bypass assignment folding, so a dynamic value is
+    never excused by resolving it against same-file assignments.
+    """
+    return val is not None and ("$" in val or "`" in val)
+
+
 def check_device_value(val, boundary, findings, line, text, container_ctx=True):
     if val is None:
         return
-    resolved = boundary.resolver.resolve(val)
-    if resolved is None:
+    if is_dynamic_value(val):
+        # No assignment folding: a dynamic value in a container context is
+        # always dynamic_route. Outside a container context folding is used
+        # to indict only (never to excuse).
         if container_ctx:
             findings.append(Finding("dynamic_route", "unresolved_value", boundary.path, line, text))
+        else:
+            resolved = boundary.resolver.resolve(val)
+            if resolved is not None \
+                    and (DEV_UINPUT.match(resolved) or DEV_INPUT.match(resolved)):
+                findings.append(Finding("host_uinput_device", "device_flag", boundary.path,
+                                        line, text))
         return
-    if DEV_UINPUT.match(resolved) or DEV_INPUT.match(resolved):
+    if DEV_UINPUT.match(val) or DEV_INPUT.match(val):
         findings.append(Finding("host_uinput_device", "device_flag", boundary.path, line, text))
 
 
@@ -931,11 +950,10 @@ def check_volume_value(val, boundary, findings, line, text):
         findings.append(Finding("host_input_bind", "bind_source", boundary.path, line, text))
         return
     src = val.split(":")[0]
-    resolved = boundary.resolver.resolve(src)
-    if resolved is None:
+    if is_dynamic_value(src):
         findings.append(Finding("dynamic_route", "unresolved_value", boundary.path, line, text))
         return
-    if is_host_path(resolved):
+    if is_host_path(src):
         findings.append(Finding("host_input_bind", "bind_source", boundary.path, line, text))
 
 
@@ -953,11 +971,10 @@ def check_mount_value(val, boundary, findings, line, text):
     src = fields.get("src") or fields.get("source")
     if src is None:
         return
-    resolved = boundary.resolver.resolve(src)
-    if resolved is None:
+    if is_dynamic_value(src):
         findings.append(Finding("dynamic_route", "unresolved_value", boundary.path, line, text))
         return
-    if is_host_path(resolved):
+    if is_host_path(src):
         findings.append(Finding("host_input_bind", "bind_source", boundary.path, line, text))
 
 
@@ -996,26 +1013,23 @@ def check_env_value(val, boundary, findings, line, text):
     if val is None:
         return
     if "=" not in val:
-        name = boundary.resolver.resolve(val)
-        if name is None:
+        if is_dynamic_value(val):
             findings.append(Finding("dynamic_route", "unresolved_env_name", boundary.path, line, text))
-        elif name in DISPLAY_VARS:
+        elif val in DISPLAY_VARS:
             findings.append(Finding("host_display_projection", "display_inherited", boundary.path,
                                     line, text))
         return
     name, value = val.split("=", 1)
-    resolved_name = boundary.resolver.resolve(name)
-    if resolved_name is None:
+    if is_dynamic_value(name):
         findings.append(Finding("dynamic_route", "unresolved_env_name", boundary.path, line, text))
         return
-    if resolved_name not in DISPLAY_VARS:
+    if name not in DISPLAY_VARS:
         return
-    check_display_assignment(resolved_name, value, boundary, findings, line, text)
+    check_display_assignment(name, value, boundary, findings, line, text)
 
 
 def match_container_tokens(toks, boundary, findings, start_line, text):
     """Match docker/podman-style flag values inside a token stream."""
-    resolver = boundary.resolver
     idx = 0
     n = len(toks)
     while idx < n:
@@ -1024,17 +1038,37 @@ def match_container_tokens(toks, boundary, findings, start_line, text):
             idx += 1
             continue
         idx += 1
+        run_create = False
         if idx < n and toks[idx].text in {"run", "create"}:
             idx += 1
+            run_create = True
         seen_image = False
+        after_delim = False
         while idx < n:
             tok = toks[idx]
             t = tok.text
+            if t == "--":
+                # End of options: the next positional is the image operand and
+                # can no longer be reinterpreted as a flag (pf-hwprobe#23).
+                after_delim = True
+                idx += 1
+                continue
             if not t.startswith("-"):
                 # First positional token is the image; docker flags cannot follow it.
+                # A dynamic image operand is allowed only immediately after `--`;
+                # assignment folding never proves its runtime value.
+                if run_create and after_delim is False and is_dynamic_value(t):
+                    findings.append(Finding("dynamic_route", "dynamic_image_operand",
+                                            boundary.path, start_line, text))
                 seen_image = True
                 idx += 1
                 break
+            if after_delim:
+                # `--` followed by an option-shaped word is still red.
+                findings.append(Finding("dynamic_route", "option_after_end_of_options",
+                                        boundary.path, start_line, text))
+                idx += 1
+                continue
             flag = t.split("=", 1)[0]
             inline = t.split("=", 1)[1] if "=" in t else None
 
@@ -1062,11 +1096,10 @@ def match_container_tokens(toks, boundary, findings, start_line, text):
                 val = value(max_tokens=3)
                 if val is None:
                     continue
-                resolved = resolver.resolve(val)
-                if resolved is None:
+                if is_dynamic_value(val):
                     findings.append(Finding("dynamic_route", "unresolved_value", boundary.path,
                                             start_line, text))
-                elif MAJOR13.match(resolved.strip()):
+                elif MAJOR13.match(val.strip()):
                     findings.append(Finding("input_major_wildcard", "cgroup_major13", boundary.path,
                                             start_line, text))
             elif flag in SKIP_VALUE_FLAGS:
@@ -1325,13 +1358,12 @@ def scan_systemd(text, base_line, boundary, findings):
         elif key in {"BindPaths", "BindReadOnlyPaths"}:
             for entry in value.split():
                 src = entry.split(":")[0]
-                resolved = boundary.resolver.resolve(src)
-                if resolved is None:
+                if is_dynamic_value(src):
                     findings.append(Finding("dynamic_route", "unresolved_value", boundary.path,
                                             line_no, stripped))
-                elif is_host_path(resolved):
+                elif is_host_path(src):
                     for pattern, detail in HOST_PATHS:
-                        if pattern.search(resolved) and detail == "x11_socket_path":
+                        if pattern.search(src) and detail == "x11_socket_path":
                             findings.append(Finding("host_display_projection", detail,
                                                     boundary.path, line_no, stripped,
                                                     excusable={"product_session_capability"}))
@@ -1396,9 +1428,11 @@ def scan_yaml_generic(tree, boundary, findings):
         items = [i for i in value if isinstance(i, YNode)]
         if key_name == "devices":
             for item in items:
-                val = resolver.resolve(str(item.value)) if item.value is not None else None
+                val = str(item.value) if item.value is not None else None
                 text = boundary.line_text(item.line)
                 if val is None:
+                    continue
+                if is_dynamic_value(val):
                     findings.append(Finding("dynamic_route", "unresolved_value", boundary.path,
                                             item.line, text))
                 elif DEV_UINPUT.match(val) or DEV_INPUT.match(val):

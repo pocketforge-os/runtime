@@ -2,9 +2,13 @@
 
 Status: normative. This document is the canonical host-route specification
 referenced by `tests/fixtures/host-route-policy-v1.json` (`policy_id
-host-route-policy-v1`, `schema_version 1`). Ports in other repositories vendor
-the policy JSON, the case JSONL and the runner host map from this repository
-and pin them with a `.SOURCE` file; they must not restate or fork the rules.
+host-route-policy-v1`, `schema_version 2` — bumped for §2.1, the
+dynamic-container-value and image-operand rule from the pf-hwprobe#23
+adjudication; the case JSONL object schema is unchanged, and the filenames
+stay `*-v1*` because ports pin paths and sha256s). Ports in other repositories
+vendor the policy JSON, the case JSONL and the runner host map from this
+repository and pin them with a `.SOURCE` file; they must not restate or fork
+the rules.
 
 Origin: incident tsp-ihne1.56 (a CI harness typed into the owner's live laptop
 through host uinput fake devices — `/dev/uinput` is host-global and a container
@@ -44,7 +48,7 @@ Every finding carries exactly one rule id. The seven rule families are:
 | `host_uinput_permission` | loading or permissioning the host uinput route: `modprobe`/`insmod uinput`, `chmod`/`chgrp`/`chown`/`setfacl`/`mknod`/`install` on `/dev/uinput` or `/dev/input`, `sg input`/`newgrp input`, systemd `DeviceAllow=`, `modules-load.d` entries loading `uinput` |
 | `host_display_projection` | inheriting `${DISPLAY}`/`${WAYLAND_DISPLAY}`/`${XAUTHORITY}`, exporting a display without same-boundary private creation, bare host display paths, `xdotool`/`xhost`/`xwd`, source-level `set_var("DISPLAY"|"WAYLAND_DISPLAY"|"XAUTHORITY")` / `os.environ[...] =` / `setenv(...)` |
 | `host_clipboard_write` | `wl-copy`/`xclip`/`xsel`, clipboard crates (`arboard`, `copypasta`, `x11-clipboard`, `wl-clipboard-rs`, `gtk::Clipboard`), `copy_text()`/`copy_image()` APIs |
-| `dynamic_route` | fail-closed: any value that could not be resolved statically (container device/volume/env values, `runs-on` expressions, malformed shell/YAML/host map) and every contract violation (§6) |
+| `dynamic_route` | fail-closed: any value containing a shell expansion that cannot be proven statically (§2.1: container device/volume/mount/env values, systemd `BindPaths=`, compose `devices:`, dynamic `docker run`/`create` image operands outside the `--` end-of-options position, option-shaped words after `--`, `runs-on` expressions, malformed shell/YAML/host map) and every contract violation (§6) |
 
 Tokenisation: shell, YAML and systemd values are tokenised, not grepped.
 Backslash-newline continuations, quoting, `$( )`/backticks, heredoc bodies and
@@ -53,6 +57,31 @@ whitespace variants are resolved before matching, so `--device=/dev/uinput`,
 same finding. Files that cannot be tokenised (unbalanced quotes, tabs in YAML
 indentation, trailing flow junk) fail closed as `dynamic_route` with detail
 `malformed_file`.
+
+### 2.1 Dynamic values and container image operands
+
+A text scan cannot prove a shell variable's runtime value (pf-hwprobe#23
+round-4 adjudication): `printf -v`, `read`, `eval`, sourced scripts and
+`$GITHUB_ENV` writes all bypass assignment folding. This spec therefore has no
+assignment-folding or proven-variable exception for dynamic container values:
+
+- Any value containing an expansion (`$` or a backtick) is *dynamic*. Dynamic
+  container `--device`, `-v`/`--volume`, `--mount` source, `-e`/`--env` name,
+  `--device-cgroup-rule` value, systemd `BindPaths=`/`BindReadOnlyPaths=`
+  source and compose `devices:` entries are `dynamic_route` (detail
+  `unresolved_value`) regardless of same-file literal assignments.
+- A dynamic `docker run`/`docker create` image operand — quoted or unquoted —
+  is allowed only immediately after `--`, the end of options, where it can no
+  longer be reinterpreted as a flag. Anywhere else it is `dynamic_route`
+  (detail `dynamic_image_operand`).
+- A static literal image needs no delimiter.
+- `--` followed by an option-shaped word is still red (`dynamic_route`, detail
+  `option_after_end_of_options`).
+
+Assignment folding survives only where it can never excuse anything: the typed
+`private_compositor` creation-evidence exception (§3.1), and folding that
+*indicts* a non-container `--device` argument whose recorded value is a
+literal `/dev/uinput` or `/dev/input/*` path.
 
 ## 3. Typed exceptions
 
@@ -184,12 +213,15 @@ loader).
    seeded violation, clean tree) — original behaviour, unchanged;
 2. every case in `tests/fixtures/host-route-cases-v1.jsonl`: seeded reds for
    all seven rule families (including continuation, quoting and whitespace
-   variants), positive controls (private xvfb-run, `Xvfb :99` + literal
-   `DISPLAY=:99`, headless weston on a literal and on a generated socket,
-   broker FIFO/socketpair, `guest_internal`, docs-only text,
+   variants, and a dynamic image operand per mutation channel — `printf -v`,
+   `read`, `eval`, a sourced script, `$GITHUB_ENV`, unquoted — plus `--`
+   followed by an option-shaped word), positive controls (private xvfb-run,
+   `Xvfb :99` + literal `DISPLAY=:99`, headless weston on a literal and on a
+   generated socket, broker FIFO/socketpair, `guest_internal`, docs-only text,
    `product_session_capability`, clipboard adapter, clean workflow, private
-   display inside a workflow run block, `.SOURCE`-pinned map) and mutants
-   (removing the creation line from a private-compositor green turns it red);
+   display inside a workflow run block, `.SOURCE`-pinned map, a `--`-delimited
+   dynamic image operand, a static literal image) and mutants (removing the
+   creation line from a private-compositor green turns it red);
 3. the full tree check.
 
 A case is `ok` when a red case produces a failure matching its declared rule
