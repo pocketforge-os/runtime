@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "policy_id": "host-route-policy-v1",
   "normative_doc": "docs/host-route-policy.md",
   "origin": {
@@ -34,7 +34,7 @@
     },
     {
       "id": "dynamic_route",
-      "summary": "Fail closed: a value that could not be resolved statically (container device/volume/env values, runs-on expressions, malformed shell/YAML/host-map, contract violations such as stale or duplicate inventory rows)."
+      "summary": "Fail closed: any value containing a shell expansion that cannot be proven statically, with no assignment-folding or proven-variable exception (container device/volume/mount/env/cgroup values, systemd BindPaths, compose devices, dynamic docker run/create image operands outside the -- position, option-shaped words after --, runs-on expressions, malformed shell/YAML/host-map, contract violations such as stale or duplicate inventory rows)."
     }
   ],
   "inventory": {
@@ -92,6 +92,16 @@
       "gate_marker": "host_clipboard_disabled",
       "requires": ["gate marker present in the occurrence file"]
     }
+  },
+  "dynamic_image_operand": {
+    "adjudication": "pf-hwprobe#23 round 4: a text scan cannot prove a shell variable's runtime value.",
+    "no_assignment_folding": true,
+    "delimiter": "--",
+    "mutation_channels": ["printf -v", "read", "eval", "sourced scripts", "$GITHUB_ENV writes"],
+    "option_after_delimiter": "red",
+    "option_parsing": "Known docker/podman global and run/create option arities are parsed, so split values are consumed and the image operand is found reliably. An unknown option taints the command: the -- delimiter is not trusted, no positional operand is trusted as the image, and any dynamic operand in the tainted run/create command is dynamic_route (detail=dynamic_image_operand). Inline --opt=value forms for unknown options keep the command scannable. In the run context -t/-i/-d (and clusters such as -it) are booleans; --pull is string-valued for run and create and consumes a split or inline value (#147 review round 2). An unknown global option taints and its following non-subcommand word is treated as its possible split value, so a later run/create is still reached. The taint fail-closed applies inside run/create only: a non-run/create subcommand after an unknown global option carries no image operand and reports nothing.",
+    "static_literal_images_need_no_delimiter": true,
+    "summary": "A dynamic docker run/create image operand (any quoted or unquoted expansion) is allowed only immediately after --, the end of options; otherwise it is dynamic_route (detail=dynamic_image_operand). A -- followed by an option-shaped word is dynamic_route (detail=option_after_end_of_options). Static literal images need no delimiter. The same no-folding rule applies to container device/volume/mount/env/cgroup values, systemd BindPaths and compose devices (detail=unresolved_value)."
   },
   "scan_scope": {
     "kinds": {
