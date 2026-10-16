@@ -1,0 +1,91 @@
+{
+  "schema_version": 1,
+  "map_id": "input-runner-host-map-v1-test-fixture",
+  "generated_from": {
+    "repo": "pocketforge-automation",
+    "commit": "test-fixture"
+  },
+  "note": "Small canonical test fixture of the runner-host map schema (design section 4). The authoritative map is generated in pocketforge-automation from committed provisioning and vendored into port repos with a .SOURCE pin.",
+  "entries": [
+    {
+      "runner": "github-hosted-ubuntu",
+      "label_patterns": ["ubuntu-*"],
+      "host_class": "github-hosted",
+      "ephemeral": true,
+      "seat_policy": "unknown",
+      "provisioning_sources": ["config/ci-runner-label-sets.txt"],
+      "may_launch_pfvd_guest": false
+    },
+    {
+      "runner": "pf-builder-vm",
+      "name_pattern": "mm-eph-build*",
+      "labels": ["self-hosted", "pf-builder-vm"],
+      "host_class": "vm",
+      "ephemeral": true,
+      "seat_policy": "forbidden",
+      "provisioning_sources": ["scripts/provision-build-host.sh", "config/runner-pool.json"],
+      "may_launch_pfvd_guest": true
+    },
+    {
+      "runner": "pf-public-ci",
+      "name_pattern": "mm-eph-public*",
+      "labels": ["self-hosted", "pf-public-ci"],
+      "host_class": "vm",
+      "ephemeral": true,
+      "seat_policy": "forbidden",
+      "provisioning_sources": ["config/runner-pool.json"],
+      "may_launch_pfvd_guest": false
+    },
+    {
+      "runner": "pf-pool-ci",
+      "name_pattern": "mm-eph-ci*",
+      "labels": ["self-hosted", "pf-pool-ci"],
+      "host_class": "vm",
+      "ephemeral": true,
+      "seat_policy": "forbidden",
+      "provisioning_sources": ["config/runner-pool.json"],
+      "may_launch_pfvd_guest": false
+    },
+    {
+      "runner": "pf-pool-trusted",
+      "name_pattern": "mm-eph-trusted*",
+      "labels": ["self-hosted", "pf-pool-trusted"],
+      "host_class": "vm",
+      "ephemeral": true,
+      "seat_policy": "forbidden",
+      "provisioning_sources": ["config/runner-pool.json"],
+      "may_launch_pfvd_guest": false
+    },
+    {
+      "runner": "pf-review-vm",
+      "labels": ["self-hosted", "pf-ci", "pf-pr-review", "pf-ci-container"],
+      "physical_host": "pf-review-vm (Dell KVM guest)",
+      "host_class": "vm",
+      "ephemeral": false,
+      "seat_policy": "forbidden",
+      "provisioning_sources": ["config/runner-pool.json", "scripts/lib/runner-target.sh"],
+      "may_launch_pfvd_guest": false
+    },
+    {
+      "runner": "mm-review-vm-pool",
+      "name_pattern": "mm-review-vm-*",
+      "labels": ["self-hosted", "pf-ci", "pf-ci-container"],
+      "physical_host": "Dell KVM guests",
+      "host_class": "vm",
+      "ephemeral": false,
+      "seat_policy": "forbidden",
+      "provisioning_sources": ["config/runner-pool.json", "scripts/lib/runner-target.sh"],
+      "may_launch_pfvd_guest": false
+    },
+    {
+      "runner": "dell-trimui-build-lab",
+      "labels": ["self-hosted", "docker", "device-lab", "trimui", "build-lab"],
+      "physical_host": "Dell trimui-build-lab",
+      "host_class": "bare-metal",
+      "ephemeral": false,
+      "seat_policy": "present",
+      "provisioning_sources": ["config/dell-uinput-exposure.json", "scripts/lib/pf-ci-runner-fleet.sh"],
+      "may_launch_pfvd_guest": false
+    }
+  ]
+}
