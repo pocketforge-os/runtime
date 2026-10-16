@@ -111,7 +111,8 @@ class MalformedFile(Exception):
 class Finding:
     """A candidate host-route occurrence before exception resolution."""
 
-    def __init__(self, rule, detail, path, line, text, excusable=frozenset()):
+    def __init__(self, rule, detail, path, line, text, excusable=frozenset(),
+                 route_source=None, route_destination=None):
         self.rule = rule
         self.detail = detail
         self.path = path
@@ -121,6 +122,8 @@ class Finding:
         self.excused = False
         self.kind = "source"
         self.job = None
+        self.route_source = route_source
+        self.route_destination = route_destination
 
     @property
     def key(self):
@@ -412,6 +415,10 @@ def host_route_file_kind(rel, head):
 
 
 STRING_LITERAL = re.compile(r"\"([^\"\\\n]*(?:\\.[^\"\\\n]*)*)\"|'([^'\\\n]*(?:\\.[^'\\\n]*)*)'")
+SOURCE_ROUTE_PAIR = re.compile(
+    r"\(\s*[\"'](?P<source>/[^\"'\r\n]*)[\"']\s*,\s*"
+    r"[\"'](?P<destination>/[^\"'\r\n]*)[\"']\s*\)"
+)
 
 
 def string_literals(line):
@@ -761,6 +768,7 @@ CANONICAL_CLASSES = {
 DEFAULT_GUEST_ENTRY_POINTS = ["*/run-guest.sh", "run-guest.sh", "*/guest/*"]
 DEFAULT_CLIPBOARD_GATE = "host_clipboard_disabled"
 DEFAULT_PRODUCER_X11_SOURCE = "/run/pocketforge/x11/.X11-unix/X0"
+DEFAULT_PRODUCER_X11_DESTINATION = "/tmp/.X11-unix/X0"
 
 
 class Policy:
@@ -784,6 +792,8 @@ class Policy:
             "gate_marker", DEFAULT_CLIPBOARD_GATE)
         self.producer_x11_source = typed.get("product_session_capability", {}).get(
             "producer_x11_source", DEFAULT_PRODUCER_X11_SOURCE)
+        self.producer_x11_destination = typed.get("product_session_capability", {}).get(
+            "producer_x11_destination", DEFAULT_PRODUCER_X11_DESTINATION)
 
 
 def load_policy(root, failures):
@@ -1219,12 +1229,16 @@ def match_permission_command(prog, arg_texts, boundary, findings, line, text):
             return
 
 
-def match_bare_host_path(token_text, boundary, findings, line, text):
+def match_bare_host_path(token_text, boundary, findings, line, text,
+                         route_source=None, route_destination=None):
     for pattern, detail in HOST_PATHS:
         if pattern.search(token_text):
             excusable = {"product_session_capability"} if detail == "x11_socket_path" else frozenset()
-            findings.append(Finding("host_display_projection", detail, boundary.path, line, text,
-                                    excusable=excusable))
+            findings.append(Finding(
+                "host_display_projection", detail, boundary.path, line, text,
+                excusable=excusable, route_source=route_source,
+                route_destination=route_destination,
+            ))
             return
 
 
@@ -1347,7 +1361,8 @@ def scan_embedded_body(body, base_line, delim, boundary, findings, text_of):
         scan_source_text(body, base_line, boundary, findings)
 
 
-def match_loose_tokens(toks, boundary, findings, line, text):
+def match_loose_tokens(toks, boundary, findings, line, text,
+                       route_source=None, route_destination=None):
     """Non-shell contexts: flag obvious host-route tokens on a logical line."""
     match_container_tokens(toks, boundary, findings, line, text)
     words = _command_words(toks)
@@ -1389,7 +1404,10 @@ def match_loose_tokens(toks, boundary, findings, line, text):
             check_device_value(words[pos + 1], boundary, findings, line, text,
                                container_ctx=False)
         else:
-            match_bare_host_path(word, boundary, findings, line, text)
+            match_bare_host_path(
+                word, boundary, findings, line, text,
+                route_source=route_source, route_destination=route_destination,
+            )
 
 
 def scan_source_text(text, base_line, boundary, findings, shell_commands=False):
@@ -1398,10 +1416,26 @@ def scan_source_text(text, base_line, boundary, findings, shell_commands=False):
         stripped = logical.strip()
         if not stripped:
             continue
-        for literal in string_literals(stripped):
+        literal_matches = list(STRING_LITERAL.finditer(stripped))
+        route_by_destination_span = {}
+        for route in SOURCE_ROUTE_PAIR.finditer(stripped):
+            destination_pos = route.start("destination")
+            for literal_match in literal_matches:
+                if literal_match.start() < destination_pos < literal_match.end():
+                    route_by_destination_span[literal_match.span()] = (
+                        route.group("source"), route.group("destination")
+                    )
+                    break
+        for literal_match in literal_matches:
+            literal = (literal_match.group(1) if literal_match.group(1) is not None
+                       else literal_match.group(2))
+            route_endpoints = route_by_destination_span.get(literal_match.span(), (None, None))
             for tok in lex_tolerant(literal, line_no):
-                match_loose_tokens([tok], boundary, findings, line_no, stripped)
-        toks = lex_tolerant(stripped, line_no)
+                match_loose_tokens(
+                    [tok], boundary, findings, line_no, stripped,
+                    route_source=route_endpoints[0], route_destination=route_endpoints[1],
+                )
+        toks = lex_tolerant(STRING_LITERAL.sub(" ", stripped), line_no)
         match_loose_tokens(toks, boundary, findings, line_no, stripped)
         if CLIPBOARD_API.search(stripped):
             findings.append(Finding("host_clipboard_write", "clipboard_api", boundary.path,
@@ -1900,7 +1934,8 @@ def apply_product_session_capability(findings, policy):
             continue
         if finding.kind != "source":
             continue
-        if policy.producer_x11_source in finding.text:
+        if finding.route_source == policy.producer_x11_source \
+                and finding.route_destination == policy.producer_x11_destination:
             finding.excused = True
 
 

@@ -85,6 +85,7 @@
     },
     "product_session_capability": {
       "producer_x11_source": "/run/pocketforge/x11/.X11-unix/X0",
+      "producer_x11_destination": "/tmp/.X11-unix/X0",
       "requires": ["individual source occurrence that literally carries both the producer X11 source and destination paths"],
       "summary": "Excuses the bare /tmp/.X11-unix destination spelling only on the same product-source occurrence as the producer-owned capability source; never file-wide, workflows, shell scripts or systemd units."
     },
