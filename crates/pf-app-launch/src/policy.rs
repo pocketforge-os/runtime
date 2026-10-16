@@ -11,9 +11,10 @@ use std::path::{Component, Path, PathBuf};
 
 pub const POLICY_SCHEMA_VERSION: u32 = 1;
 const DNS_PORT: u16 = 53;
-pub const X11_SOCKET: &str = "/run/pocketforge/session/capabilities/x11/X0";
-pub const X11_SOCKET_DESTINATION: &str = "/tmp/.X11-unix/X0";
-pub const X11_ENVIRONMENT: &str = "/run/pocketforge/session/capabilities/x11/environment";
+const X11_BIND: (&str, &str) = ("/run/pocketforge/x11/.X11-unix/X0", "/tmp/.X11-unix/X0");
+pub const X11_SOCKET: &str = X11_BIND.0;
+pub const X11_SOCKET_DESTINATION: &str = X11_BIND.1;
+pub const X11_ENVIRONMENT: &str = "/run/pocketforge/x11/policy/environment";
 
 #[derive(Clone, Copy)]
 enum DisplayResourceGrant {
@@ -388,11 +389,11 @@ pub fn derive_policy(
                 }
             }
         }
-        let socket = PathBuf::from(X11_SOCKET);
+        let socket = PathBuf::from(X11_BIND.0);
         landlock_only_socket_paths.insert(socket.clone());
         bind_read_write_mappings.push(BindMapping {
             source: socket,
-            destination: PathBuf::from(X11_SOCKET_DESTINATION),
+            destination: PathBuf::from(X11_BIND.1),
         });
         environment.push(EnvironmentProjection {
             source: PathBuf::from(X11_ENVIRONMENT),

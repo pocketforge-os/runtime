@@ -1,6 +1,6 @@
 use pf_app_launch::policy::{
     derive_policy, render_systemd_dropin, AppClass, FsAccess, MediatedEndpoint, NetAccess,
-    PolicyInputs, PolicyResourceInventory,
+    PolicyInputs, PolicyResourceInventory, X11_SOCKET_DESTINATION,
 };
 use pf_app_manifest::{parse_manifest, parse_platform_contract, ResolvedApp};
 use std::collections::BTreeMap;
@@ -94,15 +94,11 @@ fn inputs(root: &Path) -> PolicyInputs {
         ),
         (
             "x11-environment".into(),
-            vec![PathBuf::from(
-                "/run/pocketforge/session/capabilities/x11/environment",
-            )],
+            vec![PathBuf::from("/run/pocketforge/x11/policy/environment")],
         ),
         (
             "x11-socket".into(),
-            vec![PathBuf::from(
-                "/run/pocketforge/session/capabilities/x11/X0",
-            )],
+            vec![PathBuf::from("/run/pocketforge/x11/.X11-unix/X0")],
         ),
     ]);
     PolicyInputs {
@@ -118,8 +114,8 @@ fn inputs(root: &Path) -> PolicyInputs {
 #[test]
 fn x11_projection_is_exact_manifest_scoped_and_fail_closed() {
     let root = PathBuf::from("/fixture");
-    let socket = Path::new("/run/pocketforge/session/capabilities/x11/X0");
-    let mapping = "BindPaths=/run/pocketforge/session/capabilities/x11/X0:/tmp/.X11-unix/X0";
+    let socket = Path::new("/run/pocketforge/x11/.X11-unix/X0");
+    let mapping = "BindPaths=/run/pocketforge/x11/.X11-unix/X0:/tmp/.X11-unix/X0";
 
     let x11 = derive_policy(&resolved(&root, &["x11"], false, true), &inputs(&root)).unwrap();
     let rendered = render_systemd_dropin(&x11);
@@ -133,11 +129,11 @@ fn x11_projection_is_exact_manifest_scoped_and_fail_closed() {
 
     let plain = derive_policy(&resolved(&root, &[], false, true), &inputs(&root)).unwrap();
     let plain_rendered = render_systemd_dropin(&plain);
-    assert!(!plain_rendered.contains("capabilities/x11"));
-    assert!(!plain_rendered.contains("/tmp/.X11-unix/X0"));
+    assert!(!plain_rendered.contains("/run/pocketforge/x11"));
+    assert!(!plain_rendered.contains(X11_SOCKET_DESTINATION));
     assert!(!serde_json::to_string(&plain)
         .unwrap()
-        .contains("capabilities/x11"));
+        .contains("/run/pocketforge/x11"));
     assert!(!plain
         .landlock
         .filesystem
@@ -156,11 +152,11 @@ fn x11_projection_is_exact_manifest_scoped_and_fail_closed() {
     }
 
     for (class, path) in [
+        ("x11-socket", "/run/pocketforge/x11/.X11-unix/@X0"),
         (
-            "x11-socket",
-            "/run/pocketforge/session/capabilities/x11/@X0",
+            "x11-environment",
+            "/run/pocketforge/x11/foreign-environment",
         ),
-        ("x11-environment", "/run/pocketforge/session/environment"),
     ] {
         let mut malformed = inputs(&root);
         malformed

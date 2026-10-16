@@ -136,14 +136,14 @@ file by name.
 
 ### 3.3 product_session_capability
 
-The product routes X11 through the broker-owned capability source
-`/run/pocketforge/session/capabilities/x11/X0` (see
-`crates/pf-app-launch/src/policy.rs`). A *source-kind* file that literally
-carries that broker source path may also carry the `/tmp/.X11-unix/X0`
-destination spelling; the scanner excuses `host_display_projection` findings
-with detail `x11_socket_path` only in such files. This exception never applies
-to workflows, shell scripts or systemd units, and never excuses a bind whose
-source is not broker-owned.
+The product routes X11 through the producer-owned real capability source
+`/run/pocketforge/x11/.X11-unix/X0` (see
+`crates/pf-app-launch/src/policy.rs`). A *source-kind* occurrence that literally
+carries that producer source path may also carry the `/tmp/.X11-unix/X0`
+destination spelling; the scanner excuses that occurrence's
+`host_display_projection` finding with detail `x11_socket_path`. The exception
+is never file-wide, never applies to workflows, shell scripts or systemd units,
+and never excuses a bind whose source is not producer-owned.
 
 ### 3.4 product_clipboard_adapter
 
