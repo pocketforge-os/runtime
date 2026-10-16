@@ -824,6 +824,38 @@ SOURCE_SETENV = re.compile(
 SKIP_VALUE_FLAGS = {"--env-file", "--label", "-l", "--name", "--user", "-u", "--workdir", "-w",
                     "--entrypoint", "--network", "--pid", "--ipc", "--cpus", "--memory", "-m",
                     "--shm-size", "--tmpfs", "--stop-signal", "--platform", "--pull", "-t", "--tag"}
+# Docker/podman global options (before the subcommand) and run/create option
+# arities. A text scan cannot prove the arity of an option it does not know, so
+# known arities are parsed and unknown options taint the rest of the command:
+# the parser keeps scanning and fails closed on any dynamic operand (#147
+# review: an unknown split-value option let the value be mistaken for the
+# image, hiding the real image operand).
+CONTAINER_GLOBAL_VALUE_FLAGS = {"--config", "--context", "-c", "--host", "-H", "--log-level",
+                                "--tlscacert", "--tlscert", "--tlskey", "--tlsversion"}
+CONTAINER_GLOBAL_BOOL_FLAGS = {"-D", "--debug", "--tls", "--tlsverify"}
+# run/create booleans; note -t is --tty here (not --tag). --pull is NOT a
+# boolean: docker and podman both declare `--pull string` for run and create
+# and accept the value as a split token, so it consumes split or inline values
+# via RUN_VALUE_FLAGS (#147 review round 2: `docker run --pull always "$IMAGE"`
+# mistook `always` for the image).
+RUN_BOOL_FLAGS = {"--rm", "--init", "-d", "--detach", "-i", "--interactive", "-t", "--tty",
+                  "--privileged", "--read-only", "--no-healthcheck", "-P", "--publish-all",
+                  "-q", "--quiet", "--sig-proxy", "--oom-kill-disable"}
+RUN_SHORT_BOOL_CHARS = set("itd")
+RUN_VALUE_FLAGS = (SKIP_VALUE_FLAGS | {
+    "--hostname", "-h", "--add-host", "--runtime", "--cap-add", "--cap-drop", "--dns",
+    "--dns-option", "--dns-search", "--domainname", "--expose", "--publish", "-p",
+    "--restart", "--sysctl", "--ulimit", "--security-opt", "--log-driver", "--log-opt",
+    "--gpus", "--group-add", "--link", "--link-local-ip", "--net", "--net-alias",
+    "--mac-address", "--ip", "--ip6", "--cpuset-cpus", "--cpuset-mems", "--cpu-shares",
+    "--cpu-period", "--cpu-quota", "--cpu-rt-period", "--cpu-rt-runtime",
+    "--cgroup-parent", "--cidfile", "--label-file", "--memory-reservation",
+    "--memory-swap", "--memory-swappiness", "--blkio-weight", "--detach-keys",
+    "--health-cmd", "--health-interval", "--health-retries", "--health-start-period",
+    "--health-timeout", "--isolation", "--kernel-memory", "--oom-score-adj",
+    "--pids-limit", "--stop-timeout", "--storage-opt", "--userns", "--uts",
+    "--volume-driver", "--volumes-from", "--device-read-bps", "--device-read-iops",
+    "--device-write-bps", "--device-write-iops", "--annotation"}) - {"-t", "--tag"}
 
 
 class Resolver:
@@ -912,15 +944,34 @@ def is_host_path(path):
     return any(pattern.search(path) for pattern, _ in HOST_PATHS)
 
 
+def is_dynamic_value(val):
+    """True when val contains a shell expansion ($ or backtick).
+
+    pf-hwprobe#23 round-4 adjudication: a text scan cannot prove a shell
+    variable's runtime value. printf -v, read, eval, sourced scripts and
+    $GITHUB_ENV writes all bypass assignment folding, so a dynamic value is
+    never excused by resolving it against same-file assignments.
+    """
+    return val is not None and ("$" in val or "`" in val)
+
+
 def check_device_value(val, boundary, findings, line, text, container_ctx=True):
     if val is None:
         return
-    resolved = boundary.resolver.resolve(val)
-    if resolved is None:
+    if is_dynamic_value(val):
+        # No assignment folding: a dynamic value in a container context is
+        # always dynamic_route. Outside a container context folding is used
+        # to indict only (never to excuse).
         if container_ctx:
             findings.append(Finding("dynamic_route", "unresolved_value", boundary.path, line, text))
+        else:
+            resolved = boundary.resolver.resolve(val)
+            if resolved is not None \
+                    and (DEV_UINPUT.match(resolved) or DEV_INPUT.match(resolved)):
+                findings.append(Finding("host_uinput_device", "device_flag", boundary.path,
+                                        line, text))
         return
-    if DEV_UINPUT.match(resolved) or DEV_INPUT.match(resolved):
+    if DEV_UINPUT.match(val) or DEV_INPUT.match(val):
         findings.append(Finding("host_uinput_device", "device_flag", boundary.path, line, text))
 
 
@@ -931,11 +982,10 @@ def check_volume_value(val, boundary, findings, line, text):
         findings.append(Finding("host_input_bind", "bind_source", boundary.path, line, text))
         return
     src = val.split(":")[0]
-    resolved = boundary.resolver.resolve(src)
-    if resolved is None:
+    if is_dynamic_value(src):
         findings.append(Finding("dynamic_route", "unresolved_value", boundary.path, line, text))
         return
-    if is_host_path(resolved):
+    if is_host_path(src):
         findings.append(Finding("host_input_bind", "bind_source", boundary.path, line, text))
 
 
@@ -953,11 +1003,10 @@ def check_mount_value(val, boundary, findings, line, text):
     src = fields.get("src") or fields.get("source")
     if src is None:
         return
-    resolved = boundary.resolver.resolve(src)
-    if resolved is None:
+    if is_dynamic_value(src):
         findings.append(Finding("dynamic_route", "unresolved_value", boundary.path, line, text))
         return
-    if is_host_path(resolved):
+    if is_host_path(src):
         findings.append(Finding("host_input_bind", "bind_source", boundary.path, line, text))
 
 
@@ -996,26 +1045,23 @@ def check_env_value(val, boundary, findings, line, text):
     if val is None:
         return
     if "=" not in val:
-        name = boundary.resolver.resolve(val)
-        if name is None:
+        if is_dynamic_value(val):
             findings.append(Finding("dynamic_route", "unresolved_env_name", boundary.path, line, text))
-        elif name in DISPLAY_VARS:
+        elif val in DISPLAY_VARS:
             findings.append(Finding("host_display_projection", "display_inherited", boundary.path,
                                     line, text))
         return
     name, value = val.split("=", 1)
-    resolved_name = boundary.resolver.resolve(name)
-    if resolved_name is None:
+    if is_dynamic_value(name):
         findings.append(Finding("dynamic_route", "unresolved_env_name", boundary.path, line, text))
         return
-    if resolved_name not in DISPLAY_VARS:
+    if name not in DISPLAY_VARS:
         return
-    check_display_assignment(resolved_name, value, boundary, findings, line, text)
+    check_display_assignment(name, value, boundary, findings, line, text)
 
 
 def match_container_tokens(toks, boundary, findings, start_line, text):
     """Match docker/podman-style flag values inside a token stream."""
-    resolver = boundary.resolver
     idx = 0
     n = len(toks)
     while idx < n:
@@ -1024,17 +1070,81 @@ def match_container_tokens(toks, boundary, findings, start_line, text):
             idx += 1
             continue
         idx += 1
-        if idx < n and toks[idx].text in {"run", "create"}:
-            idx += 1
+        run_create = False
+        tainted = False
+        # Global options may precede the subcommand (`docker --context ctx run
+        # ...`). Known arities are consumed; an unknown global option makes the
+        # command unparsable, so a following non-subcommand word is skipped as
+        # its possible split value and the scan keeps looking for run/create
+        # (#147 review round 2: an unknown split-value global option such as
+        # `podman --root /tmp run "$IMAGE"` must still reach the subcommand).
+        while idx < n:
+            t = toks[idx].text
+            if t in {"run", "create"}:
+                run_create = True
+                idx += 1
+                break
+            if t.startswith("-") and t != "--":
+                flag = t.split("=", 1)[0]
+                if "=" in t:
+                    idx += 1
+                elif flag in CONTAINER_GLOBAL_VALUE_FLAGS:
+                    idx += 2
+                elif flag in CONTAINER_GLOBAL_BOOL_FLAGS:
+                    idx += 1
+                else:
+                    tainted = True
+                    idx += 1
+                    if (idx < n and not toks[idx].text.startswith("-")
+                            and toks[idx].text not in {"run", "create"}):
+                        idx += 1
+                continue
+            break
+        if (tainted and run_create
+                and any(is_dynamic_value(tok.text) for tok in toks[idx:])):
+            # Fail closed inside run/create only: a non-run/create subcommand
+            # after an unknown global option has no image operand to prove
+            # (`podman --root /tmp inspect "$CONTAINER"` is not a route; #147
+            # review round 2 false positive).
+            findings.append(Finding("dynamic_route", "dynamic_image_operand",
+                                    boundary.path, start_line, text))
         seen_image = False
+        after_delim = False
         while idx < n:
             tok = toks[idx]
             t = tok.text
+            if t == "--" and not tainted:
+                # End of options: the next positional is the image operand and
+                # can no longer be reinterpreted as a flag (pf-hwprobe#23).
+                # After an unknown-arity option the delimiter itself may be an
+                # option value, so it is not trusted (#147 review).
+                after_delim = True
+                idx += 1
+                continue
             if not t.startswith("-"):
-                # First positional token is the image; docker flags cannot follow it.
+                # A dynamic image operand is allowed only immediately after a
+                # trusted `--`; assignment folding never proves its runtime
+                # value. With a tainted parse no positional can be proven to be
+                # the image, so scanning continues to the end of the command.
+                if run_create and after_delim is False and is_dynamic_value(t):
+                    findings.append(Finding("dynamic_route", "dynamic_image_operand",
+                                            boundary.path, start_line, text))
+                if after_delim:
+                    seen_image = True
+                    idx += 1
+                    break
+                if run_create and tainted:
+                    idx += 1
+                    continue
                 seen_image = True
                 idx += 1
                 break
+            if after_delim:
+                # `--` followed by an option-shaped word is still red.
+                findings.append(Finding("dynamic_route", "option_after_end_of_options",
+                                        boundary.path, start_line, text))
+                idx += 1
+                continue
             flag = t.split("=", 1)[0]
             inline = t.split("=", 1)[1] if "=" in t else None
 
@@ -1062,13 +1172,26 @@ def match_container_tokens(toks, boundary, findings, start_line, text):
                 val = value(max_tokens=3)
                 if val is None:
                     continue
-                resolved = resolver.resolve(val)
-                if resolved is None:
+                if is_dynamic_value(val):
                     findings.append(Finding("dynamic_route", "unresolved_value", boundary.path,
                                             start_line, text))
-                elif MAJOR13.match(resolved.strip()):
+                elif MAJOR13.match(val.strip()):
                     findings.append(Finding("input_major_wildcard", "cgroup_major13", boundary.path,
                                             start_line, text))
+            elif run_create and flag in RUN_BOOL_FLAGS:
+                idx += 1
+            elif run_create and (flag in RUN_VALUE_FLAGS or inline is not None):
+                value()
+            elif (run_create and len(flag) > 2 and flag[0] == "-" and flag[1] != "-"
+                    and all(ch in RUN_SHORT_BOOL_CHARS for ch in flag[1:])):
+                # Boolean short-flag cluster such as -it or -dit.
+                idx += 1
+            elif run_create:
+                # Unknown option: a text scan cannot prove its arity, so the
+                # rest of the command is parsed untrusted and any dynamic
+                # operand fails closed (#147 review).
+                tainted = True
+                idx += 1
             elif flag in SKIP_VALUE_FLAGS:
                 value()
             else:
@@ -1325,13 +1448,12 @@ def scan_systemd(text, base_line, boundary, findings):
         elif key in {"BindPaths", "BindReadOnlyPaths"}:
             for entry in value.split():
                 src = entry.split(":")[0]
-                resolved = boundary.resolver.resolve(src)
-                if resolved is None:
+                if is_dynamic_value(src):
                     findings.append(Finding("dynamic_route", "unresolved_value", boundary.path,
                                             line_no, stripped))
-                elif is_host_path(resolved):
+                elif is_host_path(src):
                     for pattern, detail in HOST_PATHS:
-                        if pattern.search(resolved) and detail == "x11_socket_path":
+                        if pattern.search(src) and detail == "x11_socket_path":
                             findings.append(Finding("host_display_projection", detail,
                                                     boundary.path, line_no, stripped,
                                                     excusable={"product_session_capability"}))
@@ -1396,9 +1518,11 @@ def scan_yaml_generic(tree, boundary, findings):
         items = [i for i in value if isinstance(i, YNode)]
         if key_name == "devices":
             for item in items:
-                val = resolver.resolve(str(item.value)) if item.value is not None else None
+                val = str(item.value) if item.value is not None else None
                 text = boundary.line_text(item.line)
                 if val is None:
+                    continue
+                if is_dynamic_value(val):
                     findings.append(Finding("dynamic_route", "unresolved_value", boundary.path,
                                             item.line, text))
                 elif DEV_UINPUT.match(val) or DEV_INPUT.match(val):
