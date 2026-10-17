@@ -1,6 +1,6 @@
 use pf_app_launch::landlock::{apply_landlock, EffectiveRuleset, LandlockKernel, SystemLandlock};
 use pf_app_launch::policy::{
-    derive_policy, AppClass, DowngradeMode, NetAccess, NetRule, PolicyInputs,
+    derive_policy, AppClass, DowngradeMode, FsAccess, FsRule, NetAccess, NetRule, PolicyInputs,
 };
 use pf_app_manifest::{parse_manifest, parse_platform_contract, ResolvedApp};
 use std::collections::BTreeMap;
@@ -155,6 +155,66 @@ fn full_profile_denies_cross_app_state_with_eacces() {
     }
     let error = fs::write(root.join("app/new"), b"must-not-land").unwrap_err();
     assert_eq!(error.raw_os_error(), Some(libc::EACCES));
+}
+
+#[test]
+fn fix7_regular_session_environment_rule_applies() {
+    const INNER: &str = "PF_LANDLOCK_FIX7_FILE_INNER";
+    if std::env::var_os(INNER).is_none() {
+        let root = scratch("fix7-regular-environment");
+        fs::create_dir_all(root.join("session")).unwrap();
+        fs::write(
+            root.join("session/environment"),
+            b"WAYLAND_DISPLAY=wayland-0\n",
+        )
+        .unwrap();
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "fix7_regular_session_environment_rule_applies",
+                "--nocapture",
+            ])
+            .env(INNER, &root)
+            .output()
+            .unwrap();
+        eprint!("{}", String::from_utf8_lossy(&output.stderr));
+        assert!(
+            output.status.success(),
+            "child stdout:\n{}\nchild stderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        fs::remove_file(root.join("session/environment")).unwrap();
+        fs::remove_dir(root.join("session")).unwrap();
+        fs::remove_dir(root).unwrap();
+        return;
+    }
+
+    let root = PathBuf::from(std::env::var_os(INNER).unwrap());
+    let session = root.join("session");
+    let environment = session.join("environment");
+    let mut policy = policy(&root, false);
+    policy.landlock.filesystem = vec![
+        FsRule {
+            path: session,
+            access: FsAccess::ReadOnly,
+        },
+        FsRule {
+            path: environment.clone(),
+            access: FsAccess::ReadOnly,
+        },
+    ];
+    policy.landlock.handles_network = false;
+    policy.landlock.network.clear();
+
+    let mut kernel = SystemLandlock;
+    let abi = kernel.abi().expect("query Landlock ABI");
+    assert!(abi >= 4, "runner Landlock ABI {abi} is below CI floor 4");
+    apply_landlock(&policy, &mut kernel).expect("apply fix7-shaped regular-file rule");
+    assert_eq!(
+        fs::read(environment).unwrap(),
+        b"WAYLAND_DISPLAY=wayland-0\n"
+    );
 }
 
 #[derive(Default)]
