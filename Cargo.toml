@@ -11,6 +11,7 @@ members = [
     "crates/pf-hw-exerciser",
     "crates/pf-prefs",
     "crates/pf-prefsd",
+    "crates/pf-powerd",
     "crates/pf-peer-identity",
     "crates/pf-prefs-port",
     "crates/pf-settings",

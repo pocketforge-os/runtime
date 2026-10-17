@@ -1,0 +1,21 @@
+[Unit]
+Description=PocketForge power action authority
+After=local-fs.target systemd-tmpfiles-setup.service
+
+[Service]
+Type=simple
+User=root
+Group=gamer
+UMask=0007
+RuntimeDirectory=pocketforge-power
+RuntimeDirectoryMode=0750
+ExecStart=/usr/bin/pf-powerd /run/pocketforge-power/power.sock
+Restart=on-failure
+RestartSec=1s
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target
