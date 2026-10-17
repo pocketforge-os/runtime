@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Repository inputs must be regular, bounded, and opened without symlinks."""
 
+import importlib.util
 import os
 import shutil
 import subprocess
@@ -8,6 +9,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -19,6 +21,14 @@ VENDORED = (
     "tests/fixtures/input-runner-host-map-v1.schema.json",
 )
 OVERSIZED_BYTES = 4 * 1024 * 1024 + 1
+
+
+def load_inventory_module():
+    spec = importlib.util.spec_from_file_location(
+        "uinput_inventory_input_safety", ROOT / "tests/uinput_inventory.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 class RepositoryInputSafetyTest(unittest.TestCase):
@@ -77,6 +87,30 @@ class RepositoryInputSafetyTest(unittest.TestCase):
             root = self.make_tree(tmp)
             os.mkfifo(root / "blocked.py")
             self.assert_refused(root, "repo_input_non_regular")
+
+    def test_same_size_in_place_rewrite_during_read_is_refused(self):
+        with tempfile.TemporaryDirectory(prefix="inventory-input-rewrite.") as tmp:
+            root = Path(tmp)
+            target = root / "mutable.py"
+            target.write_bytes(b"old contents\n")
+            inventory = load_inventory_module()
+            original_read = os.read
+            mutated = False
+
+            def rewrite_after_first_read(descriptor, size):
+                nonlocal mutated
+                data = original_read(descriptor, size)
+                if data and not mutated:
+                    mutated = True
+                    before = target.stat()
+                    target.write_bytes(b"new contents\n")
+                    os.utime(target, ns=(before.st_atime_ns, before.st_mtime_ns + 1_000_000_000))
+                return data
+
+            with mock.patch.object(inventory.os, "read", side_effect=rewrite_after_first_read):
+                with self.assertRaises(inventory.RepoInputError) as raised:
+                    inventory.read_repo_bytes(target, root=root)
+            self.assertEqual(raised.exception.reason, "repo_input_changed")
 
     def test_self_test_carries_all_input_controls(self):
         with tempfile.TemporaryDirectory(prefix="inventory-input-self-test.") as tmp:

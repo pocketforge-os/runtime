@@ -71,12 +71,19 @@ def repo_path_exists(path):
         return False
 
 
+def repo_input_identity(metadata):
+    """Return fields that must remain stable across a repository-file read."""
+    return (metadata.st_dev, metadata.st_ino, metadata.st_size,
+            metadata.st_mtime_ns, metadata.st_ctime_ns)
+
+
 def read_repo_bytes(path, root=None):
     """Read one bounded regular repository file without following symlinks.
 
     lstat rejects named symlinks and oversized/special files before open. The
-    O_NOFOLLOW open plus fstat identity check closes the check/open gap. Reads
-    remain bounded if a regular file grows after the pre-read size check.
+    O_NOFOLLOW open plus identity and mutation-time checks close the check/open
+    gap and reject in-place rewrites. Reads remain bounded if a regular file
+    grows after the pre-read size check.
     """
     root = (ROOT if root is None else root).resolve()
     try:
@@ -150,7 +157,7 @@ def read_repo_bytes(path, root=None):
             if not stat.S_ISREG(opened.st_mode):
                 raise RepoInputError("repo_input_non_regular", path, root,
                                      "opened input is not a regular file")
-            if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
+            if repo_input_identity(opened) != repo_input_identity(before):
                 raise RepoInputError("repo_input_changed", path, root,
                                      "input changed between lstat and open")
             if opened.st_size > MAX_REPO_INPUT_BYTES:
@@ -169,8 +176,7 @@ def read_repo_bytes(path, root=None):
                 raise RepoInputError("repo_input_oversized", path, root,
                                      "input grew beyond the limit while reading")
             after = os.fstat(descriptor)
-            if (after.st_dev, after.st_ino, after.st_size) != \
-                    (opened.st_dev, opened.st_ino, opened.st_size):
+            if repo_input_identity(after) != repo_input_identity(opened):
                 raise RepoInputError("repo_input_changed", path, root,
                                      "input changed while reading")
             return data
