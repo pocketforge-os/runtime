@@ -32,6 +32,15 @@ controls, mutants, case replay). CI runs the self-test via
 `scripts/test-uinput-domain.sh` inside the pinned CI container. The scanner is
 stdlib-only Python; the policy, the cases and the host map are data it loads.
 
+Repository inputs are part of the enforcement boundary. Before consuming any
+candidate source, manifest, policy, case, host map, schema or `.SOURCE` file,
+the scanner uses non-following metadata and `O_NOFOLLOW`, verifies the opened
+object is the same regular file, and rejects files larger than 4 MiB before
+reading. The read itself is bounded and a file that changes while being read
+is rejected. Symlinks, FIFOs and other non-regular files therefore fail with
+stable `repo_input_*` reasons instead of being followed, skipped, or allowed to
+occupy a public runner until its job timeout.
+
 ## 1. Threat model
 
 A "host route" is any static evidence that a build, test, workflow or product
