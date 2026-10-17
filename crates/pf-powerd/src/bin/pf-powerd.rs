@@ -1,9 +1,30 @@
-use pf_powerd::{serve_connection, SystemctlExecutor};
+use pf_powerd::{authorize_connection, SystemctlExecutor};
 use std::fs;
 use std::io;
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+
+const MAX_CLIENTS: usize = 4;
+
+struct ClientSlot(Arc<AtomicUsize>);
+
+impl Drop for ClientSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Release);
+    }
+}
+
+fn try_client_slot(active: &Arc<AtomicUsize>) -> Option<ClientSlot> {
+    active
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+            (n < MAX_CLIENTS).then_some(n + 1)
+        })
+        .ok()
+        .map(|_| ClientSlot(Arc::clone(active)))
+}
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let socket = std::env::args()
@@ -14,14 +35,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let listener = UnixListener::bind(&socket)?;
     fs::set_permissions(&socket, fs::Permissions::from_mode(0o660))?;
     let allowed_uid = gamer_uid()?;
+    let active = Arc::new(AtomicUsize::new(0));
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
-                std::thread::spawn(move || {
-                    if let Err(error) = serve_connection(stream, allowed_uid, &SystemctlExecutor) {
+                let connection = match authorize_connection(stream, allowed_uid) {
+                    Ok(connection) => connection,
+                    Err(error) => {
+                        eprintln!("pf-powerd: refused peer: {error}");
+                        continue;
+                    }
+                };
+                let Some(slot) = try_client_slot(&active) else {
+                    eprintln!("pf-powerd: refused peer: client limit reached");
+                    continue;
+                };
+                if let Err(error) = std::thread::Builder::new().spawn(move || {
+                    let _slot = slot;
+                    if let Err(error) = connection.serve(&SystemctlExecutor) {
                         eprintln!("pf-powerd: refused request: {error}");
                     }
-                });
+                }) {
+                    eprintln!("pf-powerd: client worker unavailable: {error}");
+                }
             }
             Err(error) => eprintln!("pf-powerd: accept failed: {error}"),
         }
@@ -60,5 +96,21 @@ fn prepare_socket(path: &Path) -> io::Result<()> {
         )),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn client_slots_are_bounded_and_reusable() {
+        let active = Arc::new(AtomicUsize::new(0));
+        let mut slots: Vec<_> = (0..MAX_CLIENTS)
+            .map(|_| try_client_slot(&active).unwrap())
+            .collect();
+        assert!(try_client_slot(&active).is_none());
+        slots.pop();
+        assert!(try_client_slot(&active).is_some());
     }
 }

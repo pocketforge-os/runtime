@@ -102,6 +102,25 @@ fn authorize(identity: io::Result<PeerServiceIdentity>, allowed_uid: u32) -> io:
     }
 }
 
+pub struct AuthorizedConnection(UnixStream);
+
+pub fn authorize_connection(
+    stream: UnixStream,
+    allowed_uid: u32,
+) -> io::Result<AuthorizedConnection> {
+    let identity = pf_peer_identity::peer_service_identity(&stream);
+    authorize_identified(stream, identity, allowed_uid)
+}
+
+fn authorize_identified(
+    stream: UnixStream,
+    identity: io::Result<PeerServiceIdentity>,
+    allowed_uid: u32,
+) -> io::Result<AuthorizedConnection> {
+    authorize(identity, allowed_uid)?;
+    Ok(AuthorizedConnection(stream))
+}
+
 pub fn handle(body: &[u8], executor: &dyn CommandExecutor) -> Response {
     let request: Request = match serde_json::from_slice(body) {
         Ok(request) => request,
@@ -141,29 +160,18 @@ pub fn serve_connection(
     allowed_uid: u32,
     executor: &dyn CommandExecutor,
 ) -> io::Result<()> {
-    let identity = pf_peer_identity::peer_service_identity(&stream);
-    serve_identified_connection(stream, identity, allowed_uid, executor)
+    authorize_connection(stream, allowed_uid)?.serve(executor)
 }
 
-fn serve_identified_connection(
-    mut stream: UnixStream,
-    identity: io::Result<PeerServiceIdentity>,
-    allowed_uid: u32,
-    executor: &dyn CommandExecutor,
-) -> io::Result<()> {
-    stream.set_read_timeout(Some(CONNECTION_TIMEOUT))?;
-    stream.set_write_timeout(Some(CONNECTION_TIMEOUT))?;
-    if let Err(error) = authorize(identity, allowed_uid) {
-        let body = serde_json::to_vec(&Response::Refused {
-            reason: error.to_string(),
-        })
-        .map_err(io::Error::other)?;
-        return pf_wire::write_frame(&mut stream, &body).map_err(map_wire);
+impl AuthorizedConnection {
+    pub fn serve(mut self, executor: &dyn CommandExecutor) -> io::Result<()> {
+        self.0.set_read_timeout(Some(CONNECTION_TIMEOUT))?;
+        self.0.set_write_timeout(Some(CONNECTION_TIMEOUT))?;
+        let body = pf_wire::read_frame(&mut self.0).map_err(map_wire)?;
+        let response = handle(&body, executor);
+        let body = serde_json::to_vec(&response).map_err(io::Error::other)?;
+        pf_wire::write_frame(&mut self.0, &body).map_err(map_wire)
     }
-    let body = pf_wire::read_frame(&mut stream).map_err(map_wire)?;
-    let response = handle(&body, executor);
-    let body = serde_json::to_vec(&response).map_err(io::Error::other)?;
-    pf_wire::write_frame(&mut stream, &body).map_err(map_wire)
 }
 
 fn map_wire(error: pf_wire::WireError) -> io::Error {
@@ -257,20 +265,11 @@ mod tests {
 
     #[test]
     fn wrong_peer_is_refused_before_any_frame_is_read() {
-        use std::io::Read;
-        let (server, mut client) = UnixStream::pair().unwrap();
-        serve_identified_connection(
-            server,
-            identity(1000, "pf-app@evil.service"),
-            1000,
-            &FakeExecutor::default(),
-        )
-        .unwrap();
-        let response: serde_json::Value =
-            serde_json::from_slice(&pf_wire::read_frame(&mut client).unwrap()).unwrap();
-        assert_eq!(response["result"], "refused");
-        let mut byte = [0];
-        assert_eq!(client.read(&mut byte).unwrap(), 0);
+        let (server, _client) = UnixStream::pair().unwrap();
+        let error = authorize_identified(server, identity(1000, "pf-app@evil.service"), 1000)
+            .err()
+            .unwrap();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
     }
 
     #[test]
