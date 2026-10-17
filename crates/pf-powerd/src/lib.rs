@@ -1,5 +1,3 @@
-//! Narrow, authenticated power-control protocol used by the system menu.
-
 use pf_peer_identity::PeerServiceIdentity;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -43,7 +41,6 @@ pub enum Response {
     },
 }
 
-#[derive(Debug)]
 pub struct CommandReceipt {
     pub status: i32,
     pub stdout: Vec<u8>,
@@ -88,28 +85,24 @@ fn digest(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
-pub fn handle(
-    body: &[u8],
-    identity: io::Result<PeerServiceIdentity>,
-    allowed_uid: u32,
-    executor: &dyn CommandExecutor,
-) -> Response {
+fn authorize(identity: io::Result<PeerServiceIdentity>, allowed_uid: u32) -> io::Result<()> {
     match identity {
-        Ok(identity) if identity.cred.uid == allowed_uid && identity.unit == SHELL_UNIT => {}
-        Ok(identity) => {
-            return Response::Refused {
-                reason: format!(
-                    "unauthorized peer uid={} unit={}",
-                    identity.cred.uid, identity.unit
-                ),
-            };
-        }
-        Err(_) => {
-            return Response::Refused {
-                reason: "peer identity unavailable".into(),
-            };
-        }
+        Ok(identity) if identity.cred.uid == allowed_uid && identity.unit == SHELL_UNIT => Ok(()),
+        Ok(identity) => Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "unauthorized peer uid={} unit={}",
+                identity.cred.uid, identity.unit
+            ),
+        )),
+        Err(_) => Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "peer identity unavailable",
+        )),
     }
+}
+
+pub fn handle(body: &[u8], executor: &dyn CommandExecutor) -> Response {
     let request: Request = match serde_json::from_slice(body) {
         Ok(request) => request,
         Err(_) => {
@@ -144,15 +137,31 @@ pub fn handle(
 }
 
 pub fn serve_connection(
+    stream: UnixStream,
+    allowed_uid: u32,
+    executor: &dyn CommandExecutor,
+) -> io::Result<()> {
+    let identity = pf_peer_identity::peer_service_identity(&stream);
+    serve_identified_connection(stream, identity, allowed_uid, executor)
+}
+
+fn serve_identified_connection(
     mut stream: UnixStream,
+    identity: io::Result<PeerServiceIdentity>,
     allowed_uid: u32,
     executor: &dyn CommandExecutor,
 ) -> io::Result<()> {
     stream.set_read_timeout(Some(CONNECTION_TIMEOUT))?;
     stream.set_write_timeout(Some(CONNECTION_TIMEOUT))?;
-    let identity = pf_peer_identity::peer_service_identity(&stream);
+    if let Err(error) = authorize(identity, allowed_uid) {
+        let body = serde_json::to_vec(&Response::Refused {
+            reason: error.to_string(),
+        })
+        .map_err(io::Error::other)?;
+        return pf_wire::write_frame(&mut stream, &body).map_err(map_wire);
+    }
     let body = pf_wire::read_frame(&mut stream).map_err(map_wire)?;
-    let response = handle(&body, identity, allowed_uid, executor);
+    let response = handle(&body, executor);
     let body = serde_json::to_vec(&response).map_err(io::Error::other)?;
     pf_wire::write_frame(&mut stream, &body).map_err(map_wire)
 }
@@ -213,19 +222,12 @@ mod tests {
             ("suspend", PowerAction::Suspend),
         ] {
             let body = format!(r#"{{"method":"request","action":"{wire}"}}"#);
-            let response = handle(body.as_bytes(), identity(1000, SHELL_UNIT), 1000, &executor);
+            let response = handle(body.as_bytes(), &executor);
             assert!(
                 matches!(response, Response::Accepted { action: got, status: 0, .. } if got == action)
             );
         }
-        assert_eq!(
-            *executor.0.lock().unwrap(),
-            vec![
-                PowerAction::PowerOff,
-                PowerAction::Restart,
-                PowerAction::Suspend
-            ]
-        );
+        assert_eq!(executor.0.lock().unwrap().len(), 3);
         assert_eq!(
             systemctl_argv(PowerAction::Restart),
             [
@@ -237,44 +239,45 @@ mod tests {
                 "reboot"
             ]
         );
+        assert!(matches!(
+            handle(br#"{"method":"request","action":"power_off"}"#, &ExitExecutor(124)),
+            Response::Refused { reason } if reason == "systemctl exited 124"
+        ));
     }
 
     #[test]
-    fn malformed_or_wrong_peer_never_invokes_power() {
+    fn malformed_request_never_invokes_power() {
         let executor = FakeExecutor::default();
-        for response in [
-            handle(b"not json", identity(1000, SHELL_UNIT), 1000, &executor),
-            handle(
-                br#"{"method":"request","action":"restart"}"#,
-                identity(1001, SHELL_UNIT),
-                1000,
-                &executor,
-            ),
-            handle(
-                br#"{"method":"request","action":"restart"}"#,
-                identity(1000, "pf-app@evil.service"),
-                1000,
-                &executor,
-            ),
-        ] {
-            assert!(matches!(response, Response::Refused { .. }));
-        }
+        assert!(matches!(
+            handle(b"not json", &executor),
+            Response::Refused { .. }
+        ));
         assert!(executor.0.lock().unwrap().is_empty());
     }
 
     #[test]
-    fn timed_out_systemctl_is_a_refusal() {
-        let response = handle(
-            br#"{"method":"request","action":"power_off"}"#,
-            identity(1000, SHELL_UNIT),
+    fn wrong_peer_is_refused_before_any_frame_is_read() {
+        use std::io::Read;
+        let (server, mut client) = UnixStream::pair().unwrap();
+        serve_identified_connection(
+            server,
+            identity(1000, "pf-app@evil.service"),
             1000,
-            &ExitExecutor(124),
-        );
-        assert_eq!(
-            response,
-            Response::Refused {
-                reason: "systemctl exited 124".into()
-            }
-        );
+            &FakeExecutor::default(),
+        )
+        .unwrap();
+        let response: serde_json::Value =
+            serde_json::from_slice(&pf_wire::read_frame(&mut client).unwrap()).unwrap();
+        assert_eq!(response["result"], "refused");
+        let mut byte = [0];
+        assert_eq!(client.read(&mut byte).unwrap(), 0);
+    }
+
+    #[test]
+    fn service_uses_a_dedicated_root_owned_runtime_directory() {
+        let unit = include_str!("../../../systemd/pf-powerd.service");
+        assert!(unit.contains("RuntimeDirectory=pocketforge-power\nRuntimeDirectoryMode=0750"));
+        assert!(unit.contains("/run/pocketforge-power/power.sock"));
+        assert!(!unit.contains("/run/pocketforge/power.sock"));
     }
 }

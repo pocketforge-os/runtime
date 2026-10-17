@@ -9,7 +9,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let socket = std::env::args()
         .nth(1)
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/run/pocketforge/power.sock"));
+        .unwrap_or_else(|| PathBuf::from("/run/pocketforge-power/power.sock"));
     prepare_socket(&socket)?;
     let listener = UnixListener::bind(&socket)?;
     fs::set_permissions(&socket, fs::Permissions::from_mode(0o660))?;
@@ -17,9 +17,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
-                if let Err(error) = serve_connection(stream, allowed_uid, &SystemctlExecutor) {
-                    eprintln!("pf-powerd: refused request: {error}");
-                }
+                std::thread::spawn(move || {
+                    if let Err(error) = serve_connection(stream, allowed_uid, &SystemctlExecutor) {
+                        eprintln!("pf-powerd: refused request: {error}");
+                    }
+                });
             }
             Err(error) => eprintln!("pf-powerd: accept failed: {error}"),
         }
