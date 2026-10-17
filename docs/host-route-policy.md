@@ -2,11 +2,16 @@
 
 Status: normative. This document is the canonical host-route specification
 referenced by `tests/fixtures/host-route-policy-v1.json` (`policy_id
-host-route-policy-v1`, `schema_version 4` — bumped for the #150
-verification ruling: `env --` ends option parsing only (§2.3), and adapter
-call sites are now exact-occurrence rows of the new class
-`product_clipboard_adapter_call` (§3.4) — the former optional `adapter=`
-inventory field is deleted, so the inventory/case schema changed.
+host-route-policy-v1`, `schema_version 5` — bumped for the #153
+fail-closed container-argv ruling (§2.5): `--env-file` takes its value and
+even a literal path needs an inventory row, `exec` and the
+`container run|create|exec` spellings are parsed, attached short values and
+short-option clusters are decomposed, and undecomposable short tokens are
+red. `schema_version 4` covered the #150 verification ruling: `env --`
+ends option parsing only (§2.3), and adapter call sites are now
+exact-occurrence rows of the new class `product_clipboard_adapter_call`
+(§3.4) — the former optional `adapter=` inventory field is deleted, so the
+inventory/case schema changed.
 `schema_version 3` covered the 2026-10-16 amendments after worker C's census
 (anchored bind sources §2.2, coreutils-`env` narrowing §2.3, nested-quote
 lexing §2.4, clipboard adapter callers §3.4); `schema_version 2` covered
