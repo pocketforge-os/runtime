@@ -4,4 +4,5 @@ set -euo pipefail
 
 bash tests/test_uinput_domain_c.sh
 python3 tests/test_uinput_domain_guard.py
+python3 tests/test_uinput_inventory_empty_tree.py
 python3 tests/uinput_inventory.py --self-test

@@ -2445,8 +2445,19 @@ def seed_creator_self_test():
     seeded_violation_red = not check(extra=[("seeded/violation.c",
                                              'fd = open("/dev/uinput", O_WRONLY);')],
                                      quiet=True)
-    first = occurrences()[0]
-    duplicate_live_red = not check(extra=[(first[1], first[3])], quiet=True)
+    live = occurrences()
+    if live:
+        first = live[0]
+        duplicate_live_red = not check(extra=[(first[1], first[3])], quiet=True)
+    else:
+        # A tree with zero live occurrences (a freshly vendored port, say)
+        # still needs the duplicate-live control: synthesize the classified
+        # seeded row it duplicates.
+        seeded = ("seeded/duplicate.c", 'fd = open("/dev/uinput", O_WRONLY);')
+        seeded_allowed = load_manifest()
+        seeded_allowed[fingerprint(*seeded)] += 1
+        duplicate_live_red = not check(extra=[seeded, seeded], quiet=True,
+                                       allowed=seeded_allowed)
     stale_key = "seeded/stale.c\t" + "0" * 64
     allowed = load_manifest()
     allowed[stale_key] += 1
