@@ -597,6 +597,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "pf-powerd"
+version = "0.0.1"
+dependencies = [
+ "libc",
+ "pf-peer-identity",
+ "pf-wire",
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
 name = "pf-prefs"
 version = "0.0.1"
 dependencies = [
