@@ -1,5 +1,5 @@
 {
-  "schema_version": 4,
+  "schema_version": 5,
   "policy_id": "host-route-policy-v1",
   "normative_doc": "docs/host-route-policy.md",
   "origin": {
@@ -26,7 +26,7 @@
     },
     {
       "id": "host_display_projection",
-      "summary": "Projecting a host display: inheriting ${DISPLAY}/${WAYLAND_DISPLAY}/${XAUTHORITY}, exporting or setting a display without same-boundary private creation, bare /tmp/.X11-unix or .Xauthority paths, xdotool/xhost/xwd, source set_var(\"DISPLAY\"|\"WAYLAND_DISPLAY\"|\"XAUTHORITY\")."
+      "summary": "Projecting a host display: inheriting ${DISPLAY}/${WAYLAND_DISPLAY}/${XAUTHORITY}, exporting or setting a display without same-boundary private creation, bare /tmp/.X11-unix or .Xauthority paths, xdotool/xhost/xwd, source set_var(\"DISPLAY\"|\"WAYLAND_DISPLAY\"|\"XAUTHORITY\"), and any container --env-file (fail-closed: the file can carry display variables and a literal path still needs an inventory row)."
     },
     {
       "id": "host_clipboard_write",
@@ -34,7 +34,7 @@
     },
     {
       "id": "dynamic_route",
-      "summary": "Fail closed: any value containing a shell expansion that cannot be proven statically, with no assignment-folding or proven-variable exception (container device/volume/mount/env/cgroup values, systemd BindPaths, compose devices, dynamic docker run/create image operands outside the -- position, option-shaped words after --, runs-on expressions, malformed shell/YAML/host-map, contract violations such as stale or duplicate inventory rows)."
+      "summary": "Fail closed: any value containing a shell expansion that cannot be proven statically, with no assignment-folding or proven-variable exception (container device/volume/mount/env/cgroup values, systemd BindPaths, compose devices, dynamic docker run/create image operands outside the -- position, option-shaped words after --, runs-on expressions, malformed shell/YAML/host-map, undecomposable short-option tokens in a route-capable container argv, contract violations such as stale or duplicate inventory rows)."
     }
   ],
   "inventory": {

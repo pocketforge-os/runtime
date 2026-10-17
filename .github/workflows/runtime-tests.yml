@@ -15,6 +15,7 @@ on:
       - 'guard/**'
       - 'tests/fixtures/uinput-domain-v1.tsv'
       - 'tests/test_uinput_domain_*'
+      - 'tests/test_uinput_inventory_*'
       - 'tests/uinput_inventory*'
       - 'tests/uinput-inventory.txt'
       - 'tests/fixtures/host-route-*'
