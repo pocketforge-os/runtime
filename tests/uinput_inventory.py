@@ -822,6 +822,7 @@ CANONICAL_CLASSES = {
     "product-session-fixture": [],
     "guest_internal": ["caller"],
     "product_clipboard_adapter": [],
+    "product_clipboard_adapter_call": [],
 }
 DEFAULT_GUEST_ENTRY_POINTS = ["*/run-guest.sh", "run-guest.sh", "*/guest/*"]
 DEFAULT_CLIPBOARD_GATE = "host_clipboard_disabled"
@@ -873,51 +874,6 @@ DISPLAY_TOOLS = ("xdotool", "xhost", "xwd")
 CLIPBOARD_TOOLS = ("wl-copy", "xclip", "xsel")
 CLIPBOARD_LIBS = ("arboard", "copypasta", "x11-clipboard", "wl-clipboard-rs", "gtk::Clipboard")
 CLIPBOARD_API = re.compile(r"\bcopy_text\s*\(|\bcopy_image\s*\(")
-# A clipboard adapter must DEFINE a primitive, not merely mention one in a
-# comment or string (#150 review): fn/def/func/function/sub spellings cover
-# the languages used across the repos this spec ports to.
-COMMENT_BLOCK_RE = re.compile(r"/\*.*?\*/", re.S)
-
-
-def strip_comments_and_strings(text):
-    """Strip comments and string-literal contents from source text.
-
-    Used for the adapter definition check and its import evidence-binding
-    (#150 review round 2): `// fn copy_text is planned` or a stem mention
-    inside a comment or string is neither a definition nor an import.
-    Handles /*...*/ blocks, // and # line comments outside quotes, and
-    replaces '...' and "..." literal contents with the empty literal.
-    """
-    text = COMMENT_BLOCK_RE.sub(" ", text)
-    out = []
-    for line in text.split("\n"):
-        res = []
-        i = 0
-        n = len(line)
-        while i < n:
-            c = line[i]
-            if c == "/" and i + 1 < n and line[i + 1] == "/":
-                break
-            if c == "#":
-                break
-            if c in "\"'":
-                q = c
-                i += 1
-                while i < n and line[i] != q:
-                    if line[i] == "\\":
-                        i += 1
-                    i += 1
-                i += 1
-                res.append(q + q)
-                continue
-            res.append(c)
-            i += 1
-        out.append("".join(res))
-    return "\n".join(out)
-
-
-CLIPBOARD_ADAPTER_DEF = re.compile(
-    r"\b(?:fn|def|func|function|sub)\s+(?:copy_text|copy_image)\b")
 DEV_UINPUT = re.compile(r"^/dev/uinput$")
 DEV_INPUT = re.compile(r"^/dev/input(/|$)")
 HOST_PATHS = [
@@ -1440,7 +1396,9 @@ def env_assignment_tokens(args):
     """Return the DISPLAY-related assignments in a coreutils env prefix.
 
     Parses every option spelling coreutils accepts (#150 review round 2):
-    `--` ends the prefix (the next word is the utility), a bare `-` is the
+    `--` ends OPTION parsing only (GNU env runs `env -- DISPLAY=x cmd` with
+    DISPLAY set, so the assignment loop still runs after it, #150
+    verification), a bare `-` is the
     -i alias, short-option clusters whose final u/C consumes the rest of
     the cluster or the following operand, and -S/--split-string whose
     operand is itself re-parsed as options and assignments. After the
@@ -1453,7 +1411,10 @@ def env_assignment_tokens(args):
     while i < len(toks):
         t = toks[i]
         if t == "--":
-            return []
+            # GNU env: `--` ends OPTION parsing, not assignment parsing:
+            # `env -- DISPLAY=x cmd` sets DISPLAY (#150 verification).
+            del toks[i]
+            break
         if t == "-":
             i += 1
             continue
@@ -2228,74 +2189,20 @@ def load_host_manifest(root, policy, failures, file_texts):
                                         "guest entry point that references the occurrence"))
                 continue
         if klass == "product_clipboard_adapter":
-            adapter = fields.get("adapter")
-            if adapter:
-                # Canonical-spec amendment ruling 4: a caller of the
-                # capability-checked adapter cites the adapter file, which
-                # must be contained in the reviewed repository (lexically
-                # and after symlink resolution), carry the gate marker,
-                # DEFINE a clipboard primitive, and be named by the
-                # occurrence file (#150 review: substring mentions and
-                # unrelated adapters must not excuse a direct
-                # framework/platform call).
-                ap = Path(adapter)
-                bad = None
-                if ap.is_absolute() or ".." in ap.parts:
-                    bad = "path escapes the repository"
-                else:
-                    target = (root / ap).resolve()
-                    if not target.is_relative_to(root.resolve()):
-                        bad = "resolved path escapes the repository"
-                    else:
-                        try:
-                            adapter_text = target.read_text(
-                                encoding="utf-8", errors="replace")
-                        except OSError:
-                            adapter_text = ""
-                        if not adapter_text:
-                            bad = "missing adapter file"
-                        elif policy.clipboard_gate_marker not in adapter_text:
-                            bad = f"adapter lacks the {policy.clipboard_gate_marker} gate marker"
-                        elif not CLIPBOARD_ADAPTER_DEF.search(
-                                strip_comments_and_strings(adapter_text)):
-                            bad = ("adapter does not define copy_text/copy_image "
-                                   "(a comment or string mention is not a "
-                                   "definition)")
-                        else:
-                            # Evidence-binding (#150 review round 2): the
-                            # occurrence file must import/use the cited
-                            # adapter module outside comments and strings,
-                            # and must not also import a direct clipboard
-                            # framework. A text scanner cannot resolve the
-                            # receiver type of the call, so a file that
-                            # imports both the adapter and a direct
-                            # framework fails closed instead of guessing.
-                            stripped_occ = strip_comments_and_strings(
-                                file_texts.get(rel_path, ""))
-                            import_re = re.compile(
-                                r"\b(?:use|import|from|require|include)\b"
-                                r"[^\n]*\b" + re.escape(ap.stem) + r"\b")
-                            if not import_re.search(stripped_occ):
-                                bad = ("occurrence is not evidence-bound to "
-                                       "the cited adapter (no import/use of "
-                                       f"{ap.stem!r} in {rel_path} outside "
-                                       "comments/strings)")
-                            elif any(lib in stripped_occ
-                                     for lib in CLIPBOARD_LIBS):
-                                bad = ("occurrence file also imports a direct "
-                                       "clipboard framework; the call target "
-                                       f"cannot be proven to be {adapter!r}")
-                if bad:
-                    failures.append(Finding("dynamic_route", "invalid_exception", MANIFEST_RELPATH,
-                                            line_no, f"adapter {adapter!r} for {rel_path}: {bad}"))
-                    continue
-            else:
-                text = file_texts.get(rel_path, "")
-                if policy.clipboard_gate_marker not in text:
-                    failures.append(Finding("dynamic_route", "invalid_exception", MANIFEST_RELPATH,
-                                            line_no, f"{rel_path} lacks the "
-                                            f"{policy.clipboard_gate_marker} gate marker"))
-                    continue
+            # The adapter's own definition file must carry the gate
+            # marker. Call sites are classified instead as rows of class
+            # product_clipboard_adapter_call: they are bound by the exact
+            # occurrence line hash alone, so a new or changed call site is
+            # unclassified and fails until a human classifies it in review
+            # (#150 verification ruling; the adapter= field, its comment/
+            # string stripper and its import-binding heuristic are deleted
+            # - a text scanner cannot resolve call receivers).
+            text = file_texts.get(rel_path, "")
+            if policy.clipboard_gate_marker not in text:
+                failures.append(Finding("dynamic_route", "invalid_exception", MANIFEST_RELPATH,
+                                        line_no, f"{rel_path} lacks the "
+                                        f"{policy.clipboard_gate_marker} gate marker"))
+                continue
         if key in allowed:
             failures.append(Finding("dynamic_route", "duplicate_inventory_row",
                                     MANIFEST_RELPATH, line_no, f"duplicate row for {key}"))
@@ -2452,8 +2359,6 @@ def _manifest_row(entry):
     fields = [f"rule={rule}", f"class={entry['class']}"]
     if entry.get("caller"):
         fields.append(f"caller={entry['caller']}")
-    if entry.get("adapter"):
-        fields.append(f"adapter={entry['adapter']}")
     if entry.get("wave2"):
         fields.append(f"wave2={entry['wave2']}")
     return f"{entry['path']}\t{sha}\t# host-route " + " ".join(fields)

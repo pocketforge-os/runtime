@@ -2,13 +2,17 @@
 
 Status: normative. This document is the canonical host-route specification
 referenced by `tests/fixtures/host-route-policy-v1.json` (`policy_id
-host-route-policy-v1`, `schema_version 3` — bumped for the 2026-10-16
-amendments after worker C's census (anchored bind sources §2.2, coreutils-`env`
-narrowing §2.3, nested-quote lexing §2.4, clipboard adapter callers §3.4);
-`schema_version 2` covered §2.1, the dynamic-container-value and image-operand
-rule from the pf-hwprobe#23 adjudication. The case JSONL object schema is
-unchanged except that inventory entries gained the optional `adapter=` field;
-the filenames stay `*-v1*` because ports pin paths and sha256s). Ports in other repositories
+host-route-policy-v1`, `schema_version 4` — bumped for the #150
+verification ruling: `env --` ends option parsing only (§2.3), and adapter
+call sites are now exact-occurrence rows of the new class
+`product_clipboard_adapter_call` (§3.4) — the former optional `adapter=`
+inventory field is deleted, so the inventory/case schema changed.
+`schema_version 3` covered the 2026-10-16 amendments after worker C's census
+(anchored bind sources §2.2, coreutils-`env` narrowing §2.3, nested-quote
+lexing §2.4, clipboard adapter callers §3.4); `schema_version 2` covered
+§2.1, the dynamic-container-value and image-operand rule from the
+pf-hwprobe#23 adjudication. The filenames stay `*-v1*` because ports pin
+paths and sha256s). Ports in other repositories
 vendor the policy JSON, the case JSONL and the runner host map from this
 repository and pin them with a `.SOURCE` file; they must not restate or fork
 the rules.
@@ -145,9 +149,13 @@ round 2): `-u`/`--unset`/`-C`/`--chdir` consume a separate operand or an
 inline `=` value; short-option clusters consume the rest of the cluster, or
 the next operand when a trailing `u`/`C` needs one
 (`env -iu DISPLAY DISPLAY=$DISPLAY cmd` is red); a bare `-` is the `-i`
-alias, not the utility (`env - DISPLAY=$DISPLAY cmd` is red); `--` ends the
-assignment prefix; and `-S`/`--split-string` operands are re-parsed as
-options plus assignments (`env -S '-u DISPLAY DISPLAY=$DISPLAY cmd'` is red). Only `NAME=VALUE` assignments of
+alias, not the utility (`env - DISPLAY=$DISPLAY cmd` is red); `--` ends
+OPTION parsing only — GNU env runs `env -- DISPLAY=x cmd` with DISPLAY set,
+so after `--` the assignment loop still runs until the first non-assignment
+word (`env -- DISPLAY=$DISPLAY cmd` is red), while tokens after that utility
+stay ignored (`env -- printf DISPLAY=$DISPLAY` is green, #150 verification);
+and `-S`/`--split-string` operands are re-parsed as options plus assignments
+(`env -S '-u DISPLAY DISPLAY=$DISPLAY cmd'` is red). Only `NAME=VALUE` assignments of
 `DISPLAY`, `WAYLAND_DISPLAY` or `XAUTHORITY` inside the assignment prefix are
 checked, so tokens after the utility (`env printf DISPLAY=$DISPLAY`), after
 `--` (`env -- printf DISPLAY=$DISPLAY`) and option operands
@@ -216,30 +224,32 @@ Product clipboard adapters whose host route is gated off in CI. The occurrence
 file must carry the gate marker `host_clipboard_disabled`; otherwise the
 inventory row is an `invalid_exception`.
 
-**Adapter callers (2026-10-16 amendment).** A call site of a capability-checked
-adapter (`shell.copy_text(...)`) is textually identical to a direct
-framework/platform clipboard call, so the raw-API detector cannot distinguish
-them; narrowing the regex would blind the rule instead. The chosen design is a
-typed exception at the *manifest* layer: a `product_clipboard_adapter` row may
-carry an optional `adapter=<repo-relative path>` field citing the adapter
-file. The row is an `invalid_exception` unless all of these hold (#150
-review): the cited path is repository-relative and, after symlink resolution,
-still inside the repository (no absolute path, no `..` segment, no symlink
-escape); the file exists and is non-empty; it carries the
-`host_clipboard_disabled` gate marker (checked in the raw text — the marker
-is a comment by design); it *defines* a clipboard primitive
-(`fn`/`def`/`func`/`function`/`sub` immediately followed by `copy_text` or
-`copy_image`) after comments and string literals are stripped, so a
-`// fn copy_text is planned` comment is not a definition; and the occurrence
-file is evidence-bound to it: outside comments and strings it must contain a
-`use`/import/`from`/`require`/`include` of the cited adapter's file stem, and
-the exception fails closed if the occurrence file also imports a direct
-clipboard framework (`arboard`, `copypasta`, `x11-clipboard`,
-`wl-clipboard-rs`, `gtk::Clipboard`) — a text scanner cannot resolve which
-receiver a call targets, so importing both is refused (#150 review round 2).
-Direct framework calls cannot satisfy the evidence-binding and definition
-conditions and stay unclassifiable (red). Rows without `adapter=` keep the
-original behaviour (the occurrence file itself carries the gate marker).
+**Adapter call sites (#150 verification ruling).** A call site of a
+capability-checked adapter (`shell.copy_text(...)`) is textually identical to
+a direct framework/platform clipboard call. No call-site text heuristic can
+prove which receiver a call targets, and a language-agnostic comment/string
+stripper cannot cover every port language, so the earlier `adapter=`
+citation machinery (path containment, stripped definition regex, import-stem
+evidence binding, framework co-import refusal) is **deleted**. Calls to a
+capability-checked adapter are handled by the exact-occurrence inventory this
+spec already has:
+
+- each adapter call site is a manifest row of class
+  `product_clipboard_adapter_call`, bound by the occurrence line hash
+  (`sha256(rule + "\n" + stripped_line)`) like every other row;
+- a new or changed call site is unclassified, so the scan fails until a human
+  classifies it in review — the same stale-hash contract as §4;
+- the adapter's own definition file keeps its `product_clipboard_adapter`
+  row, which still requires the `host_clipboard_disabled` gate marker in the
+  occurrence file.
+
+Detection is unchanged: `copy_text(`/`copy_image(` call sites and the listed
+clipboard libraries (`arboard`, `copypasta`, `x11-clipboard`,
+`wl-clipboard-rs`, `gtk::Clipboard`) stay detectable everywhere; only exact
+classified occurrences pass. A direct framework call in a file that also
+imports the adapter is red unless a human classifies that exact line.
+Ports note: pfvd's port needs `product_clipboard_adapter_call` rows for its
+~16 adapter call sites (worker C, at re-pin).
 
 ## 4. Inventory (manifest)
 
@@ -258,7 +268,9 @@ Bootstrap rows with `python3 tests/uinput_inventory.py --emit-host-routes`.
 Classes: `dormant-k-consumer` (requires `wave2=`; kernel-fidelity consumer
 kept stopped on runner hosts in wave 1), `product-reference`,
 `product-session-fixture`, `guest_internal` (requires `caller=`, validated per
-§3.2), `product_clipboard_adapter` (gate marker per §3.4). Occurrences inside
+§3.2), `product_clipboard_adapter` (gate marker per §3.4),
+`product_clipboard_adapter_call` (exact-occurrence row for a call site of the
+gated adapter, per §3.4). Occurrences inside
 `.github/workflows/**` can never be classified by a manifest row — workflow
 consumers must be deleted or made private, not inventoried.
 
