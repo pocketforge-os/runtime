@@ -1,5 +1,5 @@
 {
-  "schema_version": 2,
+  "schema_version": 4,
   "policy_id": "host-route-policy-v1",
   "normative_doc": "docs/host-route-policy.md",
   "origin": {
@@ -60,6 +60,10 @@
       "product_clipboard_adapter": {
         "required_fields": [],
         "summary": "Product clipboard adapter whose host route is gated off in CI; the occurrence file must carry the gate marker."
+      },
+      "product_clipboard_adapter_call": {
+        "required_fields": [],
+        "summary": "Call site of the capability-checked product clipboard adapter, bound by the exact occurrence line hash only; a new or changed call site is unclassified and fails until a human classifies it in review (#150 verification ruling)."
       }
     }
   },
@@ -91,6 +95,7 @@
     },
     "product_clipboard_adapter": {
       "gate_marker": "host_clipboard_disabled",
+"adapter_caller": "Calls to a capability-checked clipboard adapter are handled by the exact-occurrence inventory (#150 verification ruling): each adapter call site is a manifest row of class product_clipboard_adapter_call bound by the occurrence line hash (sha256 of rule + newline + stripped line text); a new or changed call site is unclassified and fails until a human classifies it in review. The adapter's own definition file keeps its product_clipboard_adapter row requiring the gate_marker in the occurrence file. The former optional adapter= field, its comment/string stripper and its import-binding heuristic are deleted (a text scanner cannot resolve call receivers or parse every language; exact-occurrence review is the sound mechanism). Detection is unchanged: copy_text(/copy_image( call sites and the listed clipboard libraries stay detectable everywhere, and only exact classified occurrences pass.",
       "requires": ["gate marker present in the occurrence file"]
     }
   },
@@ -103,6 +108,26 @@
     "option_parsing": "Known docker/podman global and run/create option arities are parsed, so split values are consumed and the image operand is found reliably. An unknown option taints the command: the -- delimiter is not trusted, no positional operand is trusted as the image, and any dynamic operand in the tainted run/create command is dynamic_route (detail=dynamic_image_operand). Inline --opt=value forms for unknown options keep the command scannable. In the run context -t/-i/-d (and clusters such as -it) are booleans; --pull is string-valued for run and create and consumes a split or inline value (#147 review round 2). An unknown global option taints and its following non-subcommand word is treated as its possible split value, so a later run/create is still reached. The taint fail-closed applies inside run/create only: a non-run/create subcommand after an unknown global option carries no image operand and reports nothing.",
     "static_literal_images_need_no_delimiter": true,
     "summary": "A dynamic docker run/create image operand (any quoted or unquoted expansion) is allowed only immediately after --, the end of options; otherwise it is dynamic_route (detail=dynamic_image_operand). A -- followed by an option-shaped word is dynamic_route (detail=option_after_end_of_options). Static literal images need no delimiter. The same no-folding rule applies to container device/volume/mount/env/cgroup values, systemd BindPaths and compose devices (detail=unresolved_value)."
+  },
+  "amendments_2026_10_16": {
+    "origin": "worker C census (pfvd 50 findings, image 21, qemu-tsp 1; bd comment 2026-10-16T21:41Z on tsp-ihne1.56.5) under the accidents-not-adversaries threat model; rulings by input-coord",
+    "anchored_bind_sources": {
+      "rule": "A dynamic -v/--volume/--mount source is allowed iff it is anchored at a runner workspace root: it begins with one of the anchors, followed by end of word or '/', with no literal '..' path segment anywhere.",
+      "anchors": ["$GITHUB_WORKSPACE", "${GITHUB_WORKSPACE}", "$RUNNER_TEMP", "${RUNNER_TEMP}", "${{ github.workspace }}", "${{ runner.temp }}"],
+      "manifest_row_required": false,
+      "applies_in": ["workflows", "scripts"],
+      "still_dynamic_route": ["$PWD", "$(pwd)", "$HOME", "unanchored variables", "whole-argv variables such as docker run $CI_DOCKER_RUN"],
+      "static_sources_unchanged": "/dev, /tmp/.X11-unix, XDG runtime dirs, Xauthority and Wayland socket sources keep their existing rules and stay red"
+    },
+    "coreutils_env_narrowing": {
+      "rule": "dynamic_route/unresolved_env_name applies only to container env options (docker|podman run/create/exec -e/--env/--env-file, compose environment). A coreutils env invocation running a host process is not a projection; the env command line is parsed like coreutils: options and their operands come first, then NAME=VALUE assignments, and assignment parsing stops at the utility; every supported option spelling is parsed: -u/--unset/-C/--chdir consume a separate operand or an inline = value, short-option clusters consume the rest of the cluster or the next operand for a trailing u/C, a bare - is the -i alias and not the utility, -- ends OPTION parsing only (GNU env runs env -- DISPLAY=x cmd with DISPLAY set, so after -- the normal assignment loop continues until the first non-assignment word and tokens after the utility stay ignored), and -S/--split-string operands are re-parsed as options plus assignments; only DISPLAY/WAYLAND_DISPLAY/XAUTHORITY assignments inside the assignment prefix are checked, so env DISPLAY=$DISPLAY docker run ... stays red (host_display_projection/display_inherited)."
+    },
+    "shell_tokenizer": {
+      "rule": "malformed_file must not fire on shell that passes bash -n: command substitution $(...) and backtick spans inside double quotes are skipped as balanced spans (their inner quotes belong to the substitution), a backslash outside quotes escapes the next character inside $(...), and ANSI-C $'...' strings are single tokens."
+    },
+    "clipboard_adapter_callers": {
+      "rule": "see typed_exceptions.product_clipboard_adapter.adapter_caller; design choice (#150 verification ruling): exact-occurrence inventory rows of class product_clipboard_adapter_call rather than any call-site text heuristic, because a text scanner cannot resolve call receivers and adapter calls are textually identical to direct framework calls"
+    }
   },
   "scan_scope": {
     "kinds": {
