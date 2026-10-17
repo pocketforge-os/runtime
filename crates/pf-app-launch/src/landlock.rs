@@ -57,6 +57,37 @@ const FS_ABI1: u64 = FS_EXECUTE
     | FS_MAKE_BLOCK
     | FS_MAKE_SYM;
 
+// security/landlock/fs.c only accepts these rights for non-directory objects.  Manifest access
+// describes intent before the object is opened, so adapt the rule after resolving its type.
+const FS_ACCESS_FILE: u64 =
+    FS_EXECUTE | FS_WRITE_FILE | FS_READ_FILE | FS_TRUNCATE | FS_IOCTL_DEV | FS_RESOLVE_UNIX;
+
+const fn normalize_fs_access(allowed_access: u64, is_directory: bool) -> u64 {
+    if is_directory {
+        allowed_access
+    } else {
+        allowed_access & FS_ACCESS_FILE
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fix7_regular_session_environment_drops_directory_only_rights() {
+        let requested = fs_access(FsAccess::ReadOnly);
+
+        // kernel-sunxi-7.x rejects the exact fix7 mask on a regular environment file because
+        // READ_DIR is not a file right.  Keep this negative control beside the corrected mask.
+        assert_ne!(requested & !FS_ACCESS_FILE, 0);
+        assert_eq!(normalize_fs_access(requested, false), FS_READ_FILE);
+
+        // The same manifest access on a directory must keep both traversal rights.
+        assert_eq!(normalize_fs_access(requested, true), requested);
+    }
+}
+
 #[repr(C)]
 struct RulesetAttr {
     handled_access_fs: u64,
@@ -190,8 +221,13 @@ impl LandlockKernel for SystemLandlock {
                 Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
                 Err(error) => return Err(error),
             };
+            let allowed_access =
+                normalize_fs_access(rule.allowed_access, path.metadata()?.is_dir());
+            if allowed_access == 0 {
+                continue;
+            }
             let path_attr = PathBeneathAttr {
-                allowed_access: rule.allowed_access,
+                allowed_access,
                 parent_fd: path.as_raw_fd(),
             };
             // SAFETY: both descriptors and the packed UAPI structure stay live for this call.

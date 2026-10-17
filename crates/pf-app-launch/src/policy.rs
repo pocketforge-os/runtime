@@ -371,6 +371,9 @@ pub fn derive_policy(
     };
 
     if capability_bases.contains("x11") {
+        // The generated drop-in owns the complete SupplementaryGroups value,
+        // so preserve the group that gates the compositor-owned X11 socket.
+        groups.insert("pf-session".to_owned());
         for (name, expected) in [
             ("x11-socket", X11_SOCKET),
             ("x11-environment", X11_ENVIRONMENT),

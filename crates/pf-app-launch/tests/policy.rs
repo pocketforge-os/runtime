@@ -119,6 +119,20 @@ fn x11_projection_is_exact_manifest_scoped_and_fail_closed() {
 
     let x11 = derive_policy(&resolved(&root, &["x11"], false, true), &inputs(&root)).unwrap();
     let rendered = render_systemd_dropin(&x11);
+    assert!(x11
+        .unit
+        .supplementary_groups
+        .iter()
+        .any(|group| group == "pf-session"));
+    assert!(rendered
+        .lines()
+        .find(|line| line.starts_with("SupplementaryGroups="))
+        .unwrap()
+        .split_once('=')
+        .unwrap()
+        .1
+        .split_whitespace()
+        .any(|group| group == "pf-session"));
     assert_eq!(rendered.lines().filter(|line| *line == mapping).count(), 1);
     assert!(x11
         .landlock
@@ -129,6 +143,11 @@ fn x11_projection_is_exact_manifest_scoped_and_fail_closed() {
 
     let plain = derive_policy(&resolved(&root, &[], false, true), &inputs(&root)).unwrap();
     let plain_rendered = render_systemd_dropin(&plain);
+    assert!(!plain
+        .unit
+        .supplementary_groups
+        .iter()
+        .any(|group| group == "pf-session"));
     assert!(!plain_rendered.contains("/run/pocketforge/x11"));
     assert!(!plain_rendered.contains(X11_SOCKET_DESTINATION));
     assert!(!serde_json::to_string(&plain)

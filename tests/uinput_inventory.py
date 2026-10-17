@@ -890,7 +890,9 @@ SOURCE_SETENV = re.compile(
     r"\bset_var\s*\(\s*\"(DISPLAY|WAYLAND_DISPLAY|XAUTHORITY)\"|"
     r"os\.environ\[\s*[\"'](DISPLAY|WAYLAND_DISPLAY|XAUTHORITY)[\"']\s*\]\s*=|"
     r"\bsetenv\s*\(\s*\"(DISPLAY|WAYLAND_DISPLAY|XAUTHORITY)\"")
-SKIP_VALUE_FLAGS = {"--env-file", "--label", "-l", "--name", "--user", "-u", "--workdir", "-w",
+# --env-file is deliberately NOT skippable: any --env-file fails closed
+# (#153) because the file can carry DISPLAY/WAYLAND_DISPLAY/XAUTHORITY.
+SKIP_VALUE_FLAGS = {"--label", "-l", "--name", "--user", "-u", "--workdir", "-w",
                     "--entrypoint", "--network", "--pid", "--ipc", "--cpus", "--memory", "-m",
                     "--shm-size", "--tmpfs", "--stop-signal", "--platform", "--pull", "-t", "--tag"}
 # Docker/podman global options (before the subcommand) and run/create option
@@ -910,7 +912,10 @@ CONTAINER_GLOBAL_BOOL_FLAGS = {"-D", "--debug", "--tls", "--tlsverify"}
 RUN_BOOL_FLAGS = {"--rm", "--init", "-d", "--detach", "-i", "--interactive", "-t", "--tty",
                   "--privileged", "--read-only", "--no-healthcheck", "-P", "--publish-all",
                   "-q", "--quiet", "--sig-proxy", "--oom-kill-disable"}
-RUN_SHORT_BOOL_CHARS = set("itd")
+RUN_SHORT_BOOL_CHARS = set("itdPq")
+# Short options that take a value inside run/create/exec; an attached value
+# (-eDISPLAY=:0, -v/dev/input:/x) decomposes against these (#153).
+SHORT_VALUE_CHARS = set("evuwlpmh")
 RUN_VALUE_FLAGS = (SKIP_VALUE_FLAGS | {
     "--hostname", "-h", "--add-host", "--runtime", "--cap-add", "--cap-drop", "--dns",
     "--dns-option", "--dns-search", "--domainname", "--expose", "--publish", "-p",
@@ -1175,6 +1180,7 @@ def match_container_tokens(toks, boundary, findings, start_line, text):
             continue
         idx += 1
         run_create = False
+        has_image = False
         tainted = False
         # Global options may precede the subcommand (`docker --context ctx run
         # ...`). Known arities are consumed; an unknown global option makes the
@@ -1184,7 +1190,18 @@ def match_container_tokens(toks, boundary, findings, start_line, text):
         # `podman --root /tmp run "$IMAGE"` must still reach the subcommand).
         while idx < n:
             t = toks[idx].text
+            if t == "container":
+                # `docker container run|create|exec ...` spelling (#153).
+                idx += 1
+                continue
             if t in {"run", "create"}:
+                run_create = True
+                has_image = True
+                idx += 1
+                break
+            if t == "exec":
+                # exec has no image operand, but its -e/--env/--env-file
+                # options project the same routes as run's (#153).
                 run_create = True
                 idx += 1
                 break
@@ -1200,16 +1217,17 @@ def match_container_tokens(toks, boundary, findings, start_line, text):
                     tainted = True
                     idx += 1
                     if (idx < n and not toks[idx].text.startswith("-")
-                            and toks[idx].text not in {"run", "create"}):
+                            and toks[idx].text not in {"run", "create", "exec", "container"}):
                         idx += 1
                 continue
             break
-        if (tainted and run_create
+        if (tainted and has_image
                 and any(is_dynamic_value(tok.text) for tok in toks[idx:])):
             # Fail closed inside run/create only: a non-run/create subcommand
             # after an unknown global option has no image operand to prove
             # (`podman --root /tmp inspect "$CONTAINER"` is not a route; #147
-            # review round 2 false positive).
+            # review round 2 false positive). exec carries a container name,
+            # not an image, so it is not an operand to prove either (#153).
             findings.append(Finding("dynamic_route", "dynamic_image_operand",
                                     boundary.path, start_line, text))
         seen_image = False
@@ -1230,7 +1248,9 @@ def match_container_tokens(toks, boundary, findings, start_line, text):
                 # trusted `--`; assignment folding never proves its runtime
                 # value. With a tainted parse no positional can be proven to be
                 # the image, so scanning continues to the end of the command.
-                if run_create and after_delim is False and is_dynamic_value(t):
+                # exec's first positional is a container name, not an image,
+                # so the operand rule applies to run/create only (#153).
+                if has_image and after_delim is False and is_dynamic_value(t):
                     findings.append(Finding("dynamic_route", "dynamic_image_operand",
                                             boundary.path, start_line, text))
                 if after_delim:
@@ -1249,8 +1269,51 @@ def match_container_tokens(toks, boundary, findings, start_line, text):
                                         boundary.path, start_line, text))
                 idx += 1
                 continue
-            flag = t.split("=", 1)[0]
-            inline = t.split("=", 1)[1] if "=" in t else None
+            flag = None
+            inline = None
+            if t == "-":
+                idx += 1
+                continue
+            if t.startswith("--") or not run_create:
+                flag = t.split("=", 1)[0]
+                inline = t.split("=", 1)[1] if "=" in t else None
+            else:
+                # Decompose short-option tokens structurally (#153): inside
+                # run/create/exec a short token is a cluster of boolean chars
+                # that may end in a value char with an attached value
+                # (-it, -eDISPLAY=$DISPLAY, -v/dev/input:/x, -itv/dev/input:/x).
+                # A char that is neither a known boolean nor a known value
+                # short makes the token undecomposable: it could hide an
+                # attached -e/-v route that no taint can catch, because the
+                # value is inside this token rather than a later operand, so
+                # it fails closed instead of being skipped.
+                chars = t[1:]
+                j = 0
+                undecomposable = False
+                while j < len(chars):
+                    ch = chars[j]
+                    if ch in RUN_SHORT_BOOL_CHARS:
+                        j += 1
+                        continue
+                    if ch in SHORT_VALUE_CHARS:
+                        flag = "-" + ch
+                        rest = chars[j + 1:]
+                        if rest.startswith("="):
+                            rest = rest[1:]
+                        inline = rest or None
+                        break
+                    undecomposable = True
+                    break
+                if undecomposable:
+                    findings.append(Finding("dynamic_route", "undecomposable_option",
+                                            boundary.path, start_line, text))
+                    tainted = True
+                    idx += 1
+                    continue
+                if flag is None:
+                    # Pure boolean cluster such as -it or -dit.
+                    idx += 1
+                    continue
 
             def value(max_tokens=1):
                 nonlocal idx, inline
@@ -1270,6 +1333,14 @@ def match_container_tokens(toks, boundary, findings, start_line, text):
                 check_volume_value(value(), boundary, findings, start_line, text)
             elif flag == "--mount":
                 check_mount_value(value(), boundary, findings, start_line, text)
+            elif flag == "--env-file":
+                # Fail closed on any --env-file (#153): the file can carry
+                # DISPLAY/WAYLAND_DISPLAY/XAUTHORITY, and a literal repo path
+                # does not make it green — it needs a manifest row like any
+                # other route.
+                findings.append(Finding("host_display_projection", "env_file",
+                                        boundary.path, start_line, text))
+                value()
             elif flag in {"-e", "--env"}:
                 check_env_value(value(), boundary, findings, start_line, text)
             elif flag == "--device-cgroup-rule":
@@ -1284,16 +1355,15 @@ def match_container_tokens(toks, boundary, findings, start_line, text):
                                             start_line, text))
             elif run_create and flag in RUN_BOOL_FLAGS:
                 idx += 1
-            elif run_create and (flag in RUN_VALUE_FLAGS or inline is not None):
+            elif run_create and flag in RUN_VALUE_FLAGS:
                 value()
-            elif (run_create and len(flag) > 2 and flag[0] == "-" and flag[1] != "-"
-                    and all(ch in RUN_SHORT_BOOL_CHARS for ch in flag[1:])):
-                # Boolean short-flag cluster such as -it or -dit.
-                idx += 1
             elif run_create:
                 # Unknown option: a text scan cannot prove its arity, so the
                 # rest of the command is parsed untrusted and any dynamic
-                # operand fails closed (#147 review).
+                # operand fails closed (#147 review). The former
+                # `inline is not None` catch-all silently consumed unknown
+                # `--opt=value` forms; they now taint exactly like their split
+                # spelling, so `run --mystery=x -- "$IMAGE"` stays red (#153).
                 tainted = True
                 idx += 1
             elif flag in SKIP_VALUE_FLAGS:
@@ -2445,8 +2515,19 @@ def seed_creator_self_test():
     seeded_violation_red = not check(extra=[("seeded/violation.c",
                                              'fd = open("/dev/uinput", O_WRONLY);')],
                                      quiet=True)
-    first = occurrences()[0]
-    duplicate_live_red = not check(extra=[(first[1], first[3])], quiet=True)
+    live = occurrences()
+    if live:
+        first = live[0]
+        duplicate_live_red = not check(extra=[(first[1], first[3])], quiet=True)
+    else:
+        # A tree with zero live occurrences (a freshly vendored port, say)
+        # still needs the duplicate-live control: synthesize the classified
+        # seeded row it duplicates.
+        seeded = ("seeded/duplicate.c", 'fd = open("/dev/uinput", O_WRONLY);')
+        seeded_allowed = load_manifest()
+        seeded_allowed[fingerprint(*seeded)] += 1
+        duplicate_live_red = not check(extra=[seeded, seeded], quiet=True,
+                                       allowed=seeded_allowed)
     stale_key = "seeded/stale.c\t" + "0" * 64
     allowed = load_manifest()
     allowed[stale_key] += 1
