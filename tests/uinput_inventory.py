@@ -2145,7 +2145,15 @@ def _scan_step_container(container, boundary, findings, text_of):
     image = value.get("image")
     options = value.get("options")
     if isinstance(options, YNode) and isinstance(options.value, str):
-        toks = [Tok("docker", options.line)] + lex_tolerant(options.value, options.line)
+        # tsp-ihne1.56.5.2 (launcher#171 review, comment 4301385457): an
+        # options string carries docker-run options for the implicit
+        # container create; parse it in run context. With only `docker`
+        # prepended, every option was consumed as an unknown global option
+        # and route-bearing values (--env-file, --device, --volume,
+        # --mount, --env, --device-cgroup-rule, attached shorts, clusters)
+        # were never checked: a fail-open.
+        toks = ([Tok("docker", options.line), Tok("run", options.line)]
+                + lex_tolerant(options.value, options.line))
         match_container_tokens(toks, boundary, findings, options.line, text_of(options.line))
     volumes = value.get("volumes")
     if isinstance(volumes, YNode) and isinstance(volumes.value, list):
