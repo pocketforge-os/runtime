@@ -173,6 +173,40 @@ while depth-counting a substitution, and treats ANSI-C `$'...'` strings as one
 token. Truly unbalanced input (an unclosed quote, substitution, backtick or
 `$'...'` string) still fails closed as `dynamic_route`/`malformed_file`.
 
+### 2.5 Container argv fail-closed coverage (2026-10-17 amendment)
+
+The pf-app#7 review found three fail-opens in the container argv parse. The
+property that holds now: **every `docker`/`podman` argv form that can project
+a host input or display route is detected, or the parse fails closed.**
+
+- *Route-capable subcommands* are `run`, `create` and `exec`, in both the
+  direct (`docker run`) and the `docker container run|create|exec` spelling.
+  `exec` never exits the option scan before `-e`/`--env`/`--env-file` are
+  checked; it carries no image operand, so the dynamic-image-operand rule
+  stays `run`/`create`-only (a dynamic container name is not a route).
+- *`--env-file` always fails closed* (`host_display_projection`, detail
+  `env_file`): the referenced file can carry
+  `DISPLAY`/`WAYLAND_DISPLAY`/`XAUTHORITY` and its contents are not part of
+  the scanned tree. A literal repo path does not make the occurrence green;
+  it needs a manifest row like any other route. `--env-file` is not a
+  skippable value flag.
+- *Short-option tokens decompose structurally*: inside `run`/`create`/`exec`
+  a single-dash token is a cluster of known boolean shorts (`-i -t -d -P -q`)
+  that may end in a known value short (`-e -v -u -w -l -m -p -h`) with an
+  attached value, so `-eDISPLAY=$DISPLAY`, `-v/dev/input:/x`, `-itv…`,
+  `-ite DISPLAY=…` and pflag's `-e=VALUE` spelling are all checked as their
+  decomposed flags. A short token containing any other character is
+  *undecomposable*: it could hide an attached route value inside the token
+  itself, where no operand taint can catch it, so it is red
+  (`dynamic_route`, detail `undecomposable_option`) rather than skipped.
+- *Unknown options fail closed on both spellings.* An unknown long option
+  taints the command (§2.1) whether written `--opt value` or `--opt=value`;
+  the inline spelling is no longer silently consumed. Unknown long options
+  with fully static operands stay green per the existing §2.1 taint ruling
+  (`docker run --mystery-flag value alpine:latest` — a long option's value is
+  a separate or `=`-attached token the taint already covers); undecomposable
+  short tokens are red because their would-be value is *inside* the token.
+
 ## 3. Typed exceptions
 
 Exceptions are typed and evidence-bound. There is no free-form allowlist of
