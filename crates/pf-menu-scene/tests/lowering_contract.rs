@@ -1,7 +1,7 @@
 use pf_menu::{
-    Bind, ChoiceOption, Cond, DateTimeFields, EngineOptions, Item, ItemId, ItemKind, Menu,
-    MenuEngine, MenuValue, Msg, Page, PageId, PrefsSchemas, Present, Section, TextPurpose,
-    FORMAT_V1,
+    Bind, ChoiceOption, Cond, Confirm, DateTimeFields, EngineOptions, Item, ItemId, ItemKind, Menu,
+    MenuEngine, MenuInput, MenuValue, Msg, Page, PageId, PrefsSchemas, Present, Section,
+    TextPurpose, FORMAT_V1,
 };
 use pf_menu_scene::{
     lower, MenuSceneCache, PanelFacts, RenderPreferences, ResolvedMsg, SizeClass, ThemeMode,
@@ -41,7 +41,12 @@ fn all_kinds_menu() -> Menu {
                         item(
                             "action",
                             ItemKind::Action {
-                                confirm: None,
+                                confirm: Some(Confirm {
+                                    title: Msg::text("Confirm action?"),
+                                    body: Some(Msg::text("This cannot be undone.")),
+                                    confirm_label: Msg::text("Continue"),
+                                    destructive: true,
+                                }),
                                 stay_open: true,
                             },
                         ),
@@ -293,4 +298,49 @@ fn cache_diffs_focus_but_rebuilds_value_changes() {
             .as_deref(),
         Some("On")
     );
+}
+
+#[test]
+fn confirm_overlay_owns_focus_and_exposes_destructive_state() {
+    let mut engine =
+        MenuEngine::new(all_kinds_menu(), &PrefsSchemas, EngineOptions::default()).unwrap();
+    engine.input(MenuInput::Activate, MonotonicTime::ZERO);
+    let lowered = lower(
+        &engine,
+        &ResolvedMsg,
+        PanelFacts::diagonal(5.0),
+        metrics(),
+        RenderPreferences::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        find(lowered.scene.root(), "menu/overlay").role,
+        Role::Dialog
+    );
+    assert_eq!(
+        lowered.scene.focused().unwrap().as_str(),
+        "menu/overlay/cancel"
+    );
+    assert!(
+        find(lowered.scene.root(), "menu/overlay/confirm")
+            .state
+            .destructive
+    );
+}
+
+#[test]
+fn optimistic_apply_is_exposed_as_pending_semantic_state() {
+    let mut engine =
+        MenuEngine::new(all_kinds_menu(), &PrefsSchemas, EngineOptions::default()).unwrap();
+    engine.input(MenuInput::Down, MonotonicTime::ZERO);
+    engine.input(MenuInput::Activate, MonotonicTime::ZERO);
+    let lowered = lower(
+        &engine,
+        &ResolvedMsg,
+        PanelFacts::diagonal(5.0),
+        metrics(),
+        RenderPreferences::default(),
+    )
+    .unwrap();
+    assert!(find(lowered.scene.root(), "menu/item/toggle").state.pending);
 }

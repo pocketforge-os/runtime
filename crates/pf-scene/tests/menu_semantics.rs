@@ -36,6 +36,10 @@ fn menu_roles_and_value_text_are_semantic_state() {
         .expect("value text transition succeeds");
     node = scene.root().clone();
     assert_eq!(node.state.value_text.as_deref(), Some("Fit"));
+    scene
+        .transition_state(&id("choice"), StateTransition::Pending(true))
+        .expect("pending state transition succeeds");
+    assert!(scene.root().state.pending);
 }
 
 #[test]

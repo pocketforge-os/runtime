@@ -1,9 +1,9 @@
 //! Responsive semantic-scene lowering for [`pf_menu`].
 
-use pf_menu::{ApplyState, Item, ItemKind, MenuEngine, MenuValue, Msg};
+use pf_menu::{ApplyState, Item, ItemKind, MenuEngine, MenuValue, Msg, Overlay};
 use pf_scene::{
     AlignItems, Bounds, Edges, FlexDirection, JustifyContent, LayoutStyle, LayoutValue, Node,
-    NodeAction, NodeId, Role, Scene, SceneError, SurfaceMetrics, TypeRole,
+    NodeAction, NodeId, Position, Role, Scene, SceneError, SurfaceMetrics, TypeRole,
 };
 use std::fmt;
 
@@ -263,6 +263,7 @@ struct CacheKey {
     menu_id: String,
     revision: u64,
     page: pf_menu::PageIndex,
+    overlay: Option<Overlay>,
     message_revision: u64,
     panel: [Option<u32>; 3],
     metrics: [u32; 8],
@@ -338,6 +339,7 @@ fn cache_key(
         menu_id: engine.menu().id.clone(),
         revision: engine.revision(),
         page: engine.page(),
+        overlay: engine.overlay(),
         message_revision,
         panel: [
             panel.diagonal_in.map(f32::to_bits),
@@ -499,7 +501,7 @@ pub fn lower(
         LayoutMode::WideRail => vec![navigation, list],
         LayoutMode::TabStrip => vec![navigation, list],
     };
-    let body = Node::new(
+    let mut body = Node::new(
         node_id("menu/body"),
         Role::Group,
         "",
@@ -508,6 +510,7 @@ pub fn lower(
     )
     .with_layout(body_style(mode, tokens))
     .with_children(body_children);
+    body.state.scrimmed = engine.overlay().is_some();
     let status = text_node("menu/status", resolve(&page.title), TypeRole::Caption)
         .with_layout(bar_style(tokens));
     let hint = Node::new(
@@ -519,6 +522,11 @@ pub fn lower(
     )
     .with_layout(bar_style(tokens));
     let root_id = node_id(&format!("menu/root/{}", engine.menu().id));
+    let mut root_children = vec![status, body, hint];
+    let overlay = overlay_node(engine, messages, preferences, tokens);
+    if let Some((overlay, _)) = &overlay {
+        root_children.push(overlay.clone());
+    }
     let root = Node::new(
         root_id.clone(),
         Role::Group,
@@ -527,11 +535,16 @@ pub fn lower(
         "menu-root",
     )
     .with_layout(root_style())
-    .with_children(vec![status, body, hint]);
+    .with_children(root_children);
 
-    let focused = engine
-        .focus()
-        .map(|index| node_id(&format!("menu/item/{}", engine.item(index).id.0)));
+    let focused = overlay
+        .as_ref()
+        .map(|(_, focused)| focused.clone())
+        .or_else(|| {
+            engine
+                .focus()
+                .map(|index| node_id(&format!("menu/item/{}", engine.item(index).id.0)))
+        });
     let default_focus = focused.clone().unwrap_or(root_id);
     let scene = Scene::new_with_external_focus(root, default_focus, focused)?;
     Ok(LoweredMenu {
@@ -599,6 +612,7 @@ fn item_node(
     }
     node.state.disabled = !engine.is_enabled(index);
     node.state.unavailable = matches!(engine.apply_state(index), ApplyState::Reverted(_));
+    node.state.pending = matches!(engine.apply_state(index), ApplyState::Pending { .. });
     node.state.checked = matches!(engine.value(index), Some(MenuValue::Bool(true)));
     node.state.destructive = matches!(
         &item.kind,
@@ -675,6 +689,148 @@ fn item_value(
         (ItemKind::DateTime { .. }, Some(MenuValue::Int(value))) => Some(value.to_string()),
         _ => None,
     }
+}
+
+fn overlay_node(
+    engine: &MenuEngine,
+    messages: &dyn MsgResolver,
+    preferences: RenderPreferences,
+    tokens: Tokens,
+) -> Option<(Node, NodeId)> {
+    let resolve = |message: &Msg| {
+        let value = messages.resolve(message);
+        if preferences.pseudo_locale {
+            pseudo_expand(&value)
+        } else {
+            value
+        }
+    };
+    let (content, focused) = match engine.overlay()? {
+        Overlay::Confirm {
+            item,
+            confirm_focused,
+        } => {
+            let ItemKind::Action {
+                confirm: Some(confirm),
+                ..
+            } = &engine.item(item).kind
+            else {
+                unreachable!("validated confirm overlay belongs to a confirm action")
+            };
+            let cancel_id = node_id("menu/overlay/cancel");
+            let confirm_id = node_id("menu/overlay/confirm");
+            let mut confirm_button = Node::new(
+                confirm_id.clone(),
+                Role::Button,
+                resolve(&confirm.confirm_label),
+                empty_bounds(),
+                "menu-overlay-button",
+            )
+            .with_action(NodeAction::Activate)
+            .with_corner_radius(tokens.radius_row)
+            .with_layout(overlay_button_style(tokens));
+            confirm_button.state.destructive = confirm.destructive;
+            let cancel_button = Node::new(
+                cancel_id.clone(),
+                Role::Button,
+                "Cancel",
+                empty_bounds(),
+                "menu-overlay-button",
+            )
+            .with_action(NodeAction::Back)
+            .with_corner_radius(tokens.radius_row)
+            .with_layout(overlay_button_style(tokens));
+            let mut children = vec![text_node(
+                "menu/overlay/title",
+                resolve(&confirm.title),
+                TypeRole::Title,
+            )];
+            if let Some(body) = &confirm.body {
+                children.push(text_node(
+                    "menu/overlay/body",
+                    resolve(body),
+                    TypeRole::Body,
+                ));
+            }
+            children.push(
+                Node::new(
+                    node_id("menu/overlay/actions"),
+                    Role::Group,
+                    "",
+                    empty_bounds(),
+                    "menu-overlay-actions",
+                )
+                .with_layout(overlay_actions_style(tokens))
+                .with_children(vec![cancel_button, confirm_button]),
+            );
+            (
+                Node::new(
+                    node_id("menu/overlay/card"),
+                    Role::Group,
+                    resolve(&confirm.title),
+                    empty_bounds(),
+                    "menu-overlay-card",
+                )
+                .with_corner_radius(tokens.radius_modal)
+                .with_layout(overlay_card_style(tokens))
+                .with_children(children),
+                if confirm_focused {
+                    confirm_id
+                } else {
+                    cancel_id
+                },
+            )
+        }
+        Overlay::Picker { item, cursor } => {
+            let ItemKind::Choice { options, .. } = &engine.item(item).kind else {
+                unreachable!("validated picker overlay belongs to a choice")
+            };
+            let focused = node_id(&format!("menu/overlay/option/{cursor}"));
+            let options = options
+                .iter()
+                .enumerate()
+                .map(|(index, option)| {
+                    let mut node = Node::new(
+                        node_id(&format!("menu/overlay/option/{index}")),
+                        Role::Choice,
+                        resolve(&option.label),
+                        empty_bounds(),
+                        "menu-picker-option",
+                    )
+                    .with_action(NodeAction::Activate)
+                    .with_corner_radius(tokens.radius_row)
+                    .with_layout(row_style(option.detail.is_some(), tokens));
+                    node.state.selected = index == cursor as usize;
+                    node
+                })
+                .collect();
+            (
+                Node::new(
+                    node_id("menu/overlay/card"),
+                    Role::List,
+                    resolve(&engine.item(item).label),
+                    empty_bounds(),
+                    "menu-picker",
+                )
+                .with_corner_radius(tokens.radius_modal)
+                .with_layout(overlay_card_style(tokens))
+                .with_children(options),
+                focused,
+            )
+        }
+    };
+    Some((
+        Node::new(
+            node_id("menu/overlay"),
+            Role::Dialog,
+            content.accessible_label.clone(),
+            empty_bounds(),
+            "menu-overlay",
+        )
+        .with_layout(overlay_style())
+        .with_children(vec![content]),
+        focused,
+    ))
 }
 
 fn pseudo_expand(value: &str) -> String {
@@ -848,6 +1004,57 @@ fn fixed_height(height: f32) -> LayoutStyle {
         width: LayoutValue::Pct(1.0),
         height: LayoutValue::Px(height),
         min_height: LayoutValue::Px(height),
+        ..LayoutStyle::default()
+    }
+}
+
+fn overlay_style() -> LayoutStyle {
+    LayoutStyle {
+        position: Position::Absolute,
+        width: LayoutValue::Pct(1.0),
+        height: LayoutValue::Pct(1.0),
+        inset: edges(0.0),
+        align_items: Some(AlignItems::Center),
+        justify_content: Some(JustifyContent::Center),
+        ..LayoutStyle::default()
+    }
+}
+
+fn overlay_card_style(tokens: Tokens) -> LayoutStyle {
+    LayoutStyle {
+        width: LayoutValue::Pct(0.46),
+        min_width: LayoutValue::Px(320.0 * tokens.reference_scale),
+        flex_direction: FlexDirection::Column,
+        gap: (
+            LayoutValue::Px(tokens.spacing_3),
+            LayoutValue::Px(tokens.spacing_3),
+        ),
+        padding: edges(tokens.safe_margin),
+        ..LayoutStyle::default()
+    }
+}
+
+fn overlay_actions_style(tokens: Tokens) -> LayoutStyle {
+    LayoutStyle {
+        width: LayoutValue::Pct(1.0),
+        justify_content: Some(JustifyContent::End),
+        gap: (
+            LayoutValue::Px(tokens.spacing_2),
+            LayoutValue::Px(tokens.spacing_2),
+        ),
+        ..LayoutStyle::default()
+    }
+}
+
+fn overlay_button_style(tokens: Tokens) -> LayoutStyle {
+    LayoutStyle {
+        min_height: LayoutValue::Px(tokens.target),
+        padding: Edges {
+            left: LayoutValue::Px(tokens.safe_margin),
+            right: LayoutValue::Px(tokens.safe_margin),
+            ..edges(0.0)
+        },
+        align_items: Some(AlignItems::Center),
         ..LayoutStyle::default()
     }
 }

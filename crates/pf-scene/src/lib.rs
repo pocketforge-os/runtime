@@ -72,6 +72,8 @@ pub struct NodeState {
     pub scrimmed: bool,
     pub checked: bool,
     pub expanded: bool,
+    /// A value change is awaiting confirmation from its backing service.
+    pub pending: bool,
     /// Human-readable current value, separate from the node's stable label.
     pub value_text: Option<String>,
 }
@@ -415,6 +417,7 @@ pub enum StateTransition {
     Scrimmed(bool),
     Checked(bool),
     Expanded(bool),
+    Pending(bool),
     ValueText(Option<String>),
 }
 
@@ -586,6 +589,7 @@ impl Scene {
                 StateTransition::Scrimmed(value) => node.state.scrimmed = value,
                 StateTransition::Checked(value) => node.state.checked = value,
                 StateTransition::Expanded(value) => node.state.expanded = value,
+                StateTransition::Pending(value) => node.state.pending = value,
                 StateTransition::ValueText(value) => node.state.value_text = value,
             }
         }
