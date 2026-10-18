@@ -5,6 +5,9 @@ After=pf-prefsd.service pocketforge-audio-defaults.service sound.target
 
 [Service]
 Type=simple
+User=gamer
+Group=gamer
+SupplementaryGroups=audio
 ExecStart=/usr/bin/pf-volumed
 Restart=on-failure
 RestartSec=1s
