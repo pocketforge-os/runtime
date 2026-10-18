@@ -93,33 +93,78 @@ impl std::error::Error for PreferenceError {}
 pub trait MixerBackend {
     type Error;
 
+    /// Put the shared volume path at its hardware minimum before route ownership is known.
+    fn quiesce(&mut self) -> Result<(), Self::Error>;
+
     fn apply(&mut self, output: Output, percent: u8, muted: bool) -> Result<(), Self::Error>;
+
+    /// Select `output` without exposing it at the previous route's level.
+    ///
+    /// Implementations own the whole quiesce/select/apply transaction. On error they must either
+    /// leave the previously selected route intact or leave the volume path quiesced. The caller
+    /// treats the physical route as unknown until a later transition succeeds.
+    fn transition(&mut self, output: Output, percent: u8, muted: bool) -> Result<(), Self::Error>;
 }
 
 pub struct VolumeService<M> {
     backend: M,
     active: Output,
     preferences: VolumePreferences,
+    route_uncertain: bool,
 }
 
 impl<M: MixerBackend> VolumeService<M> {
-    pub fn new(backend: M, headphones_plugged: bool, preferences: VolumePreferences) -> Self {
+    pub fn new(backend: M, active: Output, preferences: VolumePreferences) -> Self {
         Self {
             backend,
-            active: output_for_plug(headphones_plugged),
+            active,
             preferences,
+            route_uncertain: false,
         }
     }
 
     pub fn apply_current(&mut self) -> Result<(), M::Error> {
-        self.backend.apply(
-            self.active,
-            self.preferences.percent(self.active),
-            self.preferences.muted(),
-        )
+        if self.route_uncertain {
+            self.backend.transition(
+                self.active,
+                self.preferences.percent(self.active),
+                self.preferences.muted(),
+            )?;
+            self.route_uncertain = false;
+            Ok(())
+        } else {
+            self.backend.apply(
+                self.active,
+                self.preferences.percent(self.active),
+                self.preferences.muted(),
+            )
+        }
     }
 
-    pub fn preferences_changed(&mut self, preferences: VolumePreferences) -> Result<(), M::Error> {
+    /// Reconcile one serialized route/preference observation.
+    ///
+    /// Combining the observations prevents preference-first handling from applying a source
+    /// level just before a route change. A failed transition does not commit either observation;
+    /// the next call performs another safe transition, even when it requests the old route.
+    pub fn reconcile(
+        &mut self,
+        active: Output,
+        preferences: VolumePreferences,
+    ) -> Result<(), M::Error> {
+        if active != self.active || self.route_uncertain {
+            if let Err(error) =
+                self.backend
+                    .transition(active, preferences.percent(active), preferences.muted())
+            {
+                self.route_uncertain = true;
+                return Err(error);
+            }
+            self.active = active;
+            self.preferences = preferences;
+            self.route_uncertain = false;
+            return Ok(());
+        }
+
         if preferences == self.preferences {
             return Ok(());
         }
@@ -129,20 +174,6 @@ impl<M: MixerBackend> VolumeService<M> {
             preferences.muted(),
         )?;
         self.preferences = preferences;
-        Ok(())
-    }
-
-    pub fn plug_changed(&mut self, headphones_plugged: bool) -> Result<(), M::Error> {
-        let active = output_for_plug(headphones_plugged);
-        if active == self.active {
-            return Ok(());
-        }
-        self.backend.apply(
-            active,
-            self.preferences.percent(active),
-            self.preferences.muted(),
-        )?;
-        self.active = active;
         Ok(())
     }
 
@@ -156,14 +187,6 @@ impl<M: MixerBackend> VolumeService<M> {
 
     pub fn backend_mut(&mut self) -> &mut M {
         &mut self.backend
-    }
-}
-
-fn output_for_plug(headphones_plugged: bool) -> Output {
-    if headphones_plugged {
-        Output::Headphones
-    } else {
-        Output::Speaker
     }
 }
 
@@ -189,9 +212,9 @@ impl fmt::Display for RuntimeError {
 
 impl std::error::Error for RuntimeError {}
 
-/// Current hardware backend. Both physical endpoints share the codec's DAC playback level; the
-/// kernel jack/DAPM policy selects `Headphone` versus `Speaker`. `output` remains in the trait so
-/// a future WirePlumber backend can address distinct sinks.
+/// Current hardware backend. Both physical endpoints share the codec's DAC playback level. This
+/// board has no headphone-detect event, so the process applies speaker levels only and rejects
+/// route transitions. A future WirePlumber backend can own an event-driven route transaction.
 pub struct AlsaMixer {
     amixer: PathBuf,
     card: String,
@@ -235,6 +258,10 @@ impl AlsaMixer {
 impl MixerBackend for AlsaMixer {
     type Error = RuntimeError;
 
+    fn quiesce(&mut self) -> Result<(), Self::Error> {
+        self.set_control("DAC Playback Volume", "0")
+    }
+
     fn apply(&mut self, _output: Output, percent: u8, muted: bool) -> Result<(), Self::Error> {
         // The merged A133 driver exposes no independent DAC mute switch. Its 0..63 inverted
         // volume control reaches -74.24 dB at 0, so mute applies that minimum while the service
@@ -246,41 +273,19 @@ impl MixerBackend for AlsaMixer {
         };
         self.set_control("DAC Playback Volume", &raw.to_string())
     }
-}
 
-pub struct AlsaJackSource {
-    amixer: PathBuf,
-    card: String,
-}
-
-impl AlsaJackSource {
-    pub fn new(card: impl Into<String>) -> Self {
-        Self::with_amixer("/usr/bin/amixer", card)
-    }
-
-    pub fn with_amixer(path: impl Into<PathBuf>, card: impl Into<String>) -> Self {
-        Self {
-            amixer: path.into(),
-            card: card.into(),
-        }
-    }
-
-    pub fn headphones_plugged(&self) -> Result<bool, RuntimeError> {
-        let output = Command::new(&self.amixer)
-            .args(["-c", &self.card, "cget", "name=Headphone Jack"])
-            .output()
-            .map_err(|error| RuntimeError(format!("start {}: {error}", self.amixer.display())))?;
-        if !output.status.success() {
-            return Err(RuntimeError::command("read ALSA Headphone Jack", output));
-        }
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        match (stdout.contains("values=on"), stdout.contains("values=off")) {
-            (true, false) => Ok(true),
-            (false, true) => Ok(false),
-            _ => Err(RuntimeError(format!(
-                "ALSA Headphone Jack response has no unique on/off value: {stdout:?}"
-            ))),
-        }
+    fn transition(
+        &mut self,
+        _output: Output,
+        _percent: u8,
+        _muted: bool,
+    ) -> Result<(), Self::Error> {
+        // The A133 board has no headphone-detect event and this backend does not own routing.
+        // Polling after the kernel exposes a new route cannot satisfy the transition contract.
+        self.quiesce()?;
+        Err(RuntimeError(String::from(
+            "route transition unavailable without an event-driven route controller",
+        )))
     }
 }
 
