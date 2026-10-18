@@ -27,9 +27,7 @@ fn preference_change_applies_only_the_active_output() {
     let mut service = VolumeService::new(FakeMixer::default(), false, prefs(60, 40, false));
 
     service.apply_current().unwrap();
-    service
-        .preferences_changed(prefs(25, 75, false))
-        .unwrap();
+    service.preferences_changed(prefs(25, 75, false)).unwrap();
 
     assert_eq!(
         service.backend().applied,
@@ -67,9 +65,7 @@ fn mute_round_trip_preserves_the_active_outputs_level() {
 
     service.apply_current().unwrap();
     service.preferences_changed(prefs(60, 42, true)).unwrap();
-    service
-        .preferences_changed(prefs(60, 42, false))
-        .unwrap();
+    service.preferences_changed(prefs(60, 42, false)).unwrap();
 
     assert_eq!(
         service.backend().applied,
