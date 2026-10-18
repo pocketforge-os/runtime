@@ -128,8 +128,65 @@ fn system_menu(ids: &[&str]) -> MenuEngine {
     .unwrap()
 }
 
+fn split_system_menu() -> MenuEngine {
+    let section = |header: &str, footer: &str, ids: &[&str]| Section {
+        header: Some(Msg::text(header)),
+        footer: Some(Msg::text(footer)),
+        items: ids
+            .iter()
+            .map(|id| {
+                let kind = if matches!(*id, "wifi" | "bt" | "airplane") {
+                    ItemKind::Toggle {
+                        bind: Bind::Host((*id).to_string()),
+                    }
+                } else {
+                    ItemKind::Action {
+                        confirm: None,
+                        stay_open: true,
+                    }
+                };
+                Item::new(
+                    id,
+                    Msg::text(&format!("A deliberately long {id} row label")),
+                    kind,
+                )
+            })
+            .collect(),
+    };
+    MenuEngine::new(
+        Menu {
+            format: FORMAT_V1.into(),
+            id: "split-system".into(),
+            root: PageId("system".into()),
+            pages: vec![Page {
+                id: PageId("system".into()),
+                title: Msg::text("System"),
+                tabs: vec![],
+                primary: None,
+                sections: vec![
+                    section("Network", "Network footer", &["one", "wifi", "two"]),
+                    section("Radios", "Radios footer", &["bt", "three", "four"]),
+                    section("Flight", "Flight footer", &["airplane", "five"]),
+                ],
+            }],
+        },
+        &PrefsSchemas,
+        EngineOptions::default(),
+    )
+    .unwrap()
+}
+
 fn has_node(node: &Node, id: &str) -> bool {
     node.id.as_str() == id || node.children.iter().any(|child| has_node(child, id))
+}
+
+fn count_nodes(node: &Node, id: &str) -> usize {
+    usize::from(node.id.as_str() == id)
+        + node
+            .children
+            .iter()
+            .map(|child| count_nodes(child, id))
+            .sum::<usize>()
 }
 
 #[test]
@@ -175,4 +232,61 @@ fn connections_fold_is_computed_from_content_band_on_every_size_class() {
     .unwrap();
     assert!(!compact.metadata.connections_folded);
     assert!(has_node(compact.scene.root(), "menu/item/wifi"));
+}
+
+#[test]
+fn connection_fold_counts_safe_insets_sections_and_large_text() {
+    let engine = split_system_menu();
+    let mut surface = metrics(1280.0, 720.0);
+    surface.safe_insets = Insets {
+        top: 24.0,
+        right: 12.0,
+        bottom: 24.0,
+        left: 12.0,
+    };
+    let lowered = lower(
+        &engine,
+        &ResolvedMsg,
+        PanelFacts::diagonal(5.0),
+        surface,
+        RenderPreferences {
+            text_scale: TextScale::Percent200,
+            ..RenderPreferences::default()
+        },
+    )
+    .unwrap();
+
+    assert!(lowered.metadata.connections_folded);
+}
+
+#[test]
+fn split_connection_sections_emit_one_fold_for_collapsed_and_expanded_states() {
+    let mut engine = split_system_menu();
+    let surface = metrics(1280.0, 500.0);
+    let collapsed = lower(
+        &engine,
+        &ResolvedMsg,
+        PanelFacts::diagonal(5.0),
+        surface,
+        RenderPreferences::default(),
+    )
+    .expect("split connection sections must lower without duplicate IDs");
+    assert!(collapsed.metadata.connections_folded);
+    assert_eq!(count_nodes(collapsed.scene.root(), "menu/connections"), 1);
+    assert!(!has_node(collapsed.scene.root(), "menu/item/wifi"));
+
+    engine.input(MenuInput::Down, MonotonicTime::ZERO);
+    let expanded = lower(
+        &engine,
+        &ResolvedMsg,
+        PanelFacts::diagonal(5.0),
+        surface,
+        RenderPreferences::default(),
+    )
+    .expect("focused split connection sections must lower without duplicate IDs");
+    assert_eq!(count_nodes(expanded.scene.root(), "menu/connections"), 1);
+    for id in ["wifi", "bt", "airplane"] {
+        assert!(has_node(expanded.scene.root(), &format!("menu/item/{id}")));
+    }
+    assert_eq!(expanded.scene.focused().unwrap().as_str(), "menu/item/wifi");
 }

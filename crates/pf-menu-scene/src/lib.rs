@@ -394,7 +394,8 @@ pub fn lower(
     let tokens = Tokens::for_surface(size_class, metrics);
     let page_index = engine.page();
     let page = engine.page_ref(page_index);
-    let connections_folded = should_fold_connections(engine, metrics, mode, tokens);
+    let connections_folded =
+        should_fold_connections(engine, messages, metrics, mode, tokens, preferences);
     let connections_expanded = connections_folded
         && engine
             .focus()
@@ -429,6 +430,7 @@ pub fn lower(
     }
 
     let mut sections = Vec::with_capacity(page.sections.len());
+    let mut connections_emitted = false;
     for (section_number, section) in page.sections.iter().enumerate() {
         let mut children = Vec::new();
         children.push(
@@ -455,7 +457,6 @@ pub fn lower(
                 )),
             );
         }
-        let mut connections_emitted = false;
         for item in &section.items {
             let index = engine
                 .item_index(&item.id)
@@ -468,7 +469,6 @@ pub fn lower(
                     connections_emitted = true;
                     children.push(connections_node(
                         engine,
-                        section,
                         messages,
                         preferences,
                         tokens,
@@ -693,22 +693,24 @@ fn item_node(
 
 fn connections_node(
     engine: &MenuEngine,
-    section: &pf_menu::Section,
     messages: &dyn MsgResolver,
     preferences: RenderPreferences,
     tokens: Tokens,
     expanded: bool,
 ) -> Node {
     let children = if expanded {
-        section
-            .items
-            .iter()
-            .filter(|item| is_connection_item(item))
-            .filter_map(|item| {
-                let index = engine.item_index(&item.id)?;
-                engine
-                    .is_visible(index)
-                    .then(|| item_node(engine, index, item, messages, preferences, tokens))
+        engine
+            .visible_items(engine.page())
+            .filter(|index| is_connection_item(engine.item(*index)))
+            .map(|index| {
+                item_node(
+                    engine,
+                    index,
+                    engine.item(index),
+                    messages,
+                    preferences,
+                    tokens,
+                )
             })
             .collect()
     } else {
@@ -745,9 +747,11 @@ fn is_connection_item(item: &Item) -> bool {
 
 fn should_fold_connections(
     engine: &MenuEngine,
+    messages: &dyn MsgResolver,
     metrics: SurfaceMetrics,
     mode: LayoutMode,
     tokens: Tokens,
+    preferences: RenderPreferences,
 ) -> bool {
     let page = engine.page();
     let visible: Vec<_> = engine.visible_items(page).collect();
@@ -758,26 +762,150 @@ fn should_fold_connections(
     }) {
         return false;
     }
-    let rows = visible
-        .iter()
-        .map(|index| {
-            if engine.item(*index).subtitle.is_some() {
-                tokens.row_tall
-            } else {
-                tokens.row
-            }
-        })
-        .sum::<f32>();
-    let gaps = visible.len().saturating_sub(1) as f32 * tokens.spacing_2;
-    let tabs = if mode == LayoutMode::TabStrip && !engine.page_ref(page).tabs.is_empty() {
-        tokens.bar + tokens.spacing_2
-    } else {
-        0.0
+
+    let available_width =
+        (metrics.logical_width - metrics.safe_insets.left - metrics.safe_insets.right).max(0.0);
+    let body_width = (available_width - 2.0 * tokens.spacing_2).max(0.0);
+    let list_width = match mode {
+        LayoutMode::WideRail => {
+            (body_width - (336.0 * tokens.reference_scale).round() - tokens.spacing_2).max(0.0)
+        }
+        LayoutMode::TabStrip => body_width,
     };
-    let content_padding = 2.0 * (tokens.safe_margin - tokens.spacing_2).max(0.0);
-    let content_band =
-        metrics.logical_height - 2.0 * tokens.bar - tabs - tokens.bar - content_padding;
-    rows + gaps > content_band.max(0.0)
+    let content_padding = (tokens.safe_margin - tokens.spacing_2).max(0.0);
+    let content_width = (list_width - 2.0 * content_padding).max(1.0);
+    let row_text_width = (content_width - 2.0 * tokens.spacing_4).max(1.0);
+
+    let page_ref = engine.page_ref(page);
+    let title_height = tokens
+        .bar
+        .max(32.0 * 1.35 * preferences.text_scale.factor())
+        .round();
+    let mut required_height = 2.0 * content_padding + title_height;
+    required_height += page_ref.sections.len() as f32 * tokens.spacing_2;
+    for section in &page_ref.sections {
+        let visible_items: Vec<_> = section
+            .items
+            .iter()
+            .filter_map(|item| engine.item_index(&item.id))
+            .filter(|index| engine.page_of(*index) == page && engine.is_visible(*index))
+            .collect();
+        let child_count = 1
+            + usize::from(section.header.is_some())
+            + visible_items.len()
+            + usize::from(section.footer.is_some());
+        let mut section_height = tokens.spacing_1;
+        if section.header.is_some() {
+            section_height += (24.0 * tokens.reference_scale)
+                .max(14.0 * 1.35 * preferences.text_scale.factor())
+                .round();
+        }
+        section_height += visible_items
+            .iter()
+            .map(|index| {
+                estimated_item_height(
+                    engine,
+                    *index,
+                    messages,
+                    preferences,
+                    tokens,
+                    row_text_width,
+                )
+            })
+            .sum::<f32>();
+        if let Some(footer) = &section.footer {
+            section_height += estimated_text_height(
+                &resolved_message(messages, preferences, footer),
+                TypeRole::Caption,
+                preferences.text_scale,
+                content_width,
+            );
+        }
+        section_height += child_count.saturating_sub(1) as f32 * tokens.spacing_2;
+        required_height += section_height;
+    }
+
+    let surface_height =
+        (metrics.logical_height - metrics.safe_insets.top - metrics.safe_insets.bottom).max(0.0);
+    let body_height = (surface_height - 2.0 * tokens.bar).max(0.0);
+    let list_height = match mode {
+        LayoutMode::WideRail => body_height,
+        LayoutMode::TabStrip => (body_height - tokens.bar - tokens.spacing_2).max(0.0),
+    };
+    required_height > list_height
+}
+
+fn estimated_item_height(
+    engine: &MenuEngine,
+    index: pf_menu::ItemIndex,
+    messages: &dyn MsgResolver,
+    preferences: RenderPreferences,
+    tokens: Tokens,
+    text_width: f32,
+) -> f32 {
+    let item = engine.item(index);
+    let resolve = |message: &Msg| resolved_message(messages, preferences, message);
+    let label = resolve(&item.label);
+    let value = item_value(engine, index, item, &resolve);
+    let stacked = preferences.text_scale >= TextScale::Percent150;
+    let child_width = if !stacked && value.is_some() {
+        ((text_width - tokens.spacing_4).max(1.0) / 2.0).max(1.0)
+    } else {
+        text_width
+    };
+    let label_height =
+        estimated_text_height(&label, TypeRole::Body, preferences.text_scale, child_width);
+    let value_height = value.as_ref().map_or(0.0, |value| {
+        estimated_text_height(value, TypeRole::Label, preferences.text_scale, child_width)
+    });
+    let main_height = if stacked && value.is_some() {
+        label_height + tokens.spacing_2 + value_height
+    } else {
+        label_height.max(value_height)
+    };
+    let mut content_height = 2.0 * tokens.spacing_2 + main_height;
+    if let Some(subtitle) = &item.subtitle {
+        content_height += tokens.spacing_1
+            + estimated_text_height(
+                &resolve(subtitle),
+                TypeRole::Caption,
+                preferences.text_scale,
+                text_width,
+            );
+    }
+    let minimum = if item.subtitle.is_some() {
+        tokens.row_tall
+    } else {
+        tokens.row
+    };
+    content_height.max(minimum)
+}
+
+fn estimated_text_height(text: &str, role: TypeRole, text_scale: TextScale, max_width: f32) -> f32 {
+    let em = match role {
+        TypeRole::Hero => 40.0,
+        TypeRole::Title => 28.0,
+        TypeRole::H1 => 32.0,
+        TypeRole::Body | TypeRole::Label | TypeRole::Plate => 20.0,
+        TypeRole::Caption => 16.0,
+        TypeRole::Eyebrow => 14.0,
+    } * text_scale.factor();
+    let natural_width = text.chars().count().max(1) as f32 * em;
+    let lines = (natural_width / max_width.max(em)).ceil().max(1.0);
+    lines * em * 1.35
+}
+
+fn resolved_message(
+    messages: &dyn MsgResolver,
+    preferences: RenderPreferences,
+    message: &Msg,
+) -> String {
+    let value = messages.resolve(message);
+    if preferences.pseudo_locale {
+        pseudo_expand(&value)
+    } else {
+        value
+    }
 }
 
 fn item_role(kind: &ItemKind) -> Role {
