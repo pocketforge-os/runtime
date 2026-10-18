@@ -1,5 +1,5 @@
 use pf_prefsd::Client;
-use pf_volumed::{load_preferences, AlsaMixer, Output, VolumeService};
+use pf_volumed::{load_preferences, AlsaMixer, MixerBackend};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -12,20 +12,17 @@ struct Args {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = parse_args(std::env::args().skip(1))?;
     let client = Client::new(args.prefs_socket);
-    let preferences = load_preferences(&client)?;
-    // This board has no headphone-detect event. Keep the ALSA backend fixed on the supported
-    // speaker route; a future event-driven route owner can use VolumeService::reconcile.
-    let mut service = VolumeService::new(AlsaMixer::new(args.card), Output::Speaker, preferences);
-    service.apply_current()?;
+    let mut mixer = AlsaMixer::new(args.card);
+    // This board has no headphone-detect event, so neither endpoint can be established safely.
+    // Quiesce the shared DAC before any preference I/O and leave it there until an event-driven
+    // route owner can perform VolumeService's atomic transition contract.
+    mixer.quiesce()?;
+    load_preferences(&client)?;
 
     loop {
         std::thread::sleep(args.poll);
         match load_preferences(&client) {
-            Ok(preferences) => {
-                if let Err(error) = service.reconcile(Output::Speaker, preferences) {
-                    eprintln!("pf-volumed: apply preferences: {error}");
-                }
-            }
+            Ok(_) => {}
             Err(error) => eprintln!("pf-volumed: {error}"),
         }
     }

@@ -19,6 +19,12 @@ struct FakeMixer {
 impl MixerBackend for FakeMixer {
     type Error = &'static str;
 
+    fn quiesce(&mut self) -> Result<(), Self::Error> {
+        self.operations.push(Operation::Quiesce);
+        self.quiesced = true;
+        Ok(())
+    }
+
     fn apply(&mut self, output: Output, percent: u8, muted: bool) -> Result<(), Self::Error> {
         if std::mem::take(&mut self.fail_apply) {
             return Err("injected mixer failure");
@@ -29,8 +35,7 @@ impl MixerBackend for FakeMixer {
     }
 
     fn transition(&mut self, to: Output, percent: u8, muted: bool) -> Result<(), Self::Error> {
-        self.operations.push(Operation::Quiesce);
-        self.quiesced = true;
+        self.quiesce()?;
         self.operations.push(Operation::Select(to));
         if std::mem::take(&mut self.fail_transition_after_select) {
             return Err("injected route failure");

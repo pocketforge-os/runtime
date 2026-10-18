@@ -93,6 +93,9 @@ impl std::error::Error for PreferenceError {}
 pub trait MixerBackend {
     type Error;
 
+    /// Put the shared volume path at its hardware minimum before route ownership is known.
+    fn quiesce(&mut self) -> Result<(), Self::Error>;
+
     fn apply(&mut self, output: Output, percent: u8, muted: bool) -> Result<(), Self::Error>;
 
     /// Select `output` without exposing it at the previous route's level.
@@ -255,6 +258,10 @@ impl AlsaMixer {
 impl MixerBackend for AlsaMixer {
     type Error = RuntimeError;
 
+    fn quiesce(&mut self) -> Result<(), Self::Error> {
+        self.set_control("DAC Playback Volume", "0")
+    }
+
     fn apply(&mut self, _output: Output, percent: u8, muted: bool) -> Result<(), Self::Error> {
         // The merged A133 driver exposes no independent DAC mute switch. Its 0..63 inverted
         // volume control reaches -74.24 dB at 0, so mute applies that minimum while the service
@@ -275,6 +282,7 @@ impl MixerBackend for AlsaMixer {
     ) -> Result<(), Self::Error> {
         // The A133 board has no headphone-detect event and this backend does not own routing.
         // Polling after the kernel exposes a new route cannot satisfy the transition contract.
+        self.quiesce()?;
         Err(RuntimeError(String::from(
             "route transition unavailable without an event-driven route controller",
         )))

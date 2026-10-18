@@ -50,6 +50,7 @@ fn alsa_backend_maps_levels_rejects_unsafe_routes_and_surfaces_command_failure()
     write_fake(&fake, &log, &fail);
 
     let mut mixer = AlsaMixer::with_amixer(&fake, "Codec");
+    mixer.quiesce().unwrap();
     mixer.apply(Output::Speaker, 60, false).unwrap();
     mixer.apply(Output::Headphones, 40, true).unwrap();
     let transition_error = mixer.transition(Output::Headphones, 40, false).unwrap_err();
@@ -61,7 +62,11 @@ fn alsa_backend_maps_levels_rejects_unsafe_routes_and_surfaces_command_failure()
     assert!(calls.contains("cset name=DAC Playback Volume 38"));
     assert!(calls.contains("cset name=DAC Playback Volume 0"));
     assert!(!calls.contains("DAC Playback Switch"));
-    assert_eq!(calls.lines().count(), 2);
+    assert_eq!(
+        calls.lines().next(),
+        Some("-q -c Codec cset name=DAC Playback Volume 0")
+    );
+    assert_eq!(calls.lines().count(), 4);
 
     File::create(&fail).unwrap();
     let error = mixer.apply(Output::Headphones, 40, true).unwrap_err();
