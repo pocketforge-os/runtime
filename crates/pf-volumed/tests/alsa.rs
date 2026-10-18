@@ -54,6 +54,7 @@ fn alsa_backend_maps_levels_reads_jack_and_surfaces_command_failure() {
 
     let mut mixer = AlsaMixer::with_amixer(&fake, "Codec");
     mixer.apply(Output::Speaker, 60, false).unwrap();
+    mixer.apply(Output::Headphones, 40, true).unwrap();
     let jack = AlsaJackSource::with_amixer(&fake, "Codec");
     assert!(!jack.headphones_plugged().unwrap());
     fs::write(&state, "on\n").unwrap();
@@ -61,7 +62,8 @@ fn alsa_backend_maps_levels_reads_jack_and_surfaces_command_failure() {
 
     let calls = fs::read_to_string(&log).unwrap();
     assert!(calls.contains("cset name=DAC Playback Volume 38"));
-    assert!(calls.contains("cset name=DAC Playback Switch on"));
+    assert!(calls.contains("cset name=DAC Playback Volume 0"));
+    assert!(!calls.contains("DAC Playback Switch"));
     assert!(calls.contains("cget name=Headphone Jack"));
 
     File::create(&fail).unwrap();

@@ -236,9 +236,15 @@ impl MixerBackend for AlsaMixer {
     type Error = RuntimeError;
 
     fn apply(&mut self, _output: Output, percent: u8, muted: bool) -> Result<(), Self::Error> {
-        let raw = ((u16::from(percent) * 63 + 50) / 100).to_string();
-        self.set_control("DAC Playback Volume", &raw)?;
-        self.set_control("DAC Playback Switch", if muted { "off" } else { "on" })
+        // The merged A133 driver exposes no independent DAC mute switch. Its 0..63 inverted
+        // volume control reaches -74.24 dB at 0, so mute applies that minimum while the service
+        // retains the per-output percentage for the unmute round-trip.
+        let raw = if muted {
+            0
+        } else {
+            (u16::from(percent) * 63 + 50) / 100
+        };
+        self.set_control("DAC Playback Volume", &raw.to_string())
     }
 }
 
