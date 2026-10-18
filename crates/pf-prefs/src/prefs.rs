@@ -183,6 +183,18 @@ impl Prefs {
         self.get_scalar("brightness").unwrap_or(100)
     }
 
+    pub fn volume_speaker(&self) -> i64 {
+        self.get_scalar("volumeSpeaker").unwrap_or(60)
+    }
+
+    pub fn volume_headphones(&self) -> i64 {
+        self.get_scalar("volumeHeadphones").unwrap_or(40)
+    }
+
+    pub fn muted(&self) -> bool {
+        self.get_bool("muted").unwrap_or(false)
+    }
+
     pub fn auto_rotate(&self) -> bool {
         self.get_bool("auto_rotate").unwrap_or(true)
     }
@@ -230,6 +242,9 @@ mod tests {
         assert!(p.haptics_enabled());
         assert!(!p.mono_audio());
         assert_eq!(p.brightness(), 100);
+        assert_eq!(p.volume_speaker(), 60);
+        assert_eq!(p.volume_headphones(), 40);
+        assert!(!p.muted());
         assert!(p.auto_rotate());
         assert_eq!(p.user_rotation(), "normal");
         assert_eq!(p.source("hapticsEnabled"), Source::Default);

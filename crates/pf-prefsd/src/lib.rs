@@ -225,6 +225,18 @@ pub const WRITE_POLICY: &[WritePolicyRow] = &[
         writers: SETTINGS_AND_SHELL,
     },
     WritePolicyRow {
+        key: "volumeSpeaker",
+        writers: SETTINGS_AND_SHELL,
+    },
+    WritePolicyRow {
+        key: "volumeHeadphones",
+        writers: SETTINGS_AND_SHELL,
+    },
+    WritePolicyRow {
+        key: "muted",
+        writers: SETTINGS_AND_SHELL,
+    },
+    WritePolicyRow {
         key: "auto_rotate",
         writers: SETTINGS_AND_SHELL,
     },
