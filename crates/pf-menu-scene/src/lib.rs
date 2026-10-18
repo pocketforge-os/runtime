@@ -448,7 +448,11 @@ pub fn lower(
                     resolve(header),
                     TypeRole::Eyebrow,
                 )
-                .with_layout(fixed_height((24.0 * tokens.reference_scale).round())),
+                .with_layout(fixed_height(
+                    (24.0 * tokens.reference_scale)
+                        .max(14.0 * 1.35 * preferences.text_scale.factor())
+                        .round(),
+                )),
             );
         }
         let mut connections_emitted = false;
@@ -502,8 +506,13 @@ pub fn lower(
         );
     }
 
-    let title = text_node("menu/page/title", resolve(&page.title), TypeRole::H1)
-        .with_layout(fixed_height(tokens.bar));
+    let title =
+        text_node("menu/page/title", resolve(&page.title), TypeRole::H1).with_layout(fixed_height(
+            tokens
+                .bar
+                .max(32.0 * 1.35 * preferences.text_scale.factor())
+                .round(),
+        ));
     let list = Node::new(
         node_id("menu/page/list"),
         Role::List,
@@ -648,18 +657,30 @@ fn item_node(
     );
     node.state.value_text = value.clone();
 
-    let mut content = vec![text_node(
+    let mut main = vec![text_node(
         format!("menu/item/{}/label", item.id.0),
         resolve(&item.label),
         TypeRole::Body,
     )];
     if let Some(value) = value {
-        content.push(text_node(
+        main.push(text_node(
             format!("menu/item/{}/value", item.id.0),
             value,
             TypeRole::Label,
         ));
     }
+    let mut content = vec![Node::new(
+        node_id(&format!("menu/item/{}/main", item.id.0)),
+        Role::Group,
+        "",
+        empty_bounds(),
+        "menu-row-main",
+    )
+    .with_layout(row_line_style(
+        tokens,
+        preferences.text_scale >= TextScale::Percent150,
+    ))
+    .with_children(main)];
     if let Some(subtitle) = &item.subtitle {
         content.push(text_node(
             format!("menu/item/{}/subtitle", item.id.0),
@@ -842,7 +863,12 @@ fn overlay_node(
             )
             .with_action(NodeAction::Activate)
             .with_corner_radius(tokens.radius_row)
-            .with_layout(overlay_button_style(tokens));
+            .with_layout(overlay_button_style(tokens))
+            .with_children(vec![text_node(
+                "menu/overlay/confirm/label",
+                resolve(&confirm.confirm_label),
+                TypeRole::Label,
+            )]);
             confirm_button.state.destructive = confirm.destructive;
             let cancel_button = Node::new(
                 cancel_id.clone(),
@@ -853,7 +879,12 @@ fn overlay_node(
             )
             .with_action(NodeAction::Back)
             .with_corner_radius(tokens.radius_row)
-            .with_layout(overlay_button_style(tokens));
+            .with_layout(overlay_button_style(tokens))
+            .with_children(vec![text_node(
+                "menu/overlay/cancel/label",
+                "Cancel".to_string(),
+                TypeRole::Label,
+            )]);
             let mut children = vec![text_node(
                 "menu/overlay/title",
                 resolve(&confirm.title),
@@ -904,16 +935,30 @@ fn overlay_node(
                 .iter()
                 .enumerate()
                 .map(|(index, option)| {
+                    let label = resolve(&option.label);
+                    let mut children = vec![text_node(
+                        format!("menu/overlay/option/{index}/label"),
+                        label.clone(),
+                        TypeRole::Body,
+                    )];
+                    if let Some(detail) = &option.detail {
+                        children.push(text_node(
+                            format!("menu/overlay/option/{index}/detail"),
+                            resolve(detail),
+                            TypeRole::Caption,
+                        ));
+                    }
                     let mut node = Node::new(
                         node_id(&format!("menu/overlay/option/{index}")),
                         Role::Choice,
-                        resolve(&option.label),
+                        label,
                         empty_bounds(),
                         "menu-picker-option",
                     )
                     .with_action(NodeAction::Activate)
                     .with_corner_radius(tokens.radius_row)
-                    .with_layout(row_style(option.detail.is_some(), tokens));
+                    .with_layout(row_style(option.detail.is_some(), tokens))
+                    .with_children(children);
                     node.state.selected = index == cursor as usize;
                     node
                 })
@@ -972,6 +1017,7 @@ fn text_node(id: impl AsRef<str>, label: String, type_role: TypeRole) -> Node {
         "menu-text",
     )
     .with_type_role(type_role)
+    .with_layout(LayoutStyle::default())
 }
 
 fn edges(value: f32) -> Edges<LayoutValue> {
@@ -1096,12 +1142,12 @@ fn row_style(two_line: bool, tokens: Tokens) -> LayoutStyle {
         } else {
             tokens.row
         }),
-        flex_direction: FlexDirection::Row,
-        align_items: Some(AlignItems::Center),
-        justify_content: Some(JustifyContent::SpaceBetween),
+        flex_direction: FlexDirection::Column,
+        align_items: Some(AlignItems::Stretch),
+        justify_content: Some(JustifyContent::Center),
         gap: (
-            LayoutValue::Px(tokens.spacing_4),
-            LayoutValue::Px(tokens.spacing_2),
+            LayoutValue::Px(tokens.spacing_1),
+            LayoutValue::Px(tokens.spacing_1),
         ),
         padding: Edges {
             top: LayoutValue::Px(tokens.spacing_2),
@@ -1109,6 +1155,32 @@ fn row_style(two_line: bool, tokens: Tokens) -> LayoutStyle {
             bottom: LayoutValue::Px(tokens.spacing_2),
             left: LayoutValue::Px(tokens.spacing_4),
         },
+        ..LayoutStyle::default()
+    }
+}
+
+fn row_line_style(tokens: Tokens, stacked: bool) -> LayoutStyle {
+    LayoutStyle {
+        width: LayoutValue::Pct(1.0),
+        flex_direction: if stacked {
+            FlexDirection::Column
+        } else {
+            FlexDirection::Row
+        },
+        align_items: Some(if stacked {
+            AlignItems::Stretch
+        } else {
+            AlignItems::Center
+        }),
+        justify_content: Some(if stacked {
+            JustifyContent::Start
+        } else {
+            JustifyContent::SpaceBetween
+        }),
+        gap: (
+            LayoutValue::Px(tokens.spacing_4),
+            LayoutValue::Px(tokens.spacing_2),
+        ),
         ..LayoutStyle::default()
     }
 }

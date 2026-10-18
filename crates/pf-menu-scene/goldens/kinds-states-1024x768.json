@@ -1,0 +1,3086 @@
+[
+  {
+    "name": "base-root",
+    "focused": "menu/item/action",
+    "nodes": [
+      {
+        "id": "menu/root/golden",
+        "role": "Group",
+        "bounds": [
+          0,
+          0,
+          1024,
+          768
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/status",
+        "role": "Text",
+        "bounds": [
+          0,
+          0,
+          1024,
+          58
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/body",
+        "role": "Group",
+        "bounds": [
+          0,
+          58,
+          1024,
+          652
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/navigation",
+        "role": "List",
+        "bounds": [
+          10,
+          58,
+          1004,
+          58
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/tab/root",
+        "role": "Tab",
+        "bounds": [
+          10,
+          58,
+          328,
+          58
+        ],
+        "radius": 14,
+        "state": "f0 p0 d0 s1 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/tab/other",
+        "role": "Tab",
+        "bounds": [
+          348,
+          58,
+          328,
+          58
+        ],
+        "radius": 14,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/tab/last",
+        "role": "Tab",
+        "bounds": [
+          686,
+          58,
+          328,
+          58
+        ],
+        "radius": 14,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/page/list",
+        "role": "List",
+        "bounds": [
+          10,
+          126,
+          1004,
+          584
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/page/title",
+        "role": "Text",
+        "bounds": [
+          29,
+          145,
+          966,
+          58
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/section/0",
+        "role": "Group",
+        "bounds": [
+          29,
+          213,
+          966,
+          461
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/section/0/separator",
+        "role": "Separator",
+        "bounds": [
+          29,
+          213,
+          966,
+          5
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/section/0/header",
+        "role": "Text",
+        "bounds": [
+          29,
+          228,
+          966,
+          29
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/item/action",
+        "role": "Button",
+        "bounds": [
+          29,
+          267,
+          966,
+          67
+        ],
+        "radius": 14,
+        "state": "f1 p0 d0 s0 u0 x1 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/item/action/main",
+        "role": "Group",
+        "bounds": [
+          48,
+          287,
+          928,
+          27
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/item/action/label",
+        "role": "Text",
+        "bounds": [
+          48,
+          287,
+          62,
+          27
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/item/toggle",
+        "role": "Toggle",
+        "bounds": [
+          29,
+          344,
+          966,
+          67
+        ],
+        "radius": 14,
+        "state": "f0 p0 d0 s0 u0 x0 c1 e0 busy0 scrim0",
+        "value": "On"
+      },
+      {
+        "id": "menu/item/toggle/main",
+        "role": "Group",
+        "bounds": [
+          48,
+          364,
+          928,
+          27
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/item/toggle/label",
+        "role": "Text",
+        "bounds": [
+          48,
+          364,
+          62,
+          27
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/item/toggle/value",
+        "role": "Text",
+        "bounds": [
+          955,
+          364,
+          21,
+          27
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/item/choice",
+        "role": "Choice",
+        "bounds": [
+          29,
+          421,
+          966,
+          67
+        ],
+        "radius": 14,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": "Two"
+      },
+      {
+        "id": "menu/item/choice/main",
+        "role": "Group",
+        "bounds": [
+          48,
+          441,
+          928,
+          27
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/item/choice/label",
+        "role": "Text",
+        "bounds": [
+          48,
+          441,
+          62,
+          27
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/item/choice/value",
+        "role": "Text",
+        "bounds": [
+          945,
+          441,
+          31,
+          27
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/item/stepper",
+        "role": "Slider",
+        "bounds": [
+          29,
+          498,
+          966,
+          67
+        ],
+        "radius": 14,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": "4 ms"
+      },
+      {
+        "id": "menu/item/stepper/main",
+        "role": "Group",
+        "bounds": [
+          48,
+          518,
+          928,
+          27
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/item/stepper/label",
+        "role": "Text",
+        "bounds": [
+          48,
+          518,
+          73,
+          27
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/item/stepper/value",
+        "role": "Text",
+        "bounds": [
+          934,
+          518,
+          42,
+          27
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/item/info",
+        "role": "Text",
+        "bounds": [
+          29,
+          575,
+          966,
+          67
+        ],
+        "radius": 14,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": "Ready"
+      },
+      {
+        "id": "menu/item/info/main",
+        "role": "Group",
+        "bounds": [
+          48,
+          595,
+          928,
+          27
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/item/info/label",
+        "role": "Text",
+        "bounds": [
+          48,
+          595,
+          42,
+          27
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/item/info/value",
+        "role": "Text",
+        "bounds": [
+          924,
+          595,
+          52,
+          27
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/section/0/footer",
+        "role": "Text",
+        "bounds": [
+          29,
+          652,
+          966,
+          22
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/hint",
+        "role": "Group",
+        "bounds": [
+          0,
+          710,
+          1024,
+          58
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      }
+    ]
+  },
+  {
+    "name": "base-other",
+    "focused": "menu/item/slider",
+    "nodes": [
+      {
+        "id": "menu/root/golden",
+        "role": "Group",
+        "bounds": [
+          0,
+          0,
+          1024,
+          768
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/status",
+        "role": "Text",
+        "bounds": [
+          0,
+          0,
+          1024,
+          58
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/body",
+        "role": "Group",
+        "bounds": [
+          0,
+          58,
+          1024,
+          652
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/navigation",
+        "role": "List",
+        "bounds": [
+          10,
+          58,
+          1004,
+          58
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/tab/root",
+        "role": "Tab",
+        "bounds": [
+          10,
+          58,
+          328,
+          58
+        ],
+        "radius": 14,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/tab/other",
+        "role": "Tab",
+        "bounds": [
+          348,
+          58,
+          328,
+          58
+        ],
+        "radius": 14,
+        "state": "f0 p0 d0 s1 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/tab/last",
+        "role": "Tab",
+        "bounds": [
+          686,
+          58,
+          328,
+          58
+        ],
+        "radius": 14,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/page/list",
+        "role": "List",
+        "bounds": [
+          10,
+          126,
+          1004,
+          584
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/page/title",
+        "role": "Text",
+        "bounds": [
+          29,
+          145,
+          966,
+          58
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/section/0",
+        "role": "Group",
+        "bounds": [
+          29,
+          213,
+          966,
+          371
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/section/0/separator",
+        "role": "Separator",
+        "bounds": [
+          29,
+          213,
+          966,
+          5
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/section/0/header",
+        "role": "Text",
+        "bounds": [
+          29,
+          228,
+          966,
+          29
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/item/slider",
+        "role": "Slider",
+        "bounds": [
+          29,
+          267,
+          966,
+          67
+        ],
+        "radius": 14,
+        "state": "f1 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": "65"
+      },
+      {
+        "id": "menu/item/slider/main",
+        "role": "Group",
+        "bounds": [
+          48,
+          287,
+          928,
+          27
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/item/slider/label",
+        "role": "Text",
+        "bounds": [
+          48,
+          287,
+          62,
+          27
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/item/slider/value",
+        "role": "Text",
+        "bounds": [
+          955,
+          287,
+          21,
+          27
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/item/text",
+        "role": "TextField",
+        "bounds": [
+          29,
+          344,
+          966,
+          86
+        ],
+        "radius": 14,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/item/text/main",
+        "role": "Group",
+        "bounds": [
+          48,
+          360,
+          928,
+          27
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/item/text/label",
+        "role": "Text",
+        "bounds": [
+          48,
+          360,
+          42,
+          27
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/item/text/subtitle",
+        "role": "Text",
+        "bounds": [
+          48,
+          392,
+          928,
+          22
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/item/link",
+        "role": "Link",
+        "bounds": [
+          29,
+          440,
+          966,
+          67
+        ],
+        "radius": 14,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/item/link/main",
+        "role": "Group",
+        "bounds": [
+          48,
+          460,
+          928,
+          27
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/item/link/label",
+        "role": "Text",
+        "bounds": [
+          48,
+          460,
+          42,
+          27
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/item/progress",
+        "role": "Progress",
+        "bounds": [
+          29,
+          517,
+          966,
+          67
+        ],
+        "radius": 14,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": "40"
+      },
+      {
+        "id": "menu/item/progress/main",
+        "role": "Group",
+        "bounds": [
+          48,
+          537,
+          928,
+          27
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/item/progress/label",
+        "role": "Text",
+        "bounds": [
+          48,
+          537,
+          83,
+          27
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/item/progress/value",
+        "role": "Text",
+        "bounds": [
+          955,
+          537,
+          21,
+          27
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/hint",
+        "role": "Group",
+        "bounds": [
+          0,
+          710,
+          1024,
+          58
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      }
+    ]
+  },
+  {
+    "name": "base-last",
+    "focused": "menu/item/binding",
+    "nodes": [
+      {
+        "id": "menu/root/golden",
+        "role": "Group",
+        "bounds": [
+          0,
+          0,
+          1024,
+          768
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/status",
+        "role": "Text",
+        "bounds": [
+          0,
+          0,
+          1024,
+          58
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/body",
+        "role": "Group",
+        "bounds": [
+          0,
+          58,
+          1024,
+          652
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/navigation",
+        "role": "List",
+        "bounds": [
+          10,
+          58,
+          1004,
+          58
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/tab/root",
+        "role": "Tab",
+        "bounds": [
+          10,
+          58,
+          328,
+          58
+        ],
+        "radius": 14,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/tab/other",
+        "role": "Tab",
+        "bounds": [
+          348,
+          58,
+          328,
+          58
+        ],
+        "radius": 14,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/tab/last",
+        "role": "Tab",
+        "bounds": [
+          686,
+          58,
+          328,
+          58
+        ],
+        "radius": 14,
+        "state": "f0 p0 d0 s1 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/page/list",
+        "role": "List",
+        "bounds": [
+          10,
+          126,
+          1004,
+          584
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/page/title",
+        "role": "Text",
+        "bounds": [
+          29,
+          145,
+          966,
+          58
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/section/0",
+        "role": "Group",
+        "bounds": [
+          29,
+          213,
+          966,
+          352
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/section/0/separator",
+        "role": "Separator",
+        "bounds": [
+          29,
+          213,
+          966,
+          5
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/section/0/header",
+        "role": "Text",
+        "bounds": [
+          29,
+          228,
+          966,
+          29
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/item/binding",
+        "role": "Button",
+        "bounds": [
+          29,
+          267,
+          966,
+          67
+        ],
+        "radius": 14,
+        "state": "f1 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": "jump"
+      },
+      {
+        "id": "menu/item/binding/main",
+        "role": "Group",
+        "bounds": [
+          48,
+          287,
+          928,
+          27
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/item/binding/label",
+        "role": "Text",
+        "bounds": [
+          48,
+          287,
+          73,
+          27
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/item/binding/value",
+        "role": "Text",
+        "bounds": [
+          934,
+          287,
+          42,
+          27
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/item/datetime",
+        "role": "Choice",
+        "bounds": [
+          29,
+          344,
+          966,
+          67
+        ],
+        "radius": 14,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/item/datetime/main",
+        "role": "Group",
+        "bounds": [
+          48,
+          364,
+          928,
+          27
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/item/datetime/label",
+        "role": "Text",
+        "bounds": [
+          48,
+          364,
+          83,
+          27
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/item/custom",
+        "role": "Group",
+        "bounds": [
+          29,
+          421,
+          966,
+          67
+        ],
+        "radius": 14,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/item/custom/main",
+        "role": "Group",
+        "bounds": [
+          48,
+          441,
+          928,
+          27
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/item/custom/label",
+        "role": "Text",
+        "bounds": [
+          48,
+          441,
+          62,
+          27
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/item/disabled",
+        "role": "Button",
+        "bounds": [
+          29,
+          498,
+          966,
+          67
+        ],
+        "radius": 14,
+        "state": "f0 p0 d1 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/item/disabled/main",
+        "role": "Group",
+        "bounds": [
+          48,
+          518,
+          928,
+          27
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/item/disabled/label",
+        "role": "Text",
+        "bounds": [
+          48,
+          518,
+          83,
+          27
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/hint",
+        "role": "Group",
+        "bounds": [
+          0,
+          710,
+          1024,
+          58
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      }
+    ]
+  },
+  {
+    "name": "pending",
+    "focused": "menu/item/toggle",
+    "nodes": [
+      {
+        "id": "menu/root/golden",
+        "role": "Group",
+        "bounds": [
+          0,
+          0,
+          1024,
+          768
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/status",
+        "role": "Text",
+        "bounds": [
+          0,
+          0,
+          1024,
+          58
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/body",
+        "role": "Group",
+        "bounds": [
+          0,
+          58,
+          1024,
+          652
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/navigation",
+        "role": "List",
+        "bounds": [
+          10,
+          58,
+          1004,
+          58
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/tab/root",
+        "role": "Tab",
+        "bounds": [
+          10,
+          58,
+          328,
+          58
+        ],
+        "radius": 14,
+        "state": "f0 p0 d0 s1 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/tab/other",
+        "role": "Tab",
+        "bounds": [
+          348,
+          58,
+          328,
+          58
+        ],
+        "radius": 14,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/tab/last",
+        "role": "Tab",
+        "bounds": [
+          686,
+          58,
+          328,
+          58
+        ],
+        "radius": 14,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/page/list",
+        "role": "List",
+        "bounds": [
+          10,
+          126,
+          1004,
+          584
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/page/title",
+        "role": "Text",
+        "bounds": [
+          29,
+          145,
+          966,
+          58
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/section/0",
+        "role": "Group",
+        "bounds": [
+          29,
+          213,
+          966,
+          461
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/section/0/separator",
+        "role": "Separator",
+        "bounds": [
+          29,
+          213,
+          966,
+          5
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/section/0/header",
+        "role": "Text",
+        "bounds": [
+          29,
+          228,
+          966,
+          29
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/item/action",
+        "role": "Button",
+        "bounds": [
+          29,
+          267,
+          966,
+          67
+        ],
+        "radius": 14,
+        "state": "f0 p0 d0 s0 u0 x1 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/item/action/main",
+        "role": "Group",
+        "bounds": [
+          48,
+          287,
+          928,
+          27
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/item/action/label",
+        "role": "Text",
+        "bounds": [
+          48,
+          287,
+          62,
+          27
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/item/toggle",
+        "role": "Toggle",
+        "bounds": [
+          29,
+          344,
+          966,
+          67
+        ],
+        "radius": 14,
+        "state": "f1 p0 d0 s0 u0 x0 c0 e0 busy1 scrim0",
+        "value": "Off"
+      },
+      {
+        "id": "menu/item/toggle/main",
+        "role": "Group",
+        "bounds": [
+          48,
+          364,
+          928,
+          27
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/item/toggle/label",
+        "role": "Text",
+        "bounds": [
+          48,
+          364,
+          62,
+          27
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/item/toggle/value",
+        "role": "Text",
+        "bounds": [
+          945,
+          364,
+          31,
+          27
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/item/choice",
+        "role": "Choice",
+        "bounds": [
+          29,
+          421,
+          966,
+          67
+        ],
+        "radius": 14,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": "Two"
+      },
+      {
+        "id": "menu/item/choice/main",
+        "role": "Group",
+        "bounds": [
+          48,
+          441,
+          928,
+          27
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/item/choice/label",
+        "role": "Text",
+        "bounds": [
+          48,
+          441,
+          62,
+          27
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/item/choice/value",
+        "role": "Text",
+        "bounds": [
+          945,
+          441,
+          31,
+          27
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/item/stepper",
+        "role": "Slider",
+        "bounds": [
+          29,
+          498,
+          966,
+          67
+        ],
+        "radius": 14,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": "4 ms"
+      },
+      {
+        "id": "menu/item/stepper/main",
+        "role": "Group",
+        "bounds": [
+          48,
+          518,
+          928,
+          27
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/item/stepper/label",
+        "role": "Text",
+        "bounds": [
+          48,
+          518,
+          73,
+          27
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/item/stepper/value",
+        "role": "Text",
+        "bounds": [
+          934,
+          518,
+          42,
+          27
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/item/info",
+        "role": "Text",
+        "bounds": [
+          29,
+          575,
+          966,
+          67
+        ],
+        "radius": 14,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": "Ready"
+      },
+      {
+        "id": "menu/item/info/main",
+        "role": "Group",
+        "bounds": [
+          48,
+          595,
+          928,
+          27
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/item/info/label",
+        "role": "Text",
+        "bounds": [
+          48,
+          595,
+          42,
+          27
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/item/info/value",
+        "role": "Text",
+        "bounds": [
+          924,
+          595,
+          52,
+          27
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/section/0/footer",
+        "role": "Text",
+        "bounds": [
+          29,
+          652,
+          966,
+          22
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/hint",
+        "role": "Group",
+        "bounds": [
+          0,
+          710,
+          1024,
+          58
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      }
+    ]
+  },
+  {
+    "name": "unavailable",
+    "focused": "menu/item/toggle",
+    "nodes": [
+      {
+        "id": "menu/root/golden",
+        "role": "Group",
+        "bounds": [
+          0,
+          0,
+          1024,
+          768
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/status",
+        "role": "Text",
+        "bounds": [
+          0,
+          0,
+          1024,
+          58
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/body",
+        "role": "Group",
+        "bounds": [
+          0,
+          58,
+          1024,
+          652
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/navigation",
+        "role": "List",
+        "bounds": [
+          10,
+          58,
+          1004,
+          58
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/tab/root",
+        "role": "Tab",
+        "bounds": [
+          10,
+          58,
+          328,
+          58
+        ],
+        "radius": 14,
+        "state": "f0 p0 d0 s1 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/tab/other",
+        "role": "Tab",
+        "bounds": [
+          348,
+          58,
+          328,
+          58
+        ],
+        "radius": 14,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/tab/last",
+        "role": "Tab",
+        "bounds": [
+          686,
+          58,
+          328,
+          58
+        ],
+        "radius": 14,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/page/list",
+        "role": "List",
+        "bounds": [
+          10,
+          126,
+          1004,
+          584
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/page/title",
+        "role": "Text",
+        "bounds": [
+          29,
+          145,
+          966,
+          58
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/section/0",
+        "role": "Group",
+        "bounds": [
+          29,
+          213,
+          966,
+          461
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/section/0/separator",
+        "role": "Separator",
+        "bounds": [
+          29,
+          213,
+          966,
+          5
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/section/0/header",
+        "role": "Text",
+        "bounds": [
+          29,
+          228,
+          966,
+          29
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/item/action",
+        "role": "Button",
+        "bounds": [
+          29,
+          267,
+          966,
+          67
+        ],
+        "radius": 14,
+        "state": "f0 p0 d0 s0 u0 x1 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/item/action/main",
+        "role": "Group",
+        "bounds": [
+          48,
+          287,
+          928,
+          27
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/item/action/label",
+        "role": "Text",
+        "bounds": [
+          48,
+          287,
+          62,
+          27
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/item/toggle",
+        "role": "Toggle",
+        "bounds": [
+          29,
+          344,
+          966,
+          67
+        ],
+        "radius": 14,
+        "state": "f1 p0 d0 s0 u1 x0 c1 e0 busy0 scrim0",
+        "value": "On"
+      },
+      {
+        "id": "menu/item/toggle/main",
+        "role": "Group",
+        "bounds": [
+          48,
+          364,
+          928,
+          27
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/item/toggle/label",
+        "role": "Text",
+        "bounds": [
+          48,
+          364,
+          62,
+          27
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/item/toggle/value",
+        "role": "Text",
+        "bounds": [
+          955,
+          364,
+          21,
+          27
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/item/choice",
+        "role": "Choice",
+        "bounds": [
+          29,
+          421,
+          966,
+          67
+        ],
+        "radius": 14,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": "Two"
+      },
+      {
+        "id": "menu/item/choice/main",
+        "role": "Group",
+        "bounds": [
+          48,
+          441,
+          928,
+          27
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/item/choice/label",
+        "role": "Text",
+        "bounds": [
+          48,
+          441,
+          62,
+          27
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/item/choice/value",
+        "role": "Text",
+        "bounds": [
+          945,
+          441,
+          31,
+          27
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/item/stepper",
+        "role": "Slider",
+        "bounds": [
+          29,
+          498,
+          966,
+          67
+        ],
+        "radius": 14,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": "4 ms"
+      },
+      {
+        "id": "menu/item/stepper/main",
+        "role": "Group",
+        "bounds": [
+          48,
+          518,
+          928,
+          27
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/item/stepper/label",
+        "role": "Text",
+        "bounds": [
+          48,
+          518,
+          73,
+          27
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/item/stepper/value",
+        "role": "Text",
+        "bounds": [
+          934,
+          518,
+          42,
+          27
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/item/info",
+        "role": "Text",
+        "bounds": [
+          29,
+          575,
+          966,
+          67
+        ],
+        "radius": 14,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": "Ready"
+      },
+      {
+        "id": "menu/item/info/main",
+        "role": "Group",
+        "bounds": [
+          48,
+          595,
+          928,
+          27
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/item/info/label",
+        "role": "Text",
+        "bounds": [
+          48,
+          595,
+          42,
+          27
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/item/info/value",
+        "role": "Text",
+        "bounds": [
+          924,
+          595,
+          52,
+          27
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/section/0/footer",
+        "role": "Text",
+        "bounds": [
+          29,
+          652,
+          966,
+          22
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/hint",
+        "role": "Group",
+        "bounds": [
+          0,
+          710,
+          1024,
+          58
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      }
+    ]
+  },
+  {
+    "name": "confirm",
+    "focused": "menu/overlay/cancel",
+    "nodes": [
+      {
+        "id": "menu/root/golden",
+        "role": "Group",
+        "bounds": [
+          0,
+          0,
+          1024,
+          768
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/status",
+        "role": "Text",
+        "bounds": [
+          0,
+          0,
+          1024,
+          58
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/body",
+        "role": "Group",
+        "bounds": [
+          0,
+          58,
+          1024,
+          652
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim1",
+        "value": null
+      },
+      {
+        "id": "menu/navigation",
+        "role": "List",
+        "bounds": [
+          10,
+          58,
+          1004,
+          58
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/tab/root",
+        "role": "Tab",
+        "bounds": [
+          10,
+          58,
+          328,
+          58
+        ],
+        "radius": 14,
+        "state": "f0 p0 d0 s1 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/tab/other",
+        "role": "Tab",
+        "bounds": [
+          348,
+          58,
+          328,
+          58
+        ],
+        "radius": 14,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/tab/last",
+        "role": "Tab",
+        "bounds": [
+          686,
+          58,
+          328,
+          58
+        ],
+        "radius": 14,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/page/list",
+        "role": "List",
+        "bounds": [
+          10,
+          126,
+          1004,
+          584
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/page/title",
+        "role": "Text",
+        "bounds": [
+          29,
+          145,
+          966,
+          58
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/section/0",
+        "role": "Group",
+        "bounds": [
+          29,
+          213,
+          966,
+          461
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/section/0/separator",
+        "role": "Separator",
+        "bounds": [
+          29,
+          213,
+          966,
+          5
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/section/0/header",
+        "role": "Text",
+        "bounds": [
+          29,
+          228,
+          966,
+          29
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/item/action",
+        "role": "Button",
+        "bounds": [
+          29,
+          267,
+          966,
+          67
+        ],
+        "radius": 14,
+        "state": "f0 p0 d0 s0 u0 x1 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/item/action/main",
+        "role": "Group",
+        "bounds": [
+          48,
+          287,
+          928,
+          27
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/item/action/label",
+        "role": "Text",
+        "bounds": [
+          48,
+          287,
+          62,
+          27
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/item/toggle",
+        "role": "Toggle",
+        "bounds": [
+          29,
+          344,
+          966,
+          67
+        ],
+        "radius": 14,
+        "state": "f0 p0 d0 s0 u0 x0 c1 e0 busy0 scrim0",
+        "value": "On"
+      },
+      {
+        "id": "menu/item/toggle/main",
+        "role": "Group",
+        "bounds": [
+          48,
+          364,
+          928,
+          27
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/item/toggle/label",
+        "role": "Text",
+        "bounds": [
+          48,
+          364,
+          62,
+          27
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/item/toggle/value",
+        "role": "Text",
+        "bounds": [
+          955,
+          364,
+          21,
+          27
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/item/choice",
+        "role": "Choice",
+        "bounds": [
+          29,
+          421,
+          966,
+          67
+        ],
+        "radius": 14,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": "Two"
+      },
+      {
+        "id": "menu/item/choice/main",
+        "role": "Group",
+        "bounds": [
+          48,
+          441,
+          928,
+          27
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/item/choice/label",
+        "role": "Text",
+        "bounds": [
+          48,
+          441,
+          62,
+          27
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/item/choice/value",
+        "role": "Text",
+        "bounds": [
+          945,
+          441,
+          31,
+          27
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/item/stepper",
+        "role": "Slider",
+        "bounds": [
+          29,
+          498,
+          966,
+          67
+        ],
+        "radius": 14,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": "4 ms"
+      },
+      {
+        "id": "menu/item/stepper/main",
+        "role": "Group",
+        "bounds": [
+          48,
+          518,
+          928,
+          27
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/item/stepper/label",
+        "role": "Text",
+        "bounds": [
+          48,
+          518,
+          73,
+          27
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/item/stepper/value",
+        "role": "Text",
+        "bounds": [
+          934,
+          518,
+          42,
+          27
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/item/info",
+        "role": "Text",
+        "bounds": [
+          29,
+          575,
+          966,
+          67
+        ],
+        "radius": 14,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": "Ready"
+      },
+      {
+        "id": "menu/item/info/main",
+        "role": "Group",
+        "bounds": [
+          48,
+          595,
+          928,
+          27
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/item/info/label",
+        "role": "Text",
+        "bounds": [
+          48,
+          595,
+          42,
+          27
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/item/info/value",
+        "role": "Text",
+        "bounds": [
+          924,
+          595,
+          52,
+          27
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/section/0/footer",
+        "role": "Text",
+        "bounds": [
+          29,
+          652,
+          966,
+          22
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/hint",
+        "role": "Group",
+        "bounds": [
+          0,
+          710,
+          1024,
+          58
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/overlay",
+        "role": "Dialog",
+        "bounds": [
+          0,
+          0,
+          1024,
+          768
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/overlay/card",
+        "role": "Group",
+        "bounds": [
+          276,
+          280,
+          471,
+          209
+        ],
+        "radius": 19,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/overlay/title",
+        "role": "Text",
+        "bounds": [
+          305,
+          309,
+          413,
+          38
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/overlay/body",
+        "role": "Text",
+        "bounds": [
+          305,
+          360,
+          413,
+          27
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/overlay/actions",
+        "role": "Group",
+        "bounds": [
+          305,
+          401,
+          413,
+          58
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/overlay/cancel",
+        "role": "Button",
+        "bounds": [
+          447,
+          401,
+          120,
+          58
+        ],
+        "radius": 14,
+        "state": "f1 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/overlay/cancel/label",
+        "role": "Text",
+        "bounds": [
+          476,
+          417,
+          62,
+          27
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/overlay/confirm",
+        "role": "Button",
+        "bounds": [
+          577,
+          401,
+          141,
+          58
+        ],
+        "radius": 14,
+        "state": "f0 p0 d0 s0 u0 x1 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/overlay/confirm/label",
+        "role": "Text",
+        "bounds": [
+          606,
+          417,
+          83,
+          27
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      }
+    ]
+  },
+  {
+    "name": "picker",
+    "focused": "menu/overlay/option/1",
+    "nodes": [
+      {
+        "id": "menu/root/golden",
+        "role": "Group",
+        "bounds": [
+          0,
+          0,
+          1024,
+          768
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/status",
+        "role": "Text",
+        "bounds": [
+          0,
+          0,
+          1024,
+          58
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/body",
+        "role": "Group",
+        "bounds": [
+          0,
+          58,
+          1024,
+          652
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim1",
+        "value": null
+      },
+      {
+        "id": "menu/navigation",
+        "role": "List",
+        "bounds": [
+          10,
+          58,
+          1004,
+          58
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/tab/root",
+        "role": "Tab",
+        "bounds": [
+          10,
+          58,
+          328,
+          58
+        ],
+        "radius": 14,
+        "state": "f0 p0 d0 s1 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/tab/other",
+        "role": "Tab",
+        "bounds": [
+          348,
+          58,
+          328,
+          58
+        ],
+        "radius": 14,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/tab/last",
+        "role": "Tab",
+        "bounds": [
+          686,
+          58,
+          328,
+          58
+        ],
+        "radius": 14,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/page/list",
+        "role": "List",
+        "bounds": [
+          10,
+          126,
+          1004,
+          584
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/page/title",
+        "role": "Text",
+        "bounds": [
+          29,
+          145,
+          966,
+          58
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/section/0",
+        "role": "Group",
+        "bounds": [
+          29,
+          213,
+          966,
+          461
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/section/0/separator",
+        "role": "Separator",
+        "bounds": [
+          29,
+          213,
+          966,
+          5
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/section/0/header",
+        "role": "Text",
+        "bounds": [
+          29,
+          228,
+          966,
+          29
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/item/action",
+        "role": "Button",
+        "bounds": [
+          29,
+          267,
+          966,
+          67
+        ],
+        "radius": 14,
+        "state": "f0 p0 d0 s0 u0 x1 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/item/action/main",
+        "role": "Group",
+        "bounds": [
+          48,
+          287,
+          928,
+          27
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/item/action/label",
+        "role": "Text",
+        "bounds": [
+          48,
+          287,
+          62,
+          27
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/item/toggle",
+        "role": "Toggle",
+        "bounds": [
+          29,
+          344,
+          966,
+          67
+        ],
+        "radius": 14,
+        "state": "f0 p0 d0 s0 u0 x0 c1 e0 busy0 scrim0",
+        "value": "On"
+      },
+      {
+        "id": "menu/item/toggle/main",
+        "role": "Group",
+        "bounds": [
+          48,
+          364,
+          928,
+          27
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/item/toggle/label",
+        "role": "Text",
+        "bounds": [
+          48,
+          364,
+          62,
+          27
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/item/toggle/value",
+        "role": "Text",
+        "bounds": [
+          955,
+          364,
+          21,
+          27
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/item/choice",
+        "role": "Choice",
+        "bounds": [
+          29,
+          421,
+          966,
+          67
+        ],
+        "radius": 14,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": "Two"
+      },
+      {
+        "id": "menu/item/choice/main",
+        "role": "Group",
+        "bounds": [
+          48,
+          441,
+          928,
+          27
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/item/choice/label",
+        "role": "Text",
+        "bounds": [
+          48,
+          441,
+          62,
+          27
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/item/choice/value",
+        "role": "Text",
+        "bounds": [
+          945,
+          441,
+          31,
+          27
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/item/stepper",
+        "role": "Slider",
+        "bounds": [
+          29,
+          498,
+          966,
+          67
+        ],
+        "radius": 14,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": "4 ms"
+      },
+      {
+        "id": "menu/item/stepper/main",
+        "role": "Group",
+        "bounds": [
+          48,
+          518,
+          928,
+          27
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/item/stepper/label",
+        "role": "Text",
+        "bounds": [
+          48,
+          518,
+          73,
+          27
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/item/stepper/value",
+        "role": "Text",
+        "bounds": [
+          934,
+          518,
+          42,
+          27
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/item/info",
+        "role": "Text",
+        "bounds": [
+          29,
+          575,
+          966,
+          67
+        ],
+        "radius": 14,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": "Ready"
+      },
+      {
+        "id": "menu/item/info/main",
+        "role": "Group",
+        "bounds": [
+          48,
+          595,
+          928,
+          27
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/item/info/label",
+        "role": "Text",
+        "bounds": [
+          48,
+          595,
+          42,
+          27
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/item/info/value",
+        "role": "Text",
+        "bounds": [
+          924,
+          595,
+          52,
+          27
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/section/0/footer",
+        "role": "Text",
+        "bounds": [
+          29,
+          652,
+          966,
+          22
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/hint",
+        "role": "Group",
+        "bounds": [
+          0,
+          710,
+          1024,
+          58
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/overlay",
+        "role": "Dialog",
+        "bounds": [
+          0,
+          0,
+          1024,
+          768
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/overlay/card",
+        "role": "List",
+        "bounds": [
+          276,
+          281,
+          471,
+          206
+        ],
+        "radius": 19,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/overlay/option/0",
+        "role": "Choice",
+        "bounds": [
+          305,
+          310,
+          413,
+          67
+        ],
+        "radius": 14,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/overlay/option/0/label",
+        "role": "Text",
+        "bounds": [
+          324,
+          330,
+          375,
+          27
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/overlay/option/1",
+        "role": "Choice",
+        "bounds": [
+          305,
+          391,
+          413,
+          67
+        ],
+        "radius": 14,
+        "state": "f1 p0 d0 s1 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      },
+      {
+        "id": "menu/overlay/option/1/label",
+        "role": "Text",
+        "bounds": [
+          324,
+          411,
+          375,
+          27
+        ],
+        "radius": 0,
+        "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+        "value": null
+      }
+    ]
+  }
+]

@@ -589,6 +589,7 @@ dependencies = [
  "pf-ports",
  "pf-render",
  "pf-scene",
+ "serde",
  "serde_json",
 ]
 

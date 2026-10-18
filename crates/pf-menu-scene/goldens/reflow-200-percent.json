@@ -1,0 +1,279 @@
+{
+  "name": "text-200",
+  "focused": "menu/item/language",
+  "nodes": [
+    {
+      "id": "menu/root/reflow",
+      "role": "Group",
+      "bounds": [
+        0,
+        0,
+        1280,
+        720
+      ],
+      "radius": 0,
+      "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+      "value": null
+    },
+    {
+      "id": "menu/status",
+      "role": "Text",
+      "bounds": [
+        0,
+        0,
+        1280,
+        48
+      ],
+      "radius": 0,
+      "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+      "value": null
+    },
+    {
+      "id": "menu/body",
+      "role": "Group",
+      "bounds": [
+        0,
+        48,
+        1280,
+        624
+      ],
+      "radius": 0,
+      "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+      "value": null
+    },
+    {
+      "id": "menu/navigation",
+      "role": "List",
+      "bounds": [
+        8,
+        48,
+        1264,
+        48
+      ],
+      "radius": 0,
+      "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+      "value": null
+    },
+    {
+      "id": "menu/page/list",
+      "role": "List",
+      "bounds": [
+        8,
+        104,
+        1264,
+        568
+      ],
+      "radius": 0,
+      "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+      "value": null
+    },
+    {
+      "id": "menu/page/title",
+      "role": "Text",
+      "bounds": [
+        24,
+        120,
+        1232,
+        86
+      ],
+      "radius": 0,
+      "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+      "value": null
+    },
+    {
+      "id": "menu/section/0",
+      "role": "Group",
+      "bounds": [
+        24,
+        214,
+        1232,
+        401
+      ],
+      "radius": 0,
+      "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+      "value": null
+    },
+    {
+      "id": "menu/section/0/separator",
+      "role": "Separator",
+      "bounds": [
+        24,
+        214,
+        1232,
+        4
+      ],
+      "radius": 0,
+      "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+      "value": null
+    },
+    {
+      "id": "menu/section/0/header",
+      "role": "Text",
+      "bounds": [
+        24,
+        226,
+        1232,
+        38
+      ],
+      "radius": 0,
+      "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+      "value": null
+    },
+    {
+      "id": "menu/item/language",
+      "role": "Choice",
+      "bounds": [
+        24,
+        272,
+        1232,
+        187
+      ],
+      "radius": 12,
+      "state": "f1 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+      "value": "Automatic regional language selection"
+    },
+    {
+      "id": "menu/item/language/main",
+      "role": "Group",
+      "bounds": [
+        40,
+        280,
+        1200,
+        124
+      ],
+      "radius": 0,
+      "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+      "value": null
+    },
+    {
+      "id": "menu/item/language/label",
+      "role": "Text",
+      "bounds": [
+        40,
+        280,
+        1200,
+        54
+      ],
+      "radius": 0,
+      "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+      "value": null
+    },
+    {
+      "id": "menu/item/language/value",
+      "role": "Text",
+      "bounds": [
+        40,
+        350,
+        1200,
+        54
+      ],
+      "radius": 0,
+      "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+      "value": null
+    },
+    {
+      "id": "menu/item/language/subtitle",
+      "role": "Text",
+      "bounds": [
+        40,
+        408,
+        1200,
+        43
+      ],
+      "radius": 0,
+      "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+      "value": null
+    },
+    {
+      "id": "menu/item/screen_reader",
+      "role": "Toggle",
+      "bounds": [
+        24,
+        467,
+        1232,
+        70
+      ],
+      "radius": 12,
+      "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+      "value": null
+    },
+    {
+      "id": "menu/item/screen_reader/main",
+      "role": "Group",
+      "bounds": [
+        40,
+        475,
+        1200,
+        54
+      ],
+      "radius": 0,
+      "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+      "value": null
+    },
+    {
+      "id": "menu/item/screen_reader/label",
+      "role": "Text",
+      "bounds": [
+        40,
+        475,
+        1200,
+        54
+      ],
+      "radius": 0,
+      "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+      "value": null
+    },
+    {
+      "id": "menu/item/apply",
+      "role": "Button",
+      "bounds": [
+        24,
+        545,
+        1232,
+        70
+      ],
+      "radius": 12,
+      "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+      "value": null
+    },
+    {
+      "id": "menu/item/apply/main",
+      "role": "Group",
+      "bounds": [
+        40,
+        553,
+        1200,
+        54
+      ],
+      "radius": 0,
+      "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+      "value": null
+    },
+    {
+      "id": "menu/item/apply/label",
+      "role": "Text",
+      "bounds": [
+        40,
+        553,
+        1200,
+        54
+      ],
+      "radius": 0,
+      "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+      "value": null
+    },
+    {
+      "id": "menu/hint",
+      "role": "Group",
+      "bounds": [
+        0,
+        672,
+        1280,
+        48
+      ],
+      "radius": 0,
+      "state": "f0 p0 d0 s0 u0 x0 c0 e0 busy0 scrim0",
+      "value": null
+    }
+  ]
+}
