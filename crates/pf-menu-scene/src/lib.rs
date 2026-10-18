@@ -419,7 +419,7 @@ pub fn lower(
             Role::Tab,
             resolve(&tab_page.title),
             empty_bounds(),
-            "menu-tab",
+            "--state-rest-surface",
         )
         .with_action(NodeAction::Custom(format!("tab:{}", tab_id.0)))
         .with_corner_radius(tokens.radius_row)
@@ -437,7 +437,7 @@ pub fn lower(
                 Role::Separator,
                 "",
                 empty_bounds(),
-                "menu-separator",
+                "--color-border-hairline",
             )
             .with_layout(fixed_height(tokens.spacing_1)),
         );
@@ -499,7 +499,7 @@ pub fn lower(
                 Role::Group,
                 "",
                 empty_bounds(),
-                "menu-section",
+                "--color-transparent",
             )
             .with_layout(column_style(tokens.spacing_2))
             .with_children(children),
@@ -518,7 +518,7 @@ pub fn lower(
         Role::List,
         resolve(&page.title),
         empty_bounds(),
-        "menu-list",
+        "--color-transparent",
     )
     .with_layout(content_style(tokens))
     .with_children(std::iter::once(title).chain(sections).collect::<Vec<_>>());
@@ -527,7 +527,7 @@ pub fn lower(
         Role::List,
         "Pages",
         empty_bounds(),
-        "menu-navigation",
+        "--color-surface-sunken",
     )
     .with_layout(navigation_style(mode, tokens))
     .with_children(tabs);
@@ -540,7 +540,7 @@ pub fn lower(
         Role::Group,
         "",
         empty_bounds(),
-        "menu-body",
+        "--color-transparent",
     )
     .with_layout(body_style(mode, tokens))
     .with_children(body_children);
@@ -552,7 +552,7 @@ pub fn lower(
         Role::Group,
         "Controller prompts",
         empty_bounds(),
-        "menu-hint-bar",
+        "--color-surface-raised",
     )
     .with_layout(bar_style(tokens));
     let root_id = node_id(&format!("menu/root/{}", engine.menu().id));
@@ -566,7 +566,7 @@ pub fn lower(
         Role::Group,
         resolve(&page.title),
         Bounds::new(0.0, 0.0, metrics.logical_width, metrics.logical_height),
-        "menu-root",
+        "--color-surface-canvas",
     )
     .with_layout(root_style())
     .with_children(root_children);
@@ -637,7 +637,7 @@ fn item_node(
         role,
         accessible_label,
         empty_bounds(),
-        "menu-row",
+        "--state-rest-surface",
     )
     .with_corner_radius(tokens.radius_row)
     .with_layout(row_style(item.subtitle.is_some(), tokens));
@@ -674,7 +674,7 @@ fn item_node(
         Role::Group,
         "",
         empty_bounds(),
-        "menu-row-main",
+        "--color-transparent",
     )
     .with_layout(row_line_style(
         tokens,
@@ -723,7 +723,7 @@ fn connections_node(
         if expanded { Role::Group } else { Role::Link },
         "Connections",
         empty_bounds(),
-        "menu-connections",
+        "--state-rest-surface",
     )
     .with_corner_radius(tokens.radius_row)
     .with_layout(if expanded {
@@ -859,7 +859,7 @@ fn overlay_node(
                 Role::Button,
                 resolve(&confirm.confirm_label),
                 empty_bounds(),
-                "menu-overlay-button",
+                "--state-rest-surface",
             )
             .with_action(NodeAction::Activate)
             .with_corner_radius(tokens.radius_row)
@@ -875,7 +875,7 @@ fn overlay_node(
                 Role::Button,
                 "Cancel",
                 empty_bounds(),
-                "menu-overlay-button",
+                "--state-rest-surface",
             )
             .with_action(NodeAction::Back)
             .with_corner_radius(tokens.radius_row)
@@ -903,7 +903,7 @@ fn overlay_node(
                     Role::Group,
                     "",
                     empty_bounds(),
-                    "menu-overlay-actions",
+                    "--color-transparent",
                 )
                 .with_layout(overlay_actions_style(tokens))
                 .with_children(vec![cancel_button, confirm_button]),
@@ -914,7 +914,7 @@ fn overlay_node(
                     Role::Group,
                     resolve(&confirm.title),
                     empty_bounds(),
-                    "menu-overlay-card",
+                    "--color-surface-overlay",
                 )
                 .with_corner_radius(tokens.radius_modal)
                 .with_layout(overlay_card_style(tokens))
@@ -953,7 +953,7 @@ fn overlay_node(
                         Role::Choice,
                         label,
                         empty_bounds(),
-                        "menu-picker-option",
+                        "--state-rest-surface",
                     )
                     .with_action(NodeAction::Activate)
                     .with_corner_radius(tokens.radius_row)
@@ -969,7 +969,7 @@ fn overlay_node(
                     Role::List,
                     resolve(&engine.item(item).label),
                     empty_bounds(),
-                    "menu-picker",
+                    "--color-surface-overlay",
                 )
                 .with_corner_radius(tokens.radius_modal)
                 .with_layout(overlay_card_style(tokens))
@@ -984,7 +984,7 @@ fn overlay_node(
             Role::Dialog,
             content.accessible_label.clone(),
             empty_bounds(),
-            "menu-overlay",
+            "--color-transparent",
         )
         .with_layout(overlay_style())
         .with_children(vec![content]),
@@ -1014,7 +1014,7 @@ fn text_node(id: impl AsRef<str>, label: String, type_role: TypeRole) -> Node {
         Role::Text,
         label,
         empty_bounds(),
-        "menu-text",
+        "--color-transparent",
     )
     .with_type_role(type_role)
     .with_layout(LayoutStyle::default())
