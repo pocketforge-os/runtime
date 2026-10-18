@@ -125,7 +125,9 @@ pub fn kind_name(kind: PrefKind) -> &'static str {
 /// object; version 2 adds the shell accessibility keys and writes `schemaVersion: 2`.
 pub const SCHEMA_VERSION: u64 = 2;
 
-/// The v2 preference schema.
+/// The v2 preference schema. Additive keys retain version 2 because an absent key resolves to its
+/// schema default and older readers already preserve unknown keys; no stored representation
+/// changed.
 ///
 /// Defaults are chosen to match the already-merged in-memory seam (`hapticsEnabled` defaults ON,
 /// as `InProcessBackend::rumble_pulse` reads it) and the accessibility-off-by-default norm
@@ -195,6 +197,24 @@ keyboards, as an xkb `layout(variant)` token (first boot may seed it from \
         kind: PrefKind::Scalar { min: 0, max: 100 },
         default: PrefValue::Scalar(100),
         doc: "Display brightness 0..=100 (CONTRACT-ONLY in v1; no sysfs apply leg).",
+    },
+    PrefSpec {
+        key: "volumeSpeaker",
+        kind: PrefKind::Scalar { min: 0, max: 100 },
+        default: PrefValue::Scalar(60),
+        doc: "Playback volume for the built-in speaker output, from 0 through 100.",
+    },
+    PrefSpec {
+        key: "volumeHeadphones",
+        kind: PrefKind::Scalar { min: 0, max: 100 },
+        default: PrefValue::Scalar(40),
+        doc: "Playback volume for the wired-headphone output, from 0 through 100.",
+    },
+    PrefSpec {
+        key: "muted",
+        kind: PrefKind::Bool,
+        default: PrefValue::Bool(false),
+        doc: "Mute the active system audio output without discarding its stored level.",
     },
     PrefSpec {
         key: "auto_rotate",
@@ -339,6 +359,15 @@ mod tests {
         );
         assert_eq!(spec("monoAudio").unwrap().default, PrefValue::Bool(false));
         assert_eq!(spec("brightness").unwrap().default, PrefValue::Scalar(100));
+        assert_eq!(
+            spec("volumeSpeaker").unwrap().default,
+            PrefValue::Scalar(60)
+        );
+        assert_eq!(
+            spec("volumeHeadphones").unwrap().default,
+            PrefValue::Scalar(40)
+        );
+        assert_eq!(spec("muted").unwrap().default, PrefValue::Bool(false));
         assert_eq!(spec("auto_rotate").unwrap().default, PrefValue::Bool(true));
         assert_eq!(
             spec("user_rotation").unwrap().default,

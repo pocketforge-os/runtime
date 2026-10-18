@@ -752,6 +752,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "pf-volumed"
+version = "0.0.1"
+dependencies = [
+ "pf-prefsd",
+ "serde_json",
+]
+
+[[package]]
 name = "pf-wire"
 version = "0.0.1"
 

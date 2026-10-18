@@ -228,6 +228,45 @@ fn same_uid_app_peer_cannot_set_but_trusted_units_can() {
 }
 
 #[test]
+fn volume_keys_are_writable_by_control_plane_but_not_apps() {
+    for (key, value) in [
+        ("volumeSpeaker", serde_json::json!(35)),
+        ("volumeHeadphones", serde_json::json!(45)),
+        ("muted", serde_json::json!(true)),
+    ] {
+        let app_root = Scratch::new(&format!("app-volume-{key}"));
+        let app = Server::start_as(&app_root.0, None);
+        assert!(matches!(
+            rpc(
+                &app.socket,
+                serde_json::json!({"method":"set", "key":key, "value":value})
+            ),
+            RpcResponse::Error {
+                kind: Some(ErrorKind::PermissionDenied),
+                ..
+            }
+        ));
+
+        for (label, writer) in [
+            ("settings", PreferenceWriter::Settings),
+            ("shell", PreferenceWriter::Shell),
+        ] {
+            let root = Scratch::new(&format!("{label}-volume-{key}"));
+            let server = Server::start_as(&root.0, Some(writer));
+            assert_eq!(
+                rpc(
+                    &server.socket,
+                    serde_json::json!({"method":"set", "key":key, "value":value})
+                ),
+                RpcResponse::Value {
+                    value: value.clone()
+                }
+            );
+        }
+    }
+}
+
+#[test]
 fn idle_client_times_out_and_does_not_block_next_client() {
     let scratch = Scratch::new("idle-timeout");
     let server = Server::start(&scratch.0);

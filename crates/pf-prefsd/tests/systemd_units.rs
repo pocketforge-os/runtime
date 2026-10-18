@@ -70,6 +70,56 @@ fn runtime_directory_conflicts<'a>(
         .collect()
 }
 
+fn service_setting<'a>(unit: &'a str, key: &str) -> Option<&'a str> {
+    let mut section = "";
+    unit.lines().find_map(|raw_line| {
+        let line = raw_line.trim();
+        if let Some(section_name) = line
+            .strip_prefix('[')
+            .and_then(|line| line.strip_suffix(']'))
+        {
+            section = section_name;
+            return None;
+        }
+        (section == "Service")
+            .then(|| line.strip_prefix(key))
+            .flatten()
+            .and_then(|value| value.strip_prefix('='))
+    })
+}
+
+fn volume_reader_identity_error(prefsd: &str, volumed: &str) -> Option<String> {
+    let prefs_owner = service_setting(prefsd, "User").unwrap_or("root");
+    let volume_user = service_setting(volumed, "User").unwrap_or("root");
+    if volume_user != prefs_owner {
+        return Some(format!(
+            "pf-volumed User={volume_user} cannot read as pf-prefsd owner User={prefs_owner}"
+        ));
+    }
+    let prefs_group = service_setting(prefsd, "Group").unwrap_or("root");
+    let volume_group = service_setting(volumed, "Group").unwrap_or("root");
+    if volume_group != prefs_group {
+        return Some(format!(
+            "pf-volumed Group={volume_group} must remain outside the writer group"
+        ));
+    }
+    let groups = service_setting(volumed, "SupplementaryGroups").unwrap_or("");
+    if !groups.split_whitespace().any(|group| group == "audio") {
+        return Some(String::from(
+            "pf-volumed needs SupplementaryGroups=audio for the ALSA devices",
+        ));
+    }
+    if groups
+        .split_whitespace()
+        .any(|group| group == "pf-pref-writer")
+    {
+        return Some(String::from(
+            "pf-volumed must remain a read-only preference client",
+        ));
+    }
+    None
+}
+
 #[test]
 fn units_do_not_share_runtime_directories_across_users() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
@@ -123,4 +173,37 @@ fn missing_user_is_treated_as_root() {
     assert_eq!(conflicts.len(), 1);
     assert!(conflicts[0].contains("gamer.service (User=gamer)"));
     assert!(conflicts[0].contains("default-root.service (User=root)"));
+}
+
+#[test]
+fn volume_service_uses_the_read_only_prefs_owner_for_startup_and_polling() {
+    let prefsd = include_str!("../../../systemd/pf-prefsd.service");
+    let volumed = include_str!("../../../systemd/pf-volumed.service");
+
+    assert_eq!(
+        volume_reader_identity_error(prefsd, "[Service]\nUser=root\nSupplementaryGroups=audio\n")
+            .as_deref(),
+        Some("pf-volumed User=root cannot read as pf-prefsd owner User=gamer")
+    );
+    assert_eq!(
+        volume_reader_identity_error(
+            prefsd,
+            "[Service]\nUser=gamer\nGroup=pf-pref-writer\nSupplementaryGroups=audio\n"
+        )
+        .as_deref(),
+        Some("pf-volumed Group=pf-pref-writer must remain outside the writer group")
+    );
+    assert_eq!(
+        volume_reader_identity_error(prefsd, "[Service]\nUser=gamer\nGroup=gamer\n").as_deref(),
+        Some("pf-volumed needs SupplementaryGroups=audio for the ALSA devices")
+    );
+    assert_eq!(
+        volume_reader_identity_error(
+            prefsd,
+            "[Service]\nUser=gamer\nGroup=gamer\nSupplementaryGroups=audio pf-pref-writer\n"
+        )
+        .as_deref(),
+        Some("pf-volumed must remain a read-only preference client")
+    );
+    assert_eq!(volume_reader_identity_error(prefsd, volumed), None);
 }
