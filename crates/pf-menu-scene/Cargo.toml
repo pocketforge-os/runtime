@@ -16,5 +16,6 @@ pf-menu = { workspace = true }
 pf-scene = { workspace = true }
 
 [dev-dependencies]
+pf-ports = { workspace = true }
 pf-render = { workspace = true }
 serde_json.workspace = true

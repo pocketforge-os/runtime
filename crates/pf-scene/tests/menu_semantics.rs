@@ -76,3 +76,46 @@ fn external_menu_focus_preserves_disabled_rows_and_rejects_missing_ids() {
         Err(SceneError::ExternalFocusMissing(id("missing")))
     );
 }
+
+#[test]
+fn external_focus_updates_are_exact_and_failure_atomic() {
+    let first = Node::new(
+        id("first"),
+        Role::Button,
+        "First",
+        Bounds::new(0.0, 0.0, 100.0, 48.0),
+        "menu-row",
+    )
+    .with_action(NodeAction::Activate);
+    let mut second = Node::new(
+        id("second"),
+        Role::Button,
+        "Second",
+        Bounds::new(0.0, 48.0, 100.0, 48.0),
+        "menu-row",
+    )
+    .with_action(NodeAction::Activate);
+    second.state.disabled = true;
+    let root = Node::new(
+        id("root"),
+        Role::Group,
+        "Menu",
+        Bounds::new(0.0, 0.0, 100.0, 96.0),
+        "menu",
+    )
+    .with_children(vec![first, second]);
+    let mut scene = Scene::new_with_external_focus(root, id("first"), Some(id("first"))).unwrap();
+
+    scene.set_external_focus(Some(id("second"))).unwrap();
+    assert_eq!(scene.focused(), Some(&id("second")));
+    assert!(scene.focused_node().unwrap().state.disabled);
+
+    assert_eq!(
+        scene.set_external_focus(Some(id("missing"))),
+        Err(SceneError::ExternalFocusMissing(id("missing")))
+    );
+    assert_eq!(scene.focused(), Some(&id("second")));
+
+    scene.set_external_focus(None).unwrap();
+    assert_eq!(scene.focused(), None);
+}

@@ -251,6 +251,129 @@ pub struct LoweredMenu {
     pub metadata: RenderMetadata,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UpdateKind {
+    Rebuilt,
+    FocusOnly,
+    Unchanged,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CacheKey {
+    menu_id: String,
+    revision: u64,
+    page: pf_menu::PageIndex,
+    message_revision: u64,
+    panel: [Option<u32>; 3],
+    metrics: [u32; 8],
+    text_scale: TextScale,
+    theme: ThemeMode,
+    high_contrast: bool,
+    reduce_motion: bool,
+    pseudo_locale: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ItemSnapshot {
+    value: Option<MenuValue>,
+    apply: ApplyState,
+    visible: bool,
+    enabled: bool,
+}
+
+#[derive(Default)]
+pub struct MenuSceneCache {
+    key: Option<CacheKey>,
+    items: Vec<ItemSnapshot>,
+    lowered: Option<LoweredMenu>,
+}
+
+impl MenuSceneCache {
+    pub fn lowered(&self) -> Option<&LoweredMenu> {
+        self.lowered.as_ref()
+    }
+
+    /// Reuses retained scene structure for focus-only engine updates.
+    ///
+    /// `message_revision` must change whenever the resolver's output can change.
+    pub fn update(
+        &mut self,
+        engine: &MenuEngine,
+        messages: &dyn MsgResolver,
+        message_revision: u64,
+        panel: PanelFacts,
+        metrics: SurfaceMetrics,
+        preferences: RenderPreferences,
+    ) -> Result<UpdateKind, LowerError> {
+        let key = cache_key(engine, message_revision, panel, metrics, preferences);
+        let items = item_snapshot(engine);
+        if self.key.as_ref() == Some(&key) && self.items == items {
+            let focused = engine
+                .focus()
+                .map(|index| node_id(&format!("menu/item/{}", engine.item(index).id.0)));
+            let lowered = self.lowered.as_mut().expect("cache key implies a scene");
+            if lowered.scene.focused() == focused.as_ref() {
+                return Ok(UpdateKind::Unchanged);
+            }
+            lowered.scene.set_external_focus(focused)?;
+            return Ok(UpdateKind::FocusOnly);
+        }
+
+        let lowered = lower(engine, messages, panel, metrics, preferences)?;
+        self.key = Some(key);
+        self.items = items;
+        self.lowered = Some(lowered);
+        Ok(UpdateKind::Rebuilt)
+    }
+}
+
+fn cache_key(
+    engine: &MenuEngine,
+    message_revision: u64,
+    panel: PanelFacts,
+    metrics: SurfaceMetrics,
+    preferences: RenderPreferences,
+) -> CacheKey {
+    CacheKey {
+        menu_id: engine.menu().id.clone(),
+        revision: engine.revision(),
+        page: engine.page(),
+        message_revision,
+        panel: [
+            panel.diagonal_in.map(f32::to_bits),
+            panel.active_mm.map(|value| value.0.to_bits()),
+            panel.active_mm.map(|value| value.1.to_bits()),
+        ],
+        metrics: [
+            metrics.logical_width.to_bits(),
+            metrics.logical_height.to_bits(),
+            metrics.scale.to_bits(),
+            metrics.safe_insets.top.to_bits(),
+            metrics.safe_insets.right.to_bits(),
+            metrics.safe_insets.bottom.to_bits(),
+            metrics.safe_insets.left.to_bits(),
+            metrics.orientation as u32,
+        ],
+        text_scale: preferences.text_scale,
+        theme: preferences.theme,
+        high_contrast: preferences.high_contrast,
+        reduce_motion: preferences.reduce_motion,
+        pseudo_locale: preferences.pseudo_locale,
+    }
+}
+
+fn item_snapshot(engine: &MenuEngine) -> Vec<ItemSnapshot> {
+    (0..engine.item_count() as u32)
+        .map(pf_menu::ItemIndex)
+        .map(|index| ItemSnapshot {
+            value: engine.value(index),
+            apply: engine.apply_state(index),
+            visible: engine.is_visible(index),
+            enabled: engine.is_enabled(index),
+        })
+        .collect()
+}
+
 /// Lowers the active page of an engine into a renderer-independent semantic scene.
 pub fn lower(
     engine: &MenuEngine,

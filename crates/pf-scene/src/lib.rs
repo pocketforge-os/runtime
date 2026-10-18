@@ -511,6 +511,20 @@ impl Scene {
             .map(|id| find(&self.root, id).expect("validated focus identifier"))
     }
 
+    /// Replaces focus without applying spatial focusability policy.
+    ///
+    /// This is the incremental counterpart of [`Scene::new_with_external_focus`]. Validation
+    /// happens before mutation, so a missing ID leaves the prior focus unchanged.
+    pub fn set_external_focus(&mut self, focused: Option<NodeId>) -> Result<(), SceneError> {
+        if let Some(focused) = focused.as_ref() {
+            find(&self.root, focused)
+                .ok_or_else(|| SceneError::ExternalFocusMissing(focused.clone()))?;
+        }
+        set_focus(&mut self.root, focused.as_ref());
+        self.focused = focused;
+        Ok(())
+    }
+
     /// Moves toward the nearest focusable node in the requested half-plane.
     /// At an edge it returns `false` and leaves focus unchanged; traversal never wraps.
     pub fn move_focus(&mut self, direction: AxisMove) -> bool {

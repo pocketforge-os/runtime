@@ -3,7 +3,11 @@ use pf_menu::{
     MenuEngine, MenuValue, Msg, Page, PageId, PrefsSchemas, Present, Section, TextPurpose,
     FORMAT_V1,
 };
-use pf_menu_scene::{lower, PanelFacts, RenderPreferences, ResolvedMsg, SizeClass, ThemeMode};
+use pf_menu_scene::{
+    lower, MenuSceneCache, PanelFacts, RenderPreferences, ResolvedMsg, SizeClass, ThemeMode,
+    UpdateKind,
+};
+use pf_ports::MonotonicTime;
 use pf_scene::{Insets, Node, Orientation, Role, SurfaceMetrics};
 
 fn item(id: &str, kind: ItemKind) -> Item {
@@ -252,4 +256,41 @@ fn preferences_are_typed_metadata_not_ad_hoc_style_strings() {
     assert_eq!(lowered.metadata.theme, ThemeMode::Day);
     assert!(lowered.metadata.high_contrast);
     assert_eq!(lowered.metadata.transition_ms, 0);
+}
+
+#[test]
+fn cache_diffs_focus_but_rebuilds_value_changes() {
+    let mut engine =
+        MenuEngine::new(all_kinds_menu(), &PrefsSchemas, EngineOptions::default()).unwrap();
+    let mut cache = MenuSceneCache::default();
+    let update = |cache: &mut MenuSceneCache, engine: &MenuEngine| {
+        cache.update(
+            engine,
+            &ResolvedMsg,
+            1,
+            PanelFacts::diagonal(5.0),
+            metrics(),
+            RenderPreferences::default(),
+        )
+    };
+
+    assert_eq!(update(&mut cache, &engine).unwrap(), UpdateKind::Rebuilt);
+    engine.input(pf_menu::MenuInput::Down, MonotonicTime::ZERO);
+    assert_eq!(update(&mut cache, &engine).unwrap(), UpdateKind::FocusOnly);
+    assert_eq!(
+        cache.lowered().unwrap().scene.focused().unwrap().as_str(),
+        "menu/item/toggle"
+    );
+    assert_eq!(update(&mut cache, &engine).unwrap(), UpdateKind::Unchanged);
+
+    let toggle = engine.item_index(&ItemId("toggle".into())).unwrap();
+    engine.set_value(toggle, MenuValue::Bool(true)).unwrap();
+    assert_eq!(update(&mut cache, &engine).unwrap(), UpdateKind::Rebuilt);
+    assert_eq!(
+        find(cache.lowered().unwrap().scene.root(), "menu/item/toggle")
+            .state
+            .value_text
+            .as_deref(),
+        Some("On")
+    );
 }
