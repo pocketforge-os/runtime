@@ -37,6 +37,7 @@ members = [
     "crates/pf-hang-sampler",
     "crates/pf-input-ipc",
     "crates/pf-menu",
+    "crates/pf-menu-scene",
     "crates/pf-volumed",
 ]
 
@@ -60,6 +61,8 @@ pf-prefsd = { path = "crates/pf-prefsd", version = "0.0.1" }
 pf-peer-identity = { path = "crates/pf-peer-identity", version = "0.0.1" }
 pf-ports = { path = "crates/pf-ports", version = "0.0.1" }
 pf-scene = { path = "crates/pf-scene", version = "0.0.1" }
+pf-menu = { path = "crates/pf-menu", version = "0.0.1" }
+pf-menu-scene = { path = "crates/pf-menu-scene", version = "0.0.1" }
 pf-input-map = { path = "crates/pf-input-map", version = "0.0.1" }
 pf-render = { path = "crates/pf-render", version = "0.0.1" }
 pf-text-raster = { path = "crates/pf-text-raster", version = "0.0.1" }

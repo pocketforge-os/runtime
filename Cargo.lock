@@ -582,6 +582,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "pf-menu-scene"
+version = "0.0.1"
+dependencies = [
+ "pf-menu",
+ "pf-ports",
+ "pf-render",
+ "pf-scene",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "pf-peer-identity"
 version = "0.0.1"
 dependencies = [

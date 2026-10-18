@@ -1,0 +1,22 @@
+[package]
+name = "pf-menu-scene"
+description = "Semantic scene lowering and responsive layout policy for pf-menu"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lib]
+name = "pf_menu_scene"
+
+[dependencies]
+pf-menu = { workspace = true }
+pf-scene = { workspace = true }
+
+[dev-dependencies]
+pf-ports = { workspace = true }
+pf-render = { workspace = true }
+serde.workspace = true
+serde_json.workspace = true

@@ -39,6 +39,12 @@ pub enum Role {
     Button,
     Toggle,
     Slider,
+    Choice,
+    TextField,
+    Progress,
+    Tab,
+    Link,
+    Separator,
     List,
     ListItem,
     Dialog,
@@ -54,7 +60,7 @@ pub enum NodeAction {
 }
 
 /// Structural state. Visual emphasis is derived from these bits by a theme.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct NodeState {
     pub focused: bool,
     pub pressed: bool,
@@ -66,6 +72,10 @@ pub struct NodeState {
     pub scrimmed: bool,
     pub checked: bool,
     pub expanded: bool,
+    /// A value change is awaiting confirmation from its backing service.
+    pub pending: bool,
+    /// Human-readable current value, separate from the node's stable label.
+    pub value_text: Option<String>,
 }
 
 /// Theme-owned depth treatment. Renderers resolve these to pre-baked assets.
@@ -250,6 +260,12 @@ impl Node {
         self
     }
 
+    /// Supplies the node's current human-readable value for renderers and accessibility.
+    pub fn with_value_text(mut self, value: impl Into<String>) -> Self {
+        self.state.value_text = Some(value.into());
+        self
+    }
+
     pub fn with_children(mut self, children: Vec<Node>) -> Self {
         self.children = children;
         self
@@ -342,7 +358,16 @@ impl Node {
 
 impl Role {
     fn is_control(self) -> bool {
-        matches!(self, Self::Button | Self::Toggle | Self::Slider)
+        matches!(
+            self,
+            Self::Button
+                | Self::Toggle
+                | Self::Slider
+                | Self::Choice
+                | Self::TextField
+                | Self::Tab
+                | Self::Link
+        )
     }
 }
 
@@ -382,7 +407,7 @@ pub enum AxisMove {
 }
 
 /// A controlled structural-state transition. Focus itself is owned by [`Scene`].
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum StateTransition {
     Pressed(bool),
     Disabled(bool),
@@ -392,6 +417,8 @@ pub enum StateTransition {
     Scrimmed(bool),
     Checked(bool),
     Expanded(bool),
+    Pending(bool),
+    ValueText(Option<String>),
 }
 
 /// A validated scene with exactly one declared default-focus anchor.
@@ -408,6 +435,7 @@ pub enum SceneError {
     DuplicateNodeId(NodeId),
     DefaultFocusMissing(NodeId),
     DefaultFocusNotFocusable(NodeId),
+    ExternalFocusMissing(NodeId),
     NodeMissing(NodeId),
     CannotDisableFocused(NodeId),
 }
@@ -440,6 +468,32 @@ impl Scene {
         })
     }
 
+    /// Validates a scene while preserving focus selected by an external focus engine.
+    ///
+    /// Unlike [`Scene::new`], this constructor does not reinterpret focusability. This lets a
+    /// menu model keep a disabled row focused while still exposing its disabled semantic state.
+    /// The external owner is responsible for choosing a valid focus target.
+    pub fn new_with_external_focus(
+        mut root: Node,
+        default_focus: NodeId,
+        focused: Option<NodeId>,
+    ) -> Result<Self, SceneError> {
+        let mut ids = HashSet::new();
+        validate_ids(&root, &mut ids)?;
+        find(&root, &default_focus)
+            .ok_or_else(|| SceneError::DefaultFocusMissing(default_focus.clone()))?;
+        if let Some(focused) = focused.as_ref() {
+            find(&root, focused)
+                .ok_or_else(|| SceneError::ExternalFocusMissing(focused.clone()))?;
+        }
+        set_focus(&mut root, focused.as_ref());
+        Ok(Self {
+            root,
+            default_focus,
+            focused,
+        })
+    }
+
     pub fn root(&self) -> &Node {
         &self.root
     }
@@ -458,6 +512,20 @@ impl Scene {
         self.focused
             .as_ref()
             .map(|id| find(&self.root, id).expect("validated focus identifier"))
+    }
+
+    /// Replaces focus without applying spatial focusability policy.
+    ///
+    /// This is the incremental counterpart of [`Scene::new_with_external_focus`]. Validation
+    /// happens before mutation, so a missing ID leaves the prior focus unchanged.
+    pub fn set_external_focus(&mut self, focused: Option<NodeId>) -> Result<(), SceneError> {
+        if let Some(focused) = focused.as_ref() {
+            find(&self.root, focused)
+                .ok_or_else(|| SceneError::ExternalFocusMissing(focused.clone()))?;
+        }
+        set_focus(&mut self.root, focused.as_ref());
+        self.focused = focused;
+        Ok(())
     }
 
     /// Moves toward the nearest focusable node in the requested half-plane.
@@ -504,7 +572,9 @@ impl Scene {
         id: &NodeId,
         transition: StateTransition,
     ) -> Result<(), SceneError> {
-        if self.focused.as_ref() == Some(id) && transition == StateTransition::Disabled(true) {
+        if self.focused.as_ref() == Some(id)
+            && matches!(&transition, StateTransition::Disabled(true))
+        {
             return Err(SceneError::CannotDisableFocused(id.clone()));
         }
         {
@@ -519,6 +589,8 @@ impl Scene {
                 StateTransition::Scrimmed(value) => node.state.scrimmed = value,
                 StateTransition::Checked(value) => node.state.checked = value,
                 StateTransition::Expanded(value) => node.state.expanded = value,
+                StateTransition::Pending(value) => node.state.pending = value,
+                StateTransition::ValueText(value) => node.state.value_text = value,
             }
         }
         if self.focused.as_ref() == Some(id)
