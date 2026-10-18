@@ -1,4 +1,4 @@
-use pf_volumed::{AlsaJackSource, AlsaMixer, MixerBackend, Output};
+use pf_volumed::{AlsaMixer, MixerBackend, Output};
 use std::fs::{self, File};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -29,12 +29,11 @@ impl Drop for Scratch {
     }
 }
 
-fn write_fake(path: &Path, log: &Path, state: &Path, fail: &Path) {
+fn write_fake(path: &Path, log: &Path, fail: &Path) {
     let script = format!(
-        "#!/bin/sh\nset -eu\nprintf '%s\\n' \"$*\" >> '{}'\nif [ -e '{}' ]; then echo injected-failure >&2; exit 9; fi\ncase \"$*\" in\n  *cget*) printf '  : values=%s\\n' \"$(cat '{}')\" ;;\nesac\n",
+        "#!/bin/sh\nset -eu\nprintf '%s\\n' \"$*\" >> '{}'\nif [ -e '{}' ]; then echo injected-failure >&2; exit 9; fi\n",
         log.display(),
         fail.display(),
-        state.display()
     );
     fs::write(path, script).unwrap();
     let mut permissions = fs::metadata(path).unwrap().permissions();
@@ -43,28 +42,26 @@ fn write_fake(path: &Path, log: &Path, state: &Path, fail: &Path) {
 }
 
 #[test]
-fn alsa_backend_maps_levels_reads_jack_and_surfaces_command_failure() {
+fn alsa_backend_maps_levels_rejects_unsafe_routes_and_surfaces_command_failure() {
     let scratch = Scratch::new();
     let fake = scratch.0.join("amixer");
     let log = scratch.0.join("calls");
-    let state = scratch.0.join("jack");
     let fail = scratch.0.join("fail");
-    fs::write(&state, "off\n").unwrap();
-    write_fake(&fake, &log, &state, &fail);
+    write_fake(&fake, &log, &fail);
 
     let mut mixer = AlsaMixer::with_amixer(&fake, "Codec");
     mixer.apply(Output::Speaker, 60, false).unwrap();
     mixer.apply(Output::Headphones, 40, true).unwrap();
-    let jack = AlsaJackSource::with_amixer(&fake, "Codec");
-    assert!(!jack.headphones_plugged().unwrap());
-    fs::write(&state, "on\n").unwrap();
-    assert!(jack.headphones_plugged().unwrap());
+    let transition_error = mixer.transition(Output::Headphones, 40, false).unwrap_err();
+    assert!(transition_error
+        .to_string()
+        .contains("event-driven route controller"));
 
     let calls = fs::read_to_string(&log).unwrap();
     assert!(calls.contains("cset name=DAC Playback Volume 38"));
     assert!(calls.contains("cset name=DAC Playback Volume 0"));
     assert!(!calls.contains("DAC Playback Switch"));
-    assert!(calls.contains("cget name=Headphone Jack"));
+    assert_eq!(calls.lines().count(), 2);
 
     File::create(&fail).unwrap();
     let error = mixer.apply(Output::Headphones, 40, true).unwrap_err();

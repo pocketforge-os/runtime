@@ -1,5 +1,5 @@
 use pf_prefsd::Client;
-use pf_volumed::{load_preferences, AlsaJackSource, AlsaMixer, VolumeService};
+use pf_volumed::{load_preferences, AlsaMixer, Output, VolumeService};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -12,29 +12,21 @@ struct Args {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = parse_args(std::env::args().skip(1))?;
     let client = Client::new(args.prefs_socket);
-    let jack = AlsaJackSource::new(&args.card);
     let preferences = load_preferences(&client)?;
-    let plugged = jack.headphones_plugged()?;
-    let mut service = VolumeService::new(AlsaMixer::new(args.card), plugged, preferences);
+    // This board has no headphone-detect event. Keep the ALSA backend fixed on the supported
+    // speaker route; a future event-driven route owner can use VolumeService::reconcile.
+    let mut service = VolumeService::new(AlsaMixer::new(args.card), Output::Speaker, preferences);
     service.apply_current()?;
 
     loop {
         std::thread::sleep(args.poll);
         match load_preferences(&client) {
             Ok(preferences) => {
-                if let Err(error) = service.preferences_changed(preferences) {
+                if let Err(error) = service.reconcile(Output::Speaker, preferences) {
                     eprintln!("pf-volumed: apply preferences: {error}");
                 }
             }
             Err(error) => eprintln!("pf-volumed: {error}"),
-        }
-        match jack.headphones_plugged() {
-            Ok(plugged) => {
-                if let Err(error) = service.plug_changed(plugged) {
-                    eprintln!("pf-volumed: apply jack transition: {error}");
-                }
-            }
-            Err(error) => eprintln!("pf-volumed: read jack transition: {error}"),
         }
     }
 }
