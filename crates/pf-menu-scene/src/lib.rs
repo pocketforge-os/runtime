@@ -272,6 +272,7 @@ struct CacheKey {
     high_contrast: bool,
     reduce_motion: bool,
     pseudo_locale: bool,
+    focused_connection: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -361,6 +362,9 @@ fn cache_key(
         high_contrast: preferences.high_contrast,
         reduce_motion: preferences.reduce_motion,
         pseudo_locale: preferences.pseudo_locale,
+        focused_connection: engine
+            .focus()
+            .is_some_and(|index| is_connection_item(engine.item(index))),
     }
 }
 
@@ -390,6 +394,11 @@ pub fn lower(
     let tokens = Tokens::for_surface(size_class, metrics);
     let page_index = engine.page();
     let page = engine.page_ref(page_index);
+    let connections_folded = should_fold_connections(engine, metrics, mode, tokens);
+    let connections_expanded = connections_folded
+        && engine
+            .focus()
+            .is_some_and(|index| is_connection_item(engine.item(index)));
     let resolve = |message: &Msg| {
         let value = messages.resolve(message);
         if preferences.pseudo_locale {
@@ -442,19 +451,35 @@ pub fn lower(
                 .with_layout(fixed_height((24.0 * tokens.reference_scale).round())),
             );
         }
+        let mut connections_emitted = false;
         for item in &section.items {
             let index = engine
                 .item_index(&item.id)
                 .expect("validated menu item is indexed");
             if engine.page_of(index) == page_index && engine.is_visible(index) {
-                children.push(item_node(
-                    engine,
-                    index,
-                    item,
-                    messages,
-                    preferences,
-                    tokens,
-                ));
+                if connections_folded && is_connection_item(item) {
+                    if connections_emitted {
+                        continue;
+                    }
+                    connections_emitted = true;
+                    children.push(connections_node(
+                        engine,
+                        section,
+                        messages,
+                        preferences,
+                        tokens,
+                        connections_expanded,
+                    ));
+                } else {
+                    children.push(item_node(
+                        engine,
+                        index,
+                        item,
+                        messages,
+                        preferences,
+                        tokens,
+                    ));
+                }
             }
         }
         if let Some(footer) = &section.footer {
@@ -557,7 +582,7 @@ pub fn lower(
             theme: preferences.theme,
             high_contrast: preferences.high_contrast,
             transition_ms: if preferences.reduce_motion { 0 } else { 120 },
-            connections_folded: false,
+            connections_folded,
         },
     })
 }
@@ -643,6 +668,95 @@ fn item_node(
         ));
     }
     node.with_children(content)
+}
+
+fn connections_node(
+    engine: &MenuEngine,
+    section: &pf_menu::Section,
+    messages: &dyn MsgResolver,
+    preferences: RenderPreferences,
+    tokens: Tokens,
+    expanded: bool,
+) -> Node {
+    let children = if expanded {
+        section
+            .items
+            .iter()
+            .filter(|item| is_connection_item(item))
+            .filter_map(|item| {
+                let index = engine.item_index(&item.id)?;
+                engine
+                    .is_visible(index)
+                    .then(|| item_node(engine, index, item, messages, preferences, tokens))
+            })
+            .collect()
+    } else {
+        vec![text_node(
+            "menu/connections/label",
+            "Connections".to_string(),
+            TypeRole::Body,
+        )]
+    };
+    let mut node = Node::new(
+        node_id("menu/connections"),
+        if expanded { Role::Group } else { Role::Link },
+        "Connections",
+        empty_bounds(),
+        "menu-connections",
+    )
+    .with_corner_radius(tokens.radius_row)
+    .with_layout(if expanded {
+        column_style(tokens.spacing_1)
+    } else {
+        row_style(false, tokens)
+    })
+    .with_children(children);
+    node.state.expanded = expanded;
+    if !expanded {
+        node = node.with_action(NodeAction::Custom("connections".to_string()));
+    }
+    node
+}
+
+fn is_connection_item(item: &Item) -> bool {
+    matches!(item.id.0.as_str(), "wifi" | "bt" | "airplane")
+}
+
+fn should_fold_connections(
+    engine: &MenuEngine,
+    metrics: SurfaceMetrics,
+    mode: LayoutMode,
+    tokens: Tokens,
+) -> bool {
+    let page = engine.page();
+    let visible: Vec<_> = engine.visible_items(page).collect();
+    if !["wifi", "bt", "airplane"].iter().all(|wanted| {
+        visible
+            .iter()
+            .any(|index| engine.item(*index).id.0 == *wanted)
+    }) {
+        return false;
+    }
+    let rows = visible
+        .iter()
+        .map(|index| {
+            if engine.item(*index).subtitle.is_some() {
+                tokens.row_tall
+            } else {
+                tokens.row
+            }
+        })
+        .sum::<f32>();
+    let gaps = visible.len().saturating_sub(1) as f32 * tokens.spacing_2;
+    let tabs = if mode == LayoutMode::TabStrip && !engine.page_ref(page).tabs.is_empty() {
+        tokens.bar + tokens.spacing_2
+    } else {
+        0.0
+    };
+    let content_padding = 2.0 * (tokens.safe_margin - tokens.spacing_2).max(0.0);
+    let content_band =
+        metrics.logical_height - 2.0 * tokens.bar - tabs - tokens.bar - content_padding;
+    rows + gaps > content_band.max(0.0)
 }
 
 fn item_role(kind: &ItemKind) -> Role {

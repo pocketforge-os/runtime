@@ -1,7 +1,13 @@
-use pf_menu_scene::{
-    classify_size, layout_mode, LayoutMode, PanelFacts, SizeClass, TextScale, Tokens,
+use pf_menu::{
+    Bind, EngineOptions, Item, ItemKind, Menu, MenuEngine, MenuInput, Msg, Page, PageId,
+    PrefsSchemas, Section, FORMAT_V1,
 };
-use pf_scene::{Insets, Orientation, SurfaceMetrics};
+use pf_menu_scene::{
+    classify_size, layout_mode, lower, LayoutMode, PanelFacts, RenderPreferences, ResolvedMsg,
+    SizeClass, TextScale, Tokens,
+};
+use pf_ports::MonotonicTime;
+use pf_scene::{Insets, Node, Orientation, SurfaceMetrics};
 
 fn metrics(width: f32, height: f32) -> SurfaceMetrics {
     SurfaceMetrics {
@@ -80,4 +86,93 @@ fn four_by_three_compact_and_large_text_use_tab_strip() {
         ),
         LayoutMode::WideRail
     );
+}
+
+fn system_menu(ids: &[&str]) -> MenuEngine {
+    let items = ids
+        .iter()
+        .map(|id| {
+            let kind = if matches!(*id, "wifi" | "bt" | "airplane") {
+                ItemKind::Toggle {
+                    bind: Bind::Host((*id).to_string()),
+                }
+            } else {
+                ItemKind::Action {
+                    confirm: None,
+                    stay_open: true,
+                }
+            };
+            Item::new(id, Msg::text(id), kind)
+        })
+        .collect();
+    MenuEngine::new(
+        Menu {
+            format: FORMAT_V1.into(),
+            id: "system".into(),
+            root: PageId("system".into()),
+            pages: vec![Page {
+                id: PageId("system".into()),
+                title: Msg::text("System"),
+                tabs: vec![],
+                primary: None,
+                sections: vec![Section {
+                    header: None,
+                    footer: None,
+                    items,
+                }],
+            }],
+        },
+        &PrefsSchemas,
+        EngineOptions::default(),
+    )
+    .unwrap()
+}
+
+fn has_node(node: &Node, id: &str) -> bool {
+    node.id.as_str() == id || node.children.iter().any(|child| has_node(child, id))
+}
+
+#[test]
+fn connections_fold_is_computed_from_content_band_on_every_size_class() {
+    let mut overflowing = system_menu(&[
+        "one", "two", "three", "four", "five", "six", "wifi", "bt", "airplane", "ten", "eleven",
+        "twelve",
+    ]);
+    let regular = lower(
+        &overflowing,
+        &ResolvedMsg,
+        PanelFacts::diagonal(5.0),
+        metrics(1280.0, 720.0),
+        RenderPreferences::default(),
+    )
+    .unwrap();
+    assert!(regular.metadata.connections_folded);
+    assert!(has_node(regular.scene.root(), "menu/connections"));
+    assert!(!has_node(regular.scene.root(), "menu/item/wifi"));
+
+    for _ in 0..6 {
+        overflowing.input(MenuInput::Down, MonotonicTime::ZERO);
+    }
+    let expanded = lower(
+        &overflowing,
+        &ResolvedMsg,
+        PanelFacts::diagonal(5.0),
+        metrics(1280.0, 720.0),
+        RenderPreferences::default(),
+    )
+    .unwrap();
+    assert!(has_node(expanded.scene.root(), "menu/item/wifi"));
+    assert_eq!(expanded.scene.focused().unwrap().as_str(), "menu/item/wifi");
+
+    let fitting = system_menu(&["one", "wifi", "bt", "airplane", "five"]);
+    let compact = lower(
+        &fitting,
+        &ResolvedMsg,
+        PanelFacts::diagonal(3.2),
+        metrics(1024.0, 768.0),
+        RenderPreferences::default(),
+    )
+    .unwrap();
+    assert!(!compact.metadata.connections_folded);
+    assert!(has_node(compact.scene.root(), "menu/item/wifi"));
 }
