@@ -1490,6 +1490,36 @@ range = { min = 0, max = 255, fuzz = 0, flat = 0 }
     }
 
     #[test]
+    fn fake_authority_posture_reaches_live_and_resync_paths() {
+        use crate::remap::{Posture, Rotation};
+
+        let (feed, publisher) = PostureFeed::synthetic();
+        let mut pump = posture_pump().with_posture_feed(feed);
+        // The fixture represents the authority's resolved outcome after a hall event,
+        // accelerometer proposal, and an unlocked rotate-lock state.  The positive control
+        // is deliberately non-Normal: the current broker hard-code must make this RED.
+        publisher.publish(Posture::WholeBodyRotated(Rotation::Cw90));
+
+        let out = run(&mut pump, &[ev(ioc::EV_ABS, 0x10, -1), syn()]);
+        assert!(out.contains(&(ioc::EV_ABS, 0x11, -1)), "live: {out:?}");
+        assert!(!out.iter().any(|&(ty, code, _)| {
+            ty == ioc::EV_ABS && code == 0x10
+        }));
+
+        let source = FakeSource {
+            pressed: Vec::new(),
+            abs: vec![(0x10, 1)],
+        };
+        let out = run_with(
+            &mut pump,
+            &[ev(ioc::EV_SYN, ioc::SYN_DROPPED, 0), syn()],
+            &source,
+        );
+        assert!(out.contains(&(ioc::EV_ABS, 0x10, 0)), "resync: {out:?}");
+        assert!(out.contains(&(ioc::EV_ABS, 0x11, 1)), "resync: {out:?}");
+    }
+
+    #[test]
     fn pump_rotates_axes_only_for_whole_body_rotation() {
         use crate::remap::{Posture, Rotation};
         let hat_left = [ev(ioc::EV_ABS, 0x10 /* ABS_HAT0X */, -1), syn()];
