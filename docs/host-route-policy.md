@@ -311,6 +311,10 @@ rows and are tagged:
 
 The key binds path, rule and exact line text; editing the occurrence
 invalidates the row (stale) and the new text fails until reclassified.
+Line references inside `malformed_file` parser diagnostics
+(`... at line 1641`) are hashed as `at line N` (`key_text`), so an edit that
+only moves a malformed-file occurrence keeps its row. Source occurrences are
+never normalized, even when their text says `at line N`.
 Bootstrap rows with `python3 tests/uinput_inventory.py --emit-host-routes`.
 
 Classes: `dormant-k-consumer` (requires `wave2=`; kernel-fidelity consumer

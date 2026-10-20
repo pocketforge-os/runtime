@@ -286,6 +286,22 @@ class MalformedFile(Exception):
     pass
 
 
+# Parser diagnostics such as "unbalanced single quote at line 1641" name where
+# a malformed-file finding sits; their keys must not, or every edit above it
+# stales the row. Source occurrences keep their exact text: a changed source
+# line must never reuse an old classification.
+LINE_REFERENCE = re.compile(r"\bat line [0-9]+\b")
+
+
+def key_text(text, detail=None):
+    """Finding text as manifest keys use it: line references are removed from
+    malformed-file diagnostics only."""
+    text = text.strip()
+    if detail != "malformed_file":
+        return text
+    return LINE_REFERENCE.sub("at line N", text)
+
+
 class Finding:
     """A candidate host-route occurrence before exception resolution."""
 
@@ -305,7 +321,8 @@ class Finding:
 
     @property
     def key(self):
-        digest = hashlib.sha256(f"{self.rule}\n{self.text}".encode()).hexdigest()
+        digest = hashlib.sha256(
+            f"{self.rule}\n{key_text(self.text, self.detail)}".encode()).hexdigest()
         return f"{self.path}\t{digest}"
 
     def render(self):
@@ -2631,7 +2648,8 @@ def scan_host_routes(root, use_manifest=True, quiet=False):
 def _manifest_row(entry):
     rule = entry["rule"]
     text = entry.get("text", "")
-    sha = entry.get("sha") or hashlib.sha256(f"{rule}\n{text.strip()}".encode()).hexdigest()
+    sha = entry.get("sha") or hashlib.sha256(
+        f"{rule}\n{key_text(text, entry.get('detail'))}".encode()).hexdigest()
     fields = [f"rule={rule}", f"class={entry['class']}"]
     if entry.get("caller"):
         fields.append(f"caller={entry['caller']}")
