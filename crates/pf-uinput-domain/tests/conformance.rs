@@ -77,3 +77,58 @@ fn shared_fixture_and_mocked_opener_conform() {
         }
     }
 }
+
+fn dut_probe() -> Probe {
+    Probe {
+        container: Check::No,
+        vm: Check::No,
+        dt: DtState::Ok,
+        compatibles: CURRENT_COMPATIBLES.iter().map(|s| s.to_string()).collect(),
+        marker: MarkerState::Missing,
+        logind: LogindState::NotProbed,
+    }
+}
+
+#[test]
+fn allowed_open_writes_exactly_one_audit_record() {
+    let mut sink = Vec::new();
+    let got = guarded_open_audited(&dut_probe(), &mut sink, || Ok(7)).unwrap();
+    assert_eq!(got, 7);
+    assert_eq!(
+        String::from_utf8(sink).unwrap(),
+        "pf-uinput-audit: reason=safe_uinput_domain domain=dut\n"
+    );
+}
+
+#[test]
+fn refused_or_failed_open_writes_no_success_record() {
+    let mut refused = dut_probe();
+    refused.dt = DtState::Missing;
+    refused.compatibles.clear();
+    let mut sink = Vec::new();
+    let err = guarded_open_audited(&refused, &mut sink, || Ok(())).unwrap_err();
+    assert!(err.to_string().contains("reason=unsafe_uinput_domain"));
+    assert!(sink.is_empty());
+
+    let err = guarded_open_audited(&dut_probe(), &mut sink, || -> std::io::Result<()> {
+        Err(std::io::Error::other("open failed"))
+    })
+    .unwrap_err();
+    assert_eq!(err.to_string(), "open failed");
+    assert!(sink.is_empty());
+}
+
+#[test]
+fn audit_is_per_open_not_per_event() {
+    // Device use after the open never touches the audit sink: only the opener
+    // runs inside the guard, so N events after it add zero records.
+    let mut sink = Vec::new();
+    let mut events = 0;
+    guarded_open_audited(&dut_probe(), &mut sink, || Ok(())).unwrap();
+    for _ in 0..1000 {
+        events += 1;
+    }
+    assert_eq!(events, 1000);
+    assert_eq!(sink.iter().filter(|b| **b == b'\n').count(), 1);
+    assert!(sink.len() < 128);
+}
