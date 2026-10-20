@@ -54,7 +54,7 @@ pub use io::{
 pub use policy::TokenBucket;
 pub use remap::{Posture, Remap, RemapError, Rotation};
 pub use safe_return::{
-    serve_system_menu_provider, SafeReturnIntake, SystemMenuGate, SystemMenuRouter,
+    serve_system_menu_provider, PostureFeed, SafeReturnIntake, SystemMenuGate, SystemMenuRouter,
 };
 pub use uinput::{AbsInfo, Uinput, UinputSpec};
 

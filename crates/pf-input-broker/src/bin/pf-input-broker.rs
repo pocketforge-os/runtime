@@ -35,7 +35,7 @@ use std::sync::Arc;
 
 use pf_input_broker::{
     is_private_stream_eof, serve_client, serve_system_menu_provider, FdEventSink, FdEventSource,
-    InputBroker, RunConfig, SafeReturnIntake, SourceIdentity, SystemMenuRouter,
+    InputBroker, PostureFeed, RunConfig, SafeReturnIntake, SourceIdentity, SystemMenuRouter,
 };
 use pocketforge::backends::InProcessBackend;
 use pocketforge::{Backend, Descriptor};
@@ -188,6 +188,13 @@ fn run_production(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         None => discover_with_timeout(&descriptor, &identity)?,
     };
     let mut broker = InputBroker::start_checked(&source, &descriptor, grab, &identity)?;
+    if let Some(sock) = safe_return_sock.as_deref() {
+        broker = broker.with_posture_feed(PostureFeed::spawn(sock)?);
+    } else {
+        eprintln!(
+            "pf-input-broker: orientation_source_unavailable source=none reason=authority_socket_missing fallback=normal"
+        );
+    }
     let system_menu_router = safe_return_sock
         .as_deref()
         .map(SafeReturnIntake::spawn)

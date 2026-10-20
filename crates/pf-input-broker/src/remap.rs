@@ -123,9 +123,8 @@ fn lookup(table: &[(&str, u16)], name: &str) -> Option<u16> {
 /// (tate) does the deck move relative to the user and the broker must
 /// re-express body-frame vectors in the logical frame.
 ///
-/// Where this value comes from at runtime is designed by tsp-mc9m.41.1026.6
-/// (the session orientation policy); until that lands, the broker wires
-/// [`Posture::Normal`] and nothing else.
+/// At runtime the broker consumes the session authority's versioned whole-body snapshot. The
+/// authority, rather than this remap, owns hall, accelerometer, and rotate-lock source policy.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Posture {
     /// The body is in its normal operating pose; deck frame and logical frame

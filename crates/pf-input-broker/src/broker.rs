@@ -21,7 +21,7 @@ use crate::io::{EventSink, EventSource, SourceState};
 use crate::ioc;
 use crate::policy::TokenBucket;
 use crate::remap::{AbsAction, Posture, Remap};
-use crate::safe_return::{SystemMenuGate, SystemMenuRouter, GUIDE_CODE};
+use crate::safe_return::{PostureFeed, SystemMenuGate, SystemMenuRouter, GUIDE_CODE};
 use crate::scm;
 use crate::uinput::Uinput;
 
@@ -222,10 +222,9 @@ impl<'a> RunConfig<'a> {
 pub(crate) struct ReportPump {
     remap: Remap,
     /// The posture [`Remap::remap_axis_event`] re-expresses spatial axis events for.
-    /// Production wiring is [`Posture::Normal`]: TODO(tsp-mc9m.41.1026.6) — the
-    /// session orientation policy designs where the runtime posture comes from;
-    /// do not invent a source here.
+    /// Updated from the session authority before each report, including a SYN_DROPPED resync.
     posture: Posture,
+    posture_feed: Option<PostureFeed>,
     bucket: TokenBucket,
     pending_report: Vec<(u16, u16, i32)>,
     pending_report_oversized: bool,
@@ -357,6 +356,12 @@ impl InputBroker {
     /// withheld from apps, and each press routes through the provider/fallback policy.
     pub fn with_system_menu(mut self, router: SystemMenuRouter) -> InputBroker {
         self.pump.system_menu = Some(SystemMenuGate::new(router));
+        self
+    }
+
+    /// Consume the session authority's resolved whole-body posture for axis remapping.
+    pub fn with_posture_feed(mut self, feed: PostureFeed) -> InputBroker {
+        self.pump = self.pump.with_posture_feed(feed);
         self
     }
 
@@ -592,10 +597,8 @@ impl ReportPump {
             .collect();
         ReportPump {
             remap,
-            // TODO(tsp-mc9m.41.1026.6): the runtime posture source is designed
-            // by the session orientation policy; Normal is the only value wired
-            // until that lands.
             posture: Posture::Normal,
+            posture_feed: None,
             bucket: TokenBucket::default_broker(),
             pending_report: Vec::new(),
             pending_report_oversized: false,
@@ -603,6 +606,17 @@ impl ReportPump {
             pressed: HashSet::new(),
             abs_state,
             system_menu: None,
+        }
+    }
+
+    fn with_posture_feed(mut self, feed: PostureFeed) -> Self {
+        self.posture_feed = Some(feed);
+        self
+    }
+
+    fn refresh_posture(&mut self) {
+        if let Some(feed) = self.posture_feed.as_ref() {
+            self.posture = feed.current();
         }
     }
 
@@ -622,6 +636,7 @@ impl ReportPump {
         source: &impl SourceState,
         emit: &mut impl FnMut(u16, u16, i32) -> io::Result<()>,
     ) -> io::Result<usize> {
+        self.refresh_posture();
         let mut emitted = 0usize;
         for ev in events {
             let t = ev.type_;
@@ -1056,6 +1071,12 @@ mod readiness_tests {
         assert!(unit.lines().any(|line| {
             line == "After=local-fs.target dev-uinput.device pf-input-decode.service"
         }));
+        assert!(unit
+            .lines()
+            .any(|line| line == "After=pf-session-authorityd.service"));
+        assert!(unit.contains(
+            "--safe-return-sock /run/pocketforge/session-authority.sock"
+        ));
         assert!(unit.lines().any(|line| line == "Restart=on-failure"));
         assert!(
             !unit.contains("--allow-unidentified-pad"),
@@ -1441,12 +1462,11 @@ range = { min = 0, max = 255, fuzz = 0, flat = 0 }
 
     // --- posture wiring (tsp-mc9m.41.1026.1) --------------------------------------------------
     //
-    // The report pump's posture is a PURE INPUT to the axis remap (`remap::Posture`); its
-    // runtime source is designed by tsp-mc9m.41.1026.6 and until that lands production
-    // constructs the pump with Posture::Normal. The rotation convention (body rotated N°
-    // clockwise; logical = rotate-clockwise(body vector, N)) is named and tested in remap.rs;
-    // what is proven HERE is the wiring: only a whole-body rotation rotates the emitted
-    // stream, on both the live path and the SYN_DROPPED resync path.
+    // The report pump's posture is a PURE INPUT to the axis remap (`remap::Posture`); production
+    // consumes the session authority's resolved snapshot. The rotation convention (body rotated
+    // N° clockwise; logical = rotate-clockwise(body vector, N)) is named and tested in remap.rs;
+    // what is proven HERE is the wiring: only a whole-body rotation rotates the emitted stream,
+    // on both the live path and the SYN_DROPPED resync path.
 
     /// Synthetic descriptor with the spatial axes (d-pad hat + both stick axes, so every
     /// rotated code is advertised by the spec) plus one binary trigger.
@@ -1502,9 +1522,9 @@ range = { min = 0, max = 255, fuzz = 0, flat = 0 }
 
         let out = run(&mut pump, &[ev(ioc::EV_ABS, 0x10, -1), syn()]);
         assert!(out.contains(&(ioc::EV_ABS, 0x11, -1)), "live: {out:?}");
-        assert!(!out.iter().any(|&(ty, code, _)| {
-            ty == ioc::EV_ABS && code == 0x10
-        }));
+        assert!(!out
+            .iter()
+            .any(|&(ty, code, _)| { ty == ioc::EV_ABS && code == 0x10 }));
 
         let source = FakeSource {
             pressed: Vec::new(),
@@ -1515,16 +1535,19 @@ range = { min = 0, max = 255, fuzz = 0, flat = 0 }
             &[ev(ioc::EV_SYN, ioc::SYN_DROPPED, 0), syn()],
             &source,
         );
-        assert!(out.contains(&(ioc::EV_ABS, 0x10, 0)), "resync: {out:?}");
         assert!(out.contains(&(ioc::EV_ABS, 0x11, 1)), "resync: {out:?}");
+        assert!(
+            !out.iter()
+                .any(|&(ty, code, _)| { ty == ioc::EV_ABS && code == 0x10 }),
+            "resync must emit the rotated axis, not the physical axis: {out:?}"
+        );
     }
 
     #[test]
     fn pump_rotates_axes_only_for_whole_body_rotation() {
         use crate::remap::{Posture, Rotation};
         let hat_left = [ev(ioc::EV_ABS, 0x10 /* ABS_HAT0X */, -1), syn()];
-        // Production wiring: Posture::Normal. Positive control — the d-pad passes
-        // through untouched, exactly the stream from before postures existed.
+        // Positive control — the d-pad passes through untouched in Normal posture.
         let mut pump = posture_pump();
         assert_eq!(pump.posture, Posture::Normal);
         let out = run(&mut pump, &hat_left);
