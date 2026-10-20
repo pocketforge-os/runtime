@@ -1,6 +1,5 @@
 use pf_volumed::jack::{
-    advertises_headphone_switch, discover, route_from_switch_bits, EvdevJack, RouteSource,
-    JACK_DEVICE_NAME,
+    advertises_headphone_switch, discover, route_from_switch_bits, EvdevJack, JACK_DEVICE_NAME,
 };
 use pf_volumed::Output;
 use std::fs;
