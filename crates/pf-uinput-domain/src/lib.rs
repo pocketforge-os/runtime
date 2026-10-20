@@ -362,20 +362,51 @@ pub fn require_safe_host() -> io::Result<Domain> {
     require_safe(&probe_host())
 }
 
+/// Prefix of the one-line audit record written for each allowed open.
+pub const AUDIT_PREFIX: &str = "pf-uinput-audit";
+
+/// Format the success audit record (no trailing newline): the allow reason and domain.
+pub fn audit_line(verdict: &Verdict) -> String {
+    format!("{AUDIT_PREFIX}: {verdict}")
+}
+
+/// Open under the guard, writing exactly one audit record to `audit` after the
+/// opener succeeds. A refusal opens nothing and writes no success record (the
+/// caller gets the `unsafe_uinput_domain` error); a failed opener writes none.
+pub fn guarded_open_audited<T, F>(
+    probe: &Probe,
+    audit: &mut dyn io::Write,
+    opener: F,
+) -> io::Result<T>
+where
+    F: FnOnce() -> io::Result<T>,
+{
+    let result = evaluate(probe);
+    if !result.allowed {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            result.to_string(),
+        ));
+    }
+    let opened = opener()?;
+    // Audit is best-effort: a broken log sink must not tear down a working device.
+    let _ = writeln!(audit, "{}", audit_line(&result));
+    Ok(opened)
+}
+
 pub fn guarded_open<T, F>(probe: &Probe, opener: F) -> io::Result<T>
 where
     F: FnOnce() -> io::Result<T>,
 {
-    require_safe(probe)?;
-    opener()
+    guarded_open_audited(probe, &mut io::sink(), opener)
 }
 
+/// Host-probing open; the success record goes to stderr (the journal).
 pub fn guarded_host_open<T, F>(opener: F) -> io::Result<T>
 where
     F: FnOnce() -> io::Result<T>,
 {
-    require_safe_host()?;
-    opener()
+    guarded_open_audited(&probe_host(), &mut io::stderr(), opener)
 }
 
 #[cfg(test)]
