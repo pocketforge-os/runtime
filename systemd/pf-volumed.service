@@ -18,6 +18,7 @@ PrivateTmp=yes
 PrivateDevices=no
 DevicePolicy=closed
 DeviceAllow=char-alsa rw
+DeviceAllow=char-input r
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectControlGroups=yes

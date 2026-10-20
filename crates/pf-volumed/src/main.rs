@@ -1,7 +1,11 @@
 use pf_prefsd::Client;
-use pf_volumed::{load_preferences, AlsaMixer, MixerBackend};
-use std::path::PathBuf;
+use pf_volumed::jack::{discover, EvdevJack};
+use pf_volumed::{load_preferences, AlsaMixer, MixerBackend, SyncError, VolumeService};
+use std::path::{Path, PathBuf};
 use std::time::Duration;
+
+const SYSFS_INPUT: &str = "/sys/class/input";
+const DEV_INPUT: &str = "/dev/input";
 
 struct Args {
     prefs_socket: PathBuf,
@@ -9,21 +13,86 @@ struct Args {
     poll: Duration,
 }
 
+fn open_jack() -> Result<Option<EvdevJack>, pf_volumed::jack::RouteError> {
+    match discover(Path::new(SYSFS_INPUT), Path::new(DEV_INPUT))? {
+        Some(path) => EvdevJack::open(&path).map(Some),
+        None => Ok(None),
+    }
+}
+
+fn report(last: &mut String, message: String) {
+    if *last != message {
+        eprintln!("pf-volumed: {message}");
+        *last = message;
+    }
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = parse_args(std::env::args().skip(1))?;
     let client = Client::new(args.prefs_socket);
     let mut mixer = AlsaMixer::new(args.card);
-    // This board has no headphone-detect event, so neither endpoint can be established safely.
-    // Quiesce the shared DAC before any preference I/O and leave it there until an event-driven
-    // route owner can perform VolumeService's atomic transition contract.
+    // Nothing is exposed until the route is known: hold the shared DAC at its minimum, then let
+    // the headphone-jack switch (EVIOCGSW at start, events after) drive VolumeService's atomic
+    // transition. If the switch device is absent or unreadable the DAC simply stays quiesced.
     mixer.quiesce()?;
-    load_preferences(&client)?;
+    let mut service = VolumeService::unrouted(mixer, load_preferences(&client)?);
+    let mut jack: Option<EvdevJack> = None;
+    let mut last = String::new();
 
     loop {
-        std::thread::sleep(args.poll);
+        if jack.is_none() {
+            match open_jack() {
+                Ok(found) => {
+                    if found.is_none() {
+                        report(
+                            &mut last,
+                            String::from("headphone-jack switch absent; volume held at minimum"),
+                        );
+                    }
+                    jack = found;
+                }
+                Err(error) => report(
+                    &mut last,
+                    format!("headphone-jack switch unusable: {error}"),
+                ),
+            }
+        }
+        let Some(source) = jack.as_mut() else {
+            std::thread::sleep(args.poll);
+            if let Err(error) = load_preferences(&client) {
+                report(&mut last, error.to_string());
+            }
+            continue;
+        };
         match load_preferences(&client) {
-            Ok(_) => {}
-            Err(error) => eprintln!("pf-volumed: {error}"),
+            Ok(preferences) => match service.sync_route(source, preferences) {
+                Ok(()) => last.clear(),
+                Err(SyncError::Route(error)) => {
+                    report(
+                        &mut last,
+                        format!("route unknown, volume held at minimum: {error}"),
+                    );
+                    jack = None;
+                    continue;
+                }
+                Err(SyncError::Mixer(error)) => {
+                    report(&mut last, error.to_string());
+                    if !service.route_known() {
+                        // A failed transition may have left the previous level exposed: confirm
+                        // the minimum or stop (systemd restarts the unit) rather than continue.
+                        service.route_lost()?;
+                    }
+                }
+            },
+            Err(error) => report(&mut last, error.to_string()),
+        }
+        if let Err(error) = source.wait(args.poll) {
+            report(
+                &mut last,
+                format!("route unknown, volume held at minimum: {error}"),
+            );
+            jack = None;
+            service.route_lost()?;
         }
     }
 }

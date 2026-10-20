@@ -3,7 +3,15 @@
 //! Preference and route policy deliberately depend on [`MixerBackend`], not ALSA.  PipeWire /
 //! WirePlumber can therefore replace [`AlsaMixer`] without changing the per-output preference
 //! contract when tsp-ihne1.30 lands.
+//!
+//! The physical route comes from the codec's headphone-jack input switch ([`jack`]); the kernel's
+//! codec/DAPM policy selects the analog path, so [`AlsaMixer`]'s transition quiesces the shared
+//! DAC and then applies the destination output's stored level. When the route is unknown (switch
+//! device absent or unreadable) the service holds the DAC at its minimum.
 
+pub mod jack;
+
+use jack::RouteSource;
 use pf_prefsd::Client;
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -123,6 +131,23 @@ impl<M: MixerBackend> VolumeService<M> {
         }
     }
 
+    /// A service whose physical route has not been established: the first `reconcile` performs a
+    /// full transition, so no level is exposed before the route is known.
+    pub fn unrouted(backend: M, preferences: VolumePreferences) -> Self {
+        Self {
+            backend,
+            active: Output::Speaker,
+            preferences,
+            route_uncertain: true,
+        }
+    }
+
+    /// The route became unknown: hold the volume path at its minimum until a transition succeeds.
+    pub fn route_lost(&mut self) -> Result<(), M::Error> {
+        self.route_uncertain = true;
+        self.backend.quiesce()
+    }
+
     pub fn apply_current(&mut self) -> Result<(), M::Error> {
         if self.route_uncertain {
             self.backend.transition(
@@ -177,6 +202,28 @@ impl<M: MixerBackend> VolumeService<M> {
         Ok(())
     }
 
+    /// Read the route and reconcile it with the latest preferences. An unreadable route
+    /// quiesces the volume path instead of keeping the last level.
+    pub fn sync_route<S: RouteSource>(
+        &mut self,
+        source: &mut S,
+        preferences: VolumePreferences,
+    ) -> Result<(), SyncError<M::Error>> {
+        match source.route() {
+            Ok(route) => self.reconcile(route, preferences).map_err(SyncError::Mixer),
+            Err(error) => {
+                self.route_lost().map_err(SyncError::Mixer)?;
+                Err(SyncError::Route(error))
+            }
+        }
+    }
+
+    /// False after a failed transition or route loss: the volume path is (or must be treated as)
+    /// quiesced and the caller must not continue without having confirmed that.
+    pub fn route_known(&self) -> bool {
+        !self.route_uncertain
+    }
+
     pub fn active_output(&self) -> Output {
         self.active
     }
@@ -188,6 +235,13 @@ impl<M: MixerBackend> VolumeService<M> {
     pub fn backend_mut(&mut self) -> &mut M {
         &mut self.backend
     }
+}
+
+#[derive(Debug)]
+pub enum SyncError<E> {
+    /// The route source failed; the volume path was quiesced.
+    Route(jack::RouteError),
+    Mixer(E),
 }
 
 #[derive(Debug)]
@@ -212,9 +266,12 @@ impl fmt::Display for RuntimeError {
 
 impl std::error::Error for RuntimeError {}
 
+const QUIESCE_ATTEMPTS: usize = 3;
+const QUIESCE_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
+
 /// Current hardware backend. Both physical endpoints share the codec's DAC playback level. This
-/// board has no headphone-detect event, so the process applies speaker levels only and rejects
-/// route transitions. A future WirePlumber backend can own an event-driven route transaction.
+/// board's route comes from the jack input switch ([`jack`]); the kernel selects the analog path
+/// and this backend orders the level changes. A future WirePlumber backend can own the route.
 pub struct AlsaMixer {
     amixer: PathBuf,
     card: String,
@@ -259,7 +316,17 @@ impl MixerBackend for AlsaMixer {
     type Error = RuntimeError;
 
     fn quiesce(&mut self) -> Result<(), Self::Error> {
-        self.set_control("DAC Playback Volume", "0")
+        // Minimum volume is the fail-safe state, so a transient amixer failure is retried before
+        // the caller is told the path could not be quiesced.
+        let mut result = self.set_control("DAC Playback Volume", "0");
+        for _ in 1..QUIESCE_ATTEMPTS {
+            if result.is_ok() {
+                break;
+            }
+            std::thread::sleep(QUIESCE_RETRY_DELAY);
+            result = self.set_control("DAC Playback Volume", "0");
+        }
+        result
     }
 
     fn apply(&mut self, _output: Output, percent: u8, muted: bool) -> Result<(), Self::Error> {
@@ -274,18 +341,11 @@ impl MixerBackend for AlsaMixer {
         self.set_control("DAC Playback Volume", &raw.to_string())
     }
 
-    fn transition(
-        &mut self,
-        _output: Output,
-        _percent: u8,
-        _muted: bool,
-    ) -> Result<(), Self::Error> {
-        // The A133 board has no headphone-detect event and this backend does not own routing.
-        // Polling after the kernel exposes a new route cannot satisfy the transition contract.
+    fn transition(&mut self, output: Output, percent: u8, muted: bool) -> Result<(), Self::Error> {
+        // The codec's jack/DAPM policy selects the analog path (see mixer-defaults); this backend
+        // owns the level ordering: minimum first, then the destination output's stored level.
         self.quiesce()?;
-        Err(RuntimeError(String::from(
-            "route transition unavailable without an event-driven route controller",
-        )))
+        self.apply(output, percent, muted)
     }
 }
 
