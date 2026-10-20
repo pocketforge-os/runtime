@@ -286,6 +286,16 @@ class MalformedFile(Exception):
     pass
 
 
+# Diagnostic text such as "unbalanced single quote at line 1641" names where a
+# finding sits; keys must not, or every edit above it stales its row.
+LINE_REFERENCE = re.compile(r"\bat line [0-9]+\b")
+
+
+def key_text(text):
+    """Finding text with line references removed, as manifest keys use it."""
+    return LINE_REFERENCE.sub("at line N", text.strip())
+
+
 class Finding:
     """A candidate host-route occurrence before exception resolution."""
 
@@ -305,7 +315,8 @@ class Finding:
 
     @property
     def key(self):
-        digest = hashlib.sha256(f"{self.rule}\n{self.text}".encode()).hexdigest()
+        digest = hashlib.sha256(
+            f"{self.rule}\n{key_text(self.text)}".encode()).hexdigest()
         return f"{self.path}\t{digest}"
 
     def render(self):
@@ -2631,7 +2642,8 @@ def scan_host_routes(root, use_manifest=True, quiet=False):
 def _manifest_row(entry):
     rule = entry["rule"]
     text = entry.get("text", "")
-    sha = entry.get("sha") or hashlib.sha256(f"{rule}\n{text.strip()}".encode()).hexdigest()
+    sha = entry.get("sha") or hashlib.sha256(
+        f"{rule}\n{key_text(text)}".encode()).hexdigest()
     fields = [f"rule={rule}", f"class={entry['class']}"]
     if entry.get("caller"):
         fields.append(f"caller={entry['caller']}")
