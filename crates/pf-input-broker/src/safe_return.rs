@@ -46,9 +46,10 @@ pub const SAFE_RETURN_BODY: &[u8] = br#"{"method":"safe_return"}"#;
 
 const ORIENTATION_RPC_VERSION: u32 = 1;
 const ORIENTATION_WAIT: Duration = Duration::from_secs(1);
-/// Keep orientation shutdown below systemd's five-second service stop budget even when the
-/// authority accepted a long-poll request and never replies.
-const ORIENTATION_IO_TIMEOUT: Duration = Duration::from_millis(250);
+/// The authority may hold an unchanged snapshot for ORIENTATION_WAIT. The margin keeps a normal
+/// long-poll response from becoming a reconnect while remaining below systemd's five-second
+/// service stop budget if the authority never replies during shutdown.
+const ORIENTATION_READ_TIMEOUT: Duration = Duration::from_millis(1_250);
 
 /// The broker's nonblocking view of the session authority's resolved body posture.
 ///
@@ -214,8 +215,8 @@ fn orientation_worker(
 
 fn read_orientation(sock: &Path, after_serial: Option<u64>) -> io::Result<(u64, Posture)> {
     let mut stream = connect_with_timeout(sock, CONNECT_TIMEOUT)?;
-    stream.set_read_timeout(Some(ORIENTATION_IO_TIMEOUT))?;
-    stream.set_write_timeout(Some(ORIENTATION_IO_TIMEOUT))?;
+    stream.set_read_timeout(Some(ORIENTATION_READ_TIMEOUT))?;
+    stream.set_write_timeout(Some(CONNECT_TIMEOUT))?;
     let mut request = serde_json::json!({
         "method": "orientation",
         "version": ORIENTATION_RPC_VERSION,
@@ -1335,6 +1336,35 @@ mod tests {
     }
 
     #[test]
+    fn unchanged_orientation_long_poll_outlives_read_deadline() {
+        let sock = scratch("orientation-long-poll");
+        let _ = std::fs::remove_file(&sock);
+        let listener = UnixListener::bind(&sock).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request: serde_json::Value =
+                serde_json::from_slice(&pf_wire::read_frame(&mut stream).unwrap()).unwrap();
+            assert_eq!(request["after_serial"], 11);
+            assert_eq!(request["wait_ms"], 1_000);
+            // An unchanged snapshot is the authority's long-poll response, not a
+            // failed source. It must be allowed to outlive the previous 250 ms
+            // read deadline.
+            std::thread::sleep(ORIENTATION_WAIT + Duration::from_millis(100));
+            pf_wire::write_frame(
+                &mut stream,
+                br#"{"result":"orientation","version":1,"state":{"serial":11,"output":"normal","logical":"landscape","app":"landscape","presentation":"fill","whole_body":"left","screen_only":"normal","locked":false,"degraded":[]}}"#,
+            )
+            .unwrap();
+        });
+        assert_eq!(
+            read_orientation(&sock, Some(11)).unwrap(),
+            (11, Posture::WholeBodyRotated(Rotation::Cw270))
+        );
+        server.join().unwrap();
+        let _ = std::fs::remove_file(sock);
+    }
+
+    #[test]
     fn absent_orientation_source_logs_named_fallback_and_stops_cleanly() {
         let sock = scratch("orientation-absent");
         let _ = std::fs::remove_file(&sock);
@@ -1363,7 +1393,7 @@ mod tests {
         let started = Instant::now();
         drop(feed);
         assert!(
-            started.elapsed() < Duration::from_secs(1),
+            started.elapsed() < IO_TIMEOUT,
             "orientation shutdown exceeded its bounded read wait"
         );
         let _ = std::fs::remove_file(sock);
