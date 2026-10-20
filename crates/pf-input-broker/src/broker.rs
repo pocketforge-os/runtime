@@ -231,6 +231,11 @@ pub(crate) struct ReportPump {
     resynchronizing: bool,
     pressed: HashSet<u16>,
     abs_state: HashMap<u16, i32>,
+    /// Last observed source-frame values for passthrough axes.  Unlike `abs_state`, this remains
+    /// in the physical frame so a posture change can re-express held axes without a new event.
+    physical_abs_state: HashMap<u16, i32>,
+    /// Logical ABS codes that have been presented to the virtual device.
+    known_abs: HashSet<u16>,
     /// `None` (no `--safe-return-sock`) leaves the stream exactly as before: guide passes through.
     system_menu: Option<SystemMenuGate>,
 }
@@ -605,6 +610,8 @@ impl ReportPump {
             resynchronizing: false,
             pressed: HashSet::new(),
             abs_state,
+            physical_abs_state: HashMap::new(),
+            known_abs: HashSet::new(),
             system_menu: None,
         }
     }
@@ -614,10 +621,69 @@ impl ReportPump {
         self
     }
 
-    fn refresh_posture(&mut self) {
+    fn capture_posture_at_boundary(&mut self) -> Option<Posture> {
         if let Some(feed) = self.posture_feed.as_ref() {
-            self.posture = feed.current();
+            let next = feed.current();
+            if next != self.posture {
+                let previous = self.posture;
+                self.posture = next;
+                return Some(previous);
+            }
         }
+        None
+    }
+
+    fn remap_pending_report(&mut self) {
+        for (ty, code, value) in &mut self.pending_report {
+            if *ty == ioc::EV_ABS {
+                (*code, *value) = self.remap.remap_axis_event(self.posture, *code, *value);
+            }
+        }
+    }
+
+    fn reconcile_held_abs(&mut self) -> Vec<(u16, u16, i32)> {
+        let current: Vec<(u16, i32)> = self
+            .physical_abs_state
+            .iter()
+            .map(|(&source_code, &value)| {
+                self.remap
+                    .remap_axis_event(self.posture, source_code, value)
+            })
+            .collect();
+        let current_codes: HashSet<u16> = current.iter().map(|&(code, _)| code).collect();
+        let mut out = Vec::new();
+        let stale: Vec<u16> = self
+            .known_abs
+            .iter()
+            .copied()
+            .filter(|code| !current_codes.contains(code))
+            .collect();
+        for code in stale {
+            let neutral = self
+                .remap
+                .spec()
+                .abs
+                .iter()
+                .find_map(|&(axis, info)| {
+                    (axis == code).then_some(
+                        (i64::from(info.min) + i64::from(info.max - info.min) / 2) as i32,
+                    )
+                })
+                .unwrap_or(0);
+            if self.abs_state.get(&code) != Some(&neutral) {
+                self.abs_state.insert(code, neutral);
+                out.push((ioc::EV_ABS, code, neutral));
+            }
+            self.known_abs.remove(&code);
+        }
+        for &(code, value) in &current {
+            if self.abs_state.get(&code) != Some(&value) {
+                self.abs_state.insert(code, value);
+                out.push((ioc::EV_ABS, code, value));
+            }
+            self.known_abs.insert(code);
+        }
+        out
     }
 
     /// `true` when the System Menu gate owns this canonical key transition.
@@ -636,7 +702,6 @@ impl ReportPump {
         source: &impl SourceState,
         emit: &mut impl FnMut(u16, u16, i32) -> io::Result<()>,
     ) -> io::Result<usize> {
-        self.refresh_posture();
         let mut emitted = 0usize;
         for ev in events {
             let t = ev.type_;
@@ -648,25 +713,45 @@ impl ReportPump {
                 // Events following SYN_DROPPED belong to the unreliable tail of the overrun.
                 // Once its boundary arrives, query authoritative state before accepting reports.
                 if t == ioc::EV_SYN && ev.code == ioc::SYN_REPORT {
+                    self.capture_posture_at_boundary();
                     let out = self.resynchronize_source_state(source)?;
                     for (ty, code, value) in out {
                         emit(ty, code, value)?;
                         emitted += 1;
+                        if ty == ioc::EV_ABS {
+                            self.known_abs.insert(code);
+                        }
                     }
                     self.resynchronizing = false;
                 }
             } else if t == ioc::EV_SYN && ev.code == ioc::SYN_REPORT {
+                let posture_changed = self.capture_posture_at_boundary().is_some();
+                self.remap_pending_report();
                 let allowed = self.bucket.allow(now);
-                let out = finish_report(
+                let mut out = finish_report(
                     &mut self.pending_report,
                     &mut self.pending_report_oversized,
                     &mut self.pressed,
                     allowed,
                 );
+                if posture_changed {
+                    let corrections = self.reconcile_held_abs();
+                    let has_boundary = out
+                        .last()
+                        .is_some_and(|&event| event == (ioc::EV_SYN, ioc::SYN_REPORT, 0));
+                    if has_boundary {
+                        out.pop();
+                    }
+                    out.extend(corrections);
+                    if has_boundary || !out.is_empty() {
+                        out.push((ioc::EV_SYN, ioc::SYN_REPORT, 0));
+                    }
+                }
                 for (ty, code, value) in out {
                     emit(ty, code, value)?;
                     if ty == ioc::EV_ABS {
                         self.abs_state.insert(code, value);
+                        self.known_abs.insert(code);
                     }
                     emitted += 1;
                 }
@@ -684,14 +769,14 @@ impl ReportPump {
                 // reclassified to an EV_KEY press/release on its canonical button (descriptor-driven).
                 match self.remap.classify_abs(ev.code, ev.value) {
                     AbsAction::Passthrough => {
-                        // Spatial axes are re-expressed in the logical frame for the
-                        // current posture (identity for Normal / a screen-only swivel).
-                        let (code, value) =
-                            self.remap.remap_axis_event(self.posture, ev.code, ev.value);
+                        // Keep the pending event in the source frame.  It is remapped at its
+                        // SYN_REPORT boundary, so one read batch can observe a posture change
+                        // between reports without applying one stale posture to all reports.
+                        self.physical_abs_state.insert(ev.code, ev.value);
                         push_report_event(
                             &mut self.pending_report,
                             &mut self.pending_report_oversized,
-                            (t, code, value),
+                            (t, ev.code, ev.value),
                         );
                     }
                     AbsAction::Button { code, value } => {
@@ -735,6 +820,7 @@ impl ReportPump {
                 // emitted codes), so the authoritative body-frame value is re-expressed
                 // for the current posture exactly like the live path.
                 AbsAction::Passthrough => {
+                    self.physical_abs_state.insert(code, value);
                     actual_abs.push(self.remap.remap_axis_event(self.posture, code, value))
                 }
                 AbsAction::Button { code, value } => actual_binary.push((code, value != 0)),
@@ -1524,6 +1610,21 @@ range = { min = 0, max = 255, fuzz = 0, flat = 0 }
             .iter()
             .any(|&(ty, code, _)| { ty == ioc::EV_ABS && code == 0x10 }));
 
+        // A posture change with no new axis event must still move the held hat in the
+        // virtual device's logical frame, including clearing the old logical code.
+        publisher.publish(Posture::Normal);
+        let out = run(&mut pump, &[syn()]);
+        assert!(
+            out.contains(&(ioc::EV_ABS, 0x11, 0)),
+            "transition clear: {out:?}"
+        );
+        assert!(
+            out.contains(&(ioc::EV_ABS, 0x10, -1)),
+            "transition move: {out:?}"
+        );
+
+        publisher.publish(Posture::WholeBodyRotated(Rotation::Cw90));
+
         let source = FakeSource {
             pressed: Vec::new(),
             abs: vec![(0x10, 1)],
@@ -1535,9 +1636,8 @@ range = { min = 0, max = 255, fuzz = 0, flat = 0 }
         );
         assert!(out.contains(&(ioc::EV_ABS, 0x11, 1)), "resync: {out:?}");
         assert!(
-            !out.iter()
-                .any(|&(ty, code, _)| { ty == ioc::EV_ABS && code == 0x10 }),
-            "resync must emit the rotated axis, not the physical axis: {out:?}"
+            out.contains(&(ioc::EV_ABS, 0x10, 0)),
+            "resync clear: {out:?}"
         );
     }
 
