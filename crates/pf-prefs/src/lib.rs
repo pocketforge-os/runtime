@@ -51,7 +51,7 @@ pub mod store;
 pub use error::PrefError;
 pub use prefs::{PrefChange, Prefs, Source};
 pub use schema::{
-    parse_value, spec, validate, PrefKind, PrefSpec, PrefValue, KEYBOARD_LAYOUTS,
-    KEYBOARD_LAYOUTS_PROVENANCE, SCHEMA, SCHEMA_VERSION,
+    parse_value, seed_schema, seed_schema_json, spec, validate, PrefKind, PrefSpec, PrefValue,
+    KEYBOARD_LAYOUTS, KEYBOARD_LAYOUTS_PROVENANCE, PREFS_SCHEMA_PATH, SCHEMA, SCHEMA_VERSION,
 };
 pub use store::PrefsStore;

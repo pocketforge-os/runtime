@@ -125,6 +125,9 @@ pub fn kind_name(kind: PrefKind) -> &'static str {
 /// object; version 2 adds the shell accessibility keys and writes `schemaVersion: 2`.
 pub const SCHEMA_VERSION: u64 = 2;
 
+/// The image path for the machine-readable first-run seed schema.
+pub const PREFS_SCHEMA_PATH: &str = "/usr/share/pocketforge/prefs.schema.json";
+
 /// The v2 preference schema. Additive keys retain version 2 because an absent key resolves to its
 /// schema default and older readers already preserve unknown keys; no stored representation
 /// changed.
@@ -231,6 +234,78 @@ keyboards, as an xkb `layout(variant)` token (first boot may seed it from \
         doc: "Whole-body rotation used while rotation is locked or no accelerometer is present.",
     },
 ];
+
+/// Render the first-run seed schema from [`SCHEMA`].
+///
+/// The seed is a flat object containing only preference values; it is not the versioned
+/// `prefs.json` store document. Keeping this renderer beside the Rust schema makes the image's
+/// validator artifact derive from the same key/type authority as the runtime.
+pub fn seed_schema() -> serde_json::Value {
+    let mut properties = serde_json::Map::new();
+    for spec in SCHEMA {
+        let mut property = serde_json::Map::new();
+        match spec.kind {
+            PrefKind::Bool => {
+                property.insert("type".into(), serde_json::Value::String("boolean".into()));
+            }
+            PrefKind::Scalar { min, max } => {
+                property.insert("type".into(), serde_json::Value::String("integer".into()));
+                property.insert("minimum".into(), serde_json::Value::Number(min.into()));
+                property.insert("maximum".into(), serde_json::Value::Number(max.into()));
+            }
+            PrefKind::Enum { variants } => {
+                property.insert("type".into(), serde_json::Value::String("string".into()));
+                property.insert(
+                    "enum".into(),
+                    serde_json::Value::Array(
+                        variants
+                            .iter()
+                            .map(|variant| serde_json::Value::String((*variant).into()))
+                            .collect(),
+                    ),
+                );
+            }
+        }
+        property.insert("default".into(), default_to_json(spec.default));
+        properties.insert(spec.key.into(), serde_json::Value::Object(property));
+    }
+
+    let mut document = serde_json::Map::new();
+    document.insert(
+        "$schema".into(),
+        serde_json::Value::String("http://json-schema.org/draft-07/schema#".into()),
+    );
+    document.insert(
+        "$id".into(),
+        serde_json::Value::String("pocketforge-prefs.schema.json".into()),
+    );
+    document.insert(
+        "title".into(),
+        serde_json::Value::String("PocketForge first-run preference seed".into()),
+    );
+    document.insert("type".into(), serde_json::Value::String("object".into()));
+    document.insert(
+        "additionalProperties".into(),
+        serde_json::Value::Bool(false),
+    );
+    document.insert("properties".into(), serde_json::Value::Object(properties));
+    serde_json::Value::Object(document)
+}
+
+/// Render the seed schema as stable, newline-terminated JSON for image packaging.
+pub fn seed_schema_json() -> String {
+    let mut text = serde_json::to_string_pretty(&seed_schema()).expect("schema is serializable");
+    text.push('\n');
+    text
+}
+
+fn default_to_json(value: PrefValue) -> serde_json::Value {
+    match value {
+        PrefValue::Bool(value) => serde_json::Value::Bool(value),
+        PrefValue::Scalar(value) => serde_json::Value::Number(value.into()),
+        PrefValue::Enum(value) => serde_json::Value::String(value.into()),
+    }
+}
 
 /// Look up the spec for a key, if it is a known preference.
 pub fn spec(key: &str) -> Option<&'static PrefSpec> {
@@ -464,6 +539,41 @@ mod tests {
                 s.key
             );
         }
+    }
+
+    #[test]
+    fn generated_seed_schema_matches_pf_prefs_keys_and_types() {
+        let generated: serde_json::Value =
+            serde_json::from_str(&seed_schema_json()).expect("generated schema must be JSON");
+
+        assert_eq!(generated["type"], "object");
+        assert_eq!(generated["additionalProperties"], false);
+        let matches_schema_types = |schema: &serde_json::Value| {
+            let Some(properties) = schema
+                .get("properties")
+                .and_then(serde_json::Value::as_object)
+            else {
+                return false;
+            };
+            properties.len() == SCHEMA.len()
+                && SCHEMA.iter().all(|spec| {
+                    let expected_type = match spec.kind {
+                        PrefKind::Bool => "boolean",
+                        PrefKind::Scalar { .. } => "integer",
+                        PrefKind::Enum { .. } => "string",
+                    };
+                    properties
+                        .get(spec.key)
+                        .is_some_and(|property| property["type"] == expected_type)
+                })
+        };
+        assert!(matches_schema_types(&generated));
+
+        // Negative control: a generated schema with one wrong type must not pass the
+        // same key/type comparison used by the positive control above.
+        let mut wrong = generated;
+        wrong["properties"]["brightness"]["type"] = serde_json::Value::String("string".into());
+        assert!(!matches_schema_types(&wrong));
     }
 
     #[test]
