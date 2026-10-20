@@ -107,7 +107,7 @@ impl EvdevJack {
         let rc = unsafe {
             libc::ioctl(
                 file.as_raw_fd(),
-                eviocgbit(EV_SW, SW_BYTES),
+                eviocgbit(EV_SW, SW_BYTES) as _,
                 caps.as_mut_ptr(),
             )
         };
@@ -175,8 +175,13 @@ impl RouteSource for EvdevJack {
     fn route(&mut self) -> Result<Output, RouteError> {
         let mut bits = [0_u8; SW_BYTES];
         // SAFETY: the fd is open and `bits` is SW_BYTES long, matching the length in the request.
-        let rc =
-            unsafe { libc::ioctl(self.file.as_raw_fd(), eviocgsw(SW_BYTES), bits.as_mut_ptr()) };
+        let rc = unsafe {
+            libc::ioctl(
+                self.file.as_raw_fd(),
+                eviocgsw(SW_BYTES) as _,
+                bits.as_mut_ptr(),
+            )
+        };
         if rc < 0 {
             return Err(RouteError(format!(
                 "EVIOCGSW: {}",
