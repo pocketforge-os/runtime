@@ -530,6 +530,7 @@ dependencies = [
  "pf-uinput-domain",
  "pf-wire",
  "pocketforge",
+ "serde",
  "serde_json",
  "sha2",
 ]

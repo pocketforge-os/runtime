@@ -2,11 +2,12 @@
 Description=PocketForge input capability broker
 Documentation=https://github.com/pocketforge-os/runtime
 After=local-fs.target dev-uinput.device pf-input-decode.service
+After=pf-session-authorityd.service
 ConditionPathExists=/dev/uinput
 
 [Service]
 Type=notify
-ExecStart=/usr/bin/pf-input-broker --descriptor /usr/share/pocketforge/devices/a133/capabilities.toml --acquire-sock /run/pocketforge/input-broker.sock
+ExecStart=/usr/bin/pf-input-broker --descriptor /usr/share/pocketforge/devices/a133/capabilities.toml --acquire-sock /run/pocketforge/input-broker.sock --safe-return-sock /run/pocketforge/session-authority.sock
 Restart=on-failure
 RestartSec=2
 KillSignal=SIGTERM

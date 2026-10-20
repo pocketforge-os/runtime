@@ -21,7 +21,7 @@ use crate::io::{EventSink, EventSource, SourceState};
 use crate::ioc;
 use crate::policy::TokenBucket;
 use crate::remap::{AbsAction, Posture, Remap};
-use crate::safe_return::{SystemMenuGate, SystemMenuRouter, GUIDE_CODE};
+use crate::safe_return::{PostureFeed, SystemMenuGate, SystemMenuRouter, GUIDE_CODE};
 use crate::scm;
 use crate::uinput::Uinput;
 
@@ -222,16 +222,20 @@ impl<'a> RunConfig<'a> {
 pub(crate) struct ReportPump {
     remap: Remap,
     /// The posture [`Remap::remap_axis_event`] re-expresses spatial axis events for.
-    /// Production wiring is [`Posture::Normal`]: TODO(tsp-mc9m.41.1026.6) — the
-    /// session orientation policy designs where the runtime posture comes from;
-    /// do not invent a source here.
+    /// Updated from the session authority before each report, including a SYN_DROPPED resync.
     posture: Posture,
+    posture_feed: Option<PostureFeed>,
     bucket: TokenBucket,
     pending_report: Vec<(u16, u16, i32)>,
     pending_report_oversized: bool,
     resynchronizing: bool,
     pressed: HashSet<u16>,
     abs_state: HashMap<u16, i32>,
+    /// Last observed source-frame values for passthrough axes.  Unlike `abs_state`, this remains
+    /// in the physical frame so a posture change can re-express held axes without a new event.
+    physical_abs_state: HashMap<u16, i32>,
+    /// Logical ABS codes that have been presented to the virtual device.
+    known_abs: HashSet<u16>,
     /// `None` (no `--safe-return-sock`) leaves the stream exactly as before: guide passes through.
     system_menu: Option<SystemMenuGate>,
 }
@@ -357,6 +361,12 @@ impl InputBroker {
     /// withheld from apps, and each press routes through the provider/fallback policy.
     pub fn with_system_menu(mut self, router: SystemMenuRouter) -> InputBroker {
         self.pump.system_menu = Some(SystemMenuGate::new(router));
+        self
+    }
+
+    /// Consume the session authority's resolved whole-body posture for axis remapping.
+    pub fn with_posture_feed(mut self, feed: PostureFeed) -> InputBroker {
+        self.pump = self.pump.with_posture_feed(feed);
         self
     }
 
@@ -592,18 +602,88 @@ impl ReportPump {
             .collect();
         ReportPump {
             remap,
-            // TODO(tsp-mc9m.41.1026.6): the runtime posture source is designed
-            // by the session orientation policy; Normal is the only value wired
-            // until that lands.
             posture: Posture::Normal,
+            posture_feed: None,
             bucket: TokenBucket::default_broker(),
             pending_report: Vec::new(),
             pending_report_oversized: false,
             resynchronizing: false,
             pressed: HashSet::new(),
             abs_state,
+            physical_abs_state: HashMap::new(),
+            known_abs: HashSet::new(),
             system_menu: None,
         }
+    }
+
+    fn with_posture_feed(mut self, feed: PostureFeed) -> Self {
+        self.posture_feed = Some(feed);
+        self
+    }
+
+    fn capture_posture_at_boundary(&mut self) -> Option<Posture> {
+        if let Some(feed) = self.posture_feed.as_ref() {
+            let next = feed.current();
+            if next != self.posture {
+                let previous = self.posture;
+                self.posture = next;
+                return Some(previous);
+            }
+        }
+        None
+    }
+
+    fn remap_pending_report(&mut self) {
+        for (ty, code, value) in &mut self.pending_report {
+            if *ty == ioc::EV_ABS {
+                (*code, *value) = self.remap.remap_axis_event(self.posture, *code, *value);
+            }
+        }
+    }
+
+    fn reconcile_held_abs(&mut self) -> Vec<(u16, u16, i32)> {
+        let current: Vec<(u16, i32)> = self
+            .physical_abs_state
+            .iter()
+            .map(|(&source_code, &value)| {
+                self.remap
+                    .remap_axis_event(self.posture, source_code, value)
+            })
+            .collect();
+        let current_codes: HashSet<u16> = current.iter().map(|&(code, _)| code).collect();
+        let mut out = Vec::new();
+        let stale: Vec<u16> = self
+            .known_abs
+            .iter()
+            .copied()
+            .filter(|code| !current_codes.contains(code))
+            .collect();
+        for code in stale {
+            let neutral = self
+                .remap
+                .spec()
+                .abs
+                .iter()
+                .find_map(|&(axis, info)| {
+                    (axis == code).then_some(
+                        (i64::from(info.min) + i64::from(info.max - info.min) / 2) as i32,
+                    )
+                })
+                .unwrap_or(0);
+            if self.abs_state.get(&code) != Some(&neutral) {
+                self.abs_state.insert(code, neutral);
+                out.push((ioc::EV_ABS, code, neutral));
+            }
+            self.known_abs.remove(&code);
+        }
+        for &(code, value) in &current {
+            if self.abs_state.get(&code) != Some(&value) {
+                self.abs_state.insert(code, value);
+                out.push((ioc::EV_ABS, code, value));
+            }
+            self.known_abs.insert(code);
+        }
+        out
     }
 
     /// `true` when the System Menu gate owns this canonical key transition.
@@ -633,25 +713,45 @@ impl ReportPump {
                 // Events following SYN_DROPPED belong to the unreliable tail of the overrun.
                 // Once its boundary arrives, query authoritative state before accepting reports.
                 if t == ioc::EV_SYN && ev.code == ioc::SYN_REPORT {
+                    self.capture_posture_at_boundary();
                     let out = self.resynchronize_source_state(source)?;
                     for (ty, code, value) in out {
                         emit(ty, code, value)?;
                         emitted += 1;
+                        if ty == ioc::EV_ABS {
+                            self.known_abs.insert(code);
+                        }
                     }
                     self.resynchronizing = false;
                 }
             } else if t == ioc::EV_SYN && ev.code == ioc::SYN_REPORT {
+                let posture_changed = self.capture_posture_at_boundary().is_some();
+                self.remap_pending_report();
                 let allowed = self.bucket.allow(now);
-                let out = finish_report(
+                let mut out = finish_report(
                     &mut self.pending_report,
                     &mut self.pending_report_oversized,
                     &mut self.pressed,
                     allowed,
                 );
+                if posture_changed {
+                    let corrections = self.reconcile_held_abs();
+                    let has_boundary = out
+                        .last()
+                        .is_some_and(|&event| event == (ioc::EV_SYN, ioc::SYN_REPORT, 0));
+                    if has_boundary {
+                        out.pop();
+                    }
+                    out.extend(corrections);
+                    if has_boundary || !out.is_empty() {
+                        out.push((ioc::EV_SYN, ioc::SYN_REPORT, 0));
+                    }
+                }
                 for (ty, code, value) in out {
                     emit(ty, code, value)?;
                     if ty == ioc::EV_ABS {
                         self.abs_state.insert(code, value);
+                        self.known_abs.insert(code);
                     }
                     emitted += 1;
                 }
@@ -669,14 +769,14 @@ impl ReportPump {
                 // reclassified to an EV_KEY press/release on its canonical button (descriptor-driven).
                 match self.remap.classify_abs(ev.code, ev.value) {
                     AbsAction::Passthrough => {
-                        // Spatial axes are re-expressed in the logical frame for the
-                        // current posture (identity for Normal / a screen-only swivel).
-                        let (code, value) =
-                            self.remap.remap_axis_event(self.posture, ev.code, ev.value);
+                        // Keep the pending event in the source frame.  It is remapped at its
+                        // SYN_REPORT boundary, so one read batch can observe a posture change
+                        // between reports without applying one stale posture to all reports.
+                        self.physical_abs_state.insert(ev.code, ev.value);
                         push_report_event(
                             &mut self.pending_report,
                             &mut self.pending_report_oversized,
-                            (t, code, value),
+                            (t, ev.code, ev.value),
                         );
                     }
                     AbsAction::Button { code, value } => {
@@ -720,6 +820,7 @@ impl ReportPump {
                 // emitted codes), so the authoritative body-frame value is re-expressed
                 // for the current posture exactly like the live path.
                 AbsAction::Passthrough => {
+                    self.physical_abs_state.insert(code, value);
                     actual_abs.push(self.remap.remap_axis_event(self.posture, code, value))
                 }
                 AbsAction::Button { code, value } => actual_binary.push((code, value != 0)),
@@ -1056,6 +1157,10 @@ mod readiness_tests {
         assert!(unit.lines().any(|line| {
             line == "After=local-fs.target dev-uinput.device pf-input-decode.service"
         }));
+        assert!(unit
+            .lines()
+            .any(|line| line == "After=pf-session-authorityd.service"));
+        assert!(unit.contains("--safe-return-sock /run/pocketforge/session-authority.sock"));
         assert!(unit.lines().any(|line| line == "Restart=on-failure"));
         assert!(
             !unit.contains("--allow-unidentified-pad"),
@@ -1441,12 +1546,11 @@ range = { min = 0, max = 255, fuzz = 0, flat = 0 }
 
     // --- posture wiring (tsp-mc9m.41.1026.1) --------------------------------------------------
     //
-    // The report pump's posture is a PURE INPUT to the axis remap (`remap::Posture`); its
-    // runtime source is designed by tsp-mc9m.41.1026.6 and until that lands production
-    // constructs the pump with Posture::Normal. The rotation convention (body rotated N°
-    // clockwise; logical = rotate-clockwise(body vector, N)) is named and tested in remap.rs;
-    // what is proven HERE is the wiring: only a whole-body rotation rotates the emitted
-    // stream, on both the live path and the SYN_DROPPED resync path.
+    // The report pump's posture is a PURE INPUT to the axis remap (`remap::Posture`); production
+    // consumes the session authority's resolved snapshot. The rotation convention (body rotated
+    // N° clockwise; logical = rotate-clockwise(body vector, N)) is named and tested in remap.rs;
+    // what is proven HERE is the wiring: only a whole-body rotation rotates the emitted stream,
+    // on both the live path and the SYN_DROPPED resync path.
 
     /// Synthetic descriptor with the spatial axes (d-pad hat + both stick axes, so every
     /// rotated code is advertised by the spec) plus one binary trigger.
@@ -1490,11 +1594,58 @@ range = { min = 0, max = 255, fuzz = 0, flat = 0 }
     }
 
     #[test]
+    fn fake_authority_posture_reaches_live_and_resync_paths() {
+        use crate::remap::{Posture, Rotation};
+
+        let (feed, publisher) = PostureFeed::synthetic();
+        let mut pump = posture_pump().with_posture_feed(feed);
+        // The fixture represents the authority's resolved outcome after a hall event,
+        // accelerometer proposal, and an unlocked rotate-lock state.  The positive control
+        // is deliberately non-Normal: the current broker hard-code must make this RED.
+        publisher.publish(Posture::WholeBodyRotated(Rotation::Cw90));
+
+        let out = run(&mut pump, &[ev(ioc::EV_ABS, 0x10, -1), syn()]);
+        assert!(out.contains(&(ioc::EV_ABS, 0x11, -1)), "live: {out:?}");
+        assert!(!out
+            .iter()
+            .any(|&(ty, code, _)| { ty == ioc::EV_ABS && code == 0x10 }));
+
+        // A posture change with no new axis event must still move the held hat in the
+        // virtual device's logical frame, including clearing the old logical code.
+        publisher.publish(Posture::Normal);
+        let out = run(&mut pump, &[syn()]);
+        assert!(
+            out.contains(&(ioc::EV_ABS, 0x11, 0)),
+            "transition clear: {out:?}"
+        );
+        assert!(
+            out.contains(&(ioc::EV_ABS, 0x10, -1)),
+            "transition move: {out:?}"
+        );
+
+        publisher.publish(Posture::WholeBodyRotated(Rotation::Cw90));
+
+        let source = FakeSource {
+            pressed: Vec::new(),
+            abs: vec![(0x10, 1)],
+        };
+        let out = run_with(
+            &mut pump,
+            &[ev(ioc::EV_SYN, ioc::SYN_DROPPED, 0), syn()],
+            &source,
+        );
+        assert!(out.contains(&(ioc::EV_ABS, 0x11, 1)), "resync: {out:?}");
+        assert!(
+            out.contains(&(ioc::EV_ABS, 0x10, 0)),
+            "resync clear: {out:?}"
+        );
+    }
+
+    #[test]
     fn pump_rotates_axes_only_for_whole_body_rotation() {
         use crate::remap::{Posture, Rotation};
         let hat_left = [ev(ioc::EV_ABS, 0x10 /* ABS_HAT0X */, -1), syn()];
-        // Production wiring: Posture::Normal. Positive control — the d-pad passes
-        // through untouched, exactly the stream from before postures existed.
+        // Positive control — the d-pad passes through untouched in Normal posture.
         let mut pump = posture_pump();
         assert_eq!(pump.posture, Posture::Normal);
         let out = run(&mut pump, &hat_left);
