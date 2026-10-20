@@ -46,6 +46,9 @@ pub const SAFE_RETURN_BODY: &[u8] = br#"{"method":"safe_return"}"#;
 
 const ORIENTATION_RPC_VERSION: u32 = 1;
 const ORIENTATION_WAIT: Duration = Duration::from_secs(1);
+/// Keep orientation shutdown below systemd's five-second service stop budget even when the
+/// authority accepted a long-poll request and never replies.
+const ORIENTATION_IO_TIMEOUT: Duration = Duration::from_millis(250);
 
 /// The broker's nonblocking view of the session authority's resolved body posture.
 ///
@@ -56,6 +59,51 @@ pub struct PostureFeed {
     posture: Arc<std::sync::atomic::AtomicU8>,
     stop: Arc<AtomicBool>,
     worker: Option<std::thread::JoinHandle<()>>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum OrientationTurn {
+    Normal,
+    Left,
+    UpsideDown,
+    Right,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum OrientationLogical {
+    Landscape,
+    Portrait,
+    LandscapeFlipped,
+    PortraitFlipped,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum OrientationPresentation {
+    Fill,
+    Letterbox,
+}
+
+#[derive(serde::Deserialize)]
+struct OrientationStateV1 {
+    serial: u64,
+    #[serde(rename = "output")]
+    _output: OrientationTurn,
+    #[serde(rename = "logical")]
+    _logical: OrientationLogical,
+    #[serde(rename = "app")]
+    _app: OrientationLogical,
+    #[serde(rename = "presentation")]
+    _presentation: OrientationPresentation,
+    whole_body: OrientationTurn,
+    #[serde(rename = "screen_only")]
+    _screen_only: OrientationTurn,
+    #[serde(rename = "locked")]
+    _locked: bool,
+    #[serde(rename = "degraded")]
+    _degraded: Vec<String>,
 }
 
 /// Test-only publisher for a synthetic authority snapshot.
@@ -166,8 +214,8 @@ fn orientation_worker(
 
 fn read_orientation(sock: &Path, after_serial: Option<u64>) -> io::Result<(u64, Posture)> {
     let mut stream = connect_with_timeout(sock, CONNECT_TIMEOUT)?;
-    stream.set_read_timeout(Some(IO_TIMEOUT))?;
-    stream.set_write_timeout(Some(IO_TIMEOUT))?;
+    stream.set_read_timeout(Some(ORIENTATION_IO_TIMEOUT))?;
+    stream.set_write_timeout(Some(ORIENTATION_IO_TIMEOUT))?;
     let mut request = serde_json::json!({
         "method": "orientation",
         "version": ORIENTATION_RPC_VERSION,
@@ -202,30 +250,19 @@ fn parse_orientation(reply: &[u8]) -> io::Result<(u64, Posture)> {
     }
     let state = value
         .get("state")
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "orientation state missing"))?;
-    let serial = state
-        .get("serial")
-        .and_then(serde_json::Value::as_u64)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "orientation serial missing"))?;
-    let whole_body = state
-        .get("whole_body")
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "whole_body posture missing"))?;
-    let posture = match whole_body {
-        "normal" => Posture::Normal,
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "orientation state missing"))?
+        .clone();
+    let state: OrientationStateV1 = serde_json::from_value(state)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    let posture = match state.whole_body {
+        OrientationTurn::Normal => Posture::Normal,
         // Authority's left/right names describe the user-facing turn. Remap's Rotation names
         // describe the physical body clockwise, hence the intentional inverse here.
-        "left" => Posture::WholeBodyRotated(Rotation::Cw270),
-        "upsidedown" => Posture::WholeBodyRotated(Rotation::Cw180),
-        "right" => Posture::WholeBodyRotated(Rotation::Cw90),
-        other => {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("unknown whole_body posture {other:?}"),
-            ))
-        }
+        OrientationTurn::Left => Posture::WholeBodyRotated(Rotation::Cw270),
+        OrientationTurn::UpsideDown => Posture::WholeBodyRotated(Rotation::Cw180),
+        OrientationTurn::Right => Posture::WholeBodyRotated(Rotation::Cw90),
     };
-    Ok((serial, posture))
+    Ok((state.serial, posture))
 }
 
 fn posture_to_code(posture: Posture) -> u8 {
@@ -1225,7 +1262,11 @@ mod tests {
         let reply = serde_json::json!({
             "result": "orientation",
             "version": 1,
-            "state": {"serial": 7, "whole_body": "right"}
+            "state": {
+                "serial": 7, "output": "normal", "logical": "landscape", "app": "landscape",
+                "presentation": "fill", "whole_body": "right", "screen_only": "normal",
+                "locked": false, "degraded": []
+            }
         });
         assert_eq!(
             parse_orientation(&serde_json::to_vec(&reply).unwrap()).unwrap(),
@@ -1234,7 +1275,11 @@ mod tests {
         let normal = serde_json::json!({
             "result": "orientation",
             "version": 1,
-            "state": {"serial": 8, "whole_body": "normal"}
+            "state": {
+                "serial": 8, "output": "normal", "logical": "landscape", "app": "landscape",
+                "presentation": "fill", "whole_body": "normal", "screen_only": "normal",
+                "locked": false, "degraded": []
+            }
         });
         assert_eq!(
             parse_orientation(&serde_json::to_vec(&normal).unwrap()).unwrap(),
@@ -1255,6 +1300,12 @@ mod tests {
                 "bad frame accepted: {bad:?}"
             );
         }
+        let partial_same_version = serde_json::json!({
+            "result": "orientation",
+            "version": 1,
+            "state": {"serial": 9, "whole_body": "right"}
+        });
+        assert!(parse_orientation(&serde_json::to_vec(&partial_same_version).unwrap()).is_err());
     }
 
     #[test]
@@ -1271,7 +1322,7 @@ mod tests {
             assert_eq!(request["wait_ms"], 1_000);
             pf_wire::write_frame(
                 &mut stream,
-                br#"{"result":"orientation","version":1,"state":{"serial":12,"whole_body":"left"}}"#,
+                br#"{"result":"orientation","version":1,"state":{"serial":12,"output":"normal","logical":"landscape","app":"landscape","presentation":"fill","whole_body":"left","screen_only":"normal","locked":false,"degraded":[]}}"#,
             )
             .unwrap();
         });
@@ -1299,6 +1350,22 @@ mod tests {
         assert!(line.contains("fallback=last_valid_or_normal"), "{line}");
         assert_eq!(feed.current(), Posture::Normal);
         drop(feed);
+        let _ = std::fs::remove_file(sock);
+    }
+
+    #[test]
+    fn stalled_orientation_authority_does_not_hold_shutdown_to_safe_return_timeout() {
+        let sock = scratch("orientation-stalled");
+        let _ = std::fs::remove_file(&sock);
+        let _listener = UnixListener::bind(&sock).unwrap();
+        let feed = PostureFeed::spawn_with(&sock, Box::new(|_| {})).unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        let started = Instant::now();
+        drop(feed);
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "orientation shutdown exceeded its bounded read wait"
+        );
         let _ = std::fs::remove_file(sock);
     }
 

@@ -26,6 +26,7 @@ pocketforge = { workspace = true }
 pf-wire = { workspace = true }
 libc = { workspace = true }
 # Reads the session authority's JSON reply to the SafeReturn frame (--safe-return-sock).
+serde = { workspace = true }
 serde_json = { workspace = true }
 # The built-in controller identity (enforced by default, tsp-ihne1.8/.52):
 # pf_input_decode::builtin is the one place that decides which device is the built-in pad.
