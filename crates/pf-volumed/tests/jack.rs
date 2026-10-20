@@ -1,5 +1,6 @@
 use pf_volumed::jack::{
-    discover, route_from_switch_bits, EvdevJack, RouteSource, JACK_DEVICE_NAME,
+    advertises_headphone_switch, discover, route_from_switch_bits, EvdevJack, RouteSource,
+    JACK_DEVICE_NAME,
 };
 use pf_volumed::Output;
 use std::fs;
@@ -60,6 +61,16 @@ fn switch_bitmap_maps_only_the_headphone_insert_bit() {
 }
 
 #[test]
+fn only_a_device_advertising_sw_headphone_insert_is_a_route_source() {
+    assert!(advertises_headphone_switch(&[0b0000_0100]));
+    assert!(advertises_headphone_switch(&[0b0000_1111, 0xff]));
+    // Negative controls: other switches only, nothing, and a truncated capability bitmap.
+    assert!(!advertises_headphone_switch(&[0b0000_1011]));
+    assert!(!advertises_headphone_switch(&[0]));
+    assert!(!advertises_headphone_switch(&[]));
+}
+
+#[test]
 fn discovery_matches_the_exact_device_name() {
     let sysfs = Scratch::new();
     sysfs.device("event0", "adc-keys");
@@ -85,10 +96,10 @@ fn a_node_that_is_not_an_evdev_switch_is_an_unreadable_route() {
     let scratch = Scratch::new();
     let node = scratch.0.join("event0");
     fs::write(&node, b"").unwrap();
-    let mut jack = EvdevJack::open(&node).unwrap();
+    // An all-zero EVIOCGSW would read as "speaker"; a node that cannot prove the capability is not a source.
     assert!(
-        jack.route().is_err(),
-        "EVIOCGSW on a non-evdev file must fail"
+        EvdevJack::open(&node).is_err(),
+        "a non-evdev file must not be accepted as the route source"
     );
     assert!(EvdevJack::open(&scratch.0.join("absent")).is_err());
 }

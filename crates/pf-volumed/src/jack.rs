@@ -18,6 +18,7 @@ use std::time::Duration;
 pub const JACK_DEVICE_NAME: &str = "H616 Audio Codec Headphone Jack";
 /// `SW_HEADPHONE_INSERT` from `<linux/input-event-codes.h>`.
 pub const SW_HEADPHONE_INSERT: usize = 0x02;
+const EV_SW: u8 = 0x05;
 const SW_BYTES: usize = 8;
 
 #[derive(Debug)]
@@ -54,6 +55,12 @@ pub fn route_from_switch_bits(bits: &[u8]) -> Result<Output, RouteError> {
     })
 }
 
+/// Does the `EVIOCGBIT(EV_SW)` capability bitmap include `SW_HEADPHONE_INSERT`?
+pub fn advertises_headphone_switch(caps: &[u8]) -> bool {
+    caps.get(SW_HEADPHONE_INSERT / 8)
+        .is_some_and(|byte| byte & (1 << (SW_HEADPHONE_INSERT % 8)) != 0)
+}
+
 /// Find `/dev/input/eventN` whose sysfs `device/name` is exactly [`JACK_DEVICE_NAME`].
 /// `Ok(None)` means the device is absent; an unreadable sysfs tree is an error.
 pub fn discover(sysfs_input: &Path, dev_input: &Path) -> Result<Option<PathBuf>, RouteError> {
@@ -87,12 +94,36 @@ pub struct EvdevJack {
 }
 
 impl EvdevJack {
+    /// Open the node and prove it advertises `SW_HEADPHONE_INSERT`; an all-zero `EVIOCGSW` from a
+    /// device without that switch would otherwise read as "speaker".
     pub fn open(path: &Path) -> Result<Self, RouteError> {
         let file = fs::OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
             .open(path)
             .map_err(|error| RouteError(format!("open {}: {error}", path.display())))?;
+        let mut caps = [0_u8; SW_BYTES];
+        // SAFETY: the fd is open and `caps` is SW_BYTES long, matching the length in the request.
+        let rc = unsafe {
+            libc::ioctl(
+                file.as_raw_fd(),
+                eviocgbit(EV_SW, SW_BYTES),
+                caps.as_mut_ptr(),
+            )
+        };
+        if rc < 0 {
+            return Err(RouteError(format!(
+                "EVIOCGBIT(EV_SW) on {}: {}",
+                path.display(),
+                io::Error::last_os_error()
+            )));
+        }
+        if !advertises_headphone_switch(&caps) {
+            return Err(RouteError(format!(
+                "{} does not advertise SW_HEADPHONE_INSERT",
+                path.display()
+            )));
+        }
         Ok(Self { file })
     }
 
@@ -132,6 +163,12 @@ impl EvdevJack {
 /// `EVIOCGSW(len)` = `_IOC(_IOC_READ, 'E', 0x1b, len)` (asm-generic encoding).
 const fn eviocgsw(len: usize) -> libc::c_ulong {
     ((2_u64 << 30) | ((len as u64) << 16) | ((b'E' as u64) << 8) | 0x1b) as libc::c_ulong
+}
+
+/// `EVIOCGBIT(ev, len)` = `_IOC(_IOC_READ, 'E', 0x20 + ev, len)`.
+const fn eviocgbit(ev: u8, len: usize) -> libc::c_ulong {
+    ((2_u64 << 30) | ((len as u64) << 16) | ((b'E' as u64) << 8) | (0x20 + ev as u64))
+        as libc::c_ulong
 }
 
 impl RouteSource for EvdevJack {

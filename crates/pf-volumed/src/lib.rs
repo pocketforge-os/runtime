@@ -218,6 +218,12 @@ impl<M: MixerBackend> VolumeService<M> {
         }
     }
 
+    /// False after a failed transition or route loss: the volume path is (or must be treated as)
+    /// quiesced and the caller must not continue without having confirmed that.
+    pub fn route_known(&self) -> bool {
+        !self.route_uncertain
+    }
+
     pub fn active_output(&self) -> Output {
         self.active
     }
@@ -259,6 +265,9 @@ impl fmt::Display for RuntimeError {
 }
 
 impl std::error::Error for RuntimeError {}
+
+const QUIESCE_ATTEMPTS: usize = 3;
+const QUIESCE_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
 
 /// Current hardware backend. Both physical endpoints share the codec's DAC playback level. This
 /// board's route comes from the jack input switch ([`jack`]); the kernel selects the analog path
@@ -307,7 +316,17 @@ impl MixerBackend for AlsaMixer {
     type Error = RuntimeError;
 
     fn quiesce(&mut self) -> Result<(), Self::Error> {
-        self.set_control("DAC Playback Volume", "0")
+        // Minimum volume is the fail-safe state, so a transient amixer failure is retried before
+        // the caller is told the path could not be quiesced.
+        let mut result = self.set_control("DAC Playback Volume", "0");
+        for _ in 1..QUIESCE_ATTEMPTS {
+            if result.is_ok() {
+                break;
+            }
+            std::thread::sleep(QUIESCE_RETRY_DELAY);
+            result = self.set_control("DAC Playback Volume", "0");
+        }
+        result
     }
 
     fn apply(&mut self, _output: Output, percent: u8, muted: bool) -> Result<(), Self::Error> {

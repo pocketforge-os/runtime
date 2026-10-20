@@ -329,3 +329,18 @@ fn no_switch_means_no_level_is_ever_applied() {
     let service = VolumeService::unrouted(FakeMixer::default(), prefs(60, 40, false));
     assert!(service.backend().operations.is_empty());
 }
+
+#[test]
+fn route_is_known_only_after_a_successful_transition() {
+    let mut service = VolumeService::unrouted(FakeMixer::default(), prefs(60, 40, false));
+    assert!(!service.route_known());
+    service.backend_mut().fail_transition_after_select = true;
+    assert!(service
+        .reconcile(Output::Headphones, prefs(60, 40, false))
+        .is_err());
+    assert!(!service.route_known());
+    service
+        .reconcile(Output::Headphones, prefs(60, 40, false))
+        .unwrap();
+    assert!(service.route_known());
+}

@@ -75,7 +75,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     jack = None;
                     continue;
                 }
-                Err(SyncError::Mixer(error)) => report(&mut last, error.to_string()),
+                Err(SyncError::Mixer(error)) => {
+                    report(&mut last, error.to_string());
+                    if !service.route_known() {
+                        // A failed transition may have left the previous level exposed: confirm
+                        // the minimum or stop (systemd restarts the unit) rather than continue.
+                        service.route_lost()?;
+                    }
+                }
             },
             Err(error) => report(&mut last, error.to_string()),
         }
@@ -85,9 +92,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 format!("route unknown, volume held at minimum: {error}"),
             );
             jack = None;
-            if let Err(error) = service.route_lost() {
-                report(&mut last, error.to_string());
-            }
+            service.route_lost()?;
         }
     }
 }

@@ -78,3 +78,52 @@ fn alsa_backend_maps_levels_rejects_unsafe_routes_and_surfaces_command_failure()
     let error = mixer.apply(Output::Headphones, 40, true).unwrap_err();
     assert!(error.to_string().contains("injected-failure"));
 }
+
+fn write_flaky(path: &Path, log: &Path, counter: &Path, fail_first: usize) {
+    let script = format!(
+        "#!/bin/sh\nset -eu\nprintf '%s\\n' \"$*\" >> '{log}'\nn=$(cat '{c}' 2>/dev/null || echo 0)\nn=$((n+1))\necho $n > '{c}'\nif [ $n -le {k} ]; then echo flaky >&2; exit 9; fi\n",
+        log = log.display(),
+        c = counter.display(),
+        k = fail_first,
+    );
+    fs::write(path, script).unwrap();
+    let mut permissions = fs::metadata(path).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(path, permissions).unwrap();
+}
+
+#[test]
+fn a_transient_quiesce_failure_is_retried_before_the_destination_level_is_applied() {
+    let scratch = Scratch::new();
+    let (fake, log, counter) = (
+        scratch.0.join("amixer"),
+        scratch.0.join("calls"),
+        scratch.0.join("n"),
+    );
+    write_flaky(&fake, &log, &counter, 2);
+    let mut mixer = AlsaMixer::with_amixer(&fake, "Codec");
+    mixer.transition(Output::Headphones, 40, false).unwrap();
+    let calls = fs::read_to_string(&log).unwrap();
+    let lines: Vec<_> = calls.lines().collect();
+    assert_eq!(lines.len(), 4, "{calls}");
+    assert!(lines[..3].iter().all(|line| line.ends_with("Volume 0")));
+    assert!(lines[3].ends_with("Volume 25"));
+}
+
+#[test]
+fn a_quiesce_that_never_succeeds_fails_the_transition_without_applying_any_level() {
+    let scratch = Scratch::new();
+    let (fake, log, counter) = (
+        scratch.0.join("amixer"),
+        scratch.0.join("calls"),
+        scratch.0.join("n"),
+    );
+    write_flaky(&fake, &log, &counter, 1_000_000);
+    let mut mixer = AlsaMixer::with_amixer(&fake, "Codec");
+    assert!(mixer.transition(Output::Headphones, 40, false).is_err());
+    let calls = fs::read_to_string(&log).unwrap();
+    assert!(
+        calls.lines().all(|line| line.ends_with("Volume 0")),
+        "{calls}"
+    );
+}
