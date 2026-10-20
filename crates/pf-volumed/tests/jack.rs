@@ -4,18 +4,24 @@ use pf_volumed::jack::{
 use pf_volumed::Output;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+static SERIAL: AtomicUsize = AtomicUsize::new(0);
 
 struct Scratch(PathBuf);
 
 impl Scratch {
     fn new() -> Self {
+        let serial = SERIAL.fetch_add(1, Ordering::Relaxed);
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let path =
-            std::env::temp_dir().join(format!("pf-volumed-jack-{}-{nonce}", std::process::id()));
+        let path = std::env::temp_dir().join(format!(
+            "pf-volumed-jack-{}-{nonce}-{serial}",
+            std::process::id()
+        ));
         fs::create_dir(&path).unwrap();
         Self(path)
     }
