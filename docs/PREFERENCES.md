@@ -46,23 +46,39 @@ accepts only those two forms. An explicitly versioned document other than v2 ret
 unsupported-version error before any save, so a newer schema can never be misread or downgraded.
 continues to accept an unversioned v1 document and supplies defaults for every additive v2 key.
 
-### 2.1 First-boot seed (`/etc/pocketforge/prefs.seed.json`)
+### 2.1 First-run preseed contract (`/etc/pocketforge/prefs.seed.json`)
 
-Some preferences have a provisioning source older than the user: cloud-init-tsp's `keyboard`
-module renders the seeded `keyboardLayout` into **both** `/etc/default/keyboard` (the classic
-console/X default) and a read-only seed document `/etc/pocketforge/prefs.seed.json`
-(`{"keyboardLayout":"de(nodeadkeys)"}`). `pf-prefsd` runs with `--seed-file` (that path by
-default) and `PrefsStore::load` folds the seed **under** the store:
+Cloud-init user data may provide one flat map:
 
-- A seed value is the effective value for any key the store does not explicitly hold —
-  `stored → seeded → schema default`.
-- A seeded key is **not explicit**: `is_explicit` stays `false` and `pf-settings list` reports
-  `default`, so the settings UI can show "First-boot setup" instead of "You".
-- Once the user sets the key (the single `apply()` write path), the stored value wins and the
-  seed is never re-read; seed values are never persisted into `prefs.json`.
-- A **missing** seed file is the normal no-cloud-init-keyboard case (schema defaults stand). A
-  **malformed** seed (bad JSON, unknown key, invalid value) is a typed `PrefError` — the seed is
-  trusted provisioning data, so corruption fails closed instead of silently dropping the layout.
+```yaml
+pocketforge_preferences:
+  keyboardLayout: de(nodeadkeys)
+  hapticsEnabled: false
+```
+
+The accepted keys are exactly `appearance`, `textScale`, `keyboardLayout`, `highContrast`,
+`reduceFlashing`, `reduceMotion`, `hapticsEnabled`, `monoAudio`, `brightness`, `volumeSpeaker`,
+`volumeHeadphones`, `muted`, `auto_rotate`, and `user_rotation`. `pf-prefs::SCHEMA` is the sole
+authority for their types, ranges, enum values, and defaults. The generated JSON Schema is emitted
+by `crates/pf-prefs/src/bin/pf-prefs-schema.rs` and is shipped in the image at
+`/usr/share/pocketforge/prefs.schema.json`; the cloud-init fork validates every supplied value
+against it.
+
+The keyboard module's `keyboardLayout` seed and `pocketforge_preferences` are merged into exactly
+one read-only `/etc/pocketforge/prefs.seed.json`. Equal values for the same key are accepted;
+conflicting values, unknown keys, wrong types, invalid enum values, and out-of-range scalars are
+refused before any seed file is written. The effective order remains `stored → seeded → schema
+default`; a seed is not an explicit user value and is never copied into `prefs.json`.
+
+On first run, the shell shows only supported rows that are neither explicitly stored nor present in
+the valid merged seed. A **full** seed leaves zero rows, so there is no sheet and nothing is written;
+a **partial** seed shows only the remaining rows; **none** (including a missing seed file) shows all
+supported, non-explicit rows. A Settings re-run shows every supported row, regardless of seed or
+first-run completion. If the fork sees malformed seed data, it refuses before writing. If the shell
+receives an unreadable seed, it ignores the seed, logs one health line, renders the full supported
+sheet, and never exits; an absent seed is the normal no-preseed case. The shell is ordered after
+cloud-config but starts fail-open when cloud-config is degraded or fails. The teach-only
+`pocketforge_first_run.skip` control is deferred to bead F.
 
 ## 3. Read-only to apps; observable; honored at the primitive
 
