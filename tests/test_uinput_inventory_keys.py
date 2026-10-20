@@ -22,13 +22,18 @@ SHELL = "#!/bin/sh\necho 'never closed\n"
 ROW = {
     "path": "scripts/lexer-false-positive.sh", "rule": "dynamic_route",
     "class": "product-reference",
-    "text": "unbalanced single quote at line 3",
+    "text": "unbalanced single quote at line 3", "detail": "malformed_file",
+}
+SOURCE_PATH = "scripts/load-uinput.sh"
+SOURCE_ROW = {
+    "path": SOURCE_PATH, "rule": "host_uinput_permission",
+    "class": "product-reference", "text": "modprobe uinput # at line 3",
 }
 
 
 def failures(content, row=ROW):
     found, unused_report, unused_stats = inventory.replay_case({
-        "files": {ROW["path"]: content}, "inventory": [row],
+        "files": {row["path"]: content}, "inventory": [row],
     }, ROOT)
     return [f"{item.rule}/{item.detail}" for item in found]
 
@@ -46,6 +51,22 @@ class InventoryKeyTests(unittest.TestCase):
         self.assertEqual(
             sorted(failures(changed)),
             ["dynamic_route/stale_inventory", "dynamic_route/unclassified"])
+
+    def test_source_text_naming_a_line_is_not_normalized(self):
+        # Only parser diagnostics are normalized: a source occurrence whose
+        # own text says "at line N" is still keyed on its exact bytes.
+        source = "#!/bin/sh\nmodprobe uinput # at line 3\n"
+        self.assertEqual(failures(source, SOURCE_ROW), [])
+        changed = source.replace("at line 3", "at line 99")
+        self.assertEqual(
+            sorted(failures(changed, SOURCE_ROW)),
+            ["dynamic_route/stale_inventory",
+             "host_uinput_permission/unclassified"])
+        self.assertNotEqual(
+            inventory.Finding("host_uinput_permission", "unclassified",
+                              SOURCE_PATH, 2, "modprobe uinput # at line 3").key,
+            inventory.Finding("host_uinput_permission", "unclassified",
+                              SOURCE_PATH, 2, "modprobe uinput # at line 99").key)
 
     def test_human_output_keeps_the_line(self):
         finding = inventory.Finding(
