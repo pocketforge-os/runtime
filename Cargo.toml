@@ -83,7 +83,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 toml = "0.8"
-# libc: ONLY the pf-input-broker daemon links it — it is privileged OS code (evdev/uinput
+# libc: ONLY the pf-input-broker and pf-volumed daemons link it — OS-facing code (evdev/uinput
 # ioctls, SCM_RIGHTS). The wire/facade crates stay dependency-light; this is the one place
 # raw syscalls are unavoidable, and libc gives the correct struct layouts + ioctl FFI.
 libc = "0.2"

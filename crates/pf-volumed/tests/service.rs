@@ -1,4 +1,5 @@
-use pf_volumed::{MixerBackend, Output, VolumePreferences, VolumeService};
+use pf_volumed::jack::{RouteError, RouteSource};
+use pf_volumed::{MixerBackend, Output, SyncError, VolumePreferences, VolumeService};
 
 #[derive(Debug, Eq, PartialEq)]
 enum Operation {
@@ -217,4 +218,114 @@ fn volume_preferences_reject_out_of_range_values() {
     assert!(VolumePreferences::new(100, 0, false).is_ok());
     assert!(VolumePreferences::new(101, 40, false).is_err());
     assert!(VolumePreferences::new(60, 101, false).is_err());
+}
+
+struct FakeSwitch(std::collections::VecDeque<Result<Output, &'static str>>);
+
+impl RouteSource for FakeSwitch {
+    fn route(&mut self) -> Result<Output, RouteError> {
+        self.0
+            .pop_front()
+            .expect("script exhausted")
+            .map_err(RouteError::new)
+    }
+}
+
+fn switch(script: &[Result<Output, &'static str>]) -> FakeSwitch {
+    FakeSwitch(script.iter().cloned().collect())
+}
+
+#[test]
+fn startup_with_headphones_out_applies_the_speaker_level_through_a_transition() {
+    let mut service = VolumeService::unrouted(FakeMixer::default(), prefs(60, 40, false));
+    service
+        .sync_route(&mut switch(&[Ok(Output::Speaker)]), prefs(60, 40, false))
+        .unwrap();
+    assert_eq!(
+        service.backend().operations,
+        [
+            Operation::Quiesce,
+            Operation::Select(Output::Speaker),
+            Operation::TransitionApply(Output::Speaker, 60, false)
+        ]
+    );
+}
+
+#[test]
+fn startup_with_headphones_in_applies_the_headphone_level_never_the_speaker_level() {
+    let mut service = VolumeService::unrouted(FakeMixer::default(), prefs(60, 40, false));
+    service
+        .sync_route(&mut switch(&[Ok(Output::Headphones)]), prefs(60, 40, false))
+        .unwrap();
+    assert_eq!(
+        service.backend().operations,
+        [
+            Operation::Quiesce,
+            Operation::Select(Output::Headphones),
+            Operation::TransitionApply(Output::Headphones, 40, false)
+        ]
+    );
+}
+
+#[test]
+fn switch_events_in_both_directions_transition_and_an_unchanged_route_is_a_no_op() {
+    let mut service = VolumeService::unrouted(FakeMixer::default(), prefs(60, 40, false));
+    let mut jack = switch(&[
+        Ok(Output::Speaker),
+        Ok(Output::Speaker),
+        Ok(Output::Headphones),
+        Ok(Output::Speaker),
+    ]);
+    for _ in 0..4 {
+        service.sync_route(&mut jack, prefs(60, 40, false)).unwrap();
+    }
+    assert_eq!(
+        service.backend().operations,
+        [
+            Operation::Quiesce,
+            Operation::Select(Output::Speaker),
+            Operation::TransitionApply(Output::Speaker, 60, false),
+            // second read: same route, same prefs -> nothing
+            Operation::Quiesce,
+            Operation::Select(Output::Headphones),
+            Operation::TransitionApply(Output::Headphones, 40, false),
+            Operation::Quiesce,
+            Operation::Select(Output::Speaker),
+            Operation::TransitionApply(Output::Speaker, 60, false),
+        ]
+    );
+}
+
+#[test]
+fn an_unreadable_switch_quiesces_and_the_next_good_read_recovers_with_the_latest_prefs() {
+    let mut service = VolumeService::unrouted(FakeMixer::default(), prefs(60, 40, false));
+    let mut jack = switch(&[
+        Ok(Output::Speaker),
+        Err("EVIOCGSW: gone"),
+        Ok(Output::Speaker),
+    ]);
+    service.sync_route(&mut jack, prefs(60, 40, false)).unwrap();
+    service.backend_mut().operations.clear();
+    let error = service
+        .sync_route(&mut jack, prefs(60, 40, false))
+        .unwrap_err();
+    assert!(matches!(error, SyncError::Route(_)));
+    assert_eq!(service.backend().operations, [Operation::Quiesce]);
+    service.backend_mut().operations.clear();
+    // Even though the route is unchanged, recovery must re-run a full transition at the new pref.
+    service.sync_route(&mut jack, prefs(80, 40, false)).unwrap();
+    assert_eq!(
+        service.backend().operations,
+        [
+            Operation::Quiesce,
+            Operation::Select(Output::Speaker),
+            Operation::TransitionApply(Output::Speaker, 80, false)
+        ]
+    );
+}
+
+#[test]
+fn no_switch_means_no_level_is_ever_applied() {
+    let service = VolumeService::unrouted(FakeMixer::default(), prefs(60, 40, false));
+    assert!(service.backend().operations.is_empty());
 }

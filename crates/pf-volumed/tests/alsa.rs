@@ -53,10 +53,7 @@ fn alsa_backend_maps_levels_rejects_unsafe_routes_and_surfaces_command_failure()
     mixer.quiesce().unwrap();
     mixer.apply(Output::Speaker, 60, false).unwrap();
     mixer.apply(Output::Headphones, 40, true).unwrap();
-    let transition_error = mixer.transition(Output::Headphones, 40, false).unwrap_err();
-    assert!(transition_error
-        .to_string()
-        .contains("event-driven route controller"));
+    mixer.transition(Output::Headphones, 40, false).unwrap();
 
     let calls = fs::read_to_string(&log).unwrap();
     assert!(calls.contains("cset name=DAC Playback Volume 38"));
@@ -66,7 +63,16 @@ fn alsa_backend_maps_levels_rejects_unsafe_routes_and_surfaces_command_failure()
         calls.lines().next(),
         Some("-q -c Codec cset name=DAC Playback Volume 0")
     );
-    assert_eq!(calls.lines().count(), 4);
+    // A route transition is minimum first, then the destination's stored level (40% -> 25).
+    let lines: Vec<_> = calls.lines().collect();
+    assert_eq!(
+        &lines[lines.len() - 2..],
+        [
+            "-q -c Codec cset name=DAC Playback Volume 0",
+            "-q -c Codec cset name=DAC Playback Volume 25"
+        ]
+    );
+    assert_eq!(lines.len(), 5);
 
     File::create(&fail).unwrap();
     let error = mixer.apply(Output::Headphones, 40, true).unwrap_err();
