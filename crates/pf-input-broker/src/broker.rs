@@ -1074,9 +1074,7 @@ mod readiness_tests {
         assert!(unit
             .lines()
             .any(|line| line == "After=pf-session-authorityd.service"));
-        assert!(unit.contains(
-            "--safe-return-sock /run/pocketforge/session-authority.sock"
-        ));
+        assert!(unit.contains("--safe-return-sock /run/pocketforge/session-authority.sock"));
         assert!(unit.lines().any(|line| line == "Restart=on-failure"));
         assert!(
             !unit.contains("--allow-unidentified-pad"),
