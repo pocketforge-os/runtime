@@ -3,8 +3,14 @@ use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 
 use pf_input_broker::session_ipc::{
-    authorize_peer, read_frame_with_fd, write_frame_with_fd, EndpointPolicy, PeerFacts,
+    authorize_peer, read_frame_with_fd, serve_compositor_peer, write_frame_with_fd,
+    CompositorAuthority, EndpointPolicy, PeerFacts,
 };
+use pf_input_ipc::compositor::{
+    CompositorSnapshot, CompositorToRouter, FocusSnapshot, FocusedSurface, OverlaySnapshot,
+    OverlayState, ProtectedPowerSnapshot, RouterToCompositor, TextInputState,
+};
+use pf_input_ipc::{ContentPurpose, OverlayRole};
 use pf_input_ipc::Role;
 
 #[test]
@@ -75,4 +81,69 @@ fn missing_descriptor_is_a_negative_not_a_partial_read() {
     let (received, fd) = read_frame_with_fd(&mut receiver).unwrap();
     assert_eq!(received, body);
     assert!(fd.is_none());
+}
+
+#[test]
+fn compositor_must_register_then_replay_snapshot_for_its_new_epoch() {
+    let authority = std::sync::Arc::new(CompositorAuthority::default());
+    let (mut client, server) = UnixStream::pair().unwrap();
+    let serving = authority.clone();
+    let thread = std::thread::spawn(move || serve_compositor_peer(server, &serving));
+
+    send(&mut client, &CompositorToRouter::Register);
+    let (body, fd) = read_frame_with_fd(&mut client).unwrap();
+    assert!(fd.is_none(), "compositor registration never receives a pad fd");
+    let RouterToCompositor::Registered { epoch } = pf_input_ipc::decode(&body).unwrap() else {
+        panic!("first reply must be registered");
+    };
+    assert_ne!(epoch, 0);
+
+    send(
+        &mut client,
+        &CompositorToRouter::StateSnapshot {
+            snapshot: snapshot(epoch),
+        },
+    );
+    assert!(authority.snapshot_ready(epoch));
+    assert!(!authority.secure_entry(), "secure_entry is relayed exactly");
+
+    drop(client);
+    thread.join().unwrap().unwrap();
+    assert!(authority.secure_entry(), "disconnect fails closed");
+}
+
+fn send(stream: &mut UnixStream, message: &CompositorToRouter) {
+    let body = pf_input_ipc::encode(message);
+    pf_wire::write_frame(stream, &body).unwrap();
+}
+
+fn snapshot(epoch: u64) -> CompositorSnapshot {
+    CompositorSnapshot {
+        epoch,
+        focus: FocusSnapshot {
+            surface: FocusedSurface::None,
+            text_input: TextInputState {
+                active: false,
+                purpose: ContentPurpose::Normal,
+            },
+            secure_entry: false,
+        },
+        overlays: vec![
+            overlay(OverlayRole::Keyboard),
+            overlay(OverlayRole::Menu),
+            overlay(OverlayRole::Toast),
+        ],
+        power: ProtectedPowerSnapshot {
+            pressed: false,
+            last_sequence: 0,
+        },
+    }
+}
+
+fn overlay(role: OverlayRole) -> OverlaySnapshot {
+    OverlaySnapshot {
+        role,
+        state: OverlayState::Unmapped,
+        rect: None,
+    }
 }
