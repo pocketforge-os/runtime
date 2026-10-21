@@ -139,6 +139,8 @@ fn pointer_curve_is_radial_squared_crosses_1280px_per_second_and_expires_assist(
         Axis::Horizontal(12.0)
     );
     assert_eq!(PointerEngine::scroll_axis(0.0, 0.0), Axis::None);
+    assert!(pointer.cursor_visible(Duration::from_millis(2_999)));
+    assert!(!pointer.cursor_visible(Duration::from_secs(3)));
 }
 
 #[test]
@@ -176,4 +178,22 @@ fn app_section_limits_and_spoofing_labels_fail_closed_without_mutation() {
     assert!(store
         .update("org.example.game", vec![], 4097, Duration::from_secs(3))
         .is_err());
+
+    let mut rapid = AppSectionStore::default();
+    for index in 0..10 {
+        rapid
+            .update(
+                "org.example.game",
+                vec![AppMenuItem::new("save", "Save game", AppMenuKind::Action)],
+                100,
+                Duration::from_millis(index),
+            )
+            .unwrap();
+    }
+    assert!(rapid
+        .update("org.example.game", vec![], 10, Duration::from_millis(999),)
+        .is_err());
+    assert!(rapid
+        .update("org.example.game", vec![], 10, Duration::from_secs(1),)
+        .is_ok());
 }
