@@ -400,10 +400,7 @@ fn trusted_fd_is_never_delivered_across_an_epoch_or_before_snapshot() {
         .recv_timeout(std::time::Duration::from_secs(1))
         .unwrap()
         .unwrap();
-    assert_eq!(
-        unsafe { libc::fcntl(received.as_raw_fd(), libc::F_GETFD) } >= 0,
-        true
-    );
+    assert!(unsafe { libc::fcntl(received.as_raw_fd(), libc::F_GETFD) } >= 0);
 
     drop(old_client);
     drop(new_client);
