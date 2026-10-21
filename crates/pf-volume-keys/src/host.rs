@@ -333,3 +333,12 @@ pub fn serve(prefs_sock: &Path, toast_sock: Option<&Path>, stop: &AtomicBool) {
         }
     }
 }
+
+pub const DEFAULT_PREFS_SOCK: &str = "/run/pocketforge/prefsd.sock";
+
+/// The pf-prefsd endpoint: `--prefs-sock`, else the `PF_PREFSD_SOCK` override every other
+/// preference client honours, else the default. An empty override is ignored.
+pub fn resolve_prefs_sock(flag: Option<PathBuf>, env: Option<std::ffi::OsString>) -> PathBuf {
+    flag.or_else(|| env.filter(|v| !v.is_empty()).map(PathBuf::from))
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_PREFS_SOCK))
+}

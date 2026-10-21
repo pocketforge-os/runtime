@@ -181,3 +181,27 @@ fn an_absent_jack_is_a_route_error_not_a_guess() {
     let mut lazy = pf_volume_keys::host::LazyJack::new("/nonexistent-sysfs", "/dev/input");
     assert!(pf_volumed::jack::RouteSource::route(&mut lazy).is_err());
 }
+
+#[test]
+fn prefs_endpoint_precedence_is_flag_then_env_then_default() {
+    use pf_volume_keys::host::{resolve_prefs_sock, DEFAULT_PREFS_SOCK};
+    use std::path::PathBuf;
+    let env = |v: &str| Some(std::ffi::OsString::from(v));
+    assert_eq!(
+        resolve_prefs_sock(Some("/flag.sock".into()), env("/env.sock")),
+        PathBuf::from("/flag.sock")
+    );
+    assert_eq!(
+        resolve_prefs_sock(None, env("/env.sock")),
+        PathBuf::from("/env.sock")
+    );
+    assert_eq!(
+        resolve_prefs_sock(None, None),
+        PathBuf::from(DEFAULT_PREFS_SOCK)
+    );
+    // An empty override is not an endpoint.
+    assert_eq!(
+        resolve_prefs_sock(None, env("")),
+        PathBuf::from(DEFAULT_PREFS_SOCK)
+    );
+}
