@@ -158,9 +158,6 @@ fn run_private(args: &[String], test_io: TestIo) -> Result<(), Box<dyn std::erro
     let mut source = FdEventSource::from_owned_fd(take_inherited_fd(test_io.event_fd)?);
     let mut sink = FdEventSink::from_owned_fd(take_inherited_fd(test_io.record_fd)?);
     install_signal_handlers();
-    if args.iter().any(|a| a == "--volume-keys") {
-        spawn_volume_keys(arg(args, "--volume-toast-sock"));
-    }
     println!("ready");
     use std::io::Write;
     std::io::stdout().flush()?;
@@ -306,6 +303,9 @@ fn run_production(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     } else {
         None
     };
+    if args.iter().any(|a| a == "--volume-keys") {
+        spawn_volume_keys(arg(args, "--volume-toast-sock"));
+    }
     notify_ready()?;
     println!("ready");
     use std::io::Write;
@@ -472,6 +472,24 @@ fn send_ready(socket: &str) -> std::io::Result<()> {
 mod tests {
     use super::*;
     use std::cell::Cell;
+
+    /// Slice of this file's source between `start` and the next top-level `fn `.
+    fn body_of(start: &str) -> &'static str {
+        const SOURCE: &str = include_str!("pf-input-broker.rs");
+        let from = SOURCE.find(start).expect("function present");
+        let rest = &SOURCE[from + start.len()..];
+        &SOURCE[from..from + start.len() + rest.find("\nfn ").unwrap_or(rest.len())]
+    }
+
+    #[test]
+    fn volume_keys_start_in_the_production_path_and_never_in_private_test_io() {
+        // The private-fd mode rejects --volume-keys (test_io_mode), so a spawn there is dead code
+        // and production would silently never start the handler.
+        assert!(body_of("fn run_production(").contains("spawn_volume_keys("));
+        assert!(!body_of("fn run_private(").contains("spawn_volume_keys("));
+        // Negative control for the helper itself: it must see a call that exists.
+        assert!(body_of("fn run_production(").contains("notify_ready()"));
+    }
 
     #[test]
     fn private_fd_flags_bypass_counted_production_openers() {
