@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::ffi::CString;
 use std::fs;
 use std::io::{self, Read, Write};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -402,6 +402,11 @@ pub fn authenticate_peer(stream: &UnixStream, policy: &EndpointPolicy) -> io::Re
 
 /// Send one bounded PFW1 frame, attaching exactly one descriptor to its first byte.
 pub fn write_frame_with_fd(stream: &mut UnixStream, body: &[u8], fd: RawFd) -> io::Result<()> {
+    write_frame_with_fds(stream, body, &[fd])
+}
+
+/// Send one bounded PFW1 frame with every descriptor in a single `SCM_RIGHTS` message.
+pub fn write_frame_with_fds(stream: &mut UnixStream, body: &[u8], fds: &[RawFd]) -> io::Result<()> {
     if body.len() > pf_input_ipc::MAX_FRAME {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -411,27 +416,148 @@ pub fn write_frame_with_fd(stream: &mut UnixStream, body: &[u8], fd: RawFd) -> i
     let mut frame = Vec::with_capacity(4 + body.len());
     frame.extend_from_slice(&(body.len() as u32).to_be_bytes());
     frame.extend_from_slice(body);
-    let sent = send_first_with_fd(stream.as_raw_fd(), &frame, fd)?;
+    if fds.is_empty() {
+        return stream.write_all(&frame);
+    }
+    let sent = send_first_with_fds(stream.as_raw_fd(), &frame, fds)?;
     stream.write_all(&frame[sent..])
 }
 
 /// Receive one bounded PFW1 frame and its optional single descriptor. More than one descriptor
 /// is a protocol error; every received descriptor is closed on that path.
 pub fn read_frame_with_fd(stream: &mut UnixStream) -> io::Result<(Vec<u8>, Option<OwnedFd>)> {
-    let (first, fd) = recv_first_with_fd(stream.as_raw_fd())?;
+    let (body, mut fds) = read_frame_with_fds(stream).map_err(frame_receive_io)?;
+    if fds.len() > 1 {
+        return Err(invalid("input IPC frame carried more than one descriptor"));
+    }
+    Ok((body, fds.pop()))
+}
+
+/// The approved two-descriptor ABI returned by a keyboard/menu `registered` frame.
+#[derive(Debug)]
+pub struct RegisteredDescriptors {
+    pub pad: OwnedFd,
+    pub wayland: OwnedFd,
+}
+
+/// Typed fail-closed reasons for rejecting a keyboard/menu `registered` frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RegisteredFrameError {
+    Transport(io::ErrorKind),
+    ControlTruncated,
+    DescriptorCount { got: usize },
+    FirstNotEvdev,
+    NotCloseOnExec { index: usize },
+}
+
+impl std::fmt::Display for RegisteredFrameError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Transport(kind) => {
+                write!(formatter, "registered frame transport error: {kind:?}")
+            }
+            Self::ControlTruncated => {
+                formatter.write_str("registered descriptor control truncated")
+            }
+            Self::DescriptorCount { got } => {
+                write!(
+                    formatter,
+                    "registered carried {got} descriptors instead of two"
+                )
+            }
+            Self::FirstNotEvdev => formatter.write_str("registered first descriptor is not evdev"),
+            Self::NotCloseOnExec { index } => {
+                write!(
+                    formatter,
+                    "registered descriptor {index} is not close-on-exec"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for RegisteredFrameError {}
+
+/// Receive the approved `[private_pad_evdev_fd, trusted_wayland_client_fd]` descriptor pair.
+/// `validate_pad` exists so hermetic tests can identify their synthetic stand-in; production uses
+/// [`read_registered_frame`], which executes an evdev ioctl on the first descriptor.
+pub fn read_registered_frame_with(
+    stream: &mut UnixStream,
+    validate_pad: impl FnOnce(BorrowedFd<'_>) -> io::Result<()>,
+) -> Result<(Vec<u8>, RegisteredDescriptors), RegisteredFrameError> {
+    let (body, fds) = read_frame_with_fds(stream).map_err(|error| match error {
+        FrameReceiveError::Transport(error) => RegisteredFrameError::Transport(error.kind()),
+        FrameReceiveError::ControlTruncated => RegisteredFrameError::ControlTruncated,
+    })?;
+    if fds.len() != 2 {
+        return Err(RegisteredFrameError::DescriptorCount { got: fds.len() });
+    }
+    for (index, fd) in fds.iter().enumerate() {
+        let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFD) };
+        if flags < 0 || flags & libc::FD_CLOEXEC == 0 {
+            return Err(RegisteredFrameError::NotCloseOnExec { index });
+        }
+    }
+    validate_pad(fds[0].as_fd()).map_err(|_| RegisteredFrameError::FirstNotEvdev)?;
+    let mut fds = fds.into_iter();
+    Ok((
+        body,
+        RegisteredDescriptors {
+            pad: fds.next().expect("count checked"),
+            wayland: fds.next().expect("count checked"),
+        },
+    ))
+}
+
+/// Production `registered` receiver: the first descriptor must answer an evdev identity ioctl.
+pub fn read_registered_frame(
+    stream: &mut UnixStream,
+) -> Result<(Vec<u8>, RegisteredDescriptors), RegisteredFrameError> {
+    read_registered_frame_with(stream, |fd| {
+        let mut identity: libc::input_id = unsafe { std::mem::zeroed() };
+        let rc = unsafe { libc::ioctl(fd.as_raw_fd(), crate::ioc::eviocgid(), &mut identity) };
+        if rc < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    })
+}
+
+#[derive(Debug)]
+enum FrameReceiveError {
+    Transport(io::Error),
+    ControlTruncated,
+}
+
+fn frame_receive_io(error: FrameReceiveError) -> io::Error {
+    match error {
+        FrameReceiveError::Transport(error) => error,
+        FrameReceiveError::ControlTruncated => invalid("input IPC ancillary data was truncated"),
+    }
+}
+
+fn read_frame_with_fds(
+    stream: &mut UnixStream,
+) -> Result<(Vec<u8>, Vec<OwnedFd>), FrameReceiveError> {
+    let (first, fds) = recv_first_with_fds(stream.as_raw_fd())?;
     let mut prefix = [0_u8; 4];
     prefix[0] = first;
-    stream.read_exact(&mut prefix[1..])?;
+    stream
+        .read_exact(&mut prefix[1..])
+        .map_err(FrameReceiveError::Transport)?;
     let len = u32::from_be_bytes(prefix) as usize;
     if len > pf_input_ipc::MAX_FRAME {
-        return Err(io::Error::new(
+        return Err(FrameReceiveError::Transport(io::Error::new(
             io::ErrorKind::InvalidData,
             "input IPC frame exceeds 64 KiB",
-        ));
+        )));
     }
     let mut body = vec![0_u8; len];
-    stream.read_exact(&mut body)?;
-    Ok((body, fd))
+    stream
+        .read_exact(&mut body)
+        .map_err(FrameReceiveError::Transport)?;
+    Ok((body, fds))
 }
 
 fn denied(message: String) -> io::Error {
@@ -497,12 +623,13 @@ fn group_gid(name: &str) -> io::Result<u32> {
     }
 }
 
-fn send_first_with_fd(sock: RawFd, bytes: &[u8], fd: RawFd) -> io::Result<usize> {
+fn send_first_with_fds(sock: RawFd, bytes: &[u8], fds: &[RawFd]) -> io::Result<usize> {
     let mut iov = libc::iovec {
         iov_base: bytes.as_ptr() as *mut libc::c_void,
         iov_len: bytes.len(),
     };
-    let space = unsafe { libc::CMSG_SPACE(std::mem::size_of::<RawFd>() as u32) } as usize;
+    let fd_bytes = std::mem::size_of_val(fds) as u32;
+    let space = unsafe { libc::CMSG_SPACE(fd_bytes) } as usize;
     let mut control = vec![0_u8; space];
     let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
     message.msg_iov = &mut iov;
@@ -519,8 +646,12 @@ fn send_first_with_fd(sock: RawFd, bytes: &[u8], fd: RawFd) -> io::Result<usize>
         }
         (*cmsg).cmsg_level = libc::SOL_SOCKET;
         (*cmsg).cmsg_type = libc::SCM_RIGHTS;
-        (*cmsg).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<RawFd>() as u32) as usize;
-        std::ptr::copy_nonoverlapping(&fd, libc::CMSG_DATA(cmsg).cast::<RawFd>(), 1);
+        (*cmsg).cmsg_len = libc::CMSG_LEN(fd_bytes) as usize;
+        std::ptr::copy_nonoverlapping(
+            fds.as_ptr(),
+            libc::CMSG_DATA(cmsg).cast::<RawFd>(),
+            fds.len(),
+        );
         libc::sendmsg(sock, &message, libc::MSG_NOSIGNAL)
     };
     if sent < 0 {
@@ -535,7 +666,7 @@ fn send_first_with_fd(sock: RawFd, bytes: &[u8], fd: RawFd) -> io::Result<usize>
     Ok(sent as usize)
 }
 
-fn recv_first_with_fd(sock: RawFd) -> io::Result<(u8, Option<OwnedFd>)> {
+fn recv_first_with_fds(sock: RawFd) -> Result<(u8, Vec<OwnedFd>), FrameReceiveError> {
     let mut first = 0_u8;
     let mut iov = libc::iovec {
         iov_base: (&mut first as *mut u8).cast(),
@@ -553,19 +684,13 @@ fn recv_first_with_fd(sock: RawFd) -> io::Result<(u8, Option<OwnedFd>)> {
     // SAFETY: every pointer in `message` references writable live storage for recvmsg.
     let received = unsafe { libc::recvmsg(sock, &mut message, libc::MSG_CMSG_CLOEXEC) };
     if received < 0 {
-        return Err(io::Error::last_os_error());
+        return Err(FrameReceiveError::Transport(io::Error::last_os_error()));
     }
     if received == 0 {
-        return Err(io::Error::new(
+        return Err(FrameReceiveError::Transport(io::Error::new(
             io::ErrorKind::UnexpectedEof,
             "input IPC peer closed",
-        ));
-    }
-    if message.msg_flags & libc::MSG_CTRUNC != 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "input IPC ancillary data was truncated",
-        ));
+        )));
     }
 
     let mut fds = Vec::new();
@@ -586,11 +711,9 @@ fn recv_first_with_fd(sock: RawFd) -> io::Result<(u8, Option<OwnedFd>)> {
             cmsg = libc::CMSG_NXTHDR(&message, cmsg);
         }
     }
-    if fds.len() > 1 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "input IPC frame carried more than one descriptor",
-        ));
+    if message.msg_flags & libc::MSG_CTRUNC != 0 {
+        drop(fds);
+        return Err(FrameReceiveError::ControlTruncated);
     }
-    Ok((first, fds.pop()))
+    Ok((first, fds))
 }

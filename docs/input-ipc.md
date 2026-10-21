@@ -41,6 +41,11 @@ as an evdev file descriptor handed over `SCM_RIGHTS`, exactly like the app's `Ac
   successful trust result without exactly one fd is refused; the request stays pending, no trust
   is installed, and the connection is closed. Ancillary fds attached to refused, unexpected,
   wrong-epoch or otherwise invalid frames are closed immediately.
+* A keyboard or menu `registered` frame carries exactly two descriptors in one `sendmsg`, ordered
+  `[private_pad_evdev_fd, trusted_wayland_client_fd]`; otherwise the sender attaches none. The
+  receiver uses `MSG_CMSG_CLOEXEC` and fails closed on any other count or order, a non-evdev first
+  fd, or `MSG_CTRUNC`: it closes every received fd, returns a typed registration error, and never
+  keeps a partial set.
 * **Nothing sent here blocks the router's input pump.** The pump only flips atomics and hands
   tokens to a worker thread; all socket I/O, deadlines and fallbacks run on that thread
   (`crates/pf-input-broker/src/safe_return.rs` already works this way).
@@ -140,7 +145,7 @@ Router → provider:
 
 | `type` | Fields | Meaning |
 |---|---|---|
-| `registered` | — (+ pad fd) | the read fd of the menu's private virtual pad, and the trusted Wayland client fd once §6 is in force |
+| `registered` | — (+ exactly two ordered fds) | `[private_pad_evdev_fd, trusted_wayland_client_fd]` as one `SCM_RIGHTS` message (§1) |
 | `system_menu` | `front?: {app_id, name, unit}` | a Menu press; `front` absent in the shell |
 | `ack` | `action: return` | reply to `return` |
 | `dismiss` | `reason: shown_timeout \| unhealthy \| hold_return \| front_changed` | hide now; the pad is already back with the app |
@@ -169,7 +174,7 @@ Router → pf-osk:
 
 | `type` | Fields | Meaning |
 |---|---|---|
-| `registered` | — (+ pad fd) | the keyboard's private virtual pad, and the trusted Wayland client fd once §6 is in force |
+| `registered` | — (+ exactly two ordered fds) | `[private_pad_evdev_fd, trusted_wayland_client_fd]` as one `SCM_RIGHTS` message (§1) |
 | `show_modal` | `request_id, app{app_id,name,unit}, purpose, title, initial_text, max_chars, multiline` | open the modal keyboard for the app in front (spec §12.1). The router has already applied the open guard; pf-osk draws "Typing for ‹name›" from `app`, never from the request text |
 | `hide` | `reason: menu_open \| physical_keyboard \| app_lost_front \| app_exit` | hide now; `menu_open` means come back unchanged on Resume; `physical_keyboard` lets the strip stay |
 | `ping` | `seq` | |

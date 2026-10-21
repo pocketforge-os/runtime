@@ -389,8 +389,8 @@ pub mod menu {
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
     #[serde(tag = "type", rename_all = "snake_case")]
     pub enum RouterToMenu {
-        /// Registration accepted. Carries, by `SCM_RIGHTS`, the read fd of the menu's private
-        /// virtual pad (and, once provenance landed, the trusted Wayland client fd).
+        /// Registration accepted. Carries exactly two `SCM_RIGHTS` descriptors in one sendmsg,
+        /// ordered `[private_pad_evdev_fd, trusted_wayland_client_fd]`.
         Registered,
         /// A Menu press. `front` is `None` in the shell.
         SystemMenu {
@@ -491,7 +491,8 @@ pub mod keyboard {
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
     #[serde(tag = "type", rename_all = "snake_case")]
     pub enum RouterToKeyboard {
-        /// Registration accepted. Carries the keyboard's private pad fd by `SCM_RIGHTS`.
+        /// Registration accepted. Carries exactly two `SCM_RIGHTS` descriptors in one sendmsg,
+        /// ordered `[private_pad_evdev_fd, trusted_wayland_client_fd]`.
         Registered,
         /// Open the modal keyboard for the app in front (SDK `pf_osk_show` MODAL, spec §12.1).
         /// The router has already applied the `USER_PRESS_WINDOW` open guard.
