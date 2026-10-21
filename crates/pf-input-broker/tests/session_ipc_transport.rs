@@ -120,9 +120,63 @@ fn compositor_must_register_then_replay_snapshot_for_its_new_epoch() {
     assert!(authority.secure_entry(), "disconnect fails closed");
 }
 
+#[test]
+fn superseded_compositor_disconnect_cannot_clear_the_new_epoch() {
+    let authority = std::sync::Arc::new(CompositorAuthority::default());
+    let (mut old_client, old_server) = UnixStream::pair().unwrap();
+    let old_authority = authority.clone();
+    let old_thread = std::thread::spawn(move || serve_compositor_peer(old_server, &old_authority));
+    send(&mut old_client, &CompositorToRouter::Register);
+    let (old_body, _) = read_frame_with_fd(&mut old_client).unwrap();
+    let RouterToCompositor::Registered { epoch: old_epoch } =
+        pf_input_ipc::decode(&old_body).unwrap()
+    else {
+        panic!("old compositor was not registered");
+    };
+
+    let (mut new_client, new_server) = UnixStream::pair().unwrap();
+    let new_authority = authority.clone();
+    let new_thread = std::thread::spawn(move || serve_compositor_peer(new_server, &new_authority));
+    send(&mut new_client, &CompositorToRouter::Register);
+    let (new_body, _) = read_frame_with_fd(&mut new_client).unwrap();
+    let RouterToCompositor::Registered { epoch: new_epoch } =
+        pf_input_ipc::decode(&new_body).unwrap()
+    else {
+        panic!("new compositor was not registered");
+    };
+    assert!(new_epoch > old_epoch);
+    send(
+        &mut new_client,
+        &CompositorToRouter::StateSnapshot {
+            snapshot: snapshot(new_epoch),
+        },
+    );
+    wait_for_snapshot(&authority, new_epoch);
+
+    drop(old_client);
+    old_thread.join().unwrap().unwrap();
+    assert!(
+        authority.snapshot_ready(new_epoch),
+        "old EOF must not disconnect the replacement"
+    );
+    assert!(!authority.secure_entry());
+
+    drop(new_client);
+    new_thread.join().unwrap().unwrap();
+    assert!(authority.secure_entry());
+}
+
 fn send(stream: &mut UnixStream, message: &CompositorToRouter) {
     let body = pf_input_ipc::encode(message);
     pf_wire::write_frame(stream, &body).unwrap();
+}
+
+fn wait_for_snapshot(authority: &CompositorAuthority, epoch: u64) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    while !authority.snapshot_ready(epoch) && std::time::Instant::now() < deadline {
+        std::thread::yield_now();
+    }
+    assert!(authority.snapshot_ready(epoch));
 }
 
 fn snapshot(epoch: u64) -> CompositorSnapshot {
