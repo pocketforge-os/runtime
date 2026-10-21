@@ -400,7 +400,7 @@ fn menu_registration_receives_pad_then_current_epoch_wayland_fd() {
 
     let (registered, descriptors) = read_registered_frame_with(&mut menu, |_| Ok(())).unwrap();
     assert_eq!(
-        pf_input_ipc::decode(&registered).unwrap(),
+        pf_input_ipc::decode::<pf_input_ipc::menu::RouterToMenu>(&registered).unwrap(),
         pf_input_ipc::menu::RouterToMenu::Registered
     );
     let mut pad = std::fs::File::from(descriptors.pad);

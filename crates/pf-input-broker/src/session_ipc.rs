@@ -20,6 +20,7 @@ use pf_input_ipc::compositor::{
     CompositorSession, CompositorStateError, CompositorToRouter, RouterToCompositor,
     TrustedConnectionOutcome,
 };
+use pf_input_ipc::menu::{MenuToRouter, RouterToMenu};
 use pf_input_ipc::{OverlayRole, Role};
 
 use crate::router::SessionSignals;
@@ -207,6 +208,16 @@ impl CompositorAuthority {
         Ok(receiver)
     }
 
+    fn release_trusted_connection(&self, role: OverlayRole) {
+        let mut state = self.state.lock().expect("compositor state poisoned");
+        let Some(epoch) = state.current_epoch else {
+            return;
+        };
+        if let Some(session) = state.session.as_mut() {
+            let _ = session.release_trusted_role(epoch, role);
+        }
+    }
+
     pub fn snapshot_ready(&self, epoch: u64) -> bool {
         self.state
             .lock()
@@ -261,6 +272,71 @@ pub fn serve_compositor_peer(
             authority.disconnect(epoch);
             return Err(error);
         }
+    }
+}
+
+/// Register one already-authenticated system-menu peer and deliver its private pad fd followed by
+/// a Wayland fd minted for the current compositor epoch. No partial registration is ever sent.
+pub fn serve_menu_peer(
+    mut stream: UnixStream,
+    authority: &CompositorAuthority,
+    pad: OwnedFd,
+) -> io::Result<()> {
+    let (body, fd) = read_frame_with_fd(&mut stream)?;
+    if fd.is_some() {
+        return Err(invalid("menu register carried a descriptor"));
+    }
+    let first: MenuToRouter = pf_input_ipc::decode(&body).map_err(ipc_error)?;
+    if first != MenuToRouter::Register {
+        return Err(invalid("menu must register before other messages"));
+    }
+
+    let trusted = authority
+        .request_trusted_connection(OverlayRole::Menu)?
+        .recv()
+        .map_err(|_| {
+            io::Error::new(io::ErrorKind::ConnectionAborted, "compositor epoch changed")
+        })??;
+    let registered = pf_input_ipc::encode(&RouterToMenu::Registered);
+    if let Err(error) = write_frame_with_fds(
+        &mut stream,
+        &registered,
+        &[pad.as_raw_fd(), trusted.as_raw_fd()],
+    ) {
+        authority.release_trusted_connection(OverlayRole::Menu);
+        return Err(error);
+    }
+    drop((pad, trusted));
+
+    loop {
+        let (body, fd) = match read_frame_with_fd(&mut stream) {
+            Ok(frame) => frame,
+            Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => {
+                authority.release_trusted_connection(OverlayRole::Menu);
+                return Ok(());
+            }
+            Err(error) => {
+                authority.release_trusted_connection(OverlayRole::Menu);
+                return Err(error);
+            }
+        };
+        if fd.is_some() {
+            authority.release_trusted_connection(OverlayRole::Menu);
+            return Err(invalid("menu message carried a descriptor"));
+        }
+        let message: MenuToRouter = match pf_input_ipc::decode(&body).map_err(ipc_error) {
+            Ok(message) => message,
+            Err(error) => {
+                authority.release_trusted_connection(OverlayRole::Menu);
+                return Err(error);
+            }
+        };
+        if message == MenuToRouter::Register {
+            authority.release_trusted_connection(OverlayRole::Menu);
+            return Err(invalid("duplicate menu register"));
+        }
+        // Menu policy transitions are consumed by the session router worker when this transport
+        // is wired into the daemon; this loop already enforces framing and descriptor authority.
     }
 }
 
