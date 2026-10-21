@@ -44,6 +44,37 @@ fn menu_is_consumed_before_every_destination_and_after_resync() {
 }
 
 #[test]
+fn menu_wins_under_fuzzed_report_orders() {
+    let ordinary = [SOUTH, SOUTH + 1, SOUTH + 2, SOUTH + 3];
+    let mut state = 0x5eed_u64;
+    for destination in Destination::ALL {
+        for case in 0..2_048 {
+            let mut report = Vec::new();
+            for _ in 0..8 {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1);
+                report.push(ButtonEvent::new(
+                    ordinary[((state >> 32) as usize) % ordinary.len()],
+                    true,
+                ));
+            }
+            report[(state as usize) % report.len()] = ButtonEvent::new(GUIDE_CODE, true);
+            let effects =
+                SessionRouter::new(destination).route_report(report, Duration::from_micros(case));
+            assert_eq!(effects.first(), Some(&RouteEffect::MenuPress));
+            assert!(!effects.iter().any(|effect| matches!(
+                effect,
+                RouteEffect::Button {
+                    code: GUIDE_CODE,
+                    ..
+                }
+            )));
+        }
+    }
+}
+
+#[test]
 fn every_switch_releases_the_old_destination_before_the_new_one() {
     let mut router = SessionRouter::new(Destination::App);
     router.route_button(ButtonEvent::new(SOUTH, true), Duration::ZERO);
