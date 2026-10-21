@@ -65,4 +65,6 @@ fn every_pad_destination_has_a_distinct_private_virtual_device_identity() {
         assert_eq!(spec.keys, base.keys);
         assert_eq!(spec.abs.len(), base.abs.len());
     }
+    assert!(pad_uinput_spec(&base, PadDestination::Pointer).is_none());
+    assert!(pad_uinput_spec(&base, PadDestination::Quarantined).is_none());
 }

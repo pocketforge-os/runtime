@@ -463,9 +463,15 @@ impl InputBroker {
 
     /// The re-emit `/dev/input/eventN` node path (what the app reads / the fd handed over points at).
     pub fn node_path(&self) -> Option<String> {
-        self.sink
-            .node(pf_input_ipc::PadDestination::App)
-            .map(str::to_owned)
+        self.destination_node_path(pf_input_ipc::PadDestination::App)
+    }
+
+    /// The private event node for one recipient; quarantine deliberately has no node.
+    pub fn destination_node_path(
+        &self,
+        destination: pf_input_ipc::PadDestination,
+    ) -> Option<String> {
+        self.sink.node(destination).map(str::to_owned)
     }
 
     /// The grabbed source device's name (for logging / the blessed-binary check).
