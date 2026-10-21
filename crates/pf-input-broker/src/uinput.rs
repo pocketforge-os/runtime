@@ -44,6 +44,67 @@ pub struct Uinput {
     node: Option<String>,
 }
 
+/// All virtual devices owned by the one session router process.
+///
+/// Each pad recipient has a distinct kernel device. `Quarantined` intentionally resolves to no
+/// device, and pointer events use the dedicated relative mouse rather than a pad-shaped device.
+pub struct SessionUinputs {
+    app: Uinput,
+    keyboard: Uinput,
+    menu: Uinput,
+    shell: Uinput,
+    pointer: Uinput,
+}
+
+impl SessionUinputs {
+    pub fn create(pad: &UinputSpec) -> io::Result<Self> {
+        Ok(Self {
+            app: Uinput::create(
+                &pad_uinput_spec(pad, PadDestination::App).expect("app has a pad spec"),
+            )?,
+            keyboard: Uinput::create(
+                &pad_uinput_spec(pad, PadDestination::Keyboard).expect("keyboard has a pad spec"),
+            )?,
+            menu: Uinput::create(
+                &pad_uinput_spec(pad, PadDestination::Menu).expect("menu has a pad spec"),
+            )?,
+            shell: Uinput::create(
+                &pad_uinput_spec(pad, PadDestination::Shell).expect("shell has a pad spec"),
+            )?,
+            pointer: Uinput::create(&pointer_uinput_spec())?,
+        })
+    }
+
+    pub fn node(&self, destination: PadDestination) -> Option<&str> {
+        match destination {
+            PadDestination::App => self.app.node(),
+            PadDestination::Keyboard => self.keyboard.node(),
+            PadDestination::Menu => self.menu.node(),
+            PadDestination::Shell => self.shell.node(),
+            PadDestination::Pointer => self.pointer.node(),
+            PadDestination::Quarantined => None,
+        }
+    }
+
+    pub fn emit(
+        &self,
+        destination: PadDestination,
+        event_type: u16,
+        code: u16,
+        value: i32,
+    ) -> io::Result<()> {
+        let device = match destination {
+            PadDestination::App => &self.app,
+            PadDestination::Keyboard => &self.keyboard,
+            PadDestination::Menu => &self.menu,
+            PadDestination::Shell => &self.shell,
+            PadDestination::Pointer => &self.pointer,
+            PadDestination::Quarantined => return Ok(()),
+        };
+        device.emit(event_type, code, value)
+    }
+}
+
 impl Uinput {
     /// Configure + instantiate the virtual device from `spec`.
     pub fn create(spec: &UinputSpec) -> io::Result<Uinput> {
@@ -259,6 +320,14 @@ impl EventSink for Uinput {
             self.emit(event.type_, event.code, event.value)?;
         }
         Ok(())
+    }
+}
+
+// Until the session policy multiplexer is installed by the caller, the compatibility EventSink
+// surface writes only to the app device. No other recipient can observe that stream.
+impl EventSink for SessionUinputs {
+    fn write_events(&mut self, events: &[libc::input_event]) -> io::Result<()> {
+        self.app.write_events(events)
     }
 }
 

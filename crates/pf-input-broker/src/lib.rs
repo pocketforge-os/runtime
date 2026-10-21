@@ -58,7 +58,9 @@ pub use remap::{Posture, Remap, RemapError, Rotation};
 pub use safe_return::{
     serve_system_menu_provider, PostureFeed, SafeReturnIntake, SystemMenuGate, SystemMenuRouter,
 };
-pub use uinput::{pad_uinput_spec, pointer_uinput_spec, AbsInfo, Uinput, UinputSpec};
+pub use uinput::{
+    pad_uinput_spec, pointer_uinput_spec, AbsInfo, SessionUinputs, Uinput, UinputSpec,
+};
 
 /// How the broker vends the input device to a consumer (R-C).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
