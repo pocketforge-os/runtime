@@ -173,7 +173,23 @@ fn registered_frame_refuses_count_order_and_truncation_without_leaking_fds() {
             "not evdev",
         ))
     });
+    assert_registered_rejected_with_files(RegisteredFrameError::SecondNotWayland, |_| Ok(()));
     assert_registered_rejected(9, RegisteredFrameError::ControlTruncated, |_| Ok(()));
+}
+
+fn assert_registered_rejected_with_files(
+    expected: RegisteredFrameError,
+    validate_pad: impl FnOnce(std::os::fd::BorrowedFd<'_>) -> std::io::Result<()>,
+) {
+    let (mut sender, mut receiver) = UnixStream::pair().unwrap();
+    let first = std::fs::File::open("/dev/null").unwrap();
+    let second = std::fs::File::open("/dev/null").unwrap();
+    let body = pf_input_ipc::encode(&pf_input_ipc::menu::RouterToMenu::Registered);
+    write_frame_with_fds(&mut sender, &body, &[first.as_raw_fd(), second.as_raw_fd()]).unwrap();
+    assert_eq!(
+        read_registered_frame_with(&mut receiver, validate_pad).unwrap_err(),
+        expected
+    );
 }
 
 fn assert_registered_rejected(
@@ -409,7 +425,7 @@ fn trusted_fd_is_never_delivered_across_an_epoch_or_before_snapshot() {
 }
 
 #[test]
-fn menu_registration_receives_pad_then_current_epoch_wayland_fd() {
+fn menu_registration_receives_ordered_fds_and_disconnect_invalidates_peer() {
     let authority = std::sync::Arc::new(CompositorAuthority::default());
     let (mut compositor, compositor_server) = UnixStream::pair().unwrap();
     let compositor_authority = authority.clone();
@@ -431,7 +447,7 @@ fn menu_registration_receives_pad_then_current_epoch_wayland_fd() {
 
     let (mut menu, menu_server) = UnixStream::pair().unwrap();
     let menu_authority = authority.clone();
-    let pad = std::fs::File::open("/dev/null").unwrap();
+    let (pad, mut pad_peer) = UnixStream::pair().unwrap();
     let menu_thread =
         std::thread::spawn(move || serve_menu_peer(menu_server, &menu_authority, pad.into()));
     let register = pf_input_ipc::encode(&pf_input_ipc::menu::MenuToRouter::Register);
@@ -458,28 +474,42 @@ fn menu_registration_receives_pad_then_current_epoch_wayland_fd() {
     };
     let response = pf_input_ipc::encode(&response);
     write_frame_with_fd(&mut compositor, &response, wayland.as_raw_fd()).unwrap();
+    drop(wayland);
 
     let (registered, descriptors) = read_registered_frame_with(&mut menu, |_| Ok(())).unwrap();
     assert_eq!(
         pf_input_ipc::decode::<pf_input_ipc::menu::RouterToMenu>(&registered).unwrap(),
         pf_input_ipc::menu::RouterToMenu::Registered
     );
-    let mut pad = std::fs::File::from(descriptors.pad);
+    let mut pad = UnixStream::from(descriptors.pad);
     let mut byte = [0_u8; 1];
-    assert_eq!(pad.read(&mut byte).unwrap(), 0, "pad fd is first");
+    pad_peer.write_all(b"p").unwrap();
+    pad.read_exact(&mut byte).unwrap();
+    assert_eq!(byte, [b'p'], "pad fd is first");
     let mut trusted_wayland = UnixStream::from(descriptors.wayland);
     gamescope_wayland.write_all(b"t").unwrap();
     trusted_wayland.read_exact(&mut byte).unwrap();
     assert_eq!(byte, [b't'], "trusted Wayland fd is second");
 
-    drop(menu);
-    menu_thread.join().unwrap().unwrap();
     drop(compositor);
     compositor_thread.join().unwrap().unwrap();
+    for stream in [&menu, &pad, &trusted_wayland] {
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(1)))
+            .unwrap();
+    }
+    assert_eq!(menu.read(&mut byte).unwrap(), 0, "menu control is closed");
+    assert_eq!(pad.read(&mut byte).unwrap(), 0, "private pad is revoked");
+    assert_eq!(
+        trusted_wayland.read(&mut byte).unwrap(),
+        0,
+        "trusted Wayland client is closed"
+    );
+    menu_thread.join().unwrap().unwrap();
 }
 
 #[test]
-fn keyboard_registration_receives_pad_then_current_epoch_wayland_fd() {
+fn keyboard_registration_receives_ordered_fds_and_replacement_invalidates_peer() {
     let authority = std::sync::Arc::new(CompositorAuthority::default());
     let (mut compositor, compositor_server) = UnixStream::pair().unwrap();
     let compositor_authority = authority.clone();
@@ -501,7 +531,7 @@ fn keyboard_registration_receives_pad_then_current_epoch_wayland_fd() {
 
     let (mut keyboard, keyboard_server) = UnixStream::pair().unwrap();
     let keyboard_authority = authority.clone();
-    let pad = std::fs::File::open("/dev/null").unwrap();
+    let (pad, mut pad_peer) = UnixStream::pair().unwrap();
     let keyboard_thread = std::thread::spawn(move || {
         serve_keyboard_peer(keyboard_server, &keyboard_authority, pad.into())
     });
@@ -535,24 +565,52 @@ fn keyboard_registration_receives_pad_then_current_epoch_wayland_fd() {
         wayland.as_raw_fd(),
     )
     .unwrap();
+    drop(wayland);
 
     let (registered, descriptors) = read_registered_frame_with(&mut keyboard, |_| Ok(())).unwrap();
     assert_eq!(
         pf_input_ipc::decode::<pf_input_ipc::keyboard::RouterToKeyboard>(&registered).unwrap(),
         pf_input_ipc::keyboard::RouterToKeyboard::Registered
     );
-    let mut pad = std::fs::File::from(descriptors.pad);
+    let mut pad = UnixStream::from(descriptors.pad);
     let mut byte = [0_u8; 1];
-    assert_eq!(pad.read(&mut byte).unwrap(), 0, "pad fd is first");
+    pad_peer.write_all(b"p").unwrap();
+    pad.read_exact(&mut byte).unwrap();
+    assert_eq!(byte, [b'p'], "pad fd is first");
     let mut trusted_wayland = UnixStream::from(descriptors.wayland);
     gamescope_wayland.write_all(b"t").unwrap();
     trusted_wayland.read_exact(&mut byte).unwrap();
     assert_eq!(byte, [b't'], "trusted Wayland fd is second");
 
-    drop(keyboard);
+    let (mut replacement, replacement_server) = UnixStream::pair().unwrap();
+    let replacement_authority = authority.clone();
+    let replacement_thread = std::thread::spawn(move || {
+        serve_compositor_peer(replacement_server, &replacement_authority)
+    });
+    send(&mut replacement, &CompositorToRouter::Register);
+    let _ = read_frame_with_fd(&mut replacement).unwrap();
+
+    for stream in [&keyboard, &pad, &trusted_wayland] {
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(1)))
+            .unwrap();
+    }
+    assert_eq!(
+        keyboard.read(&mut byte).unwrap(),
+        0,
+        "keyboard control is closed"
+    );
+    assert_eq!(pad.read(&mut byte).unwrap(), 0, "private pad is revoked");
+    assert_eq!(
+        trusted_wayland.read(&mut byte).unwrap(),
+        0,
+        "trusted Wayland client is closed"
+    );
     keyboard_thread.join().unwrap().unwrap();
     drop(compositor);
     compositor_thread.join().unwrap().unwrap();
+    drop(replacement);
+    replacement_thread.join().unwrap().unwrap();
 }
 
 fn send(stream: &mut UnixStream, message: &CompositorToRouter) {

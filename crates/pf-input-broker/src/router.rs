@@ -243,14 +243,21 @@ impl SessionRouter {
             MenuStep::None => Vec::new(),
             MenuStep::RoutePadToMenu => self.switch_to(Destination::Menu),
             MenuStep::RoutePadToApp => self.switch_to(self.destination_before_menu),
-            MenuStep::FallbackReturn => vec![RouteEffect::SafeReturn],
+            MenuStep::FallbackReturn => {
+                let mut effects = self.switch_to(Destination::Shell);
+                effects.push(RouteEffect::SafeReturn);
+                effects
+            }
             MenuStep::Dismiss(_) => {
                 let mut effects = vec![RouteEffect::DismissMenu];
                 effects.extend(self.switch_to(self.destination_before_menu));
                 effects
             }
             MenuStep::DismissAndReturn(_) => {
-                vec![RouteEffect::DismissMenu, RouteEffect::SafeReturn]
+                let mut effects = vec![RouteEffect::DismissMenu];
+                effects.extend(self.switch_to(Destination::Shell));
+                effects.push(RouteEffect::SafeReturn);
+                effects
             }
         }
     }

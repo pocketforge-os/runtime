@@ -3,10 +3,11 @@
 //! The frozen input IPC contract keeps serialization in `pf-input-ipc`; this module owns the
 //! Linux boundary: socket-derived identity, PFW1 framing, frame limits, and descriptor transfer.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ffi::CString;
 use std::fs;
 use std::io::{self, Read, Write};
+use std::net::Shutdown;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
@@ -32,6 +33,26 @@ struct CompositorState {
     signals: SessionSignals,
     writer: Option<UnixStream>,
     pending_fds: HashMap<u64, SyncSender<io::Result<OwnedFd>>>,
+    role_peers: BTreeMap<OverlayRole, RolePeer>,
+}
+
+struct RolePeer {
+    control: UnixStream,
+    pad: OwnedFd,
+    wayland: OwnedFd,
+}
+
+impl RolePeer {
+    fn invalidate(self) {
+        // SCM_RIGHTS duplicates share the same open file description. Revoking through the
+        // retained evdev fd therefore invalidates the role's delivered pad descriptor too.
+        unsafe {
+            libc::ioctl(self.pad.as_raw_fd(), crate::ioc::EVIOCREVOKE, 0);
+            libc::shutdown(self.pad.as_raw_fd(), libc::SHUT_RDWR);
+            libc::shutdown(self.wayland.as_raw_fd(), libc::SHUT_RDWR);
+        }
+        let _ = self.control.shutdown(Shutdown::Both);
+    }
 }
 
 /// Session state driven only by the currently registered compositor connection.
@@ -52,6 +73,7 @@ impl Default for CompositorAuthority {
                 signals: SessionSignals::default(),
                 writer: None,
                 pending_fds: HashMap::new(),
+                role_peers: BTreeMap::new(),
             }),
         }
     }
@@ -61,6 +83,9 @@ impl CompositorAuthority {
     fn register(&self, writer: UnixStream) -> u64 {
         let epoch = self.next_epoch.fetch_add(1, Ordering::Relaxed).max(1);
         let mut state = self.state.lock().expect("compositor state poisoned");
+        for peer in std::mem::take(&mut state.role_peers).into_values() {
+            peer.invalidate();
+        }
         state.pending_fds.clear();
         state.current_epoch = Some(epoch);
         state.session = Some(CompositorSession::new(epoch));
@@ -164,6 +189,9 @@ impl CompositorAuthority {
         state.session = None;
         state.writer = None;
         state.pending_fds.clear();
+        for peer in std::mem::take(&mut state.role_peers).into_values() {
+            peer.invalidate();
+        }
         state.signals.disconnect();
     }
 
@@ -173,6 +201,14 @@ impl CompositorAuthority {
         &self,
         role: OverlayRole,
     ) -> io::Result<Receiver<io::Result<OwnedFd>>> {
+        self.request_trusted_connection_with_epoch(role)
+            .map(|(_, receiver)| receiver)
+    }
+
+    fn request_trusted_connection_with_epoch(
+        &self,
+        role: OverlayRole,
+    ) -> io::Result<(u64, Receiver<io::Result<OwnedFd>>)> {
         let unit = match role {
             OverlayRole::Keyboard => "pf-osk.service",
             OverlayRole::Menu => "pf-system-menu.service",
@@ -206,14 +242,34 @@ impl CompositorAuthority {
             state.pending_fds.remove(&request_id);
             return Err(error);
         }
-        Ok(receiver)
+        Ok((epoch, receiver))
     }
 
-    fn release_trusted_connection(&self, role: OverlayRole) {
+    fn register_role_peer(&self, epoch: u64, role: OverlayRole, peer: RolePeer) -> io::Result<()> {
         let mut state = self.state.lock().expect("compositor state poisoned");
-        let Some(epoch) = state.current_epoch else {
+        if state.current_epoch != Some(epoch) {
+            peer.invalidate();
+            return Err(io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "compositor epoch changed while registering role peer",
+            ));
+        }
+        if state.role_peers.contains_key(&role) {
+            peer.invalidate();
+            return Err(invalid("trusted role peer was already registered"));
+        }
+        state.role_peers.insert(role, peer);
+        Ok(())
+    }
+
+    fn release_trusted_connection(&self, epoch: u64, role: OverlayRole) {
+        let mut state = self.state.lock().expect("compositor state poisoned");
+        if state.current_epoch != Some(epoch) {
             return;
-        };
+        }
+        if let Some(peer) = state.role_peers.remove(&role) {
+            peer.invalidate();
+        }
         if let Some(session) = state.session.as_mut() {
             let _ = session.release_trusted_role(epoch, role);
         }
@@ -292,48 +348,61 @@ pub fn serve_menu_peer(
         return Err(invalid("menu must register before other messages"));
     }
 
-    let trusted = authority
-        .request_trusted_connection(OverlayRole::Menu)?
-        .recv()
-        .map_err(|_| {
-            io::Error::new(io::ErrorKind::ConnectionAborted, "compositor epoch changed")
-        })??;
+    let (epoch, trusted) = authority.request_trusted_connection_with_epoch(OverlayRole::Menu)?;
+    let trusted = trusted.recv().map_err(|_| {
+        io::Error::new(io::ErrorKind::ConnectionAborted, "compositor epoch changed")
+    })??;
+    let role_control = match stream.try_clone() {
+        Ok(control) => control,
+        Err(error) => {
+            authority.release_trusted_connection(epoch, OverlayRole::Menu);
+            return Err(error);
+        }
+    };
     let registered = pf_input_ipc::encode(&RouterToMenu::Registered);
     if let Err(error) = write_frame_with_fds(
         &mut stream,
         &registered,
         &[pad.as_raw_fd(), trusted.as_raw_fd()],
     ) {
-        authority.release_trusted_connection(OverlayRole::Menu);
+        authority.release_trusted_connection(epoch, OverlayRole::Menu);
         return Err(error);
     }
-    drop((pad, trusted));
+    authority.register_role_peer(
+        epoch,
+        OverlayRole::Menu,
+        RolePeer {
+            control: role_control,
+            pad,
+            wayland: trusted,
+        },
+    )?;
 
     loop {
         let (body, fd) = match read_frame_with_fd(&mut stream) {
             Ok(frame) => frame,
             Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => {
-                authority.release_trusted_connection(OverlayRole::Menu);
+                authority.release_trusted_connection(epoch, OverlayRole::Menu);
                 return Ok(());
             }
             Err(error) => {
-                authority.release_trusted_connection(OverlayRole::Menu);
+                authority.release_trusted_connection(epoch, OverlayRole::Menu);
                 return Err(error);
             }
         };
         if fd.is_some() {
-            authority.release_trusted_connection(OverlayRole::Menu);
+            authority.release_trusted_connection(epoch, OverlayRole::Menu);
             return Err(invalid("menu message carried a descriptor"));
         }
         let message: MenuToRouter = match pf_input_ipc::decode(&body).map_err(ipc_error) {
             Ok(message) => message,
             Err(error) => {
-                authority.release_trusted_connection(OverlayRole::Menu);
+                authority.release_trusted_connection(epoch, OverlayRole::Menu);
                 return Err(error);
             }
         };
         if message == MenuToRouter::Register {
-            authority.release_trusted_connection(OverlayRole::Menu);
+            authority.release_trusted_connection(epoch, OverlayRole::Menu);
             return Err(invalid("duplicate menu register"));
         }
         // Menu policy transitions are consumed by the session router worker when this transport
@@ -357,48 +426,62 @@ pub fn serve_keyboard_peer(
         return Err(invalid("keyboard must register before other messages"));
     }
 
-    let trusted = authority
-        .request_trusted_connection(OverlayRole::Keyboard)?
-        .recv()
-        .map_err(|_| {
-            io::Error::new(io::ErrorKind::ConnectionAborted, "compositor epoch changed")
-        })??;
+    let (epoch, trusted) =
+        authority.request_trusted_connection_with_epoch(OverlayRole::Keyboard)?;
+    let trusted = trusted.recv().map_err(|_| {
+        io::Error::new(io::ErrorKind::ConnectionAborted, "compositor epoch changed")
+    })??;
+    let role_control = match stream.try_clone() {
+        Ok(control) => control,
+        Err(error) => {
+            authority.release_trusted_connection(epoch, OverlayRole::Keyboard);
+            return Err(error);
+        }
+    };
     let registered = pf_input_ipc::encode(&RouterToKeyboard::Registered);
     if let Err(error) = write_frame_with_fds(
         &mut stream,
         &registered,
         &[pad.as_raw_fd(), trusted.as_raw_fd()],
     ) {
-        authority.release_trusted_connection(OverlayRole::Keyboard);
+        authority.release_trusted_connection(epoch, OverlayRole::Keyboard);
         return Err(error);
     }
-    drop((pad, trusted));
+    authority.register_role_peer(
+        epoch,
+        OverlayRole::Keyboard,
+        RolePeer {
+            control: role_control,
+            pad,
+            wayland: trusted,
+        },
+    )?;
 
     loop {
         let (body, fd) = match read_frame_with_fd(&mut stream) {
             Ok(frame) => frame,
             Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => {
-                authority.release_trusted_connection(OverlayRole::Keyboard);
+                authority.release_trusted_connection(epoch, OverlayRole::Keyboard);
                 return Ok(());
             }
             Err(error) => {
-                authority.release_trusted_connection(OverlayRole::Keyboard);
+                authority.release_trusted_connection(epoch, OverlayRole::Keyboard);
                 return Err(error);
             }
         };
         if fd.is_some() {
-            authority.release_trusted_connection(OverlayRole::Keyboard);
+            authority.release_trusted_connection(epoch, OverlayRole::Keyboard);
             return Err(invalid("keyboard message carried a descriptor"));
         }
         let message: KeyboardToRouter = match pf_input_ipc::decode(&body).map_err(ipc_error) {
             Ok(message) => message,
             Err(error) => {
-                authority.release_trusted_connection(OverlayRole::Keyboard);
+                authority.release_trusted_connection(epoch, OverlayRole::Keyboard);
                 return Err(error);
             }
         };
         if matches!(message, KeyboardToRouter::Register { .. }) {
-            authority.release_trusted_connection(OverlayRole::Keyboard);
+            authority.release_trusted_connection(epoch, OverlayRole::Keyboard);
             return Err(invalid("duplicate keyboard register"));
         }
         // Keyboard policy transitions are consumed by the session router worker when this
@@ -702,6 +785,7 @@ pub enum RegisteredFrameError {
     ControlTruncated,
     DescriptorCount { got: usize },
     FirstNotEvdev,
+    SecondNotWayland,
     NotCloseOnExec { index: usize },
 }
 
@@ -721,6 +805,8 @@ impl std::fmt::Display for RegisteredFrameError {
                 )
             }
             Self::FirstNotEvdev => formatter.write_str("registered first descriptor is not evdev"),
+            Self::SecondNotWayland => formatter
+                .write_str("registered second descriptor is not a connected Wayland socket"),
             Self::NotCloseOnExec { index } => {
                 write!(
                     formatter,
@@ -754,6 +840,7 @@ pub fn read_registered_frame_with(
         }
     }
     validate_pad(fds[0].as_fd()).map_err(|_| RegisteredFrameError::FirstNotEvdev)?;
+    validate_wayland_client(fds[1].as_fd()).map_err(|_| RegisteredFrameError::SecondNotWayland)?;
     let mut fds = fds.into_iter();
     Ok((
         body,
@@ -762,6 +849,43 @@ pub fn read_registered_frame_with(
             wayland: fds.next().expect("count checked"),
         },
     ))
+}
+
+fn validate_wayland_client(fd: BorrowedFd<'_>) -> io::Result<()> {
+    let mut socket_type = 0_i32;
+    let mut socket_type_len = std::mem::size_of_val(&socket_type) as libc::socklen_t;
+    let rc = unsafe {
+        libc::getsockopt(
+            fd.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_TYPE,
+            std::ptr::addr_of_mut!(socket_type).cast(),
+            &mut socket_type_len,
+        )
+    };
+    if rc < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if socket_type != libc::SOCK_STREAM {
+        return Err(invalid("trusted Wayland descriptor is not a stream socket"));
+    }
+
+    let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    let mut address_len = std::mem::size_of_val(&address) as libc::socklen_t;
+    let rc = unsafe {
+        libc::getpeername(
+            fd.as_raw_fd(),
+            std::ptr::addr_of_mut!(address).cast(),
+            &mut address_len,
+        )
+    };
+    if rc < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if i32::from(address.sun_family) != libc::AF_UNIX {
+        return Err(invalid("trusted Wayland descriptor is not AF_UNIX"));
+    }
+    Ok(())
 }
 
 /// Production `registered` receiver: the first descriptor must answer an evdev identity ioctl.

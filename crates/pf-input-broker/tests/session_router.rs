@@ -102,16 +102,25 @@ fn menu_deadlines_and_two_second_hold_use_the_required_return_paths() {
     no_ack.route_button(ButtonEvent::new(GUIDE_CODE, true), Duration::ZERO);
     assert_eq!(
         no_ack.tick(Duration::from_millis(251)),
-        vec![RouteEffect::SafeReturn]
+        vec![
+            RouteEffect::DestinationChanged(Destination::Shell),
+            RouteEffect::SafeReturn,
+        ]
     );
+    assert_eq!(no_ack.destination(), Destination::Shell);
 
     let mut no_shown = SessionRouter::new(Destination::App);
     no_shown.route_button(ButtonEvent::new(GUIDE_CODE, true), Duration::ZERO);
     assert!(no_shown.menu_ack(Duration::from_millis(250)).is_empty());
     assert_eq!(
         no_shown.tick(Duration::from_millis(751)),
-        vec![RouteEffect::DismissMenu, RouteEffect::SafeReturn]
+        vec![
+            RouteEffect::DismissMenu,
+            RouteEffect::DestinationChanged(Destination::Shell),
+            RouteEffect::SafeReturn,
+        ]
     );
+    assert_eq!(no_shown.destination(), Destination::Shell);
 
     let mut silent = SessionRouter::new(Destination::App);
     silent.route_button(ButtonEvent::new(GUIDE_CODE, true), Duration::ZERO);
@@ -129,13 +138,27 @@ fn menu_deadlines_and_two_second_hold_use_the_required_return_paths() {
     held.route_button(ButtonEvent::new(GUIDE_CODE, true), Duration::ZERO);
     held.menu_ack(Duration::from_millis(1));
     held.menu_shown(Duration::from_millis(2));
+    held.route_button(ButtonEvent::new(SOUTH, true), Duration::from_millis(3));
     held.menu_ping(7, Duration::from_millis(1_100));
     held.menu_pong(7, Duration::from_millis(1_100));
     assert!(held.tick(Duration::from_millis(1_999)).is_empty());
     assert_eq!(
         held.tick(Duration::from_secs(2)),
-        vec![RouteEffect::DismissMenu, RouteEffect::SafeReturn]
+        vec![
+            RouteEffect::DismissMenu,
+            RouteEffect::Button {
+                destination: Destination::Menu,
+                code: SOUTH,
+                pressed: false,
+            },
+            RouteEffect::Sync {
+                destination: Destination::Menu,
+            },
+            RouteEffect::DestinationChanged(Destination::Shell),
+            RouteEffect::SafeReturn,
+        ]
     );
+    assert_eq!(held.destination(), Destination::Shell);
 }
 
 #[test]
