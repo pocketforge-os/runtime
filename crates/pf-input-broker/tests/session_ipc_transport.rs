@@ -5,9 +5,9 @@ use std::os::unix::net::UnixStream;
 
 use pf_input_broker::session_ipc::{
     authorize_peer, bind_endpoint, read_frame_with_fd, read_registered_frame_with,
-    serve_compositor_peer, serve_keyboard_peer, serve_menu_peer, write_frame_with_fd,
-    write_frame_with_fds, validate_role_uid_mapping, CompositorAuthority,
-    EndpointAdmissionError, EndpointPolicy, PeerFacts, RegisteredFrameError, RoleUidMappingError,
+    serve_compositor_peer, serve_keyboard_peer, serve_menu_peer, validate_role_uid_mapping,
+    write_frame_with_fd, write_frame_with_fds, CompositorAuthority, EndpointAdmissionError,
+    EndpointPolicy, PeerFacts, RegisteredFrameError, RoleUidMappingError,
 };
 use pf_input_ipc::compositor::{
     CompositorSnapshot, CompositorToRouter, FocusSnapshot, FocusedSurface, OverlaySnapshot,
@@ -85,10 +85,7 @@ fn role_uid_mapping_rejects_aliases_at_startup() {
         Ok(())
     );
     assert_eq!(
-        validate_role_uid_mapping(&[
-            (Role::Compositor, 1001),
-            (Role::Keyboard, 1001),
-        ]),
+        validate_role_uid_mapping(&[(Role::Compositor, 1001), (Role::Keyboard, 1001),]),
         Err(RoleUidMappingError::DuplicateUid {
             uid: 1001,
             first: Role::Compositor,

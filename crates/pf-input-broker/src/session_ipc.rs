@@ -419,29 +419,129 @@ pub struct PeerFacts {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct EndpointPolicy {
     pub role: Role,
-    pub session_uid: u32,
+    /// `None` means the role's service unit is not installed and every peer is refused.
+    pub expected_uid: Option<u32>,
     pub role_gid: u32,
     pub unit: &'static str,
 }
 
 impl EndpointPolicy {
     /// Resolve the contract's group name and exact service unit for `role`.
-    pub fn for_role(role: Role, session_uid: u32) -> io::Result<Self> {
+    pub fn for_role(role: Role, expected_uid: Option<u32>) -> io::Result<Self> {
         let (group, unit) = match role {
             Role::Compositor => (
                 pf_input_ipc::sockets::COMPOSITOR_GROUP,
-                "pocketforge-gamescope.service",
+                pf_input_ipc::sockets::COMPOSITOR_UNIT,
             ),
-            Role::Keyboard => (pf_input_ipc::sockets::KEYBOARD_GROUP, "pf-osk.service"),
-            Role::Menu => (pf_input_ipc::sockets::MENU_GROUP, "pf-system-menu.service"),
+            Role::Keyboard => (
+                pf_input_ipc::sockets::KEYBOARD_GROUP,
+                pf_input_ipc::sockets::KEYBOARD_UNIT,
+            ),
+            Role::Menu => (
+                pf_input_ipc::sockets::MENU_GROUP,
+                pf_input_ipc::sockets::MENU_UNIT,
+            ),
         };
         Ok(Self {
             role,
-            session_uid,
+            expected_uid,
             role_gid: group_gid(group)?,
             unit,
         })
     }
+}
+
+/// Typed reasons a trusted endpoint refuses an accepted socket.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EndpointAdmissionError {
+    Identity(String),
+    RoleUnavailable {
+        role: Role,
+    },
+    UidMismatch {
+        role: Role,
+        got: u32,
+        expected: u32,
+    },
+    GroupMismatch {
+        role: Role,
+        expected_gid: u32,
+    },
+    UnitMismatch {
+        role: Role,
+        got: String,
+        expected: &'static str,
+    },
+}
+
+impl std::fmt::Display for EndpointAdmissionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Identity(message) => {
+                write!(formatter, "could not derive peer identity: {message}")
+            }
+            Self::RoleUnavailable { role } => {
+                write!(formatter, "role {role:?} service unit is unavailable")
+            }
+            Self::UidMismatch {
+                role,
+                got,
+                expected,
+            } => write!(
+                formatter,
+                "role {role:?} peer uid {got} does not match pinned uid {expected}"
+            ),
+            Self::GroupMismatch { role, expected_gid } => write!(
+                formatter,
+                "role {role:?} peer lacks endpoint group {expected_gid}"
+            ),
+            Self::UnitMismatch {
+                role,
+                got,
+                expected,
+            } => write!(
+                formatter,
+                "role {role:?} peer unit {got:?} does not match {expected:?}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for EndpointAdmissionError {}
+
+/// Startup configuration error for the pinned trusted-role identity map.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RoleUidMappingError {
+    DuplicateUid { uid: u32, first: Role, second: Role },
+}
+
+impl std::fmt::Display for RoleUidMappingError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::DuplicateUid { uid, first, second } => write!(
+                formatter,
+                "trusted roles {first:?} and {second:?} resolve to the same uid {uid}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for RoleUidMappingError {}
+
+/// Refuse a startup configuration in which one service uid can claim two trusted roles.
+pub fn validate_role_uid_mapping(mapping: &[(Role, u32)]) -> Result<(), RoleUidMappingError> {
+    for (index, (first_role, first_uid)) in mapping.iter().enumerate() {
+        for (second_role, second_uid) in &mapping[index + 1..] {
+            if first_uid == second_uid && first_role != second_role {
+                return Err(RoleUidMappingError::DuplicateUid {
+                    uid: *first_uid,
+                    first: *first_role,
+                    second: *second_role,
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Resolve a configured session user without trusting environment-provided numeric ids.
@@ -508,36 +608,48 @@ pub fn bind_endpoint(path: &Path, policy: &EndpointPolicy) -> io::Result<UnixLis
     Ok(listener)
 }
 
-/// Apply all three independent endpoint checks. A matching uid alone is never authority because
-/// apps and trusted surfaces deliberately share the session uid.
-pub fn authorize_peer(policy: &EndpointPolicy, facts: &PeerFacts) -> io::Result<Role> {
-    if facts.uid != policy.session_uid {
-        return Err(denied(format!(
-            "role {:?} peer uid {} does not match session uid {}",
-            policy.role, facts.uid, policy.session_uid
-        )));
+/// Apply all three independent endpoint checks. An unavailable role refuses every peer.
+pub fn authorize_peer(
+    policy: &EndpointPolicy,
+    facts: &PeerFacts,
+) -> Result<Role, EndpointAdmissionError> {
+    let expected_uid = policy
+        .expected_uid
+        .ok_or(EndpointAdmissionError::RoleUnavailable { role: policy.role })?;
+    if facts.uid != expected_uid {
+        return Err(EndpointAdmissionError::UidMismatch {
+            role: policy.role,
+            got: facts.uid,
+            expected: expected_uid,
+        });
     }
     if !facts.groups.contains(&policy.role_gid) {
-        return Err(denied(format!(
-            "role {:?} peer lacks endpoint group {}",
-            policy.role, policy.role_gid
-        )));
+        return Err(EndpointAdmissionError::GroupMismatch {
+            role: policy.role,
+            expected_gid: policy.role_gid,
+        });
     }
     if facts.unit != policy.unit {
-        return Err(denied(format!(
-            "role {:?} peer unit {:?} does not match {:?}",
-            policy.role, facts.unit, policy.unit
-        )));
+        return Err(EndpointAdmissionError::UnitMismatch {
+            role: policy.role,
+            got: facts.unit.clone(),
+            expected: policy.unit,
+        });
     }
     Ok(policy.role)
 }
 
 /// Derive and authorize the identity behind an accepted Unix stream.
-pub fn authenticate_peer(stream: &UnixStream, policy: &EndpointPolicy) -> io::Result<Role> {
-    let identity = pf_peer_identity::peer_service_identity(stream)?;
+pub fn authenticate_peer(
+    stream: &UnixStream,
+    policy: &EndpointPolicy,
+) -> Result<Role, EndpointAdmissionError> {
+    let identity = pf_peer_identity::peer_service_identity(stream)
+        .map_err(|error| EndpointAdmissionError::Identity(error.to_string()))?;
     let facts = PeerFacts {
         uid: identity.cred.uid,
-        groups: pf_peer_identity::socket_peer_groups(stream)?,
+        groups: pf_peer_identity::socket_peer_groups(stream)
+            .map_err(|error| EndpointAdmissionError::Identity(error.to_string()))?,
         unit: identity.unit,
     };
     authorize_peer(policy, &facts)
@@ -701,10 +813,6 @@ fn read_frame_with_fds(
         .read_exact(&mut body)
         .map_err(FrameReceiveError::Transport)?;
     Ok((body, fds))
-}
-
-fn denied(message: String) -> io::Error {
-    io::Error::new(io::ErrorKind::PermissionDenied, message)
 }
 
 fn cleanup_bound_socket(path: &Path, cause: io::Error) -> io::Error {

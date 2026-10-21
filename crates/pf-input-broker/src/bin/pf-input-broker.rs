@@ -9,7 +9,7 @@
 //!                   [--safe-return-sock <authority.sock>]
 //!                   [--system-menu-sock <provider.sock>]
 //!                   [--compositor-sock <gamescope.sock> --keyboard-sock <osk.sock>
-//!                    --menu-sock <menu.sock> --session-user <user>]
+//!                    --menu-sock <menu.sock>]
 //!                   [--allow-unidentified-pad]
 //!   pf-input-broker --descriptor <caps.toml>
 //!                   --test-event-fd <inherited-fd> --test-record-fd <inherited-fd>
@@ -38,7 +38,7 @@ use std::sync::Arc;
 
 use pf_input_broker::session_ipc::{
     authenticate_peer, bind_endpoint, serve_compositor_peer, serve_keyboard_peer, serve_menu_peer,
-    user_uid, CompositorAuthority, EndpointPolicy,
+    user_uid, validate_role_uid_mapping, CompositorAuthority, EndpointPolicy,
 };
 use pf_input_broker::{
     is_private_stream_eof, open_read_fd, serve_client, serve_system_menu_provider, FdEventSink,
@@ -64,14 +64,12 @@ fn arg(args: &[String], flag: &str) -> Option<String> {
 
 fn validate_endpoint_options(args: &[String]) -> Result<(), &'static str> {
     let compositor = arg(args, "--compositor-sock").is_some();
-    let session_user = arg(args, "--session-user").is_some();
-    if compositor && !session_user {
-        return Err("--compositor-sock requires --session-user");
+    if arg(args, "--session-user").is_some() {
+        return Err("--session-user is forbidden for trusted roles; identities are role-pinned");
     }
-    if (arg(args, "--keyboard-sock").is_some() || arg(args, "--menu-sock").is_some())
-        && !(compositor && session_user)
+    if (arg(args, "--keyboard-sock").is_some() || arg(args, "--menu-sock").is_some()) && !compositor
     {
-        return Err("trusted role sockets require --compositor-sock and --session-user");
+        return Err("keyboard and menu sockets require --compositor-sock");
     }
     Ok(())
 }
@@ -202,7 +200,6 @@ fn run_production(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let compositor_sock = arg(args, "--compositor-sock");
     let keyboard_sock = arg(args, "--keyboard-sock");
     let menu_sock = arg(args, "--menu-sock");
-    let session_user = arg(args, "--session-user");
     if system_menu_sock.is_some() && safe_return_sock.is_none() {
         return Err("--system-menu-sock requires --safe-return-sock".into());
     }
@@ -298,19 +295,28 @@ fn run_production(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     } else {
         None
     };
-    let session_uid = session_user.as_deref().map(user_uid).transpose()?;
-    let compositor_policy = session_uid
-        .filter(|_| compositor_sock.is_some())
-        .map(|uid| EndpointPolicy::for_role(Role::Compositor, uid))
+    let compositor_policy = compositor_sock
+        .as_ref()
+        .map(|_| resolve_endpoint_policy(Role::Compositor))
         .transpose()?;
-    let keyboard_policy = session_uid
-        .filter(|_| keyboard_sock.is_some())
-        .map(|uid| EndpointPolicy::for_role(Role::Keyboard, uid))
+    let keyboard_policy = keyboard_sock
+        .as_ref()
+        .map(|_| resolve_endpoint_policy(Role::Keyboard))
         .transpose()?;
-    let menu_policy = session_uid
-        .filter(|_| menu_sock.is_some())
-        .map(|uid| EndpointPolicy::for_role(Role::Menu, uid))
+    let menu_policy = menu_sock
+        .as_ref()
+        .map(|_| resolve_endpoint_policy(Role::Menu))
         .transpose()?;
+    let role_uids: Vec<_> = [
+        compositor_policy.as_ref(),
+        keyboard_policy.as_ref(),
+        menu_policy.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    .filter_map(|policy| policy.expected_uid.map(|uid| (policy.role, uid)))
+    .collect();
+    validate_role_uid_mapping(&role_uids)?;
     let compositor_listener = match (compositor_sock.as_deref(), compositor_policy.as_ref()) {
         (Some(sock), Some(policy)) => {
             let listener = bind_endpoint(Path::new(sock), policy)?;
@@ -362,6 +368,41 @@ fn run_production(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     STOP.store(true, Ordering::Release);
     let _ = pump.join();
     result.map_err(Into::into)
+}
+
+fn resolve_endpoint_policy(role: Role) -> Result<EndpointPolicy, Box<dyn std::error::Error>> {
+    let (user, unit) = match role {
+        Role::Compositor => (
+            pf_input_ipc::sockets::COMPOSITOR_USER,
+            pf_input_ipc::sockets::COMPOSITOR_UNIT,
+        ),
+        Role::Keyboard => (
+            pf_input_ipc::sockets::KEYBOARD_USER,
+            pf_input_ipc::sockets::KEYBOARD_UNIT,
+        ),
+        Role::Menu => (
+            pf_input_ipc::sockets::MENU_USER,
+            pf_input_ipc::sockets::MENU_UNIT,
+        ),
+    };
+    let expected_uid = if role == Role::Menu && !service_unit_exists(unit) {
+        None
+    } else {
+        Some(user_uid(user)?)
+    };
+    Ok(EndpointPolicy::for_role(role, expected_uid)?)
+}
+
+fn service_unit_exists(unit: &str) -> bool {
+    [
+        "/etc/systemd/system",
+        "/run/systemd/system",
+        "/usr/local/lib/systemd/system",
+        "/usr/lib/systemd/system",
+        "/lib/systemd/system",
+    ]
+    .iter()
+    .any(|root| Path::new(root).join(unit).is_file())
 }
 
 fn supervise(

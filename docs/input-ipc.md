@@ -52,11 +52,13 @@ as an evdev file descriptor handed over `SCM_RIGHTS`, exactly like the app's `Ac
 
 ### Sockets, ownership, admission
 
-Apps run as the same uid as the system processes, so a path alone separates nothing. Every
-endpoint is gated twice: the directory and socket modes keep apps from connecting, and the
-router re-checks the peer on accept with `SO_PEERCRED` (uid must be the session uid) and
-`SO_PEERGROUPS` (must contain the endpoint's group), the mechanism `pf-prefsd --writer-group`
-uses. Apps never carry any of these groups. The image creates the directory and groups.
+Apps retain the session-uid rule on their unprivileged SDK endpoint. Each privileged endpoint is
+instead pinned to its isolated service identity: the router re-checks `SO_PEERCRED` against the
+role's service uid, `SO_PEERGROUPS` against the role group, and the peer's exact systemd unit.
+All three must match. A uid that resolves for two roles is a startup configuration error; there is
+no fallback to the app/session user. Until `pf-system-menu.service` and its `pf-menu` account are
+installed, the Menu policy is unavailable and refuses every registration. The image creates the
+directory and groups.
 
 | Path | Mode / owner | Who connects | Constant |
 |---|---|---|---|
@@ -64,6 +66,10 @@ uses. Apps never carry any of these groups. The image creates the directory and 
 | `/run/pocketforge/input/compositor.sock` | `0660 root:pf-input-compositor` | gamescope | `sockets::COMPOSITOR_SOCKET` |
 | `/run/pocketforge/input/keyboard.sock` | `0660 root:pf-input-keyboard` | pf-osk | `sockets::KEYBOARD_SOCKET` |
 | `/run/pocketforge/input/menu.sock` | `0660 root:pf-input-menu` | system menu | `sockets::MENU_SOCKET` |
+
+The pinned role map is: Compositor → `pf-gamescope`, `pf-input-compositor`,
+`pocketforge-gamescope.service`; Keyboard → `pf-ime`, `pf-input-keyboard`, `pf-osk.service`;
+Menu → `pf-menu`, `pf-input-menu`, `pf-system-menu.service`.
 
 `menu.sock` is the endpoint `pf-input-broker --system-menu-sock` already serves (runtime#108);
 this page fixes its path and extends its protocol within the same major.

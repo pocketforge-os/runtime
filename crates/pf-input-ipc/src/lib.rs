@@ -36,8 +36,8 @@ pub const MAX_FRAME: usize = 64 * 1024;
 // ---------------------------------------------------------------------------
 
 /// Socket paths, ownership and modes. Created by the router; `INPUT_RUN_DIR` itself comes from
-/// the image's tmpfiles entry. Apps share the session uid, so admission on every endpoint is
-/// `SO_PEERCRED` uid == session uid **and** `SO_PEERGROUPS` contains the endpoint's group.
+/// the image's tmpfiles entry. Each trusted endpoint pins its service user, role group and exact
+/// systemd unit; ordinary app clients retain the separate session-uid rule.
 pub mod sockets {
     /// Parent of every input-layer endpoint.
     pub const INPUT_RUN_DIR: &str = "/run/pocketforge/input";
@@ -51,16 +51,22 @@ pub mod sockets {
 
     /// gamescope connects here (role `compositor`).
     pub const COMPOSITOR_SOCKET: &str = "/run/pocketforge/input/compositor.sock";
+    pub const COMPOSITOR_USER: &str = "pf-gamescope";
     pub const COMPOSITOR_GROUP: &str = "pf-input-compositor";
+    pub const COMPOSITOR_UNIT: &str = "pocketforge-gamescope.service";
 
     /// pf-osk connects here (role `keyboard`); it receives its private pad fd on `registered`.
     pub const KEYBOARD_SOCKET: &str = "/run/pocketforge/input/keyboard.sock";
+    pub const KEYBOARD_USER: &str = "pf-ime";
     pub const KEYBOARD_GROUP: &str = "pf-input-keyboard";
+    pub const KEYBOARD_UNIT: &str = "pf-osk.service";
 
     /// The system menu connects here (role `menu`); it receives its private pad fd on
     /// `registered`. This is the endpoint `pf-input-broker --system-menu-sock` already serves.
     pub const MENU_SOCKET: &str = "/run/pocketforge/input/menu.sock";
+    pub const MENU_USER: &str = "pf-menu";
     pub const MENU_GROUP: &str = "pf-input-menu";
+    pub const MENU_UNIT: &str = "pf-system-menu.service";
 
     /// Reconnect policy for every client after EOF: first retry after this delay…
     pub const RECONNECT_INITIAL: std::time::Duration = std::time::Duration::from_millis(100);
