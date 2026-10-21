@@ -271,7 +271,10 @@ fn pref_to_json(v: PrefValue) -> Value {
 }
 
 /// A JSON value → a concrete value for a known key, enforcing the key's type.
-fn json_to_pref(key: &str, kind: PrefKind, raw: &Value) -> Result<PrefValue, PrefError> {
+/// The one JSON-to-preference rule shared by the seed/store loaders and the daemon's `Set` path:
+/// scalars accept integral JSON numbers (`60` and `60.0`, as Draft-07 `type: integer` does) and
+/// reject fractional, non-finite and out-of-range ones.
+pub fn json_to_pref(key: &str, kind: PrefKind, raw: &Value) -> Result<PrefValue, PrefError> {
     match kind {
         PrefKind::Bool => match raw {
             Value::Bool(b) => Ok(PrefValue::Bool(*b)),

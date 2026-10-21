@@ -6,7 +6,7 @@ use pf_peer_identity::{
 // Peer identity is the shared `pf-peer-identity` crate (one implementation for every service
 // that identifies apps); these re-exports keep the daemon's public surface stable.
 pub use pf_peer_identity::{peer_cred, verify_peer_uid, PeerCred};
-use pf_prefs::{PrefKind, PrefValue, PrefsStore, SCHEMA};
+use pf_prefs::{PrefValue, PrefsStore, SCHEMA};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -583,31 +583,8 @@ fn classify_pref_error(error: &pf_prefs::PrefError) -> ErrorKind {
 fn json_to_value(key: &str, value: Value) -> Result<PrefValue, pf_prefs::PrefError> {
     let spec =
         pf_prefs::spec(key).ok_or_else(|| pf_prefs::PrefError::UnknownKey(key.to_owned()))?;
-    let candidate = match spec.kind {
-        PrefKind::Bool => value.as_bool().map(PrefValue::Bool),
-        PrefKind::Scalar { .. } => value.as_i64().map(PrefValue::Scalar),
-        PrefKind::Enum { variants } => value
-            .as_str()
-            .and_then(|raw| variants.iter().copied().find(|variant| *variant == raw))
-            .map(PrefValue::Enum),
-    }
-    .ok_or_else(|| pf_prefs::PrefError::Type {
-        key: key.to_owned(),
-        expected: pf_prefs::schema::kind_name(spec.kind),
-        got: json_kind(&value),
-    })?;
+    let candidate = pf_prefs::json_to_pref(key, spec.kind, &value)?;
     pf_prefs::validate(key, candidate)
-}
-
-fn json_kind(value: &Value) -> &'static str {
-    match value {
-        Value::Bool(_) => "bool",
-        Value::Number(_) => "number",
-        Value::String(_) => "string",
-        Value::Null => "null",
-        Value::Array(_) => "array",
-        Value::Object(_) => "object",
-    }
 }
 
 fn value_to_json(value: PrefValue) -> Value {
@@ -947,6 +924,31 @@ mod tests {
             assert!(write_allowed(PreferenceWriter::Shell, spec.key));
         }
         assert!(!write_allowed(PreferenceWriter::Settings, "futureKey"));
+    }
+
+    #[test]
+    fn set_path_and_seed_loader_agree_on_integral_floats_for_every_scalar_key() {
+        for key in ["brightness", "volumeSpeaker", "volumeHeadphones"] {
+            // Positive control: Draft-07 `type: integer` admits 60.0, as the seed loader does.
+            assert_eq!(
+                json_to_value(key, serde_json::json!(60.0)).unwrap(),
+                pf_prefs::PrefValue::Scalar(60),
+                "{key}"
+            );
+            assert_eq!(
+                json_to_value(key, serde_json::json!(60)).unwrap(),
+                pf_prefs::PrefValue::Scalar(60),
+                "{key}"
+            );
+            // Negative controls: a fractional value, a string, and an out-of-i64-range float.
+            for bad in [
+                serde_json::json!(60.5),
+                serde_json::json!("60"),
+                serde_json::json!(1e300),
+            ] {
+                assert!(json_to_value(key, bad.clone()).is_err(), "{key} {bad}");
+            }
+        }
     }
 
     #[test]
