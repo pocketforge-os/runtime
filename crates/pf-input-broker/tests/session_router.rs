@@ -59,7 +59,8 @@ fn menu_wins_under_fuzzed_report_orders() {
                     true,
                 ));
             }
-            report[(state as usize) % report.len()] = ButtonEvent::new(GUIDE_CODE, true);
+            let menu_position = (state as usize) % report.len();
+            report[menu_position] = ButtonEvent::new(GUIDE_CODE, true);
             let effects =
                 SessionRouter::new(destination).route_report(report, Duration::from_micros(case));
             assert_eq!(effects.first(), Some(&RouteEffect::MenuPress));

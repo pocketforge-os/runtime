@@ -114,6 +114,30 @@ impl SessionRouter {
         }]
     }
 
+    /// Route a complete input report, resolving every Menu transition before ordinary buttons.
+    ///
+    /// The physical reader buffers one report through `SYN_REPORT`; this ordering prevents a
+    /// button which appears earlier in the kernel event stream from escaping to the old
+    /// destination when the same report also contains Menu.
+    pub fn route_report<I>(&mut self, report: I, now: Duration) -> Vec<RouteEffect>
+    where
+        I: IntoIterator<Item = ButtonEvent>,
+    {
+        let report: Vec<_> = report.into_iter().collect();
+        let mut effects = Vec::new();
+        for event in report
+            .iter()
+            .copied()
+            .filter(|event| event.code == GUIDE_CODE)
+        {
+            effects.extend(self.route_button(event, now));
+        }
+        for event in report.into_iter().filter(|event| event.code != GUIDE_CODE) {
+            effects.extend(self.route_button(event, now));
+        }
+        effects
+    }
+
     /// Apply an authoritative post-drop button snapshot.  Menu is always reconciled first.
     pub fn resynchronize<I>(&mut self, snapshot: I, now: Duration) -> Vec<RouteEffect>
     where
