@@ -385,6 +385,7 @@ impl Remap {
             product,
             version,
             keys,
+            rel: Vec::new(),
             abs,
         };
         Ok(Remap {

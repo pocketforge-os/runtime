@@ -31,6 +31,8 @@ pub struct UinputSpec {
     pub version: u16,
     /// Key/button codes to advertise (already remapped to the canonical layout).
     pub keys: Vec<u16>,
+    /// Relative axes to advertise (mouse motion and high-resolution wheels).
+    pub rel: Vec<u16>,
     /// Absolute axes to advertise, with calibration.
     pub abs: Vec<(u16, AbsInfo)>,
 }
@@ -55,6 +57,12 @@ impl Uinput {
             dev.set_bit(ioc::UI_SET_EVBIT, ioc::EV_KEY as libc::c_int)?;
             for &k in &spec.keys {
                 dev.set_bit(ioc::UI_SET_KEYBIT, k as libc::c_int)?;
+            }
+        }
+        if !spec.rel.is_empty() {
+            dev.set_bit(ioc::UI_SET_EVBIT, ioc::EV_REL as libc::c_int)?;
+            for &axis in &spec.rel {
+                dev.set_bit(ioc::UI_SET_RELBIT, axis as libc::c_int)?;
             }
         }
         if !spec.abs.is_empty() {
@@ -184,6 +192,20 @@ impl Uinput {
     /// Commit the current report (`EV_SYN`/`SYN_REPORT`).
     pub fn syn(&self) -> io::Result<()> {
         self.emit(ioc::EV_SYN, ioc::SYN_REPORT, 0)
+    }
+}
+
+/// Device declaration for the router's private pointer destination.
+pub fn pointer_uinput_spec() -> UinputSpec {
+    UinputSpec {
+        name: "PocketForge Pointer".to_owned(),
+        bus: 0x06, // BUS_VIRTUAL
+        vendor: 0x5046,
+        product: 0x0002,
+        version: 1,
+        keys: vec![0x110, 0x111],          // BTN_LEFT, BTN_RIGHT
+        rel: vec![0x00, 0x01, 0x0b, 0x0c], // X, Y, horizontal/vertical hi-res wheel
+        abs: Vec::new(),
     }
 }
 
