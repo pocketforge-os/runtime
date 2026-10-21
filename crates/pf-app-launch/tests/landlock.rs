@@ -1,4 +1,6 @@
-use pf_app_launch::landlock::{apply_landlock, EffectiveRuleset, LandlockKernel, SystemLandlock};
+use pf_app_launch::landlock::{
+    apply_landlock, open_rule_path, EffectiveRuleset, LandlockKernel, SystemLandlock,
+};
 use pf_app_launch::policy::{
     derive_policy, AppClass, DowngradeMode, FsAccess, FsRule, NetAccess, NetRule, PolicyInputs,
 };
@@ -215,6 +217,109 @@ fn fix7_regular_session_environment_rule_applies() {
         fs::read(environment).unwrap(),
         b"WAYLAND_DISPLAY=wayland-0\n"
     );
+}
+
+/// `O_PATH` bit of the open file description, read from `/proc/self/fdinfo` (octal `flags:`).
+fn fd_has_o_path(file: &fs::File) -> bool {
+    use std::os::fd::AsRawFd;
+    let info = fs::read_to_string(format!("/proc/self/fdinfo/{}", file.as_raw_fd())).unwrap();
+    let flags = info
+        .lines()
+        .find_map(|line| line.strip_prefix("flags:"))
+        .expect("fdinfo flags line")
+        .trim();
+    let flags = u32::from_str_radix(flags, 8).unwrap();
+    flags & (libc::O_PATH as u32) != 0
+}
+
+#[test]
+fn rule_path_open_carries_o_path_and_accepts_a_socket() {
+    // Needs no Landlock: the defect is the open. A plain read-only open of a Unix socket is
+    // ENXIO, and on the aarch64 musl production build the rule path was opened without
+    // O_PATH, which aborted the Steam Link launch with policy_apply_failed (tsp-z8vav.9.3).
+    let root = scratch("o-path-socket");
+    fs::create_dir_all(&root).unwrap();
+    let socket = root.join("wayland-0");
+    let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+
+    let plain = fs::OpenOptions::new().read(true).open(&socket).unwrap_err();
+    assert_eq!(
+        plain.raw_os_error(),
+        Some(libc::ENXIO),
+        "negative control: plain open"
+    );
+
+    let handle = open_rule_path(&socket).expect("O_PATH open of a Unix socket");
+    assert!(
+        fd_has_o_path(&handle),
+        "rule path was opened without O_PATH"
+    );
+    assert!(!handle.metadata().unwrap().is_dir());
+    let directory = open_rule_path(&root).expect("O_PATH open of a directory");
+    assert!(fd_has_o_path(&directory));
+    assert!(directory.metadata().unwrap().is_dir());
+
+    drop(handle);
+    drop(directory);
+    drop(listener);
+    fs::remove_file(&socket).unwrap();
+    fs::remove_dir(&root).unwrap();
+}
+
+#[test]
+fn unix_socket_rule_path_applies_on_every_libc() {
+    // The Wayland socket is a rule path. A plain O_RDONLY open of a Unix socket fails with
+    // ENXIO, so the rule path must be opened with O_PATH. On musl, Rust's std masks custom
+    // flags with !O_ACCMODE and musl's O_ACCMODE includes O_PATH, so
+    // OpenOptions::custom_flags(O_PATH) silently opened the socket without O_PATH and the
+    // launcher aborted with policy_apply_failed (tsp-z8vav.9.3).
+    const INNER: &str = "PF_LANDLOCK_SOCKET_INNER";
+    if std::env::var_os(INNER).is_none() {
+        let root = scratch("socket-rule");
+        fs::create_dir_all(&root).unwrap();
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "unix_socket_rule_path_applies_on_every_libc",
+                "--nocapture",
+            ])
+            .env(INNER, &root)
+            .output()
+            .unwrap();
+        eprint!("{}", String::from_utf8_lossy(&output.stderr));
+        assert!(
+            output.status.success(),
+            "child stdout:\n{}\nchild stderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let _ = fs::remove_file(root.join("wayland-0"));
+        fs::remove_dir(root).unwrap();
+        return;
+    }
+
+    let root = PathBuf::from(std::env::var_os(INNER).unwrap());
+    let socket = root.join("wayland-0");
+    let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    // Negative control: the failure being guarded is a plain open of a socket.
+    let plain = fs::OpenOptions::new().read(true).open(&socket).unwrap_err();
+    assert_eq!(
+        plain.raw_os_error(),
+        Some(libc::ENXIO),
+        "plain open of a socket"
+    );
+
+    let mut policy = policy(&root, false);
+    policy.landlock.filesystem = vec![FsRule {
+        path: socket.clone(),
+        access: FsAccess::UnixConnect,
+    }];
+    policy.landlock.handles_network = false;
+    policy.landlock.network.clear();
+    let mut kernel = SystemLandlock;
+    let abi = kernel.abi().expect("query Landlock ABI");
+    assert!(abi >= 4, "runner Landlock ABI {abi} is below CI floor 4");
+    apply_landlock(&policy, &mut kernel).expect("apply a Unix-socket rule path");
 }
 
 #[derive(Default)]

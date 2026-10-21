@@ -211,11 +211,7 @@ impl LandlockKernel for SystemLandlock {
         let ruleset_file = unsafe { File::from_raw_fd(fd as i32) };
 
         for rule in &ruleset.filesystem {
-            let path = match OpenOptions::new()
-                .read(true)
-                .custom_flags(libc::O_PATH | libc::O_CLOEXEC)
-                .open(&rule.path)
-            {
+            let path = match open_rule_path(&rule.path) {
                 Ok(path) => path,
                 // An absent hierarchy cannot be accessed and remains denied if later created.
                 Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
@@ -293,6 +289,15 @@ const fn ruleset_attr_size(abi: u32) -> usize {
     } else {
         size_of::<u64>()
     }
+}
+
+/// Open a Landlock rule path as an `O_PATH` handle. `O_PATH` is what lets a rule name a Unix
+/// socket or device node without opening it (a plain read-only `open` of a socket is `ENXIO`).
+pub fn open_rule_path(path: &std::path::Path) -> io::Result<File> {
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_PATH | libc::O_CLOEXEC)
+        .open(path)
 }
 
 pub fn apply_landlock<K: LandlockKernel>(
