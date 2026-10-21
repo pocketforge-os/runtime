@@ -8,6 +8,7 @@
 //!   pf-input-broker --descriptor <caps.toml> [--source <event-node>] [--acquire-sock <path>]
 //!                   [--safe-return-sock <authority.sock>]
 //!                   [--system-menu-sock <provider.sock>]
+//!                   [--volume-keys [--volume-toast-sock <osd.sock>]]
 //!                   [--allow-unidentified-pad]
 //!   pf-input-broker --descriptor <caps.toml>
 //!                   --test-event-fd <inherited-fd> --test-record-fd <inherited-fd>
@@ -106,6 +107,8 @@ fn test_io_mode(args: &[String]) -> Result<Option<TestIo>, Box<dyn std::error::E
         "--safe-return-sock",
         "--system-menu-sock",
         "--allow-unidentified-pad",
+        "--volume-keys",
+        "--volume-toast-sock",
     ] {
         if args.iter().any(|arg| arg == flag) {
             return Err(format!("{flag} is unavailable with private test fds").into());
@@ -155,6 +158,9 @@ fn run_private(args: &[String], test_io: TestIo) -> Result<(), Box<dyn std::erro
     let mut source = FdEventSource::from_owned_fd(take_inherited_fd(test_io.event_fd)?);
     let mut sink = FdEventSink::from_owned_fd(take_inherited_fd(test_io.record_fd)?);
     install_signal_handlers();
+    if args.iter().any(|a| a == "--volume-keys") {
+        spawn_volume_keys(arg(args, "--volume-toast-sock"));
+    }
     println!("ready");
     use std::io::Write;
     std::io::stdout().flush()?;
@@ -164,6 +170,58 @@ fn run_private(args: &[String], test_io: TestIo) -> Result<(), Box<dyn std::erro
         Err(error) if is_private_stream_eof(&error) => Ok(()),
         result => result.map_err(Into::into),
     }
+}
+
+/// Volume keys are system keys: handled here, never routed to apps (tsp-ihne1.63). The thread
+/// owns its own non-grabbing fd on the LRADC key node and writes through pf-prefsd as this unit.
+fn spawn_volume_keys(toast_sock: Option<String>) {
+    use pf_volume_keys::host::{discover_keys, run, EvdevKeys, LazyJack, SocketSink, ToastSink};
+    use pf_volume_keys::{PrefsdStore, VolumeKeys};
+    struct Null;
+    impl ToastSink for Null {
+        fn show(&mut self, _: &pf_volume_keys::ToastModel) {}
+    }
+    std::thread::spawn(move || {
+        let sock = std::env::var("PF_PREFSD_SOCK")
+            .unwrap_or_else(|_| "/run/pocketforge/prefsd.sock".into());
+        let started = std::time::Instant::now();
+        while !STOP.load(Ordering::Relaxed) {
+            let source = discover_keys("/sys/class/input".as_ref(), "/dev/input".as_ref())
+                .and_then(|n| EvdevKeys::open(&n));
+            let mut source = match source {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("pf-input-broker: volume keys unavailable, retrying: {e}");
+                    std::thread::sleep(std::time::Duration::from_secs(2));
+                    continue;
+                }
+            };
+            let mut volume = VolumeKeys::new(
+                PrefsdStore(pf_prefsd::Client::new(&sock)),
+                LazyJack::new("/sys/class/input", "/dev/input"),
+            );
+            let result = match toast_sock.as_deref().map(SocketSink::new) {
+                Some(Ok(mut sink)) => run(
+                    &mut volume,
+                    &mut source,
+                    &mut sink,
+                    || started.elapsed(),
+                    &STOP,
+                ),
+                _ => run(
+                    &mut volume,
+                    &mut source,
+                    &mut Null,
+                    || started.elapsed(),
+                    &STOP,
+                ),
+            };
+            if let Err(e) = result {
+                eprintln!("pf-input-broker: volume keys stopped, retrying: {e}");
+                std::thread::sleep(std::time::Duration::from_secs(1));
+            }
+        }
+    });
 }
 
 fn run_production(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {

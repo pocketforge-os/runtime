@@ -1,0 +1,17 @@
+[package]
+name = "pf-volume-keys"
+description = "Volume-key state machine and system volume toast (OSD) renderer core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+pf-prefsd.workspace = true
+pf-render.workspace = true
+pf-scene.workspace = true
+pf-volumed.workspace = true
+serde_json.workspace = true
+libc.workspace = true
