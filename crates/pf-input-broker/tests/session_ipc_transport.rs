@@ -1,5 +1,5 @@
 use std::io::{Read, Write};
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 
@@ -166,9 +166,123 @@ fn superseded_compositor_disconnect_cannot_clear_the_new_epoch() {
     assert!(authority.secure_entry());
 }
 
+#[test]
+fn trusted_fd_is_never_delivered_across_an_epoch_or_before_snapshot() {
+    let authority = std::sync::Arc::new(CompositorAuthority::default());
+    let (mut old_client, old_server) = UnixStream::pair().unwrap();
+    let old_authority = authority.clone();
+    let old_thread = std::thread::spawn(move || serve_compositor_peer(old_server, &old_authority));
+    send(&mut old_client, &CompositorToRouter::Register);
+    let (old_body, _) = read_frame_with_fd(&mut old_client).unwrap();
+    let RouterToCompositor::Registered { epoch: old_epoch } =
+        pf_input_ipc::decode(&old_body).unwrap()
+    else {
+        panic!("old compositor was not registered");
+    };
+    send(
+        &mut old_client,
+        &CompositorToRouter::StateSnapshot {
+            snapshot: snapshot(old_epoch),
+        },
+    );
+    wait_for_snapshot(&authority, old_epoch);
+
+    let stale = authority
+        .request_trusted_connection(OverlayRole::Menu)
+        .unwrap();
+    let (request_body, request_fd) = read_frame_with_fd(&mut old_client).unwrap();
+    assert!(request_fd.is_none());
+    let RouterToCompositor::TrustedConnection {
+        request_id: stale_id,
+        ..
+    } = pf_input_ipc::decode(&request_body).unwrap()
+    else {
+        panic!("trusted connection was not requested");
+    };
+
+    let (mut new_client, new_server) = UnixStream::pair().unwrap();
+    let new_authority = authority.clone();
+    let new_thread = std::thread::spawn(move || serve_compositor_peer(new_server, &new_authority));
+    send(&mut new_client, &CompositorToRouter::Register);
+    let (new_body, _) = read_frame_with_fd(&mut new_client).unwrap();
+    let RouterToCompositor::Registered { epoch: new_epoch } =
+        pf_input_ipc::decode(&new_body).unwrap()
+    else {
+        panic!("new compositor was not registered");
+    };
+
+    assert!(
+        authority
+            .request_trusted_connection(OverlayRole::Menu)
+            .is_err(),
+        "no trusted fd may be requested before snapshot replay"
+    );
+    send_with_fd(
+        &mut old_client,
+        &CompositorToRouter::TrustedConnectionResult {
+            epoch: old_epoch,
+            request_id: stale_id,
+            result: pf_input_ipc::compositor::TrustedConnectionOutcome::Ok,
+        },
+    );
+    assert!(
+        stale
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .is_err(),
+        "re-registration invalidates the old epoch's pending delivery"
+    );
+
+    send(
+        &mut new_client,
+        &CompositorToRouter::StateSnapshot {
+            snapshot: snapshot(new_epoch),
+        },
+    );
+    wait_for_snapshot(&authority, new_epoch);
+    let fresh = authority
+        .request_trusted_connection(OverlayRole::Menu)
+        .unwrap();
+    let (request_body, request_fd) = read_frame_with_fd(&mut new_client).unwrap();
+    assert!(request_fd.is_none());
+    let RouterToCompositor::TrustedConnection {
+        request_id: fresh_id,
+        ..
+    } = pf_input_ipc::decode(&request_body).unwrap()
+    else {
+        panic!("fresh trusted connection was not requested");
+    };
+    send_with_fd(
+        &mut new_client,
+        &CompositorToRouter::TrustedConnectionResult {
+            epoch: new_epoch,
+            request_id: fresh_id,
+            result: pf_input_ipc::compositor::TrustedConnectionOutcome::Ok,
+        },
+    );
+    let received: OwnedFd = fresh
+        .recv_timeout(std::time::Duration::from_secs(1))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        unsafe { libc::fcntl(received.as_raw_fd(), libc::F_GETFD) } >= 0,
+        true
+    );
+
+    drop(old_client);
+    drop(new_client);
+    assert!(old_thread.join().unwrap().is_err());
+    new_thread.join().unwrap().unwrap();
+}
+
 fn send(stream: &mut UnixStream, message: &CompositorToRouter) {
     let body = pf_input_ipc::encode(message);
     pf_wire::write_frame(stream, &body).unwrap();
+}
+
+fn send_with_fd(stream: &mut UnixStream, message: &CompositorToRouter) {
+    let body = pf_input_ipc::encode(message);
+    let source = std::fs::File::open("/dev/null").unwrap();
+    write_frame_with_fd(stream, &body, source.as_raw_fd()).unwrap();
 }
 
 fn wait_for_snapshot(authority: &CompositorAuthority, epoch: u64) {
