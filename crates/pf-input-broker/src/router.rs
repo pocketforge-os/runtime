@@ -412,3 +412,232 @@ fn valid_app_label(label: &str) -> bool {
         .unwrap_or_default();
     !matches!(first_word, "close" | "return" | "home" | "power")
 }
+
+/// Kernel-authenticated identity forwarded by the unprivileged SDK front.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerIdentity {
+    pub uid: u32,
+    pub unit: String,
+}
+
+impl PeerIdentity {
+    pub fn new(uid: u32, unit: impl Into<String>) -> Self {
+        Self {
+            uid,
+            unit: unit.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SdkCall {
+    ShowKeyboard,
+    ClaimPointer,
+    UpdateMenu,
+    Open,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SdkCallError {
+    WrongUid,
+    NotFront,
+    UnitMismatch,
+    TooLarge,
+    RateLimited,
+}
+
+/// Admission state for calls crossing from the unprivileged SDK front to the core.
+#[derive(Debug)]
+pub struct SdkCallGate {
+    session_uid: u32,
+    front: Option<(String, String)>,
+    calls: HashMap<String, VecDeque<Duration>>,
+}
+
+impl SdkCallGate {
+    /// PFW1's contract-wide frame ceiling. Individual calls may impose a smaller limit.
+    pub const MAX_BODY_BYTES: usize = pf_input_ipc::MAX_FRAME;
+    /// Per-app aggregate ceiling across all SDK operations.
+    pub const CALLS_PER_SECOND: usize = 100;
+
+    pub fn new(session_uid: u32) -> Self {
+        Self {
+            session_uid,
+            front: None,
+            calls: HashMap::new(),
+        }
+    }
+
+    pub fn set_front(&mut self, app_id: impl Into<String>, unit: impl Into<String>) {
+        self.front = Some((app_id.into(), unit.into()));
+    }
+
+    pub fn clear_front(&mut self) {
+        self.front = None;
+    }
+
+    pub fn authorize(
+        &mut self,
+        app_id: &str,
+        peer: &PeerIdentity,
+        _call: SdkCall,
+        body_bytes: usize,
+        now: Duration,
+    ) -> Result<(), SdkCallError> {
+        if peer.uid != self.session_uid {
+            return Err(SdkCallError::WrongUid);
+        }
+        let Some((front_app, front_unit)) = self.front.as_ref() else {
+            return Err(SdkCallError::NotFront);
+        };
+        if front_app != app_id {
+            return Err(SdkCallError::NotFront);
+        }
+        if front_unit != &peer.unit {
+            return Err(SdkCallError::UnitMismatch);
+        }
+        if body_bytes > Self::MAX_BODY_BYTES {
+            return Err(SdkCallError::TooLarge);
+        }
+
+        let window = self.calls.entry(app_id.to_owned()).or_default();
+        while window
+            .front()
+            .is_some_and(|at| now.saturating_sub(*at) >= Duration::from_secs(1))
+        {
+            window.pop_front();
+        }
+        if window.len() >= Self::CALLS_PER_SECOND {
+            return Err(SdkCallError::RateLimited);
+        }
+        window.push_back(now);
+        Ok(())
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct UserPressGate {
+    pending: HashMap<String, Duration>,
+}
+
+impl UserPressGate {
+    pub fn record(&mut self, app_id: impl Into<String>, routed_at: Duration) {
+        self.pending.insert(app_id.into(), routed_at);
+    }
+
+    /// One matching press admits one open at or before the contract's one-second boundary.
+    pub fn consume(&mut self, app_id: &str, now: Duration) -> bool {
+        let Some(routed_at) = self.pending.get(app_id).copied() else {
+            return false;
+        };
+        if now < routed_at || now.saturating_sub(routed_at) > timeouts::USER_PRESS_WINDOW {
+            self.pending.remove(app_id);
+            return false;
+        }
+        self.pending.remove(app_id);
+        true
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EpochEffect {
+    Registered { epoch: u64 },
+    SnapshotApplied { epoch: u64 },
+    FdDelivered { epoch: u64 },
+}
+
+/// Orders fd delivery after the current registration epoch's authoritative snapshot.
+#[derive(Debug, Default)]
+pub struct EpochFdGate {
+    epoch: Option<u64>,
+    fd_delivered: bool,
+}
+
+impl EpochFdGate {
+    pub fn register(&mut self, epoch: u64) -> Vec<EpochEffect> {
+        self.epoch = Some(epoch);
+        self.fd_delivered = false;
+        vec![EpochEffect::Registered { epoch }]
+    }
+
+    pub fn snapshot_applied(&mut self, epoch: u64) -> Vec<EpochEffect> {
+        if self.epoch != Some(epoch) || self.fd_delivered {
+            return Vec::new();
+        }
+        self.fd_delivered = true;
+        vec![
+            EpochEffect::SnapshotApplied { epoch },
+            EpochEffect::FdDelivered { epoch },
+        ]
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AppProbeEffect {
+    Ping { app_id: String, sequence: u64 },
+    DimSection { app_id: String, dimmed: bool },
+}
+
+#[derive(Debug)]
+struct ActiveAppProbe {
+    app_id: String,
+    sequence: u64,
+    sent_at: Duration,
+    dimmed: bool,
+}
+
+#[derive(Debug, Default)]
+pub struct AppSectionProbe {
+    next_sequence: u64,
+    active: Option<ActiveAppProbe>,
+}
+
+impl AppSectionProbe {
+    pub const TIMEOUT: Duration = Duration::from_secs(2);
+
+    pub fn menu_opened(&mut self, app_id: impl Into<String>, now: Duration) -> Vec<AppProbeEffect> {
+        self.next_sequence = self.next_sequence.wrapping_add(1).max(1);
+        let app_id = app_id.into();
+        self.active = Some(ActiveAppProbe {
+            app_id: app_id.clone(),
+            sequence: self.next_sequence,
+            sent_at: now,
+            dimmed: false,
+        });
+        vec![AppProbeEffect::Ping {
+            app_id,
+            sequence: self.next_sequence,
+        }]
+    }
+
+    pub fn tick(&mut self, now: Duration) -> Vec<AppProbeEffect> {
+        let Some(active) = self.active.as_mut() else {
+            return Vec::new();
+        };
+        if !active.dimmed && now.saturating_sub(active.sent_at) >= Self::TIMEOUT {
+            active.dimmed = true;
+            return vec![AppProbeEffect::DimSection {
+                app_id: active.app_id.clone(),
+                dimmed: true,
+            }];
+        }
+        Vec::new()
+    }
+
+    pub fn pong(&mut self, app_id: &str, sequence: u64) -> Vec<AppProbeEffect> {
+        let Some(active) = self.active.as_mut() else {
+            return Vec::new();
+        };
+        if active.app_id != app_id || active.sequence != sequence {
+            return Vec::new();
+        }
+        if active.dimmed {
+            active.dimmed = false;
+            return vec![AppProbeEffect::DimSection {
+                app_id: active.app_id.clone(),
+                dimmed: false,
+            }];
+        }
+        Vec::new()
+    }
+}
