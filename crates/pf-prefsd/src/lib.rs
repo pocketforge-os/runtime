@@ -167,7 +167,8 @@ fn unexpected_response(response: RpcResponse) -> ClientError {
 pub enum PreferenceWriter {
     Settings,
     Shell,
-    /// The input broker's volume-key handler; scoped to [`BROKER_KEYS`] only.
+    /// The hardware volume-key handler (`pf-volume-keys.service`, or the input broker); scoped to
+    /// [`BROKER_KEYS`] only.
     InputBroker,
 }
 
@@ -268,7 +269,7 @@ fn writer_from_unit(unit: &str) -> Option<PreferenceWriter> {
     match unit {
         "pf-settings.service" => Some(PreferenceWriter::Settings),
         "pf-shell-selected.service" => Some(PreferenceWriter::Shell),
-        "pf-input-broker.service" => Some(PreferenceWriter::InputBroker),
+        "pf-input-broker.service" | "pf-volume-keys.service" => Some(PreferenceWriter::InputBroker),
         unit if unit
             .strip_prefix("pf-foreground@")
             .and_then(|instance| instance.strip_suffix(".service"))
@@ -964,10 +965,13 @@ mod tests {
         }
         assert!(!write_allowed(PreferenceWriter::InputBroker, "brightness"));
         assert!(!write_allowed(PreferenceWriter::InputBroker, "futureKey"));
-        assert_eq!(
-            writer_from_cgroup("0::/system.slice/pf-input-broker.service\n"),
-            Some(PreferenceWriter::InputBroker)
-        );
+        for unit in ["pf-input-broker.service", "pf-volume-keys.service"] {
+            assert_eq!(
+                writer_from_cgroup(&format!("0::/system.slice/{unit}\n")),
+                Some(PreferenceWriter::InputBroker),
+                "{unit}"
+            );
+        }
     }
 
     #[test]

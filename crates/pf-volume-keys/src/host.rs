@@ -282,3 +282,63 @@ impl RouteSource for LazyJack {
         result
     }
 }
+
+/// The service main loop: (re)discover the key node, run the handler, retry on failure, until
+/// `stop`. Discovery errors are retried so a late node does not need a service restart.
+pub fn serve(prefs_sock: &Path, toast_sock: Option<&Path>, stop: &AtomicBool) {
+    use crate::{PrefsdStore, VolumeKeys};
+    struct Null;
+    impl ToastSink for Null {
+        fn show(&mut self, _: &ToastModel) {}
+    }
+    let started = std::time::Instant::now();
+    let mut last = String::new();
+    while !stop.load(Ordering::Relaxed) {
+        let source = discover_keys(Path::new("/sys/class/input"), Path::new("/dev/input"))
+            .and_then(|n| EvdevKeys::open(&n));
+        let mut source = match source {
+            Ok(source) => source,
+            Err(error) => {
+                if last != error {
+                    eprintln!("pf-volume-keys: waiting for the key device: {error}");
+                    last = error;
+                }
+                std::thread::sleep(Duration::from_secs(2));
+                continue;
+            }
+        };
+        let mut volume = VolumeKeys::new(
+            PrefsdStore(pf_prefsd::Client::new(prefs_sock)),
+            LazyJack::new("/sys/class/input", "/dev/input"),
+        );
+        let result = match toast_sock.map(SocketSink::new) {
+            Some(Ok(mut sink)) => run(
+                &mut volume,
+                &mut source,
+                &mut sink,
+                || started.elapsed(),
+                stop,
+            ),
+            _ => run(
+                &mut volume,
+                &mut source,
+                &mut Null,
+                || started.elapsed(),
+                stop,
+            ),
+        };
+        if let Err(error) = result {
+            eprintln!("pf-volume-keys: stopped, retrying: {error}");
+            std::thread::sleep(Duration::from_secs(1));
+        }
+    }
+}
+
+pub const DEFAULT_PREFS_SOCK: &str = "/run/pocketforge/prefsd.sock";
+
+/// The pf-prefsd endpoint: `--prefs-sock`, else the `PF_PREFSD_SOCK` override every other
+/// preference client honours, else the default. An empty override is ignored.
+pub fn resolve_prefs_sock(flag: Option<PathBuf>, env: Option<std::ffi::OsString>) -> PathBuf {
+    flag.or_else(|| env.filter(|v| !v.is_empty()).map(PathBuf::from))
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_PREFS_SOCK))
+}

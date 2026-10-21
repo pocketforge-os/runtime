@@ -24,8 +24,6 @@ path = "src/bin/pf-input-read.rs"
 pf-uinput-domain = { workspace = true }
 pocketforge = { workspace = true }
 pf-wire = { workspace = true }
-pf-prefsd = { workspace = true }
-pf-volume-keys = { workspace = true }
 libc = { workspace = true }
 # Reads the session authority's JSON reply to the SafeReturn frame (--safe-return-sock).
 serde = { workspace = true }
