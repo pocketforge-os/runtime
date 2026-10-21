@@ -11,6 +11,7 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 
 use crate::io::EventSink;
 use crate::ioc;
+use pf_input_ipc::PadDestination;
 
 /// Absolute-axis calibration (mirrors `input_absinfo`).
 #[derive(Debug, Clone, Copy)]
@@ -207,6 +208,27 @@ pub fn pointer_uinput_spec() -> UinputSpec {
         rel: vec![0x00, 0x01, 0x0b, 0x0c], // X, Y, horizontal/vertical hi-res wheel
         abs: Vec::new(),
     }
+}
+
+/// Derive one private gamepad device from the descriptor-canonicalized pad shape.
+///
+/// The four gamepad recipients never share an evdev stream. Pointer has its own relative-device
+/// specification and quarantine deliberately has no device, so neither produces a pad spec.
+pub fn pad_uinput_spec(base: &UinputSpec, destination: PadDestination) -> Option<UinputSpec> {
+    let (name, product) = match destination {
+        PadDestination::App => ("PocketForge App Pad", 0x0100),
+        PadDestination::Keyboard => ("PocketForge Keyboard Pad", 0x0101),
+        PadDestination::Menu => ("PocketForge Menu Pad", 0x0102),
+        PadDestination::Shell => ("PocketForge Shell Pad", 0x0103),
+        PadDestination::Pointer | PadDestination::Quarantined => return None,
+    };
+    let mut spec = base.clone();
+    spec.name = name.to_owned();
+    spec.bus = 0x06; // BUS_VIRTUAL
+    spec.vendor = 0x5046;
+    spec.product = product;
+    spec.version = 1;
+    Some(spec)
 }
 
 fn open_uinput() -> io::Result<RawFd> {

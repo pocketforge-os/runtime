@@ -42,11 +42,14 @@ fn every_pad_destination_has_a_distinct_private_virtual_device_identity() {
     ];
     let specs: Vec<_> = destinations
         .into_iter()
-        .map(|destination| pad_uinput_spec(&base, destination))
+        .map(|destination| pad_uinput_spec(&base, destination).unwrap())
         .collect();
 
     assert_eq!(
-        specs.iter().map(|spec| spec.name.as_str()).collect::<Vec<_>>(),
+        specs
+            .iter()
+            .map(|spec| spec.name.as_str())
+            .collect::<Vec<_>>(),
         [
             "PocketForge App Pad",
             "PocketForge Keyboard Pad",
@@ -54,8 +57,7 @@ fn every_pad_destination_has_a_distinct_private_virtual_device_identity() {
             "PocketForge Shell Pad",
         ]
     );
-    let products: std::collections::BTreeSet<_> =
-        specs.iter().map(|spec| spec.product).collect();
+    let products: std::collections::BTreeSet<_> = specs.iter().map(|spec| spec.product).collect();
     assert_eq!(products.len(), specs.len());
     for spec in specs {
         assert_eq!(spec.bus, 0x06, "private devices use BUS_VIRTUAL");
