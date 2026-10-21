@@ -8,7 +8,6 @@
 //!   pf-input-broker --descriptor <caps.toml> [--source <event-node>] [--acquire-sock <path>]
 //!                   [--safe-return-sock <authority.sock>]
 //!                   [--system-menu-sock <provider.sock>]
-//!                   [--volume-keys [--volume-toast-sock <osd.sock>]]
 //!                   [--allow-unidentified-pad]
 //!   pf-input-broker --descriptor <caps.toml>
 //!                   --test-event-fd <inherited-fd> --test-record-fd <inherited-fd>
@@ -107,8 +106,6 @@ fn test_io_mode(args: &[String]) -> Result<Option<TestIo>, Box<dyn std::error::E
         "--safe-return-sock",
         "--system-menu-sock",
         "--allow-unidentified-pad",
-        "--volume-keys",
-        "--volume-toast-sock",
     ] {
         if args.iter().any(|arg| arg == flag) {
             return Err(format!("{flag} is unavailable with private test fds").into());
@@ -167,58 +164,6 @@ fn run_private(args: &[String], test_io: TestIo) -> Result<(), Box<dyn std::erro
         Err(error) if is_private_stream_eof(&error) => Ok(()),
         result => result.map_err(Into::into),
     }
-}
-
-/// Volume keys are system keys: handled here, never routed to apps (tsp-ihne1.63). The thread
-/// owns its own non-grabbing fd on the LRADC key node and writes through pf-prefsd as this unit.
-fn spawn_volume_keys(toast_sock: Option<String>) {
-    use pf_volume_keys::host::{discover_keys, run, EvdevKeys, LazyJack, SocketSink, ToastSink};
-    use pf_volume_keys::{PrefsdStore, VolumeKeys};
-    struct Null;
-    impl ToastSink for Null {
-        fn show(&mut self, _: &pf_volume_keys::ToastModel) {}
-    }
-    std::thread::spawn(move || {
-        let sock = std::env::var("PF_PREFSD_SOCK")
-            .unwrap_or_else(|_| "/run/pocketforge/prefsd.sock".into());
-        let started = std::time::Instant::now();
-        while !STOP.load(Ordering::Relaxed) {
-            let source = discover_keys("/sys/class/input".as_ref(), "/dev/input".as_ref())
-                .and_then(|n| EvdevKeys::open(&n));
-            let mut source = match source {
-                Ok(s) => s,
-                Err(e) => {
-                    eprintln!("pf-input-broker: volume keys unavailable, retrying: {e}");
-                    std::thread::sleep(std::time::Duration::from_secs(2));
-                    continue;
-                }
-            };
-            let mut volume = VolumeKeys::new(
-                PrefsdStore(pf_prefsd::Client::new(&sock)),
-                LazyJack::new("/sys/class/input", "/dev/input"),
-            );
-            let result = match toast_sock.as_deref().map(SocketSink::new) {
-                Some(Ok(mut sink)) => run(
-                    &mut volume,
-                    &mut source,
-                    &mut sink,
-                    || started.elapsed(),
-                    &STOP,
-                ),
-                _ => run(
-                    &mut volume,
-                    &mut source,
-                    &mut Null,
-                    || started.elapsed(),
-                    &STOP,
-                ),
-            };
-            if let Err(e) = result {
-                eprintln!("pf-input-broker: volume keys stopped, retrying: {e}");
-                std::thread::sleep(std::time::Duration::from_secs(1));
-            }
-        }
-    });
 }
 
 fn run_production(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
@@ -303,9 +248,6 @@ fn run_production(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     } else {
         None
     };
-    if args.iter().any(|a| a == "--volume-keys") {
-        spawn_volume_keys(arg(args, "--volume-toast-sock"));
-    }
     notify_ready()?;
     println!("ready");
     use std::io::Write;
@@ -472,24 +414,6 @@ fn send_ready(socket: &str) -> std::io::Result<()> {
 mod tests {
     use super::*;
     use std::cell::Cell;
-
-    /// Slice of this file's source between `start` and the next top-level `fn `.
-    fn body_of(start: &str) -> &'static str {
-        const SOURCE: &str = include_str!("pf-input-broker.rs");
-        let from = SOURCE.find(start).expect("function present");
-        let rest = &SOURCE[from + start.len()..];
-        &SOURCE[from..from + start.len() + rest.find("\nfn ").unwrap_or(rest.len())]
-    }
-
-    #[test]
-    fn volume_keys_start_in_the_production_path_and_never_in_private_test_io() {
-        // The private-fd mode rejects --volume-keys (test_io_mode), so a spawn there is dead code
-        // and production would silently never start the handler.
-        assert!(body_of("fn run_production(").contains("spawn_volume_keys("));
-        assert!(!body_of("fn run_private(").contains("spawn_volume_keys("));
-        // Negative control for the helper itself: it must see a call that exists.
-        assert!(body_of("fn run_production(").contains("notify_ready()"));
-    }
 
     #[test]
     fn private_fd_flags_bypass_counted_production_openers() {

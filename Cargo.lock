@@ -528,7 +528,6 @@ dependencies = [
  "pf-prefsd",
  "pf-session-authority",
  "pf-uinput-domain",
- "pf-volume-keys",
  "pf-wire",
  "pocketforge",
  "serde",
