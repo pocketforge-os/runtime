@@ -95,6 +95,10 @@ fn menu_deadlines_and_two_second_hold_use_the_required_return_paths() {
 
     let mut held = SessionRouter::new(Destination::Pointer);
     held.route_button(ButtonEvent::new(GUIDE_CODE, true), Duration::ZERO);
+    held.menu_ack(Duration::from_millis(1));
+    held.menu_shown(Duration::from_millis(2));
+    held.menu_ping(7, Duration::from_millis(1_100));
+    held.menu_pong(7, Duration::from_millis(1_100));
     assert!(held.tick(Duration::from_millis(1_999)).is_empty());
     assert_eq!(
         held.tick(Duration::from_secs(2)),
@@ -105,7 +109,10 @@ fn menu_deadlines_and_two_second_hold_use_the_required_return_paths() {
 #[test]
 fn pointer_curve_is_radial_squared_crosses_1280px_per_second_and_expires_assist() {
     let mut pointer = PointerEngine::default();
-    assert_eq!(pointer.frame(0.1, 0.0, false, Duration::ZERO), PointerFrame::ZERO);
+    assert_eq!(
+        pointer.frame(0.1, 0.0, false, Duration::ZERO),
+        PointerFrame::ZERO
+    );
     let full = pointer.frame(1.0, 0.0, false, Duration::ZERO);
     assert_eq!(full.dx_per_second, 1280.0);
     assert_eq!(full.dy_per_second, 0.0);
@@ -113,15 +120,24 @@ fn pointer_curve_is_radial_squared_crosses_1280px_per_second_and_expires_assist(
     assert_eq!(precise.dx_per_second, 448.0);
 
     pointer.set_assist(0.5, Duration::ZERO).unwrap();
-    assert!(pointer.frame(0.3, 0.0, false, Duration::from_millis(120)).dx_per_second <
-        PointerEngine::default().frame(0.3, 0.0, false, Duration::from_millis(120)).dx_per_second);
+    assert!(
+        pointer
+            .frame(0.3, 0.0, false, Duration::from_millis(120))
+            .dx_per_second
+            < PointerEngine::default()
+                .frame(0.3, 0.0, false, Duration::from_millis(120))
+                .dx_per_second
+    );
     assert_eq!(
         pointer.frame(0.3, 0.0, false, Duration::from_millis(121)),
         PointerEngine::default().frame(0.3, 0.0, false, Duration::from_millis(121))
     );
 
     assert_eq!(PointerEngine::scroll_axis(12.0, 11.0), Axis::Vertical(12.0));
-    assert_eq!(PointerEngine::scroll_axis(11.0, 12.0), Axis::Horizontal(12.0));
+    assert_eq!(
+        PointerEngine::scroll_axis(11.0, 12.0),
+        Axis::Horizontal(12.0)
+    );
     assert_eq!(PointerEngine::scroll_axis(0.0, 0.0), Axis::None);
 }
 
@@ -129,21 +145,35 @@ fn pointer_curve_is_radial_squared_crosses_1280px_per_second_and_expires_assist(
 fn app_section_limits_and_spoofing_labels_fail_closed_without_mutation() {
     let mut store = AppSectionStore::default();
     let valid = AppMenuItem::new("save", "Save game", AppMenuKind::Action);
-    store.update("org.example.game", vec![valid], 100, Duration::ZERO).unwrap();
+    store
+        .update("org.example.game", vec![valid], 100, Duration::ZERO)
+        .unwrap();
     let before = store.items("org.example.game").unwrap().to_vec();
 
     for label in ["Close", "Return to game", "P\u{202e}ower", "Ρower"] {
         let bad = AppMenuItem::new("bad", label, AppMenuKind::Action);
-        assert!(store
-            .update("org.example.game", vec![bad], 100, Duration::from_secs(1))
-            .is_err(),
-            "label={label:?}");
+        assert!(
+            store
+                .update("org.example.game", vec![bad], 100, Duration::from_secs(1))
+                .is_err(),
+            "label={label:?}"
+        );
         assert_eq!(store.items("org.example.game").unwrap(), before.as_slice());
     }
 
     let too_many = (0..9)
-        .map(|i| AppMenuItem::new(format!("item-{i}"), format!("Item {i}"), AppMenuKind::Action))
+        .map(|i| {
+            AppMenuItem::new(
+                format!("item-{i}"),
+                format!("Item {i}"),
+                AppMenuKind::Action,
+            )
+        })
         .collect();
-    assert!(store.update("org.example.game", too_many, 100, Duration::from_secs(2)).is_err());
-    assert!(store.update("org.example.game", vec![], 4097, Duration::from_secs(3)).is_err());
+    assert!(store
+        .update("org.example.game", too_many, 100, Duration::from_secs(2))
+        .is_err());
+    assert!(store
+        .update("org.example.game", vec![], 4097, Duration::from_secs(3))
+        .is_err());
 }
