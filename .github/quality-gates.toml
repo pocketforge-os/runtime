@@ -140,12 +140,12 @@ origin = "tsp-bwrg.8"
 
 [[gate]]
 id = "musl-cross-build"
-invariant = "The a133 device binaries (pf-app-launch, pf-input-collect, pf-collect-ui) link for aarch64-unknown-linux-musl with NO per-invocation RUSTFLAGS override — proving the workspace .cargo/config.toml linker pin works on a stock runner."
+invariant = "The a133 device binaries, including the session-wide pf-input-broker, link for aarch64-unknown-linux-musl with NO per-invocation RUSTFLAGS override — proving both target-portable libc bindings and the workspace .cargo/config.toml linker pin on a stock runner."
 workflow = ".github/workflows/runtime-tests.yml"
 job = "rust"
 # Accepted fork-skip posture: self-hosted CI skips fork PRs, never same-repo code PRs.
 allow_if = "github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository"
-required_tokens = ["cargo build", "--locked", "--target aarch64-unknown-linux-musl"]
+required_tokens = ["cargo build", "--locked", "--target aarch64-unknown-linux-musl", "-p pf-input-broker", "--bin pf-input-broker"]
 guards_paths = ["crates/**", "Cargo.toml", "Cargo.lock", ".cargo/config.toml"]
 should_be_required_check = true
 origin = "tsp-bwrg"

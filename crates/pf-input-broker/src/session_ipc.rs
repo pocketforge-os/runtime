@@ -47,7 +47,7 @@ impl RolePeer {
         // SCM_RIGHTS duplicates share the same open file description. Revoking through the
         // retained evdev fd therefore invalidates the role's delivered pad descriptor too.
         unsafe {
-            libc::ioctl(self.pad.as_raw_fd(), crate::ioc::EVIOCREVOKE, 0);
+            libc::ioctl(self.pad.as_raw_fd(), crate::ioc::EVIOCREVOKE as _, 0);
             libc::shutdown(self.pad.as_raw_fd(), libc::SHUT_RDWR);
             libc::shutdown(self.wayland.as_raw_fd(), libc::SHUT_RDWR);
         }
@@ -894,7 +894,7 @@ pub fn read_registered_frame(
 ) -> Result<(Vec<u8>, RegisteredDescriptors), RegisteredFrameError> {
     read_registered_frame_with(stream, |fd| {
         let mut identity: libc::input_id = unsafe { std::mem::zeroed() };
-        let rc = unsafe { libc::ioctl(fd.as_raw_fd(), crate::ioc::eviocgid(), &mut identity) };
+        let rc = unsafe { libc::ioctl(fd.as_raw_fd(), crate::ioc::eviocgid() as _, &mut identity) };
         if rc < 0 {
             Err(io::Error::last_os_error())
         } else {
@@ -1010,7 +1010,7 @@ fn send_first_with_fds(sock: RawFd, bytes: &[u8], fds: &[RawFd]) -> io::Result<u
     message.msg_iov = &mut iov;
     message.msg_iovlen = 1;
     message.msg_control = control.as_mut_ptr().cast();
-    message.msg_controllen = control.len();
+    message.msg_controllen = control.len() as _;
     // SAFETY: every pointer in `message` references live storage for the duration of sendmsg.
     let sent = unsafe {
         let cmsg = libc::CMSG_FIRSTHDR(&message);
@@ -1021,7 +1021,7 @@ fn send_first_with_fds(sock: RawFd, bytes: &[u8], fds: &[RawFd]) -> io::Result<u
         }
         (*cmsg).cmsg_level = libc::SOL_SOCKET;
         (*cmsg).cmsg_type = libc::SCM_RIGHTS;
-        (*cmsg).cmsg_len = libc::CMSG_LEN(fd_bytes) as usize;
+        (*cmsg).cmsg_len = libc::CMSG_LEN(fd_bytes) as _;
         std::ptr::copy_nonoverlapping(
             fds.as_ptr(),
             libc::CMSG_DATA(cmsg).cast::<RawFd>(),
@@ -1055,7 +1055,7 @@ fn recv_first_with_fds(sock: RawFd) -> Result<(u8, Vec<OwnedFd>), FrameReceiveEr
     message.msg_iov = &mut iov;
     message.msg_iovlen = 1;
     message.msg_control = control.as_mut_ptr().cast();
-    message.msg_controllen = control.len();
+    message.msg_controllen = control.len() as _;
     // SAFETY: every pointer in `message` references writable live storage for recvmsg.
     let received = unsafe { libc::recvmsg(sock, &mut message, libc::MSG_CMSG_CLOEXEC) };
     if received < 0 {

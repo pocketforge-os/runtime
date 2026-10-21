@@ -236,6 +236,14 @@ def m_remove_format(root):
     _payload_replace(root, "cargo fmt --all -- --check", "echo formatter removed")
 
 
+def m_remove_input_broker_cross_build(root):
+    path = root / PAYLOAD
+    path.write_text("\n".join(
+        line for line in path.read_text().splitlines()
+        if not (line.startswith("cargo build") and "-p pf-input-broker" in line)
+    ))
+
+
 def m_delete_whole_workflow(root):
     (root / RUNTIME_TESTS).unlink()
 
@@ -261,6 +269,7 @@ CASES = [
     (m_early_success,            "conditionally skippable",        "payload exits successfully before any tests"),
     (m_script_redirect,          "inputs differ",                  "caller redirects execution to empty script"),
     (m_remove_format,            "[format-workspace]",             "whole-workspace format check removed"),
+    (m_remove_input_broker_cross_build, "[musl-cross-build]",      "device broker cross-build removed"),
     (m_delete_workspace_test,    "[workspace-tests]",              "workspace test deleted, keyboard test remains"),
     (m_narrow_workspace_test,    "[workspace-tests]",              "workspace test narrowed to pf-wire"),
     (m_delete_workspace_clippy,  "[clippy-workspace]",             "workspace clippy deleted, keyboard clippy remains"),
