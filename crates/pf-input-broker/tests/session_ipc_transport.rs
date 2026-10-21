@@ -5,8 +5,8 @@ use std::os::unix::net::UnixStream;
 
 use pf_input_broker::session_ipc::{
     authorize_peer, bind_endpoint, read_frame_with_fd, read_registered_frame_with,
-    serve_compositor_peer, serve_menu_peer, write_frame_with_fd, write_frame_with_fds,
-    CompositorAuthority, EndpointPolicy, PeerFacts, RegisteredFrameError,
+    serve_compositor_peer, serve_keyboard_peer, serve_menu_peer, write_frame_with_fd,
+    write_frame_with_fds, CompositorAuthority, EndpointPolicy, PeerFacts, RegisteredFrameError,
 };
 use pf_input_ipc::compositor::{
     CompositorSnapshot, CompositorToRouter, FocusSnapshot, FocusedSurface, OverlaySnapshot,
@@ -413,6 +413,83 @@ fn menu_registration_receives_pad_then_current_epoch_wayland_fd() {
 
     drop(menu);
     menu_thread.join().unwrap().unwrap();
+    drop(compositor);
+    compositor_thread.join().unwrap().unwrap();
+}
+
+#[test]
+fn keyboard_registration_receives_pad_then_current_epoch_wayland_fd() {
+    let authority = std::sync::Arc::new(CompositorAuthority::default());
+    let (mut compositor, compositor_server) = UnixStream::pair().unwrap();
+    let compositor_authority = authority.clone();
+    let compositor_thread =
+        std::thread::spawn(move || serve_compositor_peer(compositor_server, &compositor_authority));
+    send(&mut compositor, &CompositorToRouter::Register);
+    let (registered, _) = read_frame_with_fd(&mut compositor).unwrap();
+    let RouterToCompositor::Registered { epoch } = pf_input_ipc::decode(&registered).unwrap()
+    else {
+        panic!("compositor was not registered");
+    };
+    send(
+        &mut compositor,
+        &CompositorToRouter::StateSnapshot {
+            snapshot: snapshot(epoch),
+        },
+    );
+    wait_for_snapshot(&authority, epoch);
+
+    let (mut keyboard, keyboard_server) = UnixStream::pair().unwrap();
+    let keyboard_authority = authority.clone();
+    let pad = std::fs::File::open("/dev/null").unwrap();
+    let keyboard_thread = std::thread::spawn(move || {
+        serve_keyboard_peer(keyboard_server, &keyboard_authority, pad.into())
+    });
+    let register = pf_input_ipc::encode(&pf_input_ipc::keyboard::KeyboardToRouter::Register {
+        surfaces: vec![pf_input_ipc::keyboard::KeyboardSurface::Docked],
+    });
+    pf_wire::write_frame(&mut keyboard, &register).unwrap();
+
+    let (request, request_fd) = read_frame_with_fd(&mut compositor).unwrap();
+    assert!(request_fd.is_none());
+    let RouterToCompositor::TrustedConnection {
+        epoch: request_epoch,
+        request_id,
+        role: OverlayRole::Keyboard,
+        unit,
+    } = pf_input_ipc::decode(&request).unwrap()
+    else {
+        panic!("keyboard trust was not requested");
+    };
+    assert_eq!(request_epoch, epoch);
+    assert_eq!(unit, "pf-osk.service");
+    let (wayland, mut gamescope_wayland) = UnixStream::pair().unwrap();
+    let response = CompositorToRouter::TrustedConnectionResult {
+        epoch,
+        request_id,
+        result: pf_input_ipc::compositor::TrustedConnectionOutcome::Ok,
+    };
+    write_frame_with_fd(
+        &mut compositor,
+        &pf_input_ipc::encode(&response),
+        wayland.as_raw_fd(),
+    )
+    .unwrap();
+
+    let (registered, descriptors) = read_registered_frame_with(&mut keyboard, |_| Ok(())).unwrap();
+    assert_eq!(
+        pf_input_ipc::decode::<pf_input_ipc::keyboard::RouterToKeyboard>(&registered).unwrap(),
+        pf_input_ipc::keyboard::RouterToKeyboard::Registered
+    );
+    let mut pad = std::fs::File::from(descriptors.pad);
+    let mut byte = [0_u8; 1];
+    assert_eq!(pad.read(&mut byte).unwrap(), 0, "pad fd is first");
+    let mut trusted_wayland = UnixStream::from(descriptors.wayland);
+    gamescope_wayland.write_all(b"t").unwrap();
+    trusted_wayland.read_exact(&mut byte).unwrap();
+    assert_eq!(byte, [b't'], "trusted Wayland fd is second");
+
+    drop(keyboard);
+    keyboard_thread.join().unwrap().unwrap();
     drop(compositor);
     compositor_thread.join().unwrap().unwrap();
 }
