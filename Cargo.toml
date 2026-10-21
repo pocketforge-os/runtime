@@ -39,6 +39,7 @@ members = [
     "crates/pf-menu",
     "crates/pf-menu-scene",
     "crates/pf-volumed",
+    "crates/pf-volume-keys",
 ]
 
 # Shared metadata for every crate in the runtime workspace (tsp-e1b.2 / E2).
@@ -77,6 +78,7 @@ pf-hang-trigger = { path = "crates/pf-hang-trigger", version = "0.0.1" }
 pf-hang-sampler = { path = "crates/pf-hang-sampler", version = "0.0.1" }
 pf-input-ipc = { path = "crates/pf-input-ipc", version = "0.0.1" }
 pf-volumed = { path = "crates/pf-volumed", version = "0.0.1" }
+pf-volume-keys = { path = "crates/pf-volume-keys", version = "0.0.1" }
 serde = { version = "1", features = ["derive"] }
 # serde_json backs the single current-state JSON preference document (owner ruling Q2). Only the
 # NEW pf-prefs leaf crate depends on it; the dependency-light wire/facade crates are untouched.

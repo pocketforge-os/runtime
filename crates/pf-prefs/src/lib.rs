@@ -54,4 +54,4 @@ pub use schema::{
     parse_value, seed_schema, seed_schema_json, spec, validate, PrefKind, PrefSpec, PrefValue,
     KEYBOARD_LAYOUTS, KEYBOARD_LAYOUTS_PROVENANCE, PREFS_SCHEMA_PATH, SCHEMA, SCHEMA_VERSION,
 };
-pub use store::PrefsStore;
+pub use store::{json_to_pref, PrefsStore};

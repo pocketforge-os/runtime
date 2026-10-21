@@ -1,0 +1,27 @@
+[Unit]
+Description=PocketForge hardware volume keys (step the active output's level, feed the OSD)
+Wants=pf-prefsd.service
+After=pf-prefsd.service pf-volumed.service
+
+[Service]
+Type=simple
+User=gamer
+Group=gamer
+SupplementaryGroups=input audio pf-pref-writer
+ExecStart=/usr/bin/pf-volume-keys
+Restart=on-failure
+RestartSec=1s
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=no
+DevicePolicy=closed
+DeviceAllow=char-input r
+RestrictAddressFamilies=AF_UNIX
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+
+[Install]
+WantedBy=multi-user.target

@@ -6,7 +6,7 @@ use pf_peer_identity::{
 // Peer identity is the shared `pf-peer-identity` crate (one implementation for every service
 // that identifies apps); these re-exports keep the daemon's public surface stable.
 pub use pf_peer_identity::{peer_cred, verify_peer_uid, PeerCred};
-use pf_prefs::{PrefKind, PrefValue, PrefsStore, SCHEMA};
+use pf_prefs::{PrefValue, PrefsStore, SCHEMA};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -167,6 +167,9 @@ fn unexpected_response(response: RpcResponse) -> ClientError {
 pub enum PreferenceWriter {
     Settings,
     Shell,
+    /// The hardware volume-key handler (`pf-volume-keys.service`, or the input broker); scoped to
+    /// [`BROKER_KEYS`] only.
+    InputBroker,
 }
 
 /// Kernel-authenticated access to the preference service. Readers never acquire write authority.
@@ -185,6 +188,14 @@ pub struct WritePolicyRow {
 
 const SETTINGS_AND_SHELL: &[PreferenceWriter] =
     &[PreferenceWriter::Settings, PreferenceWriter::Shell];
+const SETTINGS_SHELL_AND_BROKER: &[PreferenceWriter] = &[
+    PreferenceWriter::Settings,
+    PreferenceWriter::Shell,
+    PreferenceWriter::InputBroker,
+];
+
+/// The only keys the input broker identity may write (tsp-ihne1.63 D2): the hardware volume keys.
+pub const BROKER_KEYS: &[&str] = &["volumeSpeaker", "volumeHeadphones", "muted"];
 
 /// Every currently writable preference is named here. Schema additions do not inherit access.
 pub const WRITE_POLICY: &[WritePolicyRow] = &[
@@ -226,15 +237,15 @@ pub const WRITE_POLICY: &[WritePolicyRow] = &[
     },
     WritePolicyRow {
         key: "volumeSpeaker",
-        writers: SETTINGS_AND_SHELL,
+        writers: SETTINGS_SHELL_AND_BROKER,
     },
     WritePolicyRow {
         key: "volumeHeadphones",
-        writers: SETTINGS_AND_SHELL,
+        writers: SETTINGS_SHELL_AND_BROKER,
     },
     WritePolicyRow {
         key: "muted",
-        writers: SETTINGS_AND_SHELL,
+        writers: SETTINGS_SHELL_AND_BROKER,
     },
     WritePolicyRow {
         key: "auto_rotate",
@@ -258,6 +269,7 @@ fn writer_from_unit(unit: &str) -> Option<PreferenceWriter> {
     match unit {
         "pf-settings.service" => Some(PreferenceWriter::Settings),
         "pf-shell-selected.service" => Some(PreferenceWriter::Shell),
+        "pf-input-broker.service" | "pf-volume-keys.service" => Some(PreferenceWriter::InputBroker),
         unit if unit
             .strip_prefix("pf-foreground@")
             .and_then(|instance| instance.strip_suffix(".service"))
@@ -571,31 +583,8 @@ fn classify_pref_error(error: &pf_prefs::PrefError) -> ErrorKind {
 fn json_to_value(key: &str, value: Value) -> Result<PrefValue, pf_prefs::PrefError> {
     let spec =
         pf_prefs::spec(key).ok_or_else(|| pf_prefs::PrefError::UnknownKey(key.to_owned()))?;
-    let candidate = match spec.kind {
-        PrefKind::Bool => value.as_bool().map(PrefValue::Bool),
-        PrefKind::Scalar { .. } => value.as_i64().map(PrefValue::Scalar),
-        PrefKind::Enum { variants } => value
-            .as_str()
-            .and_then(|raw| variants.iter().copied().find(|variant| *variant == raw))
-            .map(PrefValue::Enum),
-    }
-    .ok_or_else(|| pf_prefs::PrefError::Type {
-        key: key.to_owned(),
-        expected: pf_prefs::schema::kind_name(spec.kind),
-        got: json_kind(&value),
-    })?;
+    let candidate = pf_prefs::json_to_pref(key, spec.kind, &value)?;
     pf_prefs::validate(key, candidate)
-}
-
-fn json_kind(value: &Value) -> &'static str {
-    match value {
-        Value::Bool(_) => "bool",
-        Value::Number(_) => "number",
-        Value::String(_) => "string",
-        Value::Null => "null",
-        Value::Array(_) => "array",
-        Value::Object(_) => "object",
-    }
 }
 
 fn value_to_json(value: PrefValue) -> Value {
@@ -938,10 +927,73 @@ mod tests {
     }
 
     #[test]
+    fn set_path_and_seed_loader_agree_on_integral_floats_for_every_scalar_key() {
+        for key in ["brightness", "volumeSpeaker", "volumeHeadphones"] {
+            // Positive control: Draft-07 `type: integer` admits 60.0, as the seed loader does.
+            assert_eq!(
+                json_to_value(key, serde_json::json!(60.0)).unwrap(),
+                pf_prefs::PrefValue::Scalar(60),
+                "{key}"
+            );
+            assert_eq!(
+                json_to_value(key, serde_json::json!(60)).unwrap(),
+                pf_prefs::PrefValue::Scalar(60),
+                "{key}"
+            );
+            // Negative controls: a fractional value, a string, and an out-of-i64-range float.
+            for bad in [
+                serde_json::json!(60.5),
+                serde_json::json!("60"),
+                serde_json::json!(1e300),
+            ] {
+                assert!(json_to_value(key, bad.clone()).is_err(), "{key} {bad}");
+            }
+        }
+    }
+
+    #[test]
+    fn input_broker_may_write_exactly_the_volume_keys_and_nothing_else() {
+        for row in WRITE_POLICY {
+            let expected = BROKER_KEYS.contains(&row.key);
+            assert_eq!(
+                write_allowed(PreferenceWriter::InputBroker, row.key),
+                expected,
+                "{}",
+                row.key
+            );
+        }
+        for key in BROKER_KEYS {
+            assert!(write_allowed(PreferenceWriter::InputBroker, key), "{key}");
+        }
+        assert!(!write_allowed(PreferenceWriter::InputBroker, "brightness"));
+        assert!(!write_allowed(PreferenceWriter::InputBroker, "futureKey"));
+        for unit in ["pf-input-broker.service", "pf-volume-keys.service"] {
+            assert_eq!(
+                writer_from_cgroup(&format!("0::/system.slice/{unit}\n")),
+                Some(PreferenceWriter::InputBroker),
+                "{unit}"
+            );
+        }
+    }
+
+    #[test]
+    fn app_identities_cannot_write_the_volume_keys() {
+        for cgroup in [
+            "0::/system.slice/pf-app@steam.service\n",
+            "0::/system.slice/pf-foreground-app.service\n",
+            "0::/user.slice/user-1000.slice/session-3.scope\n",
+        ] {
+            let writer = writer_from_cgroup(cgroup);
+            assert_eq!(writer, None, "{cgroup:?}");
+        }
+    }
+
+    #[test]
     fn cgroup_identity_ignores_app_broker_scopes_and_client_like_text() {
         for cgroup in [
             "0::/system.slice/pf-app@settings.service\n",
-            "0::/system.slice/pf-input-broker.service\n",
+            "0::/system.slice/pf-input-broker.service.d/x.scope\n",
+            "0::/system.slice/pf-app@pf-input-broker.service\n",
             "0::/user.slice/user-1000.slice/session-3.scope\n",
             "0::/system.slice/not-pf-settings.service\n",
             "5:freezer:/pf-settings.service\n",

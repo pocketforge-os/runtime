@@ -766,6 +766,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "pf-volume-keys"
+version = "0.0.1"
+dependencies = [
+ "libc",
+ "pf-prefsd",
+ "pf-render",
+ "pf-scene",
+ "pf-volumed",
+ "serde_json",
+]
+
+[[package]]
 name = "pf-volumed"
 version = "0.0.1"
 dependencies = [
