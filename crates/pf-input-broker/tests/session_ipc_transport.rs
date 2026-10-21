@@ -6,7 +6,8 @@ use std::os::unix::net::UnixStream;
 use pf_input_broker::session_ipc::{
     authorize_peer, bind_endpoint, read_frame_with_fd, read_registered_frame_with,
     serve_compositor_peer, serve_keyboard_peer, serve_menu_peer, write_frame_with_fd,
-    write_frame_with_fds, CompositorAuthority, EndpointPolicy, PeerFacts, RegisteredFrameError,
+    write_frame_with_fds, validate_role_uid_mapping, CompositorAuthority,
+    EndpointAdmissionError, EndpointPolicy, PeerFacts, RegisteredFrameError, RoleUidMappingError,
 };
 use pf_input_ipc::compositor::{
     CompositorSnapshot, CompositorToRouter, FocusSnapshot, FocusedSurface, OverlaySnapshot,
@@ -19,7 +20,7 @@ use pf_input_ipc::{ContentPurpose, OverlayRole};
 fn endpoint_admission_requires_uid_role_group_and_exact_unit() {
     let policy = EndpointPolicy {
         role: Role::Keyboard,
-        session_uid: 1000,
+        expected_uid: Some(1000),
         role_gid: 2001,
         unit: "pf-osk.service",
     };
@@ -30,23 +31,89 @@ fn endpoint_admission_requires_uid_role_group_and_exact_unit() {
     };
     assert_eq!(authorize_peer(&policy, &good).unwrap(), Role::Keyboard);
 
-    for bad in [
-        PeerFacts {
+    assert_eq!(
+        authorize_peer(
+            &policy,
+            &PeerFacts {
+                uid: 1001,
+                ..good.clone()
+            }
+        ),
+        Err(EndpointAdmissionError::UidMismatch {
+            role: Role::Keyboard,
+            got: 1001,
+            expected: 1000,
+        })
+    );
+    assert_eq!(
+        authorize_peer(
+            &policy,
+            &PeerFacts {
+                groups: vec![3000],
+                ..good.clone()
+            }
+        ),
+        Err(EndpointAdmissionError::GroupMismatch {
+            role: Role::Keyboard,
+            expected_gid: 2001,
+        })
+    );
+    assert_eq!(
+        authorize_peer(
+            &policy,
+            &PeerFacts {
+                unit: "pf-app@impostor.service".into(),
+                ..good
+            }
+        ),
+        Err(EndpointAdmissionError::UnitMismatch {
+            role: Role::Keyboard,
+            got: "pf-app@impostor.service".into(),
+            expected: "pf-osk.service",
+        })
+    );
+}
+
+#[test]
+fn role_uid_mapping_rejects_aliases_at_startup() {
+    assert_eq!(
+        validate_role_uid_mapping(&[
+            (Role::Compositor, 1001),
+            (Role::Keyboard, 1002),
+            (Role::Menu, 1003),
+        ]),
+        Ok(())
+    );
+    assert_eq!(
+        validate_role_uid_mapping(&[
+            (Role::Compositor, 1001),
+            (Role::Keyboard, 1001),
+        ]),
+        Err(RoleUidMappingError::DuplicateUid {
             uid: 1001,
-            ..good.clone()
-        },
-        PeerFacts {
-            groups: vec![3000],
-            ..good.clone()
-        },
-        PeerFacts {
-            unit: "pf-app@impostor.service".into(),
-            ..good
-        },
-    ] {
-        let error = authorize_peer(&policy, &bad).unwrap_err();
-        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
-    }
+            first: Role::Compositor,
+            second: Role::Keyboard,
+        })
+    );
+}
+
+#[test]
+fn missing_menu_unit_policy_refuses_every_registration() {
+    let unavailable = EndpointPolicy {
+        role: Role::Menu,
+        expected_uid: None,
+        role_gid: 2002,
+        unit: "pf-system-menu.service",
+    };
+    let otherwise_valid = PeerFacts {
+        uid: 1003,
+        groups: vec![2002],
+        unit: "pf-system-menu.service".into(),
+    };
+    assert_eq!(
+        authorize_peer(&unavailable, &otherwise_valid),
+        Err(EndpointAdmissionError::RoleUnavailable { role: Role::Menu })
+    );
 }
 
 #[test]
@@ -551,7 +618,7 @@ fn endpoint_binding_sets_contract_mode_and_refuses_non_socket_collisions() {
     let socket = root.join("compositor.sock");
     let policy = EndpointPolicy {
         role: Role::Compositor,
-        session_uid: unsafe { libc::geteuid() },
+        expected_uid: Some(unsafe { libc::geteuid() }),
         role_gid: unsafe { libc::getegid() },
         unit: "pocketforge-gamescope.service",
     };

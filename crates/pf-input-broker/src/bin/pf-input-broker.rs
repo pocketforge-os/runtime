@@ -627,21 +627,14 @@ mod tests {
     }
 
     #[test]
-    fn trusted_role_sockets_require_the_session_user_and_compositor_authority() {
+    fn trusted_role_sockets_use_pinned_role_identities_and_compositor_authority() {
         for role_flag in ["--keyboard-sock", "--menu-sock"] {
             assert!(validate_endpoint_options(&[
                 role_flag.into(),
                 "/run/pocketforge/input/role.sock".into(),
-                "--session-user".into(),
-                "gamer".into(),
             ])
             .is_err());
         }
-        assert!(validate_endpoint_options(&[
-            "--compositor-sock".into(),
-            "/run/pocketforge/input/compositor.sock".into(),
-        ])
-        .is_err());
         assert!(validate_endpoint_options(&[
             "--compositor-sock".into(),
             "/run/pocketforge/input/compositor.sock".into(),
@@ -649,10 +642,15 @@ mod tests {
             "/run/pocketforge/input/keyboard.sock".into(),
             "--menu-sock".into(),
             "/run/pocketforge/input/menu.sock".into(),
+        ])
+        .is_ok());
+        assert!(validate_endpoint_options(&[
+            "--compositor-sock".into(),
+            "/run/pocketforge/input/compositor.sock".into(),
             "--session-user".into(),
             "gamer".into(),
         ])
-        .is_ok());
+        .is_err());
     }
 
     #[test]

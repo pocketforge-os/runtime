@@ -297,6 +297,44 @@ fn socket_constants_live_under_one_group_gated_directory() {
     assert!(sockets::RECONNECT_INITIAL < sockets::RECONNECT_MAX);
 }
 
+#[test]
+fn trusted_endpoint_identities_are_role_specific_and_pinned() {
+    assert_eq!(
+        (
+            sockets::COMPOSITOR_USER,
+            sockets::COMPOSITOR_GROUP,
+            sockets::COMPOSITOR_UNIT,
+        ),
+        (
+            "pf-gamescope",
+            "pf-input-compositor",
+            "pocketforge-gamescope.service",
+        )
+    );
+    assert_eq!(
+        (
+            sockets::KEYBOARD_USER,
+            sockets::KEYBOARD_GROUP,
+            sockets::KEYBOARD_UNIT,
+        ),
+        ("pf-ime", "pf-input-keyboard", "pf-osk.service")
+    );
+    assert_eq!(
+        (sockets::MENU_USER, sockets::MENU_GROUP, sockets::MENU_UNIT),
+        ("pf-menu", "pf-input-menu", "pf-system-menu.service")
+    );
+    assert_eq!(
+        BTreeSet::from([
+            sockets::COMPOSITOR_USER,
+            sockets::KEYBOARD_USER,
+            sockets::MENU_USER,
+        ])
+        .len(),
+        3,
+        "a service uid may not authorize two trusted roles"
+    );
+}
+
 /// Ordering rule (c): the keyboard gets the pad only with BOTH halves; failure is toward the
 /// app; an open menu wins. Positive and negative controls in one invocation.
 #[test]
