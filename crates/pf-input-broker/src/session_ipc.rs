@@ -20,6 +20,7 @@ use pf_input_ipc::compositor::{
     CompositorSession, CompositorStateError, CompositorToRouter, RouterToCompositor,
     TrustedConnectionOutcome,
 };
+use pf_input_ipc::keyboard::{KeyboardToRouter, RouterToKeyboard};
 use pf_input_ipc::menu::{MenuToRouter, RouterToMenu};
 use pf_input_ipc::{OverlayRole, Role};
 
@@ -337,6 +338,72 @@ pub fn serve_menu_peer(
         }
         // Menu policy transitions are consumed by the session router worker when this transport
         // is wired into the daemon; this loop already enforces framing and descriptor authority.
+    }
+}
+
+/// Register one already-authenticated keyboard peer and deliver its private pad fd followed by a
+/// Wayland fd minted for the current compositor epoch. No partial registration is ever sent.
+pub fn serve_keyboard_peer(
+    mut stream: UnixStream,
+    authority: &CompositorAuthority,
+    pad: OwnedFd,
+) -> io::Result<()> {
+    let (body, fd) = read_frame_with_fd(&mut stream)?;
+    if fd.is_some() {
+        return Err(invalid("keyboard register carried a descriptor"));
+    }
+    let first: KeyboardToRouter = pf_input_ipc::decode(&body).map_err(ipc_error)?;
+    if !matches!(first, KeyboardToRouter::Register { .. }) {
+        return Err(invalid("keyboard must register before other messages"));
+    }
+
+    let trusted = authority
+        .request_trusted_connection(OverlayRole::Keyboard)?
+        .recv()
+        .map_err(|_| {
+            io::Error::new(io::ErrorKind::ConnectionAborted, "compositor epoch changed")
+        })??;
+    let registered = pf_input_ipc::encode(&RouterToKeyboard::Registered);
+    if let Err(error) = write_frame_with_fds(
+        &mut stream,
+        &registered,
+        &[pad.as_raw_fd(), trusted.as_raw_fd()],
+    ) {
+        authority.release_trusted_connection(OverlayRole::Keyboard);
+        return Err(error);
+    }
+    drop((pad, trusted));
+
+    loop {
+        let (body, fd) = match read_frame_with_fd(&mut stream) {
+            Ok(frame) => frame,
+            Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => {
+                authority.release_trusted_connection(OverlayRole::Keyboard);
+                return Ok(());
+            }
+            Err(error) => {
+                authority.release_trusted_connection(OverlayRole::Keyboard);
+                return Err(error);
+            }
+        };
+        if fd.is_some() {
+            authority.release_trusted_connection(OverlayRole::Keyboard);
+            return Err(invalid("keyboard message carried a descriptor"));
+        }
+        let message: KeyboardToRouter = match pf_input_ipc::decode(&body).map_err(ipc_error) {
+            Ok(message) => message,
+            Err(error) => {
+                authority.release_trusted_connection(OverlayRole::Keyboard);
+                return Err(error);
+            }
+        };
+        if matches!(message, KeyboardToRouter::Register { .. }) {
+            authority.release_trusted_connection(OverlayRole::Keyboard);
+            return Err(invalid("duplicate keyboard register"));
+        }
+        // Keyboard policy transitions are consumed by the session router worker when this
+        // transport is wired into the daemon; this loop already enforces framing and descriptor
+        // authority.
     }
 }
 
