@@ -112,6 +112,8 @@ fn test_io_mode(args: &[String]) -> Result<Option<TestIo>, Box<dyn std::error::E
         "--acquire-sock",
         "--safe-return-sock",
         "--system-menu-sock",
+        "--menu-sock",
+        "--keyboard-sock",
         "--compositor-sock",
         "--session-user",
         "--allow-unidentified-pad",
@@ -518,6 +520,35 @@ mod tests {
         ])
         .is_err());
         assert_eq!(test_io_mode(&[]).unwrap(), None);
+    }
+
+    #[test]
+    fn trusted_role_sockets_require_the_session_user_and_compositor_authority() {
+        for role_flag in ["--keyboard-sock", "--menu-sock"] {
+            assert!(validate_endpoint_options(&[
+                role_flag.into(),
+                "/run/pocketforge/input/role.sock".into(),
+                "--session-user".into(),
+                "gamer".into(),
+            ])
+            .is_err());
+        }
+        assert!(validate_endpoint_options(&[
+            "--compositor-sock".into(),
+            "/run/pocketforge/input/compositor.sock".into(),
+        ])
+        .is_err());
+        assert!(validate_endpoint_options(&[
+            "--compositor-sock".into(),
+            "/run/pocketforge/input/compositor.sock".into(),
+            "--keyboard-sock".into(),
+            "/run/pocketforge/input/keyboard.sock".into(),
+            "--menu-sock".into(),
+            "/run/pocketforge/input/menu.sock".into(),
+            "--session-user".into(),
+            "gamer".into(),
+        ])
+        .is_ok());
     }
 
     #[test]
