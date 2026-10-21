@@ -5,12 +5,13 @@ use linux_raw_sys::general::{
     __NR_landlock_add_rule, __NR_landlock_create_ruleset, __NR_landlock_restrict_self,
 };
 use linux_raw_sys::landlock::landlock_rule_type;
+use std::ffi::CString;
 use std::fmt;
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io;
 use std::mem::size_of;
 use std::os::fd::{AsRawFd, FromRawFd};
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 
 const CREATE_RULESET_VERSION: u32 = 1;
@@ -211,11 +212,7 @@ impl LandlockKernel for SystemLandlock {
         let ruleset_file = unsafe { File::from_raw_fd(fd as i32) };
 
         for rule in &ruleset.filesystem {
-            let path = match OpenOptions::new()
-                .read(true)
-                .custom_flags(libc::O_PATH | libc::O_CLOEXEC)
-                .open(&rule.path)
-            {
+            let path = match open_rule_path(&rule.path) {
                 Ok(path) => path,
                 // An absent hierarchy cannot be accessed and remains denied if later created.
                 Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
@@ -293,6 +290,24 @@ const fn ruleset_attr_size(abi: u32) -> usize {
     } else {
         size_of::<u64>()
     }
+}
+
+/// Open a Landlock rule path as an `O_PATH` handle. `O_PATH` is what lets a rule name a Unix
+/// socket or device node without opening it (a plain read-only `open` of a socket is `ENXIO`).
+///
+/// This calls `open(2)` directly. `OpenOptions::custom_flags(O_PATH)` is not reliable: on the
+/// aarch64 musl production build it reached the kernel without `O_PATH` and the Wayland socket
+/// rule failed with `ENXIO`.
+pub fn open_rule_path(path: &std::path::Path) -> io::Result<File> {
+    let c_path = CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
+    // SAFETY: `c_path` is a valid NUL-terminated string that outlives the call.
+    let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: a successful `open` returns a descriptor owned by nothing else.
+    Ok(unsafe { File::from_raw_fd(fd) })
 }
 
 pub fn apply_landlock<K: LandlockKernel>(
