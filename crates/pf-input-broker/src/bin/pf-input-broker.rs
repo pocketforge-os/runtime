@@ -347,24 +347,24 @@ fn run_production(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         let _ = pump_tx.send(broker.run(&STOP));
     });
 
-    let result = supervise(
-        listener.as_ref(),
-        system_menu_listener.as_ref(),
-        system_menu_router.as_ref(),
-        compositor_listener.as_ref(),
-        compositor_policy.as_ref(),
-        compositor_authority.as_ref(),
-        keyboard_listener.as_ref(),
-        keyboard_policy.as_ref(),
-        keyboard_node.as_deref(),
-        menu_listener.as_ref(),
-        menu_policy.as_ref(),
-        menu_node.as_deref(),
-        &node,
-        &backend,
-        &pump_rx,
-        &STOP,
-    );
+    let result = supervise(Supervision {
+        listener: listener.as_ref(),
+        system_menu_listener: system_menu_listener.as_ref(),
+        system_menu_router: system_menu_router.as_ref(),
+        compositor_listener: compositor_listener.as_ref(),
+        compositor_policy: compositor_policy.as_ref(),
+        compositor_authority: compositor_authority.as_ref(),
+        keyboard_listener: keyboard_listener.as_ref(),
+        keyboard_policy: keyboard_policy.as_ref(),
+        keyboard_node: keyboard_node.as_deref(),
+        menu_listener: menu_listener.as_ref(),
+        menu_policy: menu_policy.as_ref(),
+        menu_node: menu_node.as_deref(),
+        node: &node,
+        backend: &backend,
+        pump_rx: &pump_rx,
+        stop: &STOP,
+    });
     STOP.store(true, Ordering::Release);
     let _ = pump.join();
     result.map_err(Into::into)
@@ -405,24 +405,44 @@ fn service_unit_exists(unit: &str) -> bool {
     .any(|root| Path::new(root).join(unit).is_file())
 }
 
-fn supervise(
-    listener: Option<&UnixListener>,
-    system_menu_listener: Option<&UnixListener>,
-    system_menu_router: Option<&SystemMenuRouter>,
-    compositor_listener: Option<&UnixListener>,
-    compositor_policy: Option<&EndpointPolicy>,
-    compositor_authority: Option<&Arc<CompositorAuthority>>,
-    keyboard_listener: Option<&UnixListener>,
-    keyboard_policy: Option<&EndpointPolicy>,
-    keyboard_node: Option<&str>,
-    menu_listener: Option<&UnixListener>,
-    menu_policy: Option<&EndpointPolicy>,
-    menu_node: Option<&str>,
-    node: &str,
-    backend: &Arc<dyn Backend>,
-    pump_rx: &std::sync::mpsc::Receiver<std::io::Result<()>>,
-    stop: &AtomicBool,
-) -> std::io::Result<()> {
+struct Supervision<'a> {
+    listener: Option<&'a UnixListener>,
+    system_menu_listener: Option<&'a UnixListener>,
+    system_menu_router: Option<&'a SystemMenuRouter>,
+    compositor_listener: Option<&'a UnixListener>,
+    compositor_policy: Option<&'a EndpointPolicy>,
+    compositor_authority: Option<&'a Arc<CompositorAuthority>>,
+    keyboard_listener: Option<&'a UnixListener>,
+    keyboard_policy: Option<&'a EndpointPolicy>,
+    keyboard_node: Option<&'a str>,
+    menu_listener: Option<&'a UnixListener>,
+    menu_policy: Option<&'a EndpointPolicy>,
+    menu_node: Option<&'a str>,
+    node: &'a str,
+    backend: &'a Arc<dyn Backend>,
+    pump_rx: &'a std::sync::mpsc::Receiver<std::io::Result<()>>,
+    stop: &'a AtomicBool,
+}
+
+fn supervise(supervision: Supervision<'_>) -> std::io::Result<()> {
+    let Supervision {
+        listener,
+        system_menu_listener,
+        system_menu_router,
+        compositor_listener,
+        compositor_policy,
+        compositor_authority,
+        keyboard_listener,
+        keyboard_policy,
+        keyboard_node,
+        menu_listener,
+        menu_policy,
+        menu_node,
+        node,
+        backend,
+        pump_rx,
+        stop,
+    } = supervision;
     loop {
         if let Ok(result) = pump_rx.try_recv() {
             return result;
@@ -763,24 +783,24 @@ mod tests {
         let stop = AtomicBool::new(false);
         let started = std::time::Instant::now();
         assert_eq!(
-            supervise(
-                Some(&listener),
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                "/unused",
-                &test_backend(),
-                &rx,
-                &stop,
-            )
+            supervise(Supervision {
+                listener: Some(&listener),
+                system_menu_listener: None,
+                system_menu_router: None,
+                compositor_listener: None,
+                compositor_policy: None,
+                compositor_authority: None,
+                keyboard_listener: None,
+                keyboard_policy: None,
+                keyboard_node: None,
+                menu_listener: None,
+                menu_policy: None,
+                menu_node: None,
+                node: "/unused",
+                backend: &test_backend(),
+                pump_rx: &rx,
+                stop: &stop,
+            })
             .unwrap_err()
             .kind(),
             std::io::ErrorKind::BrokenPipe
@@ -806,24 +826,24 @@ mod tests {
         let (_tx, rx) = std::sync::mpsc::channel();
         let stop = AtomicBool::new(true);
         let started = std::time::Instant::now();
-        supervise(
-            Some(&listener),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            "/unused",
-            &test_backend(),
-            &rx,
-            &stop,
-        )
+        supervise(Supervision {
+            listener: Some(&listener),
+            system_menu_listener: None,
+            system_menu_router: None,
+            compositor_listener: None,
+            compositor_policy: None,
+            compositor_authority: None,
+            keyboard_listener: None,
+            keyboard_policy: None,
+            keyboard_node: None,
+            menu_listener: None,
+            menu_policy: None,
+            menu_node: None,
+            node: "/unused",
+            backend: &test_backend(),
+            pump_rx: &rx,
+            stop: &stop,
+        })
         .unwrap();
         assert!(started.elapsed() < std::time::Duration::from_secs(1));
         std::fs::remove_file(path).unwrap();
