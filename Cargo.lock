@@ -528,6 +528,7 @@ dependencies = [
  "pf-prefsd",
  "pf-session-authority",
  "pf-uinput-domain",
+ "pf-volume-keys",
  "pf-wire",
  "pocketforge",
  "serde",
@@ -762,6 +763,18 @@ version = "0.0.1"
 dependencies = [
  "libc",
  "sha2",
+]
+
+[[package]]
+name = "pf-volume-keys"
+version = "0.0.1"
+dependencies = [
+ "libc",
+ "pf-prefsd",
+ "pf-render",
+ "pf-scene",
+ "pf-volumed",
+ "serde_json",
 ]
 
 [[package]]

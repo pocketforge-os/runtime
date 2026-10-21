@@ -167,6 +167,8 @@ fn unexpected_response(response: RpcResponse) -> ClientError {
 pub enum PreferenceWriter {
     Settings,
     Shell,
+    /// The input broker's volume-key handler; scoped to [`BROKER_KEYS`] only.
+    InputBroker,
 }
 
 /// Kernel-authenticated access to the preference service. Readers never acquire write authority.
@@ -185,6 +187,14 @@ pub struct WritePolicyRow {
 
 const SETTINGS_AND_SHELL: &[PreferenceWriter] =
     &[PreferenceWriter::Settings, PreferenceWriter::Shell];
+const SETTINGS_SHELL_AND_BROKER: &[PreferenceWriter] = &[
+    PreferenceWriter::Settings,
+    PreferenceWriter::Shell,
+    PreferenceWriter::InputBroker,
+];
+
+/// The only keys the input broker identity may write (tsp-ihne1.63 D2): the hardware volume keys.
+pub const BROKER_KEYS: &[&str] = &["volumeSpeaker", "volumeHeadphones", "muted"];
 
 /// Every currently writable preference is named here. Schema additions do not inherit access.
 pub const WRITE_POLICY: &[WritePolicyRow] = &[
@@ -226,15 +236,15 @@ pub const WRITE_POLICY: &[WritePolicyRow] = &[
     },
     WritePolicyRow {
         key: "volumeSpeaker",
-        writers: SETTINGS_AND_SHELL,
+        writers: SETTINGS_SHELL_AND_BROKER,
     },
     WritePolicyRow {
         key: "volumeHeadphones",
-        writers: SETTINGS_AND_SHELL,
+        writers: SETTINGS_SHELL_AND_BROKER,
     },
     WritePolicyRow {
         key: "muted",
-        writers: SETTINGS_AND_SHELL,
+        writers: SETTINGS_SHELL_AND_BROKER,
     },
     WritePolicyRow {
         key: "auto_rotate",
@@ -258,6 +268,7 @@ fn writer_from_unit(unit: &str) -> Option<PreferenceWriter> {
     match unit {
         "pf-settings.service" => Some(PreferenceWriter::Settings),
         "pf-shell-selected.service" => Some(PreferenceWriter::Shell),
+        "pf-input-broker.service" => Some(PreferenceWriter::InputBroker),
         unit if unit
             .strip_prefix("pf-foreground@")
             .and_then(|instance| instance.strip_suffix(".service"))
@@ -938,10 +949,45 @@ mod tests {
     }
 
     #[test]
+    fn input_broker_may_write_exactly_the_volume_keys_and_nothing_else() {
+        for row in WRITE_POLICY {
+            let expected = BROKER_KEYS.contains(&row.key);
+            assert_eq!(
+                write_allowed(PreferenceWriter::InputBroker, row.key),
+                expected,
+                "{}",
+                row.key
+            );
+        }
+        for key in BROKER_KEYS {
+            assert!(write_allowed(PreferenceWriter::InputBroker, key), "{key}");
+        }
+        assert!(!write_allowed(PreferenceWriter::InputBroker, "brightness"));
+        assert!(!write_allowed(PreferenceWriter::InputBroker, "futureKey"));
+        assert_eq!(
+            writer_from_cgroup("0::/system.slice/pf-input-broker.service\n"),
+            Some(PreferenceWriter::InputBroker)
+        );
+    }
+
+    #[test]
+    fn app_identities_cannot_write_the_volume_keys() {
+        for cgroup in [
+            "0::/system.slice/pf-app@steam.service\n",
+            "0::/system.slice/pf-foreground-app.service\n",
+            "0::/user.slice/user-1000.slice/session-3.scope\n",
+        ] {
+            let writer = writer_from_cgroup(cgroup);
+            assert_eq!(writer, None, "{cgroup:?}");
+        }
+    }
+
+    #[test]
     fn cgroup_identity_ignores_app_broker_scopes_and_client_like_text() {
         for cgroup in [
             "0::/system.slice/pf-app@settings.service\n",
-            "0::/system.slice/pf-input-broker.service\n",
+            "0::/system.slice/pf-input-broker.service.d/x.scope\n",
+            "0::/system.slice/pf-app@pf-input-broker.service\n",
             "0::/user.slice/user-1000.slice/session-3.scope\n",
             "0::/system.slice/not-pf-settings.service\n",
             "5:freezer:/pf-settings.service\n",
