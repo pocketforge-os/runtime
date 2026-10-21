@@ -4,8 +4,9 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 
 use pf_input_broker::session_ipc::{
-    authorize_peer, bind_endpoint, read_frame_with_fd, serve_compositor_peer, write_frame_with_fd,
-    CompositorAuthority, EndpointPolicy, PeerFacts,
+    authorize_peer, bind_endpoint, read_frame_with_fd, read_registered_frame_with,
+    serve_compositor_peer, write_frame_with_fd, write_frame_with_fds, CompositorAuthority,
+    EndpointPolicy, PeerFacts, RegisteredFrameError,
 };
 use pf_input_ipc::compositor::{
     CompositorSnapshot, CompositorToRouter, FocusSnapshot, FocusedSurface, OverlaySnapshot,
@@ -68,6 +69,78 @@ fn framed_descriptor_transfer_is_bounded_and_preserves_first_byte_ancillary_data
     let oversized = vec![0_u8; pf_input_ipc::MAX_FRAME + 1];
     let error = write_frame_with_fd(&mut sender, &oversized, source.as_raw_fd()).unwrap_err();
     assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+}
+
+#[test]
+fn registered_frame_has_ordered_pad_and_wayland_fds_and_closes_both_on_exec() {
+    let (mut sender, mut receiver) = UnixStream::pair().unwrap();
+    let pad = std::fs::File::open("/dev/null").unwrap();
+    let (wayland, mut wayland_peer) = UnixStream::pair().unwrap();
+    let body = pf_input_ipc::encode(&pf_input_ipc::menu::RouterToMenu::Registered);
+
+    write_frame_with_fds(&mut sender, &body, &[pad.as_raw_fd(), wayland.as_raw_fd()]).unwrap();
+    let (received, descriptors) = read_registered_frame_with(&mut receiver, |_| Ok(())).unwrap();
+    assert_eq!(received, body);
+    for fd in [&descriptors.pad, &descriptors.wayland] {
+        assert_ne!(
+            unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFD) } & libc::FD_CLOEXEC,
+            0,
+            "every received descriptor is close-on-exec"
+        );
+    }
+    let mut trusted_display = UnixStream::from(descriptors.wayland);
+    wayland_peer.write_all(b"w").unwrap();
+    let mut byte = [0_u8; 1];
+    trusted_display.read_exact(&mut byte).unwrap();
+    assert_eq!(byte, [b'w'], "the second descriptor is the Wayland socket");
+}
+
+#[test]
+fn registered_frame_refuses_count_order_and_truncation_without_leaking_fds() {
+    assert_registered_rejected(1, RegisteredFrameError::DescriptorCount { got: 1 }, |_| {
+        Ok(())
+    });
+    assert_registered_rejected(3, RegisteredFrameError::DescriptorCount { got: 3 }, |_| {
+        Ok(())
+    });
+    assert_registered_rejected(2, RegisteredFrameError::FirstNotEvdev, |_| {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "not evdev",
+        ))
+    });
+    assert_registered_rejected(9, RegisteredFrameError::ControlTruncated, |_| Ok(()));
+}
+
+fn assert_registered_rejected(
+    count: usize,
+    expected: RegisteredFrameError,
+    validate_pad: impl FnOnce(std::os::fd::BorrowedFd<'_>) -> std::io::Result<()>,
+) {
+    let (mut sender, mut receiver) = UnixStream::pair().unwrap();
+    let mut peers = Vec::new();
+    let mut sent = Vec::new();
+    for _ in 0..count {
+        let (peer, descriptor) = UnixStream::pair().unwrap();
+        peers.push(peer);
+        sent.push(descriptor);
+    }
+    let body = pf_input_ipc::encode(&pf_input_ipc::menu::RouterToMenu::Registered);
+    let raw: Vec<_> = sent.iter().map(AsRawFd::as_raw_fd).collect();
+    write_frame_with_fds(&mut sender, &body, &raw).unwrap();
+    drop(sent);
+    let error = read_registered_frame_with(&mut receiver, validate_pad).unwrap_err();
+    assert_eq!(error, expected);
+    for mut peer in peers {
+        peer.set_read_timeout(Some(std::time::Duration::from_secs(1)))
+            .unwrap();
+        let mut byte = [0_u8; 1];
+        assert_eq!(
+            peer.read(&mut byte).unwrap(),
+            0,
+            "rejected registration must close every received descriptor"
+        );
+    }
 }
 
 #[test]
