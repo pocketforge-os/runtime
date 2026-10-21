@@ -46,8 +46,9 @@ pub mod session_ipc;
 pub mod uinput;
 
 pub use broker::{
-    acquire_input_fd, handle_acquire, missing_source_capabilities, read_events_raw, serve_acquire,
-    serve_client, InputBroker, MissingCapabilities, RunConfig, SourceCapabilities, SourceIdentity,
+    acquire_input_fd, handle_acquire, missing_source_capabilities, open_read_fd, read_events_raw,
+    serve_acquire, serve_client, InputBroker, MissingCapabilities, RunConfig, SourceCapabilities,
+    SourceIdentity,
 };
 pub use io::{
     is_private_stream_eof, EventSink, EventSource, FdEventSink, FdEventSource, PrivateStreamEof,
