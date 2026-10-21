@@ -259,6 +259,7 @@ struct PointerAssist {
 #[derive(Debug, Default)]
 pub struct PointerEngine {
     assist: Option<PointerAssist>,
+    last_motion: Option<Duration>,
 }
 
 impl PointerEngine {
@@ -274,7 +275,7 @@ impl PointerEngine {
     }
 
     /// 10% radial deadzone, rescaled then squared, with a 1280 px/s full-scale speed.
-    pub fn frame(&self, x: f64, y: f64, precision: bool, now: Duration) -> PointerFrame {
+    pub fn frame(&mut self, x: f64, y: f64, precision: bool, now: Duration) -> PointerFrame {
         let magnitude = x.hypot(y).min(1.0);
         if !magnitude.is_finite() || magnitude <= 0.1 {
             return PointerFrame::ZERO;
@@ -290,10 +291,24 @@ impl PointerEngine {
                 speed *= 1.0 - assist.strength * 0.5;
             }
         }
-        PointerFrame {
+        let frame = PointerFrame {
             dx_per_second: x / magnitude * speed,
             dy_per_second: y / magnitude * speed,
+        };
+        if frame != PointerFrame::ZERO {
+            self.last_motion = Some(now);
         }
+        frame
+    }
+
+    pub fn physical_mouse_motion(&mut self, now: Duration) {
+        self.last_motion = Some(now);
+    }
+
+    /// The cursor hides three seconds after the last virtual or physical mouse motion.
+    pub fn cursor_visible(&self, now: Duration) -> bool {
+        self.last_motion
+            .is_some_and(|at| now.saturating_sub(at) < Duration::from_secs(3))
     }
 
     /// Emit only the dominant high-resolution scroll axis.

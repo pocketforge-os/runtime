@@ -139,8 +139,8 @@ fn pointer_curve_is_radial_squared_crosses_1280px_per_second_and_expires_assist(
         Axis::Horizontal(12.0)
     );
     assert_eq!(PointerEngine::scroll_axis(0.0, 0.0), Axis::None);
-    assert!(pointer.cursor_visible(Duration::from_millis(2_999)));
-    assert!(!pointer.cursor_visible(Duration::from_secs(3)));
+    assert!(pointer.cursor_visible(Duration::from_millis(3_120)));
+    assert!(!pointer.cursor_visible(Duration::from_millis(3_121)));
 }
 
 #[test]
