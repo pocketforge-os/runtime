@@ -25,6 +25,7 @@ pf-uinput-domain = { workspace = true }
 pocketforge = { workspace = true }
 pf-wire = { workspace = true }
 pf-input-ipc = { workspace = true }
+pf-peer-identity = { workspace = true }
 libc = { workspace = true }
 # Reads the session authority's JSON reply to the SafeReturn frame (--safe-return-sock).
 serde = { workspace = true }
@@ -39,7 +40,6 @@ pf-input-decode = { path = "../pf-input-decode", version = "0.0.1" }
 # (tests/safe_return_authority.rs) and that GetAppearance reaches a real prefsd
 # (tests/prefsd_passthrough.rs). Test-only: the daemon links none of these.
 pf-session-authority = { workspace = true }
-pf-peer-identity = { workspace = true }
 pf-app-manifest = { workspace = true }
 pf-ports = { workspace = true }
 pf-prefs = { workspace = true }

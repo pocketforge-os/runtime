@@ -42,6 +42,7 @@ pub mod remap;
 pub mod router;
 pub mod safe_return;
 pub mod scm;
+pub mod session_ipc;
 pub mod uinput;
 
 pub use broker::{
