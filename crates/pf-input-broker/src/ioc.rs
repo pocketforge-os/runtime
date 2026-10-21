@@ -12,6 +12,8 @@ use std::os::raw::c_ulong;
 pub const EV_SYN: u16 = 0x00;
 /// `EV_KEY` — key/button event type.
 pub const EV_KEY: u16 = 0x01;
+/// `EV_REL` — relative-axis event type.
+pub const EV_REL: u16 = 0x02;
 /// `EV_ABS` — absolute-axis event type.
 pub const EV_ABS: u16 = 0x03;
 /// `SYN_REPORT` — commit the current event report.
@@ -95,6 +97,8 @@ pub const UI_DEV_DESTROY: c_ulong = ioc(IOC_NONE, UI, 2, 0);
 pub const UI_SET_EVBIT: c_ulong = ioc(IOC_WRITE, UI, 100, 4);
 /// `UI_SET_KEYBIT` — advertise a key/button code (arg: `int`).
 pub const UI_SET_KEYBIT: c_ulong = ioc(IOC_WRITE, UI, 101, 4);
+/// `UI_SET_RELBIT` — advertise a relative axis (arg: `int`).
+pub const UI_SET_RELBIT: c_ulong = ioc(IOC_WRITE, UI, 102, 4);
 /// `UI_SET_ABSBIT` — advertise an absolute axis (arg: `int`).
 pub const UI_SET_ABSBIT: c_ulong = ioc(IOC_WRITE, UI, 103, 4);
 
@@ -124,6 +128,10 @@ mod tests {
         assert_eq!(
             UI_SET_KEYBIT, 0x40045565,
             "UI_SET_KEYBIT = _IOW('U', 101, int)"
+        );
+        assert_eq!(
+            UI_SET_RELBIT, 0x40045566,
+            "UI_SET_RELBIT = _IOW('U', 102, int)"
         );
         assert_eq!(
             UI_SET_ABSBIT, 0x40045567,

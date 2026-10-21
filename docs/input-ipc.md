@@ -41,17 +41,24 @@ as an evdev file descriptor handed over `SCM_RIGHTS`, exactly like the app's `Ac
   successful trust result without exactly one fd is refused; the request stays pending, no trust
   is installed, and the connection is closed. Ancillary fds attached to refused, unexpected,
   wrong-epoch or otherwise invalid frames are closed immediately.
+* A keyboard or menu `registered` frame carries exactly two descriptors in one `sendmsg`, ordered
+  `[private_pad_evdev_fd, trusted_wayland_client_fd]`; otherwise the sender attaches none. The
+  receiver uses `MSG_CMSG_CLOEXEC` and fails closed on any other count or order, a non-evdev first
+  fd, or `MSG_CTRUNC`: it closes every received fd, returns a typed registration error, and never
+  keeps a partial set.
 * **Nothing sent here blocks the router's input pump.** The pump only flips atomics and hands
   tokens to a worker thread; all socket I/O, deadlines and fallbacks run on that thread
   (`crates/pf-input-broker/src/safe_return.rs` already works this way).
 
 ### Sockets, ownership, admission
 
-Apps run as the same uid as the system processes, so a path alone separates nothing. Every
-endpoint is gated twice: the directory and socket modes keep apps from connecting, and the
-router re-checks the peer on accept with `SO_PEERCRED` (uid must be the session uid) and
-`SO_PEERGROUPS` (must contain the endpoint's group), the mechanism `pf-prefsd --writer-group`
-uses. Apps never carry any of these groups. The image creates the directory and groups.
+Apps retain the session-uid rule on their unprivileged SDK endpoint. Each privileged endpoint is
+instead pinned to its isolated service identity: the router re-checks `SO_PEERCRED` against the
+role's service uid, `SO_PEERGROUPS` against the role group, and the peer's exact systemd unit.
+All three must match. A uid that resolves for two roles is a startup configuration error; there is
+no fallback to the app/session user. Until `pf-system-menu.service` and its `pf-menu` account are
+installed, the Menu policy is unavailable and refuses every registration. The image creates the
+directory and groups.
 
 | Path | Mode / owner | Who connects | Constant |
 |---|---|---|---|
@@ -59,6 +66,10 @@ uses. Apps never carry any of these groups. The image creates the directory and 
 | `/run/pocketforge/input/compositor.sock` | `0660 root:pf-input-compositor` | gamescope | `sockets::COMPOSITOR_SOCKET` |
 | `/run/pocketforge/input/keyboard.sock` | `0660 root:pf-input-keyboard` | pf-osk | `sockets::KEYBOARD_SOCKET` |
 | `/run/pocketforge/input/menu.sock` | `0660 root:pf-input-menu` | system menu | `sockets::MENU_SOCKET` |
+
+The pinned role map is: Compositor → `pf-gamescope`, `pf-input-compositor`,
+`pocketforge-gamescope.service`; Keyboard → `pf-ime`, `pf-input-keyboard`, `pf-osk.service`;
+Menu → `pf-menu`, `pf-input-menu`, `pf-system-menu.service`.
 
 `menu.sock` is the endpoint `pf-input-broker --system-menu-sock` already serves (runtime#108);
 this page fixes its path and extends its protocol within the same major.
@@ -140,7 +151,7 @@ Router → provider:
 
 | `type` | Fields | Meaning |
 |---|---|---|
-| `registered` | — (+ pad fd) | the read fd of the menu's private virtual pad, and the trusted Wayland client fd once §6 is in force |
+| `registered` | — (+ exactly two ordered fds) | `[private_pad_evdev_fd, trusted_wayland_client_fd]` as one `SCM_RIGHTS` message (§1) |
 | `system_menu` | `front?: {app_id, name, unit}` | a Menu press; `front` absent in the shell |
 | `ack` | `action: return` | reply to `return` |
 | `dismiss` | `reason: shown_timeout \| unhealthy \| hold_return \| front_changed` | hide now; the pad is already back with the app |
@@ -169,7 +180,7 @@ Router → pf-osk:
 
 | `type` | Fields | Meaning |
 |---|---|---|
-| `registered` | — (+ pad fd) | the keyboard's private virtual pad, and the trusted Wayland client fd once §6 is in force |
+| `registered` | — (+ exactly two ordered fds) | `[private_pad_evdev_fd, trusted_wayland_client_fd]` as one `SCM_RIGHTS` message (§1) |
 | `show_modal` | `request_id, app{app_id,name,unit}, purpose, title, initial_text, max_chars, multiline` | open the modal keyboard for the app in front (spec §12.1). The router has already applied the open guard; pf-osk draws "Typing for ‹name›" from `app`, never from the request text |
 | `hide` | `reason: menu_open \| physical_keyboard \| app_lost_front \| app_exit` | hide now; `menu_open` means come back unchanged on Resume; `physical_keyboard` lets the strip stay |
 | `ping` | `seq` | |

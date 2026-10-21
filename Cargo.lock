@@ -522,6 +522,7 @@ dependencies = [
  "libc",
  "pf-app-manifest",
  "pf-input-decode",
+ "pf-input-ipc",
  "pf-peer-identity",
  "pf-ports",
  "pf-prefs",

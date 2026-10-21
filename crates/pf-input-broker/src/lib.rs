@@ -39,13 +39,16 @@ pub mod io;
 pub mod ioc;
 pub mod policy;
 pub mod remap;
+pub mod router;
 pub mod safe_return;
 pub mod scm;
+pub mod session_ipc;
 pub mod uinput;
 
 pub use broker::{
-    acquire_input_fd, handle_acquire, missing_source_capabilities, read_events_raw, serve_acquire,
-    serve_client, InputBroker, MissingCapabilities, RunConfig, SourceCapabilities, SourceIdentity,
+    acquire_input_fd, handle_acquire, missing_source_capabilities, open_read_fd, read_events_raw,
+    serve_acquire, serve_client, InputBroker, MissingCapabilities, RunConfig, SourceCapabilities,
+    SourceIdentity,
 };
 pub use io::{
     is_private_stream_eof, EventSink, EventSource, FdEventSink, FdEventSource, PrivateStreamEof,
@@ -56,7 +59,9 @@ pub use remap::{Posture, Remap, RemapError, Rotation};
 pub use safe_return::{
     serve_system_menu_provider, PostureFeed, SafeReturnIntake, SystemMenuGate, SystemMenuRouter,
 };
-pub use uinput::{AbsInfo, Uinput, UinputSpec};
+pub use uinput::{
+    pad_uinput_spec, pointer_uinput_spec, AbsInfo, SessionUinputs, Uinput, UinputSpec,
+};
 
 /// How the broker vends the input device to a consumer (R-C).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

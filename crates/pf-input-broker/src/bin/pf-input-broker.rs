@@ -8,6 +8,8 @@
 //!   pf-input-broker --descriptor <caps.toml> [--source <event-node>] [--acquire-sock <path>]
 //!                   [--safe-return-sock <authority.sock>]
 //!                   [--system-menu-sock <provider.sock>]
+//!                   [--compositor-sock <gamescope.sock> --keyboard-sock <osk.sock>
+//!                    --menu-sock <menu.sock>]
 //!                   [--allow-unidentified-pad]
 //!   pf-input-broker --descriptor <caps.toml>
 //!                   --test-event-fd <inherited-fd> --test-record-fd <inherited-fd>
@@ -30,13 +32,20 @@ use std::os::fd::{FromRawFd, OwnedFd, RawFd};
 use std::os::raw::c_int;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixListener;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use pf_input_broker::{
-    is_private_stream_eof, serve_client, serve_system_menu_provider, FdEventSink, FdEventSource,
-    InputBroker, PostureFeed, RunConfig, SafeReturnIntake, SourceIdentity, SystemMenuRouter,
+use pf_input_broker::session_ipc::{
+    authenticate_peer, bind_endpoint, serve_compositor_peer, serve_keyboard_peer, serve_menu_peer,
+    user_uid, validate_role_uid_mapping, CompositorAuthority, EndpointPolicy,
 };
+use pf_input_broker::{
+    is_private_stream_eof, open_read_fd, serve_client, serve_system_menu_provider, FdEventSink,
+    FdEventSource, InputBroker, PostureFeed, RunConfig, SafeReturnIntake, SourceIdentity,
+    SystemMenuRouter,
+};
+use pf_input_ipc::{PadDestination, Role};
 use pocketforge::backends::InProcessBackend;
 use pocketforge::{Backend, Descriptor};
 
@@ -51,6 +60,18 @@ fn arg(args: &[String], flag: &str) -> Option<String> {
         .position(|a| a == flag)
         .and_then(|i| args.get(i + 1))
         .cloned()
+}
+
+fn validate_endpoint_options(args: &[String]) -> Result<(), &'static str> {
+    let compositor = arg(args, "--compositor-sock").is_some();
+    if arg(args, "--session-user").is_some() {
+        return Err("--session-user is forbidden for trusted roles; identities are role-pinned");
+    }
+    if (arg(args, "--keyboard-sock").is_some() || arg(args, "--menu-sock").is_some()) && !compositor
+    {
+        return Err("keyboard and menu sockets require --compositor-sock");
+    }
+    Ok(())
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -105,6 +126,10 @@ fn test_io_mode(args: &[String]) -> Result<Option<TestIo>, Box<dyn std::error::E
         "--acquire-sock",
         "--safe-return-sock",
         "--system-menu-sock",
+        "--menu-sock",
+        "--keyboard-sock",
+        "--compositor-sock",
+        "--session-user",
         "--allow-unidentified-pad",
     ] {
         if args.iter().any(|arg| arg == flag) {
@@ -167,10 +192,14 @@ fn run_private(args: &[String], test_io: TestIo) -> Result<(), Box<dyn std::erro
 }
 
 fn run_production(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    validate_endpoint_options(args)?;
     let desc_path = descriptor_path(args)?;
     let acquire_sock = arg(args, "--acquire-sock");
     let safe_return_sock = arg(args, "--safe-return-sock");
     let system_menu_sock = arg(args, "--system-menu-sock");
+    let compositor_sock = arg(args, "--compositor-sock");
+    let keyboard_sock = arg(args, "--keyboard-sock");
+    let menu_sock = arg(args, "--menu-sock");
     if system_menu_sock.is_some() && safe_return_sock.is_none() {
         return Err("--system-menu-sock requires --safe-return-sock".into());
     }
@@ -209,6 +238,24 @@ fn run_production(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let node = broker
         .node_path()
         .ok_or("could not resolve the re-emit event node")?;
+    let keyboard_node = if keyboard_sock.is_some() {
+        Some(
+            broker
+                .destination_node_path(PadDestination::Keyboard)
+                .ok_or("keyboard event node not resolved")?,
+        )
+    } else {
+        None
+    };
+    let menu_node = if menu_sock.is_some() {
+        Some(
+            broker
+                .destination_node_path(PadDestination::Menu)
+                .ok_or("menu event node not resolved")?,
+        )
+    } else {
+        None
+    };
 
     install_signal_handlers();
 
@@ -248,6 +295,47 @@ fn run_production(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     } else {
         None
     };
+    let compositor_policy = compositor_sock
+        .as_ref()
+        .map(|_| resolve_endpoint_policy(Role::Compositor))
+        .transpose()?;
+    let keyboard_policy = keyboard_sock
+        .as_ref()
+        .map(|_| resolve_endpoint_policy(Role::Keyboard))
+        .transpose()?;
+    let menu_policy = menu_sock
+        .as_ref()
+        .map(|_| resolve_endpoint_policy(Role::Menu))
+        .transpose()?;
+    let role_uids: Vec<_> = [
+        compositor_policy.as_ref(),
+        keyboard_policy.as_ref(),
+        menu_policy.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    .filter_map(|policy| policy.expected_uid.map(|uid| (policy.role, uid)))
+    .collect();
+    validate_role_uid_mapping(&role_uids)?;
+    let compositor_listener = match (compositor_sock.as_deref(), compositor_policy.as_ref()) {
+        (Some(sock), Some(policy)) => {
+            let listener = bind_endpoint(Path::new(sock), policy)?;
+            println!("compositor-sock={sock}");
+            Some(listener)
+        }
+        _ => None,
+    };
+    let compositor_authority = compositor_listener
+        .as_ref()
+        .map(|_| Arc::new(CompositorAuthority::default()));
+    let keyboard_listener = match (keyboard_sock.as_deref(), keyboard_policy.as_ref()) {
+        (Some(sock), Some(policy)) => Some(bind_endpoint(Path::new(sock), policy)?),
+        _ => None,
+    };
+    let menu_listener = match (menu_sock.as_deref(), menu_policy.as_ref()) {
+        (Some(sock), Some(policy)) => Some(bind_endpoint(Path::new(sock), policy)?),
+        _ => None,
+    };
     notify_ready()?;
     println!("ready");
     use std::io::Write;
@@ -259,29 +347,102 @@ fn run_production(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         let _ = pump_tx.send(broker.run(&STOP));
     });
 
-    let result = supervise(
-        listener.as_ref(),
-        system_menu_listener.as_ref(),
-        system_menu_router.as_ref(),
-        &node,
-        &backend,
-        &pump_rx,
-        &STOP,
-    );
+    let result = supervise(Supervision {
+        listener: listener.as_ref(),
+        system_menu_listener: system_menu_listener.as_ref(),
+        system_menu_router: system_menu_router.as_ref(),
+        compositor_listener: compositor_listener.as_ref(),
+        compositor_policy: compositor_policy.as_ref(),
+        compositor_authority: compositor_authority.as_ref(),
+        keyboard_listener: keyboard_listener.as_ref(),
+        keyboard_policy: keyboard_policy.as_ref(),
+        keyboard_node: keyboard_node.as_deref(),
+        menu_listener: menu_listener.as_ref(),
+        menu_policy: menu_policy.as_ref(),
+        menu_node: menu_node.as_deref(),
+        node: &node,
+        backend: &backend,
+        pump_rx: &pump_rx,
+        stop: &STOP,
+    });
     STOP.store(true, Ordering::Release);
     let _ = pump.join();
     result.map_err(Into::into)
 }
 
-fn supervise(
-    listener: Option<&UnixListener>,
-    system_menu_listener: Option<&UnixListener>,
-    system_menu_router: Option<&SystemMenuRouter>,
-    node: &str,
-    backend: &Arc<dyn Backend>,
-    pump_rx: &std::sync::mpsc::Receiver<std::io::Result<()>>,
-    stop: &AtomicBool,
-) -> std::io::Result<()> {
+fn resolve_endpoint_policy(role: Role) -> Result<EndpointPolicy, Box<dyn std::error::Error>> {
+    let (user, unit) = match role {
+        Role::Compositor => (
+            pf_input_ipc::sockets::COMPOSITOR_USER,
+            pf_input_ipc::sockets::COMPOSITOR_UNIT,
+        ),
+        Role::Keyboard => (
+            pf_input_ipc::sockets::KEYBOARD_USER,
+            pf_input_ipc::sockets::KEYBOARD_UNIT,
+        ),
+        Role::Menu => (
+            pf_input_ipc::sockets::MENU_USER,
+            pf_input_ipc::sockets::MENU_UNIT,
+        ),
+    };
+    let expected_uid = if role == Role::Menu && !service_unit_exists(unit) {
+        None
+    } else {
+        Some(user_uid(user)?)
+    };
+    Ok(EndpointPolicy::for_role(role, expected_uid)?)
+}
+
+fn service_unit_exists(unit: &str) -> bool {
+    [
+        "/etc/systemd/system",
+        "/run/systemd/system",
+        "/usr/local/lib/systemd/system",
+        "/usr/lib/systemd/system",
+        "/lib/systemd/system",
+    ]
+    .iter()
+    .any(|root| Path::new(root).join(unit).is_file())
+}
+
+struct Supervision<'a> {
+    listener: Option<&'a UnixListener>,
+    system_menu_listener: Option<&'a UnixListener>,
+    system_menu_router: Option<&'a SystemMenuRouter>,
+    compositor_listener: Option<&'a UnixListener>,
+    compositor_policy: Option<&'a EndpointPolicy>,
+    compositor_authority: Option<&'a Arc<CompositorAuthority>>,
+    keyboard_listener: Option<&'a UnixListener>,
+    keyboard_policy: Option<&'a EndpointPolicy>,
+    keyboard_node: Option<&'a str>,
+    menu_listener: Option<&'a UnixListener>,
+    menu_policy: Option<&'a EndpointPolicy>,
+    menu_node: Option<&'a str>,
+    node: &'a str,
+    backend: &'a Arc<dyn Backend>,
+    pump_rx: &'a std::sync::mpsc::Receiver<std::io::Result<()>>,
+    stop: &'a AtomicBool,
+}
+
+fn supervise(supervision: Supervision<'_>) -> std::io::Result<()> {
+    let Supervision {
+        listener,
+        system_menu_listener,
+        system_menu_router,
+        compositor_listener,
+        compositor_policy,
+        compositor_authority,
+        keyboard_listener,
+        keyboard_policy,
+        keyboard_node,
+        menu_listener,
+        menu_policy,
+        menu_node,
+        node,
+        backend,
+        pump_rx,
+        stop,
+    } = supervision;
     loop {
         if let Ok(result) = pump_rx.try_recv() {
             return result;
@@ -319,6 +480,75 @@ fn supervise(
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
                 Err(e) => return Err(e),
+            }
+        }
+        if let (Some(listener), Some(policy), Some(authority)) =
+            (compositor_listener, compositor_policy, compositor_authority)
+        {
+            match listener.accept() {
+                Ok((stream, _)) => match authenticate_peer(&stream, policy) {
+                    Ok(Role::Compositor) => {
+                        let authority = authority.clone();
+                        std::thread::spawn(move || {
+                            if let Err(error) = serve_compositor_peer(stream, &authority) {
+                                eprintln!("pf-input-broker: compositor connection failed: {error}");
+                            }
+                        });
+                    }
+                    Ok(role) => {
+                        eprintln!("pf-input-broker: refused unexpected role {role:?}");
+                    }
+                    Err(error) => {
+                        eprintln!("pf-input-broker: refused compositor peer: {error}");
+                    }
+                },
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error) => return Err(error),
+            }
+        }
+        if let (Some(listener), Some(policy), Some(authority), Some(node)) = (
+            keyboard_listener,
+            keyboard_policy,
+            compositor_authority,
+            keyboard_node,
+        ) {
+            match listener.accept() {
+                Ok((stream, _)) => match authenticate_peer(&stream, policy) {
+                    Ok(Role::Keyboard) => {
+                        let pad = open_read_fd(node)?;
+                        let authority = authority.clone();
+                        std::thread::spawn(move || {
+                            if let Err(error) = serve_keyboard_peer(stream, &authority, pad) {
+                                eprintln!("pf-input-broker: keyboard connection failed: {error}");
+                            }
+                        });
+                    }
+                    Ok(role) => eprintln!("pf-input-broker: refused unexpected role {role:?}"),
+                    Err(error) => eprintln!("pf-input-broker: refused keyboard peer: {error}"),
+                },
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error) => return Err(error),
+            }
+        }
+        if let (Some(listener), Some(policy), Some(authority), Some(node)) =
+            (menu_listener, menu_policy, compositor_authority, menu_node)
+        {
+            match listener.accept() {
+                Ok((stream, _)) => match authenticate_peer(&stream, policy) {
+                    Ok(Role::Menu) => {
+                        let pad = open_read_fd(node)?;
+                        let authority = authority.clone();
+                        std::thread::spawn(move || {
+                            if let Err(error) = serve_menu_peer(stream, &authority, pad) {
+                                eprintln!("pf-input-broker: menu connection failed: {error}");
+                            }
+                        });
+                    }
+                    Ok(role) => eprintln!("pf-input-broker: refused unexpected role {role:?}"),
+                    Err(error) => eprintln!("pf-input-broker: refused menu peer: {error}"),
+                },
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error) => return Err(error),
             }
         }
         std::thread::sleep(std::time::Duration::from_millis(50));
@@ -458,6 +688,33 @@ mod tests {
     }
 
     #[test]
+    fn trusted_role_sockets_use_pinned_role_identities_and_compositor_authority() {
+        for role_flag in ["--keyboard-sock", "--menu-sock"] {
+            assert!(validate_endpoint_options(&[
+                role_flag.into(),
+                "/run/pocketforge/input/role.sock".into(),
+            ])
+            .is_err());
+        }
+        assert!(validate_endpoint_options(&[
+            "--compositor-sock".into(),
+            "/run/pocketforge/input/compositor.sock".into(),
+            "--keyboard-sock".into(),
+            "/run/pocketforge/input/keyboard.sock".into(),
+            "--menu-sock".into(),
+            "/run/pocketforge/input/menu.sock".into(),
+        ])
+        .is_ok());
+        assert!(validate_endpoint_options(&[
+            "--compositor-sock".into(),
+            "/run/pocketforge/input/compositor.sock".into(),
+            "--session-user".into(),
+            "gamer".into(),
+        ])
+        .is_err());
+    }
+
+    #[test]
     fn built_in_pad_identity_is_default_and_opt_out_is_explicit_and_loud() {
         let default = source_identity(&[]);
         assert!(default.is_enforcing());
@@ -526,15 +783,24 @@ mod tests {
         let stop = AtomicBool::new(false);
         let started = std::time::Instant::now();
         assert_eq!(
-            supervise(
-                Some(&listener),
-                None,
-                None,
-                "/unused",
-                &test_backend(),
-                &rx,
-                &stop,
-            )
+            supervise(Supervision {
+                listener: Some(&listener),
+                system_menu_listener: None,
+                system_menu_router: None,
+                compositor_listener: None,
+                compositor_policy: None,
+                compositor_authority: None,
+                keyboard_listener: None,
+                keyboard_policy: None,
+                keyboard_node: None,
+                menu_listener: None,
+                menu_policy: None,
+                menu_node: None,
+                node: "/unused",
+                backend: &test_backend(),
+                pump_rx: &rx,
+                stop: &stop,
+            })
             .unwrap_err()
             .kind(),
             std::io::ErrorKind::BrokenPipe
@@ -560,15 +826,24 @@ mod tests {
         let (_tx, rx) = std::sync::mpsc::channel();
         let stop = AtomicBool::new(true);
         let started = std::time::Instant::now();
-        supervise(
-            Some(&listener),
-            None,
-            None,
-            "/unused",
-            &test_backend(),
-            &rx,
-            &stop,
-        )
+        supervise(Supervision {
+            listener: Some(&listener),
+            system_menu_listener: None,
+            system_menu_router: None,
+            compositor_listener: None,
+            compositor_policy: None,
+            compositor_authority: None,
+            keyboard_listener: None,
+            keyboard_policy: None,
+            keyboard_node: None,
+            menu_listener: None,
+            menu_policy: None,
+            menu_node: None,
+            node: "/unused",
+            backend: &test_backend(),
+            pump_rx: &rx,
+            stop: &stop,
+        })
         .unwrap();
         assert!(started.elapsed() < std::time::Duration::from_secs(1));
         std::fs::remove_file(path).unwrap();

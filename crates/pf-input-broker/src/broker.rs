@@ -23,7 +23,7 @@ use crate::policy::TokenBucket;
 use crate::remap::{AbsAction, Posture, Remap};
 use crate::safe_return::{PostureFeed, SystemMenuGate, SystemMenuRouter, GUIDE_CODE};
 use crate::scm;
-use crate::uinput::Uinput;
+use crate::uinput::SessionUinputs;
 
 const MAX_REPORT_EVENTS: usize = 256;
 const ACQUIRE_CLIENT_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
@@ -174,7 +174,7 @@ pub fn read_events_raw(fd: RawFd, out: &mut [libc::input_event]) -> io::Result<u
 /// on drop.
 pub struct InputBroker {
     source: Evdev,
-    sink: Uinput,
+    sink: SessionUinputs,
     start: std::time::Instant,
     pump: ReportPump,
 }
@@ -347,7 +347,7 @@ impl InputBroker {
                 }
                 Ok(source)
             },
-            |_| Uinput::create(remap.spec()),
+            |_| SessionUinputs::create(remap.spec()),
         )?;
         Ok(InputBroker {
             source,
@@ -463,7 +463,15 @@ impl InputBroker {
 
     /// The re-emit `/dev/input/eventN` node path (what the app reads / the fd handed over points at).
     pub fn node_path(&self) -> Option<String> {
-        self.sink.node().map(|s| s.to_string())
+        self.destination_node_path(pf_input_ipc::PadDestination::App)
+    }
+
+    /// The private event node for one recipient; quarantine deliberately has no node.
+    pub fn destination_node_path(
+        &self,
+        destination: pf_input_ipc::PadDestination,
+    ) -> Option<String> {
+        self.sink.node(destination).map(str::to_owned)
     }
 
     /// The grabbed source device's name (for logging / the blessed-binary check).
@@ -479,7 +487,7 @@ impl InputBroker {
         let sink = &self.sink;
         self.pump
             .process(&buf[..n], now, &self.source, &mut |ty, code, value| {
-                sink.emit(ty, code, value)
+                sink.emit(pf_input_ipc::PadDestination::App, ty, code, value)
             })
     }
 
@@ -527,10 +535,21 @@ impl InputBroker {
 
     /// Open a fresh read fd on the re-emit node — the fd handed to an app via `SCM_RIGHTS`.
     pub fn open_app_fd(&self) -> io::Result<OwnedFd> {
-        let node = self
-            .node_path()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "re-emit node not resolved"))?;
-        open_read_fd(&node)
+        self.open_destination_fd(pf_input_ipc::PadDestination::App)
+    }
+
+    /// Open a private read descriptor for one virtual destination. Quarantine has no device.
+    pub fn open_destination_fd(
+        &self,
+        destination: pf_input_ipc::PadDestination,
+    ) -> io::Result<OwnedFd> {
+        let node = self.sink.node(destination).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "destination event node not resolved",
+            )
+        })?;
+        open_read_fd(node)
     }
 }
 

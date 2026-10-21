@@ -11,6 +11,7 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 
 use crate::io::EventSink;
 use crate::ioc;
+use pf_input_ipc::PadDestination;
 
 /// Absolute-axis calibration (mirrors `input_absinfo`).
 #[derive(Debug, Clone, Copy)]
@@ -31,6 +32,8 @@ pub struct UinputSpec {
     pub version: u16,
     /// Key/button codes to advertise (already remapped to the canonical layout).
     pub keys: Vec<u16>,
+    /// Relative axes to advertise (mouse motion and high-resolution wheels).
+    pub rel: Vec<u16>,
     /// Absolute axes to advertise, with calibration.
     pub abs: Vec<(u16, AbsInfo)>,
 }
@@ -39,6 +42,67 @@ pub struct UinputSpec {
 pub struct Uinput {
     fd: OwnedFd,
     node: Option<String>,
+}
+
+/// All virtual devices owned by the one session router process.
+///
+/// Each pad recipient has a distinct kernel device. `Quarantined` intentionally resolves to no
+/// device, and pointer events use the dedicated relative mouse rather than a pad-shaped device.
+pub struct SessionUinputs {
+    app: Uinput,
+    keyboard: Uinput,
+    menu: Uinput,
+    shell: Uinput,
+    pointer: Uinput,
+}
+
+impl SessionUinputs {
+    pub fn create(pad: &UinputSpec) -> io::Result<Self> {
+        Ok(Self {
+            app: Uinput::create(
+                &pad_uinput_spec(pad, PadDestination::App).expect("app has a pad spec"),
+            )?,
+            keyboard: Uinput::create(
+                &pad_uinput_spec(pad, PadDestination::Keyboard).expect("keyboard has a pad spec"),
+            )?,
+            menu: Uinput::create(
+                &pad_uinput_spec(pad, PadDestination::Menu).expect("menu has a pad spec"),
+            )?,
+            shell: Uinput::create(
+                &pad_uinput_spec(pad, PadDestination::Shell).expect("shell has a pad spec"),
+            )?,
+            pointer: Uinput::create(&pointer_uinput_spec())?,
+        })
+    }
+
+    pub fn node(&self, destination: PadDestination) -> Option<&str> {
+        match destination {
+            PadDestination::App => self.app.node(),
+            PadDestination::Keyboard => self.keyboard.node(),
+            PadDestination::Menu => self.menu.node(),
+            PadDestination::Shell => self.shell.node(),
+            PadDestination::Pointer => self.pointer.node(),
+            PadDestination::Quarantined => None,
+        }
+    }
+
+    pub fn emit(
+        &self,
+        destination: PadDestination,
+        event_type: u16,
+        code: u16,
+        value: i32,
+    ) -> io::Result<()> {
+        let device = match destination {
+            PadDestination::App => &self.app,
+            PadDestination::Keyboard => &self.keyboard,
+            PadDestination::Menu => &self.menu,
+            PadDestination::Shell => &self.shell,
+            PadDestination::Pointer => &self.pointer,
+            PadDestination::Quarantined => return Ok(()),
+        };
+        device.emit(event_type, code, value)
+    }
 }
 
 impl Uinput {
@@ -55,6 +119,12 @@ impl Uinput {
             dev.set_bit(ioc::UI_SET_EVBIT, ioc::EV_KEY as libc::c_int)?;
             for &k in &spec.keys {
                 dev.set_bit(ioc::UI_SET_KEYBIT, k as libc::c_int)?;
+            }
+        }
+        if !spec.rel.is_empty() {
+            dev.set_bit(ioc::UI_SET_EVBIT, ioc::EV_REL as libc::c_int)?;
+            for &axis in &spec.rel {
+                dev.set_bit(ioc::UI_SET_RELBIT, axis as libc::c_int)?;
             }
         }
         if !spec.abs.is_empty() {
@@ -187,6 +257,41 @@ impl Uinput {
     }
 }
 
+/// Device declaration for the router's private pointer destination.
+pub fn pointer_uinput_spec() -> UinputSpec {
+    UinputSpec {
+        name: "PocketForge Pointer".to_owned(),
+        bus: 0x06, // BUS_VIRTUAL
+        vendor: 0x5046,
+        product: 0x0002,
+        version: 1,
+        keys: vec![0x110, 0x111],          // BTN_LEFT, BTN_RIGHT
+        rel: vec![0x00, 0x01, 0x0b, 0x0c], // X, Y, horizontal/vertical hi-res wheel
+        abs: Vec::new(),
+    }
+}
+
+/// Derive one private gamepad device from the descriptor-canonicalized pad shape.
+///
+/// The four gamepad recipients never share an evdev stream. Pointer has its own relative-device
+/// specification and quarantine deliberately has no device, so neither produces a pad spec.
+pub fn pad_uinput_spec(base: &UinputSpec, destination: PadDestination) -> Option<UinputSpec> {
+    let (name, product) = match destination {
+        PadDestination::App => ("PocketForge App Pad", 0x0100),
+        PadDestination::Keyboard => ("PocketForge Keyboard Pad", 0x0101),
+        PadDestination::Menu => ("PocketForge Menu Pad", 0x0102),
+        PadDestination::Shell => ("PocketForge Shell Pad", 0x0103),
+        PadDestination::Pointer | PadDestination::Quarantined => return None,
+    };
+    let mut spec = base.clone();
+    spec.name = name.to_owned();
+    spec.bus = 0x06; // BUS_VIRTUAL
+    spec.vendor = 0x5046;
+    spec.product = product;
+    spec.version = 1;
+    Some(spec)
+}
+
 fn open_uinput() -> io::Result<RawFd> {
     let path = std::ffi::CString::new("/dev/uinput").unwrap();
     // SAFETY: valid C string; standard uinput open after the domain guard.
@@ -215,6 +320,14 @@ impl EventSink for Uinput {
             self.emit(event.type_, event.code, event.value)?;
         }
         Ok(())
+    }
+}
+
+// Until the session policy multiplexer is installed by the caller, the compatibility EventSink
+// surface writes only to the app device. No other recipient can observe that stream.
+impl EventSink for SessionUinputs {
+    fn write_events(&mut self, events: &[libc::input_event]) -> io::Result<()> {
+        self.app.write_events(events)
     }
 }
 
