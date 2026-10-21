@@ -3,6 +3,7 @@
 //! The frozen input IPC contract keeps serialization in `pf-input-ipc`; this module owns the
 //! Linux boundary: socket-derived identity, PFW1 framing, frame limits, and descriptor transfer.
 
+use std::collections::HashMap;
 use std::ffi::CString;
 use std::fs;
 use std::io::{self, Read, Write};
@@ -12,13 +13,14 @@ use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::Mutex;
 
 use pf_input_ipc::compositor::{
     CompositorSession, CompositorStateError, CompositorToRouter, RouterToCompositor,
     TrustedConnectionOutcome,
 };
-use pf_input_ipc::Role;
+use pf_input_ipc::{OverlayRole, Role};
 
 use crate::router::SessionSignals;
 
@@ -26,11 +28,14 @@ struct CompositorState {
     current_epoch: Option<u64>,
     session: Option<CompositorSession>,
     signals: SessionSignals,
+    writer: Option<UnixStream>,
+    pending_fds: HashMap<u64, SyncSender<io::Result<OwnedFd>>>,
 }
 
 /// Session state driven only by the currently registered compositor connection.
 pub struct CompositorAuthority {
     next_epoch: AtomicU64,
+    next_request: AtomicU64,
     state: Mutex<CompositorState>,
 }
 
@@ -38,29 +43,42 @@ impl Default for CompositorAuthority {
     fn default() -> Self {
         Self {
             next_epoch: AtomicU64::new(1),
+            next_request: AtomicU64::new(1),
             state: Mutex::new(CompositorState {
                 current_epoch: None,
                 session: None,
                 signals: SessionSignals::default(),
+                writer: None,
+                pending_fds: HashMap::new(),
             }),
         }
     }
 }
 
 impl CompositorAuthority {
-    fn register(&self) -> u64 {
+    fn register(&self, writer: UnixStream) -> u64 {
         let epoch = self.next_epoch.fetch_add(1, Ordering::Relaxed).max(1);
         let mut state = self.state.lock().expect("compositor state poisoned");
+        state.pending_fds.clear();
         state.current_epoch = Some(epoch);
         state.session = Some(CompositorSession::new(epoch));
         state.signals.register_compositor(epoch);
+        state.writer = Some(writer);
         epoch
     }
 
-    fn apply(&self, connection_epoch: u64, message: CompositorToRouter) -> io::Result<()> {
+    fn apply(
+        &self,
+        connection_epoch: u64,
+        message: CompositorToRouter,
+        fd: Option<OwnedFd>,
+    ) -> io::Result<()> {
         let mut state = self.state.lock().expect("compositor state poisoned");
         if state.current_epoch != Some(connection_epoch) {
             return Err(invalid("superseded compositor connection"));
+        }
+        if !matches!(message, CompositorToRouter::TrustedConnectionResult { .. }) && fd.is_some() {
+            return Err(invalid("compositor state frame carried a descriptor"));
         }
         let session = state.session.as_mut().ok_or_else(|| {
             io::Error::new(io::ErrorKind::NotConnected, "compositor is not registered")
@@ -104,12 +122,26 @@ impl CompositorAuthority {
                 request_id,
                 result,
             } => match result {
-                TrustedConnectionOutcome::Ok => session
-                    .finish_trusted_connection(epoch, request_id, 0)
-                    .map_err(state_error)?,
-                TrustedConnectionOutcome::Refused { .. } => session
-                    .refuse_trusted_connection(epoch, request_id, 0)
-                    .map_err(state_error)?,
+                TrustedConnectionOutcome::Ok => {
+                    session
+                        .finish_trusted_connection(epoch, request_id, usize::from(fd.is_some()))
+                        .map_err(state_error)?;
+                    let sender = state.pending_fds.remove(&request_id).ok_or_else(|| {
+                        invalid("trusted connection result had no pending receiver")
+                    })?;
+                    let descriptor = fd.expect("CompositorSession checked the descriptor");
+                    let _ = sender.send(Ok(descriptor));
+                }
+                TrustedConnectionOutcome::Refused { reason } => {
+                    session
+                        .refuse_trusted_connection(epoch, request_id, usize::from(fd.is_some()))
+                        .map_err(state_error)?;
+                    let sender = state.pending_fds.remove(&request_id).ok_or_else(|| {
+                        invalid("trusted connection refusal had no pending receiver")
+                    })?;
+                    let _ =
+                        sender.send(Err(io::Error::new(io::ErrorKind::PermissionDenied, reason)));
+                }
             },
             CompositorToRouter::Pong { epoch, .. } => {
                 session.accept_delta(epoch).map_err(state_error)?;
@@ -128,7 +160,51 @@ impl CompositorAuthority {
         }
         state.current_epoch = None;
         state.session = None;
+        state.writer = None;
+        state.pending_fds.clear();
         state.signals.disconnect();
+    }
+
+    /// Ask the active compositor to mint one role-bound Wayland connection. The returned
+    /// receiver is invalidated if the compositor epoch changes before its descriptor arrives.
+    pub fn request_trusted_connection(
+        &self,
+        role: OverlayRole,
+    ) -> io::Result<Receiver<io::Result<OwnedFd>>> {
+        let unit = match role {
+            OverlayRole::Keyboard => "pf-osk.service",
+            OverlayRole::Menu => "pf-system-menu.service",
+            OverlayRole::Toast => return Err(invalid("toast has no role endpoint")),
+        };
+        let request_id = self.next_request.fetch_add(1, Ordering::Relaxed).max(1);
+        let mut state = self.state.lock().expect("compositor state poisoned");
+        let epoch = state.current_epoch.ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotConnected, "compositor is not registered")
+        })?;
+        state
+            .session
+            .as_mut()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "compositor is absent"))?
+            .begin_trusted_connection(epoch, request_id, role)
+            .map_err(state_error)?;
+        let message = RouterToCompositor::TrustedConnection {
+            epoch,
+            request_id,
+            role,
+            unit: unit.into(),
+        };
+        let (sender, receiver) = mpsc::sync_channel(1);
+        state.pending_fds.insert(request_id, sender);
+        let write_result = state
+            .writer
+            .as_mut()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "compositor writer absent"))
+            .and_then(|writer| write_message(writer, &message));
+        if let Err(error) = write_result {
+            state.pending_fds.remove(&request_id);
+            return Err(error);
+        }
+        Ok(receiver)
     }
 
     pub fn snapshot_ready(&self, epoch: u64) -> bool {
@@ -162,7 +238,7 @@ pub fn serve_compositor_peer(
     if first != CompositorToRouter::Register {
         return Err(invalid("compositor must register before state replay"));
     }
-    let epoch = authority.register();
+    let epoch = authority.register(stream.try_clone()?);
     write_message(&mut stream, &RouterToCompositor::Registered { epoch })?;
 
     loop {
@@ -178,23 +254,9 @@ pub fn serve_compositor_peer(
             }
         };
         let message: CompositorToRouter = pf_input_ipc::decode(&body).map_err(ipc_error)?;
-        let expected_fd = matches!(
-            message,
-            CompositorToRouter::TrustedConnectionResult {
-                result: TrustedConnectionOutcome::Ok,
-                ..
-            }
-        );
-        if fd.is_some() != expected_fd {
-            authority.disconnect(epoch);
-            return Err(invalid(
-                "compositor frame carried the wrong descriptor count",
-            ));
-        }
         // Trusted connection requests are added when the keyboard/menu listeners mint them. Until
         // then, an unsolicited result is rejected by CompositorSession as an unexpected id.
-        let result = authority.apply(epoch, message);
-        drop(fd);
+        let result = authority.apply(epoch, message, fd);
         if let Err(error) = result {
             authority.disconnect(epoch);
             return Err(error);
