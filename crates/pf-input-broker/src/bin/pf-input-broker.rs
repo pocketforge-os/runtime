@@ -8,6 +8,7 @@
 //!   pf-input-broker --descriptor <caps.toml> [--source <event-node>] [--acquire-sock <path>]
 //!                   [--safe-return-sock <authority.sock>]
 //!                   [--system-menu-sock <provider.sock>]
+//!                   [--compositor-sock <gamescope.sock> --session-user <user>]
 //!                   [--allow-unidentified-pad]
 //!   pf-input-broker --descriptor <caps.toml>
 //!                   --test-event-fd <inherited-fd> --test-record-fd <inherited-fd>
@@ -30,13 +31,19 @@ use std::os::fd::{FromRawFd, OwnedFd, RawFd};
 use std::os::raw::c_int;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixListener;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+use pf_input_broker::session_ipc::{
+    authenticate_peer, bind_endpoint, serve_compositor_peer, user_uid, CompositorAuthority,
+    EndpointPolicy,
+};
 use pf_input_broker::{
     is_private_stream_eof, serve_client, serve_system_menu_provider, FdEventSink, FdEventSource,
     InputBroker, PostureFeed, RunConfig, SafeReturnIntake, SourceIdentity, SystemMenuRouter,
 };
+use pf_input_ipc::Role;
 use pocketforge::backends::InProcessBackend;
 use pocketforge::{Backend, Descriptor};
 
@@ -105,6 +112,8 @@ fn test_io_mode(args: &[String]) -> Result<Option<TestIo>, Box<dyn std::error::E
         "--acquire-sock",
         "--safe-return-sock",
         "--system-menu-sock",
+        "--compositor-sock",
+        "--session-user",
         "--allow-unidentified-pad",
     ] {
         if args.iter().any(|arg| arg == flag) {
@@ -171,8 +180,13 @@ fn run_production(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let acquire_sock = arg(args, "--acquire-sock");
     let safe_return_sock = arg(args, "--safe-return-sock");
     let system_menu_sock = arg(args, "--system-menu-sock");
+    let compositor_sock = arg(args, "--compositor-sock");
+    let session_user = arg(args, "--session-user");
     if system_menu_sock.is_some() && safe_return_sock.is_none() {
         return Err("--system-menu-sock requires --safe-return-sock".into());
+    }
+    if compositor_sock.is_some() && session_user.is_none() {
+        return Err("--compositor-sock requires --session-user".into());
     }
     let grab = !args.iter().any(|a| a == "--no-grab");
     // Identity is fail-closed by default: the source must be the decoder's built-in controller
@@ -248,6 +262,25 @@ fn run_production(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     } else {
         None
     };
+    let compositor_policy = if compositor_sock.is_some() {
+        Some(EndpointPolicy::for_role(
+            Role::Compositor,
+            user_uid(session_user.as_deref().expect("checked above"))?,
+        )?)
+    } else {
+        None
+    };
+    let compositor_listener = match (compositor_sock.as_deref(), compositor_policy.as_ref()) {
+        (Some(sock), Some(policy)) => {
+            let listener = bind_endpoint(Path::new(sock), policy)?;
+            println!("compositor-sock={sock}");
+            Some(listener)
+        }
+        _ => None,
+    };
+    let compositor_authority = compositor_listener
+        .as_ref()
+        .map(|_| Arc::new(CompositorAuthority::default()));
     notify_ready()?;
     println!("ready");
     use std::io::Write;
@@ -263,6 +296,9 @@ fn run_production(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         listener.as_ref(),
         system_menu_listener.as_ref(),
         system_menu_router.as_ref(),
+        compositor_listener.as_ref(),
+        compositor_policy.as_ref(),
+        compositor_authority.as_ref(),
         &node,
         &backend,
         &pump_rx,
@@ -277,6 +313,9 @@ fn supervise(
     listener: Option<&UnixListener>,
     system_menu_listener: Option<&UnixListener>,
     system_menu_router: Option<&SystemMenuRouter>,
+    compositor_listener: Option<&UnixListener>,
+    compositor_policy: Option<&EndpointPolicy>,
+    compositor_authority: Option<&Arc<CompositorAuthority>>,
     node: &str,
     backend: &Arc<dyn Backend>,
     pump_rx: &std::sync::mpsc::Receiver<std::io::Result<()>>,
@@ -319,6 +358,30 @@ fn supervise(
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
                 Err(e) => return Err(e),
+            }
+        }
+        if let (Some(listener), Some(policy), Some(authority)) =
+            (compositor_listener, compositor_policy, compositor_authority)
+        {
+            match listener.accept() {
+                Ok((stream, _)) => match authenticate_peer(&stream, policy) {
+                    Ok(Role::Compositor) => {
+                        let authority = authority.clone();
+                        std::thread::spawn(move || {
+                            if let Err(error) = serve_compositor_peer(stream, &authority) {
+                                eprintln!("pf-input-broker: compositor connection failed: {error}");
+                            }
+                        });
+                    }
+                    Ok(role) => {
+                        eprintln!("pf-input-broker: refused unexpected role {role:?}");
+                    }
+                    Err(error) => {
+                        eprintln!("pf-input-broker: refused compositor peer: {error}");
+                    }
+                },
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error) => return Err(error),
             }
         }
         std::thread::sleep(std::time::Duration::from_millis(50));
@@ -530,6 +593,9 @@ mod tests {
                 Some(&listener),
                 None,
                 None,
+                None,
+                None,
+                None,
                 "/unused",
                 &test_backend(),
                 &rx,
@@ -562,6 +628,9 @@ mod tests {
         let started = std::time::Instant::now();
         supervise(
             Some(&listener),
+            None,
+            None,
+            None,
             None,
             None,
             "/unused",

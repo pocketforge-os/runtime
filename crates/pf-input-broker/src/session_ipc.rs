@@ -4,9 +4,13 @@
 //! Linux boundary: socket-derived identity, PFW1 framing, frame limits, and descriptor transfer.
 
 use std::ffi::CString;
+use std::fs;
 use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
-use std::os::unix::net::UnixStream;
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
@@ -227,6 +231,70 @@ impl EndpointPolicy {
     }
 }
 
+/// Resolve a configured session user without trusting environment-provided numeric ids.
+pub fn user_uid(name: &str) -> io::Result<u32> {
+    let name =
+        CString::new(name).map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+    // SAFETY: `name` is NUL terminated. `getpwnam_r` writes only through supplied buffers.
+    unsafe {
+        let mut user: libc::passwd = std::mem::zeroed();
+        let mut result = std::ptr::null_mut();
+        let mut buffer = vec![0_u8; 16 * 1024];
+        let rc = libc::getpwnam_r(
+            name.as_ptr(),
+            &mut user,
+            buffer.as_mut_ptr().cast(),
+            buffer.len(),
+            &mut result,
+        );
+        if rc != 0 {
+            return Err(io::Error::from_raw_os_error(rc));
+        }
+        if result.is_null() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "session user not found",
+            ));
+        }
+        Ok(user.pw_uid)
+    }
+}
+
+/// Bind one role endpoint with the frozen `0660 root:<role-group>` ownership. Only a stale socket
+/// is replaced; a regular file, directory, or symlink collision fails closed.
+pub fn bind_endpoint(path: &Path, policy: &EndpointPolicy) -> io::Result<UnixListener> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_socket() => fs::remove_file(path)?,
+        Ok(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("refusing to replace non-socket endpoint {}", path.display()),
+            ));
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+
+    let listener = UnixListener::bind(path)?;
+    let c_path = CString::new(path.as_os_str().as_bytes())
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+    // SAFETY: c_path is a NUL-terminated path to the socket just created in the protected run dir.
+    let rc = unsafe { libc::chown(c_path.as_ptr(), libc::uid_t::MAX, policy.role_gid) };
+    if rc < 0 {
+        return Err(cleanup_bound_socket(path, io::Error::last_os_error()));
+    }
+    if let Err(error) = fs::set_permissions(
+        path,
+        fs::Permissions::from_mode(pf_input_ipc::sockets::SOCKET_MODE),
+    ) {
+        return Err(cleanup_bound_socket(path, error));
+    }
+    if let Err(error) = listener.set_nonblocking(true) {
+        return Err(cleanup_bound_socket(path, error));
+    }
+    Ok(listener)
+}
+
 /// Apply all three independent endpoint checks. A matching uid alone is never authority because
 /// apps and trusted surfaces deliberately share the session uid.
 pub fn authorize_peer(policy: &EndpointPolicy, facts: &PeerFacts) -> io::Result<Role> {
@@ -298,6 +366,19 @@ pub fn read_frame_with_fd(stream: &mut UnixStream) -> io::Result<(Vec<u8>, Optio
 
 fn denied(message: String) -> io::Error {
     io::Error::new(io::ErrorKind::PermissionDenied, message)
+}
+
+fn cleanup_bound_socket(path: &Path, cause: io::Error) -> io::Error {
+    match fs::remove_file(path) {
+        Ok(()) => cause,
+        Err(cleanup) => io::Error::new(
+            cause.kind(),
+            format!(
+                "{cause}; additionally failed to remove {}: {cleanup}",
+                path.display()
+            ),
+        ),
+    }
 }
 
 fn invalid(message: impl Into<String>) -> io::Error {

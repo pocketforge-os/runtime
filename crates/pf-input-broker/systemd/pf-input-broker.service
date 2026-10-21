@@ -7,7 +7,7 @@ ConditionPathExists=/dev/uinput
 
 [Service]
 Type=notify
-ExecStart=/usr/bin/pf-input-broker --descriptor /usr/share/pocketforge/devices/a133/capabilities.toml --acquire-sock /run/pocketforge/input-broker.sock --safe-return-sock /run/pocketforge/session-authority.sock
+ExecStart=/usr/bin/pf-input-broker --descriptor /usr/share/pocketforge/devices/a133/capabilities.toml --acquire-sock /run/pocketforge/input-broker.sock --safe-return-sock /run/pocketforge/session-authority.sock --compositor-sock /run/pocketforge/input/compositor.sock --session-user gamer
 Restart=on-failure
 RestartSec=2
 KillSignal=SIGTERM

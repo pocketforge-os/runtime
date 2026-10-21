@@ -158,11 +158,7 @@ fn overlay(role: OverlayRole) -> OverlaySnapshot {
 
 #[test]
 fn endpoint_binding_sets_contract_mode_and_refuses_non_socket_collisions() {
-    let root = std::env::temp_dir().join(format!(
-        "pf-session-ipc-{}-{}",
-        std::process::id(),
-        std::thread::current().name().unwrap_or("test")
-    ));
+    let root = std::env::temp_dir().join(format!("pfi-{}", std::process::id()));
     std::fs::create_dir(&root).unwrap();
     let socket = root.join("compositor.sock");
     let policy = EndpointPolicy {
