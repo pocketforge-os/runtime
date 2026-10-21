@@ -549,7 +549,7 @@ impl InputBroker {
                 "destination event node not resolved",
             )
         })?;
-        open_read_fd(&node)
+        open_read_fd(node)
     }
 }
 
