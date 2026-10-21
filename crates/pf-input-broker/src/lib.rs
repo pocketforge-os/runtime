@@ -39,6 +39,7 @@ pub mod io;
 pub mod ioc;
 pub mod policy;
 pub mod remap;
+pub mod router;
 pub mod safe_return;
 pub mod scm;
 pub mod uinput;
