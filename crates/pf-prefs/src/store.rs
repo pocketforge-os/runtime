@@ -293,7 +293,8 @@ pub fn json_to_pref(key: &str, kind: PrefKind, raw: &Value) -> Result<PrefValue,
                 if !value.is_finite()
                     || value.fract() != 0.0
                     || value < i64::MIN as f64
-                    || value > i64::MAX as f64
+                    || value >= i64::MAX as f64
+                // 2^63: i64::MAX itself is not an f64
                 {
                     return None;
                 }
@@ -490,6 +491,29 @@ mod tests {
                 json_to_pref(key, spec.kind, &fractional).is_err(),
                 "fractional value for {key}"
             );
+
+            // i64 edge: `i64::MAX as f64` is 2^63, so values at or above 2^63 (an unsigned
+            // integer, or a decimal that rounds to it) must be rejected rather than saturating
+            // to i64::MAX; the exact i64 extremes remain representable.
+            for raw in [
+                "9223372036854775808",
+                "9223372036854775807.5",
+                "18446744073709551615",
+            ] {
+                let value: Value = serde_json::from_str(raw).unwrap();
+                assert!(json_to_pref(key, spec.kind, &value).is_err(), "{key} {raw}");
+            }
+            for (raw, expected) in [
+                ("9223372036854775807", i64::MAX),
+                ("-9223372036854775808", i64::MIN),
+            ] {
+                let value: Value = serde_json::from_str(raw).unwrap();
+                assert_eq!(
+                    json_to_pref(key, spec.kind, &value).unwrap(),
+                    PrefValue::Scalar(expected),
+                    "{key} {raw}"
+                );
+            }
         }
     }
 
