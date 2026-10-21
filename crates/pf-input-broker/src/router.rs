@@ -645,6 +645,14 @@ impl Default for SessionSignals {
 }
 
 impl SessionSignals {
+    pub fn snapshot_ready(&self, epoch: u64) -> bool {
+        self.epoch == Some(epoch) && self.snapshot_applied
+    }
+
+    pub fn secure_entry(&self) -> bool {
+        self.secure_entry
+    }
+
     pub fn register_compositor(&mut self, epoch: u64) {
         self.epoch = Some(epoch);
         self.snapshot_applied = false;

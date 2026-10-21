@@ -10,8 +10,8 @@ use pf_input_ipc::compositor::{
     CompositorSnapshot, CompositorToRouter, FocusSnapshot, FocusedSurface, OverlaySnapshot,
     OverlayState, ProtectedPowerSnapshot, RouterToCompositor, TextInputState,
 };
-use pf_input_ipc::{ContentPurpose, OverlayRole};
 use pf_input_ipc::Role;
+use pf_input_ipc::{ContentPurpose, OverlayRole};
 
 #[test]
 fn endpoint_admission_requires_uid_role_group_and_exact_unit() {
@@ -92,7 +92,10 @@ fn compositor_must_register_then_replay_snapshot_for_its_new_epoch() {
 
     send(&mut client, &CompositorToRouter::Register);
     let (body, fd) = read_frame_with_fd(&mut client).unwrap();
-    assert!(fd.is_none(), "compositor registration never receives a pad fd");
+    assert!(
+        fd.is_none(),
+        "compositor registration never receives a pad fd"
+    );
     let RouterToCompositor::Registered { epoch } = pf_input_ipc::decode(&body).unwrap() else {
         panic!("first reply must be registered");
     };
@@ -104,6 +107,10 @@ fn compositor_must_register_then_replay_snapshot_for_its_new_epoch() {
             snapshot: snapshot(epoch),
         },
     );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    while !authority.snapshot_ready(epoch) && std::time::Instant::now() < deadline {
+        std::thread::yield_now();
+    }
     assert!(authority.snapshot_ready(epoch));
     assert!(!authority.secure_entry(), "secure_entry is relayed exactly");
 

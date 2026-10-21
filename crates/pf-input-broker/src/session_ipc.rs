@@ -7,8 +7,188 @@ use std::ffi::CString;
 use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 
+use pf_input_ipc::compositor::{
+    CompositorSession, CompositorStateError, CompositorToRouter, RouterToCompositor,
+    TrustedConnectionOutcome,
+};
 use pf_input_ipc::Role;
+
+use crate::router::SessionSignals;
+
+struct CompositorState {
+    session: Option<CompositorSession>,
+    signals: SessionSignals,
+}
+
+/// Session state driven only by the currently registered compositor connection.
+pub struct CompositorAuthority {
+    next_epoch: AtomicU64,
+    state: Mutex<CompositorState>,
+}
+
+impl Default for CompositorAuthority {
+    fn default() -> Self {
+        Self {
+            next_epoch: AtomicU64::new(1),
+            state: Mutex::new(CompositorState {
+                session: None,
+                signals: SessionSignals::default(),
+            }),
+        }
+    }
+}
+
+impl CompositorAuthority {
+    fn register(&self) -> u64 {
+        let epoch = self.next_epoch.fetch_add(1, Ordering::Relaxed).max(1);
+        let mut state = self.state.lock().expect("compositor state poisoned");
+        state.session = Some(CompositorSession::new(epoch));
+        state.signals.register_compositor(epoch);
+        epoch
+    }
+
+    fn apply(&self, message: CompositorToRouter) -> io::Result<()> {
+        let mut state = self.state.lock().expect("compositor state poisoned");
+        let session = state.session.as_mut().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotConnected, "compositor is not registered")
+        })?;
+        match message {
+            CompositorToRouter::Register => {
+                return Err(invalid("duplicate compositor register"));
+            }
+            CompositorToRouter::StateSnapshot { snapshot } => {
+                let epoch = snapshot.epoch;
+                let secure_entry = snapshot.focus.secure_entry;
+                session.apply_snapshot(snapshot).map_err(state_error)?;
+                state.signals.snapshot(epoch, secure_entry);
+            }
+            CompositorToRouter::Focus {
+                epoch,
+                secure_entry,
+                ..
+            } => {
+                session.accept_delta(epoch).map_err(state_error)?;
+                state.signals.focus(epoch, secure_entry);
+            }
+            CompositorToRouter::Overlay { epoch, .. } => {
+                session.accept_delta(epoch).map_err(state_error)?;
+            }
+            CompositorToRouter::PhysicalInput { epoch, class } => {
+                session.accept_delta(epoch).map_err(state_error)?;
+                state.signals.physical_input(epoch, class);
+            }
+            CompositorToRouter::ProtectedPower {
+                epoch,
+                sequence,
+                state: power,
+            } => {
+                session
+                    .protected_power(epoch, sequence, power)
+                    .map_err(state_error)?;
+            }
+            CompositorToRouter::TrustedConnectionResult {
+                epoch,
+                request_id,
+                result,
+            } => match result {
+                TrustedConnectionOutcome::Ok => session
+                    .finish_trusted_connection(epoch, request_id, 0)
+                    .map_err(state_error)?,
+                TrustedConnectionOutcome::Refused { .. } => session
+                    .refuse_trusted_connection(epoch, request_id, 0)
+                    .map_err(state_error)?,
+            },
+            CompositorToRouter::Pong { epoch, .. } => {
+                session.accept_delta(epoch).map_err(state_error)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn disconnect(&self, epoch: u64) {
+        let mut state = self.state.lock().expect("compositor state poisoned");
+        if state.signals.snapshot_ready(epoch) || state.session.is_some() {
+            if let Some(session) = state.session.as_mut() {
+                session.disconnect(false);
+            }
+            state.session = None;
+            state.signals.disconnect();
+        }
+    }
+
+    pub fn snapshot_ready(&self, epoch: u64) -> bool {
+        self.state
+            .lock()
+            .expect("compositor state poisoned")
+            .signals
+            .snapshot_ready(epoch)
+    }
+
+    pub fn secure_entry(&self) -> bool {
+        self.state
+            .lock()
+            .expect("compositor state poisoned")
+            .signals
+            .secure_entry()
+    }
+}
+
+/// Serve one already-authenticated compositor. Registration is the mandatory first frame and
+/// each new connection receives a fresh epoch; the complete snapshot must precede every delta.
+pub fn serve_compositor_peer(
+    mut stream: UnixStream,
+    authority: &CompositorAuthority,
+) -> io::Result<()> {
+    let (body, fd) = read_frame_with_fd(&mut stream)?;
+    if fd.is_some() {
+        return Err(invalid("compositor register carried a descriptor"));
+    }
+    let first: CompositorToRouter = pf_input_ipc::decode(&body).map_err(ipc_error)?;
+    if first != CompositorToRouter::Register {
+        return Err(invalid("compositor must register before state replay"));
+    }
+    let epoch = authority.register();
+    write_message(&mut stream, &RouterToCompositor::Registered { epoch })?;
+
+    loop {
+        let (body, fd) = match read_frame_with_fd(&mut stream) {
+            Ok(frame) => frame,
+            Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => {
+                authority.disconnect(epoch);
+                return Ok(());
+            }
+            Err(error) => {
+                authority.disconnect(epoch);
+                return Err(error);
+            }
+        };
+        let message: CompositorToRouter = pf_input_ipc::decode(&body).map_err(ipc_error)?;
+        let expected_fd = matches!(
+            message,
+            CompositorToRouter::TrustedConnectionResult {
+                result: TrustedConnectionOutcome::Ok,
+                ..
+            }
+        );
+        if fd.is_some() != expected_fd {
+            authority.disconnect(epoch);
+            return Err(invalid(
+                "compositor frame carried the wrong descriptor count",
+            ));
+        }
+        // Trusted connection requests are added when the keyboard/menu listeners mint them. Until
+        // then, an unsolicited result is rejected by CompositorSession as an unexpected id.
+        let result = authority.apply(message);
+        drop(fd);
+        if let Err(error) = result {
+            authority.disconnect(epoch);
+            return Err(error);
+        }
+    }
+}
 
 /// Facts derived from the accepted socket and the peer's pinned process, never from a request.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -118,6 +298,24 @@ pub fn read_frame_with_fd(stream: &mut UnixStream) -> io::Result<(Vec<u8>, Optio
 
 fn denied(message: String) -> io::Error {
     io::Error::new(io::ErrorKind::PermissionDenied, message)
+}
+
+fn invalid(message: impl Into<String>) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, message.into())
+}
+
+fn ipc_error(error: pf_input_ipc::IpcError) -> io::Error {
+    invalid(error.to_string())
+}
+
+fn state_error(error: CompositorStateError) -> io::Error {
+    invalid(format!("invalid compositor state transition: {error:?}"))
+}
+
+fn write_message<M: serde::Serialize>(stream: &mut UnixStream, message: &M) -> io::Result<()> {
+    let body = pf_input_ipc::encode(message);
+    pf_wire::write_frame(stream, &body)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))
 }
 
 fn group_gid(name: &str) -> io::Result<u32> {
