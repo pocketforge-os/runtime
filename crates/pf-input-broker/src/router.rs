@@ -6,7 +6,9 @@
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::time::Duration;
 
-use pf_input_ipc::{timeouts, MenuSession, MenuStep};
+use pf_input_ipc::compositor::{PhysicalInputClass, RouterToCompositor};
+use pf_input_ipc::events::RouterEvent;
+use pf_input_ipc::{timeouts, MenuSession, MenuStep, OverlayRole};
 
 use crate::safe_return::GUIDE_CODE;
 
@@ -608,6 +610,104 @@ impl EpochFdGate {
             EpochEffect::SnapshotApplied { epoch },
             EpochEffect::FdDelivered { epoch },
         ]
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputModality {
+    Controller,
+    Keyboard,
+    Mouse,
+    Touch,
+}
+
+/// Epoch-gated compositor signals owned by the router.
+///
+/// The router records modality but never coordinates, and relays gamescope's secure bit without
+/// attempting to infer it. A disconnected compositor is fail-closed (`secure_entry=true`).
+#[derive(Debug)]
+pub struct SessionSignals {
+    epoch: Option<u64>,
+    snapshot_applied: bool,
+    modality: InputModality,
+    secure_entry: bool,
+}
+
+impl Default for SessionSignals {
+    fn default() -> Self {
+        Self {
+            epoch: None,
+            snapshot_applied: false,
+            modality: InputModality::Controller,
+            secure_entry: true,
+        }
+    }
+}
+
+impl SessionSignals {
+    pub fn register_compositor(&mut self, epoch: u64) {
+        self.epoch = Some(epoch);
+        self.snapshot_applied = false;
+        self.secure_entry = true;
+    }
+
+    pub fn snapshot(&mut self, epoch: u64, secure_entry: bool) -> Vec<RouterEvent> {
+        if self.epoch != Some(epoch) || self.snapshot_applied {
+            return Vec::new();
+        }
+        self.snapshot_applied = true;
+        self.secure_entry = secure_entry;
+        vec![RouterEvent::SecureEntry {
+            active: secure_entry,
+        }]
+    }
+
+    pub fn focus(&mut self, epoch: u64, secure_entry: bool) -> Vec<RouterEvent> {
+        if self.epoch != Some(epoch) || !self.snapshot_applied {
+            return Vec::new();
+        }
+        self.secure_entry = secure_entry;
+        vec![RouterEvent::SecureEntry {
+            active: secure_entry,
+        }]
+    }
+
+    pub fn controller_input(&mut self) -> InputModality {
+        self.modality = InputModality::Controller;
+        self.modality
+    }
+
+    pub fn physical_input(&mut self, epoch: u64, class: PhysicalInputClass) -> Vec<InputModality> {
+        if self.epoch != Some(epoch) || !self.snapshot_applied {
+            return Vec::new();
+        }
+        let modality = match class {
+            PhysicalInputClass::Keyboard => InputModality::Keyboard,
+            PhysicalInputClass::Mouse => InputModality::Mouse,
+            PhysicalInputClass::Touch => InputModality::Touch,
+        };
+        if modality == self.modality {
+            return Vec::new();
+        }
+        self.modality = modality;
+        vec![modality]
+    }
+
+    pub fn menu_secure_entry(&self, active: bool) -> Option<RouterToCompositor> {
+        (self.snapshot_applied && self.epoch.is_some()).then(|| {
+            RouterToCompositor::SurfaceSecureEntry {
+                epoch: self.epoch.expect("checked above"),
+                role: OverlayRole::Menu,
+                active,
+            }
+        })
+    }
+
+    pub fn disconnect(&mut self) -> Vec<RouterEvent> {
+        self.epoch = None;
+        self.snapshot_applied = false;
+        self.secure_entry = true;
+        vec![RouterEvent::SecureEntry { active: true }]
     }
 }
 

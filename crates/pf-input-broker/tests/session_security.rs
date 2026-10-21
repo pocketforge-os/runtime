@@ -177,9 +177,17 @@ fn app_probe_dims_only_its_section_and_late_pong_recovers_without_focus_change()
 fn modality_and_secure_entry_are_exact_compositor_relays() {
     let mut signals = SessionSignals::default();
     signals.register_compositor(7);
-    assert!(signals.physical_input(7, PhysicalInputClass::Mouse).is_empty());
-    assert_eq!(signals.snapshot(7, false), vec![RouterEvent::SecureEntry { active: false }]);
-    assert_eq!(signals.controller_input(), pf_input_broker::router::InputModality::Controller);
+    assert!(signals
+        .physical_input(7, PhysicalInputClass::Mouse)
+        .is_empty());
+    assert_eq!(
+        signals.snapshot(7, false),
+        vec![RouterEvent::SecureEntry { active: false }]
+    );
+    assert_eq!(
+        signals.controller_input(),
+        pf_input_broker::router::InputModality::Controller
+    );
     assert_eq!(
         signals.physical_input(7, PhysicalInputClass::Touch),
         vec![pf_input_broker::router::InputModality::Touch]
@@ -196,7 +204,13 @@ fn modality_and_secure_entry_are_exact_compositor_relays() {
             active: false,
         })
     );
-    assert!(signals.focus(6, false).is_empty(), "stale epochs cannot clear secrecy");
-    assert_eq!(signals.disconnect(), vec![RouterEvent::SecureEntry { active: true }]);
+    assert!(
+        signals.focus(6, false).is_empty(),
+        "stale epochs cannot clear secrecy"
+    );
+    assert_eq!(
+        signals.disconnect(),
+        vec![RouterEvent::SecureEntry { active: true }]
+    );
     assert_eq!(signals.menu_secure_entry(false), None);
 }
