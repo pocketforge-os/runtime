@@ -1,9 +1,10 @@
 use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 
 use pf_input_broker::session_ipc::{
-    authorize_peer, read_frame_with_fd, serve_compositor_peer, write_frame_with_fd,
+    authorize_peer, bind_endpoint, read_frame_with_fd, serve_compositor_peer, write_frame_with_fd,
     CompositorAuthority, EndpointPolicy, PeerFacts,
 };
 use pf_input_ipc::compositor::{
@@ -153,4 +154,41 @@ fn overlay(role: OverlayRole) -> OverlaySnapshot {
         state: OverlayState::Unmapped,
         rect: None,
     }
+}
+
+#[test]
+fn endpoint_binding_sets_contract_mode_and_refuses_non_socket_collisions() {
+    let root = std::env::temp_dir().join(format!(
+        "pf-session-ipc-{}-{}",
+        std::process::id(),
+        std::thread::current().name().unwrap_or("test")
+    ));
+    std::fs::create_dir(&root).unwrap();
+    let socket = root.join("compositor.sock");
+    let policy = EndpointPolicy {
+        role: Role::Compositor,
+        session_uid: unsafe { libc::geteuid() },
+        role_gid: unsafe { libc::getegid() },
+        unit: "pocketforge-gamescope.service",
+    };
+
+    let listener = bind_endpoint(&socket, &policy).unwrap();
+    assert_eq!(
+        std::fs::symlink_metadata(&socket)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        pf_input_ipc::sockets::SOCKET_MODE
+    );
+    drop(listener);
+    std::fs::remove_file(&socket).unwrap();
+
+    std::fs::write(&socket, b"do not replace").unwrap();
+    let error = bind_endpoint(&socket, &policy).unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+    assert_eq!(std::fs::read(&socket).unwrap(), b"do not replace");
+
+    std::fs::remove_file(socket).unwrap();
+    std::fs::remove_dir(root).unwrap();
 }
