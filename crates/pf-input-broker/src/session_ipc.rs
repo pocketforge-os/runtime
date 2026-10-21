@@ -23,6 +23,7 @@ use pf_input_ipc::Role;
 use crate::router::SessionSignals;
 
 struct CompositorState {
+    current_epoch: Option<u64>,
     session: Option<CompositorSession>,
     signals: SessionSignals,
 }
@@ -38,6 +39,7 @@ impl Default for CompositorAuthority {
         Self {
             next_epoch: AtomicU64::new(1),
             state: Mutex::new(CompositorState {
+                current_epoch: None,
                 session: None,
                 signals: SessionSignals::default(),
             }),
@@ -49,13 +51,17 @@ impl CompositorAuthority {
     fn register(&self) -> u64 {
         let epoch = self.next_epoch.fetch_add(1, Ordering::Relaxed).max(1);
         let mut state = self.state.lock().expect("compositor state poisoned");
+        state.current_epoch = Some(epoch);
         state.session = Some(CompositorSession::new(epoch));
         state.signals.register_compositor(epoch);
         epoch
     }
 
-    fn apply(&self, message: CompositorToRouter) -> io::Result<()> {
+    fn apply(&self, connection_epoch: u64, message: CompositorToRouter) -> io::Result<()> {
         let mut state = self.state.lock().expect("compositor state poisoned");
+        if state.current_epoch != Some(connection_epoch) {
+            return Err(invalid("superseded compositor connection"));
+        }
         let session = state.session.as_mut().ok_or_else(|| {
             io::Error::new(io::ErrorKind::NotConnected, "compositor is not registered")
         })?;
@@ -114,13 +120,15 @@ impl CompositorAuthority {
 
     fn disconnect(&self, epoch: u64) {
         let mut state = self.state.lock().expect("compositor state poisoned");
-        if state.signals.snapshot_ready(epoch) || state.session.is_some() {
-            if let Some(session) = state.session.as_mut() {
-                session.disconnect(false);
-            }
-            state.session = None;
-            state.signals.disconnect();
+        if state.current_epoch != Some(epoch) {
+            return;
         }
+        if let Some(session) = state.session.as_mut() {
+            session.disconnect(false);
+        }
+        state.current_epoch = None;
+        state.session = None;
+        state.signals.disconnect();
     }
 
     pub fn snapshot_ready(&self, epoch: u64) -> bool {
@@ -185,7 +193,7 @@ pub fn serve_compositor_peer(
         }
         // Trusted connection requests are added when the keyboard/menu listeners mint them. Until
         // then, an unsolicited result is rejected by CompositorSession as an unexpected id.
-        let result = authority.apply(message);
+        let result = authority.apply(epoch, message);
         drop(fd);
         if let Err(error) = result {
             authority.disconnect(epoch);
