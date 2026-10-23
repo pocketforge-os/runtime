@@ -322,17 +322,6 @@ fn open_without_symlinks(
 }
 
 pub fn required_launch_paths(app_id: &str) -> Result<LaunchPaths, LaunchError> {
-    let required = |name: &str, expected: PathBuf| {
-        let actual = std::env::var_os(name)
-            .map(PathBuf::from)
-            .ok_or_else(|| LaunchError::Xdg(io::Error::other(format!("{name} is not set"))))?;
-        if actual != expected {
-            return Err(LaunchError::Xdg(io::Error::other(format!(
-                "{name} is outside the canonical app directory"
-            ))));
-        }
-        Ok(actual)
-    };
     let state_root = PathBuf::from("/var/lib/pocketforge/apps").join(app_id);
     let inventory_path =
         PathBuf::from("/usr/share/pocketforge/app-policy").join(format!("{app_id}.resources.json"));
@@ -349,10 +338,11 @@ pub fn required_launch_paths(app_id: &str) -> Result<LaunchPaths, LaunchError> {
                 inventory_path.display()
             )))
         })?;
+    required_environment_path("XDG_RUNTIME_DIR", PathBuf::from("/run/pf-app").join(app_id))?;
     Ok(LaunchPaths {
-        xdg_config: required("XDG_CONFIG_HOME", state_root.join("config"))?,
-        xdg_state: required("XDG_STATE_HOME", state_root.join("state"))?,
-        xdg_cache: required(
+        xdg_config: required_environment_path("XDG_CONFIG_HOME", state_root.join("config"))?,
+        xdg_state: required_environment_path("XDG_STATE_HOME", state_root.join("state"))?,
+        xdg_cache: required_environment_path(
             "XDG_CACHE_HOME",
             PathBuf::from("/var/cache/pocketforge/apps").join(app_id),
         )?,
@@ -360,6 +350,25 @@ pub fn required_launch_paths(app_id: &str) -> Result<LaunchPaths, LaunchError> {
         resource_paths: platform_resource_paths(),
         resources: inventory.resources,
     })
+}
+
+fn required_environment_path(name: &str, expected: PathBuf) -> Result<PathBuf, LaunchError> {
+    validate_environment_path(name, std::env::var_os(name).map(PathBuf::from), expected)
+}
+
+fn validate_environment_path(
+    name: &str,
+    actual: Option<PathBuf>,
+    expected: PathBuf,
+) -> Result<PathBuf, LaunchError> {
+    let actual =
+        actual.ok_or_else(|| LaunchError::Xdg(io::Error::other(format!("{name} is not set"))))?;
+    if actual != expected {
+        return Err(LaunchError::Xdg(io::Error::other(format!(
+            "{name} is outside the canonical app directory"
+        ))));
+    }
+    Ok(actual)
 }
 
 #[cfg(test)]
@@ -461,6 +470,30 @@ mod tests {
     }
 
     #[test]
+    fn xdg_runtime_directory_must_be_the_private_unit_directory() {
+        let expected = PathBuf::from("/run/pf-app/org.example.app");
+        assert_eq!(
+            validate_environment_path("XDG_RUNTIME_DIR", Some(expected.clone()), expected.clone())
+                .unwrap(),
+            expected
+        );
+        assert!(
+            validate_environment_path("XDG_RUNTIME_DIR", None, expected.clone())
+                .unwrap_err()
+                .to_string()
+                .contains("is not set")
+        );
+        assert!(validate_environment_path(
+            "XDG_RUNTIME_DIR",
+            Some(PathBuf::from("/run/pf-app/another.app")),
+            expected
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("outside the canonical app directory"));
+    }
+
+    #[test]
     fn x11_environment_is_validated_and_explicitly_scoped_to_exec() {
         let dir = std::env::temp_dir().join(format!(
             "pf-app-launch-x11-{}-{:?}",
@@ -541,6 +574,15 @@ mod tests {
                 .find(|(name, _)| *name == "DISPLAY"),
             Some((std::ffi::OsStr::new("DISPLAY"), None))
         );
+        for inherited in ["WAYLAND_DISPLAY", "XDG_RUNTIME_DIR"] {
+            assert_eq!(
+                plain_command
+                    .get_envs()
+                    .find(|(name, _)| *name == inherited),
+                None,
+                "{inherited} must remain inherited from the validated systemd unit"
+            );
+        }
         let x11_command = execution_command(
             Path::new("/usr/bin/env"),
             &dir,
