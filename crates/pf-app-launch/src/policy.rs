@@ -329,6 +329,10 @@ pub fn derive_policy(
                 access: FsAccess::ReadWriteNoExec,
             });
         }
+        filesystem.push(FsRule {
+            path: PathBuf::from("/run/pf-app").join(&app.id),
+            access: FsAccess::ReadWriteNoExec,
+        });
         for path in &inputs.resource_paths {
             filesystem.push(FsRule {
                 path: path.clone(),
