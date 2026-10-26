@@ -1,8 +1,9 @@
 //! MULTI-SOURCE routing (tsp-bwrg.16): a control whose descriptor `source` names a NON-PRIMARY
 //! evdev node is captured from THAT node — and the SAME plan against a single-source collector
 //! misses it entirely. That miss is the exact structural gap this bead exists to close: the a133's
-//! VOL± live on the `sunxi-keyboard` LRADC node (event0), the guided collector read only the
-//! `TRIMUI Player1` gamepad node (event2), so no plan change could ever have captured them.
+//! VOL± live on the LRADC node (stock-OS event0 `sunxi-keyboard`; Linux 7 `5070800.lradc`), the
+//! guided collector read only the `TRIMUI Player1` gamepad node, so no plan change could ever have
+//! captured them.
 //!
 //! Proven-to-fail (guards-must-be-shown-to-fail): `single_source_build_misses_the_nonprimary_control`
 //! reproduces the PRE-CHANGE behaviour — a single node, `set_active_source` a no-op — and asserts the
@@ -16,7 +17,14 @@ use pf_input_collect::{Collector, EventSource, MultiSource};
 
 const EV_KEY: u16 = 0x01;
 const BTN_SOUTH: u16 = 0x130;
-const KEY_VOLUMEUP: u16 = 0x73; // 115 — the LRADC/sunxi-keyboard code the gamepad node never carries
+const KEY_VOLUMEUP: u16 = 0x73; // 115 — the LRADC code the gamepad node never carries
+const KEY_VOLUMEDOWN: u16 = 0x72; // 114 — also on the audiocodec headset-remote node
+
+/// The a133 LRADC node name the platform descriptor gives VOL± as `source` (platform `d81c1eec`,
+/// Linux 7 `sun4i-lradc`: `Name="5070800.lradc"`). The stock-OS name was `sunxi-keyboard`.
+const LRADC_NODE: &str = "5070800.lradc";
+/// The wired-headset remote node, which also advertises 114/115. A decoy: VOL± must never read it.
+const AUDIOCODEC_NODE: &str = "audiocodec sunxi Audio Jack";
 
 fn key(code: u16, v: i32) -> RawEvent {
     RawEvent::new(EV_KEY, code, v)
@@ -34,7 +42,7 @@ fn gamepad_ident() -> Identity {
 fn kbd_ident() -> Identity {
     // The LRADC node advertises no vid/pid of interest; identity() is only ever taken from PRIMARY.
     Identity {
-        name: "sunxi-keyboard".into(),
+        name: LRADC_NODE.into(),
         bus: 0x19,
         vid: 0x0001,
         pid: 0x0001,
@@ -60,13 +68,13 @@ fn meta() -> DeviceMeta {
     }
 }
 
-/// Two controls: `south` on the primary gamepad node, `vol_up` pinned to the `sunxi-keyboard` node.
+/// Two controls: `south` on the primary gamepad node, `vol_up` pinned to the LRADC node.
 /// `vol_up` is optional so the single-source arm SKIPS it (row omitted) rather than erroring —
 /// which is exactly how a real optional system control would behave when its node is never read.
 fn plan() -> Vec<ControlSpec> {
     vec![
         ControlSpec::new("south", Kind::Button, "press south", false),
-        ControlSpec::new("vol_up", Kind::Button, "press VOL+", true).on_source("sunxi-keyboard"),
+        ControlSpec::new("vol_up", Kind::Button, "press VOL+", true).on_source(LRADC_NODE),
     ]
 }
 
@@ -82,7 +90,7 @@ fn pad_with_south() -> ScriptedSource {
 fn multi_source_captures_the_nonprimary_control() {
     let pad = pad_with_south();
 
-    // VOL+ fires ONLY on the sunxi-keyboard node — never on the pad. If the engine reads the wrong
+    // VOL+ fires ONLY on the LRADC node — never on the pad. If the engine reads the wrong
     // node, this press is invisible and vol_up skips.
     let mut kbd = ScriptedSource::new(kbd_ident());
     kbd.push_batch(vec![key(KEY_VOLUMEUP, 1), key(KEY_VOLUMEUP, 0)]);
@@ -90,7 +98,7 @@ fn multi_source_captures_the_nonprimary_control() {
     kbd.push_batch(vec![]);
 
     let mut src = MultiSource::new("TRIMUI Player1", Box::new(pad));
-    src.add_source("sunxi-keyboard", Box::new(kbd));
+    src.add_source(LRADC_NODE, Box::new(kbd));
 
     let mut c = Collector::new(plan());
     let mut log = Vec::new();
@@ -106,7 +114,7 @@ fn multi_source_captures_the_nonprimary_control() {
         .inputs
         .iter()
         .find(|i| i.id == "vol_up")
-        .expect("vol_up must be captured from the sunxi-keyboard node (multi-source routing)");
+        .expect("vol_up must be captured from the LRADC node (multi-source routing)");
     assert_eq!(vol.code, "KEY_VOLUMEUP");
     // identity() is ALWAYS the primary node's, never the keyboard node's.
     assert_eq!(caps.identity.evdev_name, "TRIMUI Player1");
@@ -158,4 +166,44 @@ fn unknown_source_node_falls_back_to_primary_and_flags_the_miss() {
 
     src.set_active_source(None);
     assert!(!src.last_route_missed(), "None routes to primary — no miss");
+}
+
+#[test]
+fn vol_up_reads_the_linux7_lradc_node_and_no_other() {
+    // All three a133 nodes are registered and each fires a DIFFERENT press first, so the recorded
+    // code names the node the engine read: BTN_SOUTH = the pad, KEY_VOLUMEDOWN = the audiocodec
+    // decoy, KEY_VOLUMEUP = the LRADC node the descriptor names.
+    let mut pad = ScriptedSource::new(gamepad_ident());
+    pad.push_batch(vec![key(BTN_SOUTH, 1), key(BTN_SOUTH, 0)]);
+    let mut jack = ScriptedSource::new(Identity {
+        name: AUDIOCODEC_NODE.into(),
+        bus: 0x19,
+        vid: 0,
+        pid: 0,
+        version: 0,
+    });
+    jack.push_batch(vec![key(KEY_VOLUMEDOWN, 1), key(KEY_VOLUMEDOWN, 0)]);
+    let mut kbd = ScriptedSource::new(kbd_ident());
+    kbd.push_batch(vec![key(KEY_VOLUMEUP, 1), key(KEY_VOLUMEUP, 0)]);
+
+    let mut src = MultiSource::new("TRIMUI Player1", Box::new(pad));
+    src.add_source(AUDIOCODEC_NODE, Box::new(jack));
+    src.add_source(LRADC_NODE, Box::new(kbd));
+
+    let plan =
+        vec![ControlSpec::new("vol_up", Kind::Button, "press VOL+", false).on_source(LRADC_NODE)];
+    let mut c = Collector::new(plan);
+    let mut log = Vec::new();
+    collect::run(&mut c, &mut src, &meta(), &cfg(), &mut log).expect("run ok");
+
+    assert!(
+        !src.last_route_missed(),
+        "{LRADC_NODE} is registered — no miss"
+    );
+    assert_eq!(
+        c.recorded("vol_up"),
+        Some(&Recorded::Button { code: KEY_VOLUMEUP }),
+        "vol_up must come from {LRADC_NODE}, not the pad (BTN_SOUTH) or the audiocodec \
+         (KEY_VOLUMEDOWN)"
+    );
 }
