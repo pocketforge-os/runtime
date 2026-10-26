@@ -321,7 +321,7 @@ impl EventSource for ScriptedSource {
 // -------------------------------------------------------------------------------------------
 
 /// A router over N per-node event sources for a MULTI-NODE device. A device like the a133 exposes
-/// several evdev nodes (the `TRIMUI Player1` gamepad, the `sunxi-keyboard` LRADC where VOL± live,
+/// several evdev nodes (the `TRIMUI Player1` gamepad, the `5070800.lradc` LRADC where VOL± live,
 /// the `audiocodec` Audio Jack); each control's descriptor `source` names its node. The engine
 /// calls [`EventSource::set_active_source`] before pumping each control, and this router forwards
 /// `poll`/`absinfo` to the matching sub-source.
@@ -355,7 +355,7 @@ impl MultiSource {
         }
     }
 
-    /// Register an additional node's source under its evdev NAME (e.g. `"sunxi-keyboard"`).
+    /// Register an additional node's source under its evdev NAME (e.g. `"5070800.lradc"`).
     pub fn add_source(&mut self, node: &str, src: Box<dyn EventSource>) {
         self.sources.insert(node.to_string(), src);
     }
