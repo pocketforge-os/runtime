@@ -220,6 +220,22 @@ fn browser_profile_has_scopes_and_no_fs_or_net_rules() {
 }
 
 #[test]
+fn full_profile_grants_only_its_private_xdg_runtime_directory() {
+    let root = PathBuf::from("/fixture");
+    let policy = derive_policy(&resolved(&root, &[], false, true), &inputs(&root)).unwrap();
+
+    assert!(policy.landlock.filesystem.iter().any(|rule| {
+        rule.path == Path::new("/run/pf-app/org.example.app")
+            && rule.access == FsAccess::ReadWriteNoExec
+    }));
+    assert!(!policy
+        .landlock
+        .filesystem
+        .iter()
+        .any(|rule| rule.path == Path::new("/run/pf-app")));
+}
+
+#[test]
 fn device_regression_input_selects_broker_or_raw_route() {
     let root = PathBuf::from("/fixture");
     let app = resolved(&root, &["input"], false, true);
