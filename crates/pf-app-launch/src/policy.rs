@@ -15,6 +15,7 @@ const X11_BIND: (&str, &str) = ("/run/pocketforge/x11/.X11-unix/X0", "/tmp/.X11-
 pub const X11_SOCKET: &str = X11_BIND.0;
 pub const X11_SOCKET_DESTINATION: &str = X11_BIND.1;
 pub const X11_ENVIRONMENT: &str = "/run/pocketforge/x11/policy/environment";
+pub const INPUT_BROKER_SOCKET: &str = "/run/pocketforge/input-broker.sock";
 
 #[derive(Clone, Copy)]
 enum DisplayResourceGrant {
@@ -545,7 +546,11 @@ pub fn derive_policy(
         let optional = requested_brokered
             .iter()
             .all(|name| capability_optional.get(*name) == Some(&true));
-        socket_paths.extend(resource("broker-sockets", optional)?);
+        let broker_paths = resource("broker-sockets", optional)?;
+        if !broker_paths.is_empty() {
+            uses_input_broker = true;
+        }
+        socket_paths.extend(broker_paths);
     }
     if class == AppClass::Full {
         filesystem.extend(read_only_paths.iter().cloned().map(|path| FsRule {
