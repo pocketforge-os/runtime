@@ -46,6 +46,11 @@ const ABS_RZ: u16 = 0x05;
 const KEY_VOLUMEDOWN: u16 = 114;
 const KEY_VOLUMEUP: u16 = 115;
 
+/// The evdev node the a133 descriptor names for VOL± (`source`): the Linux 7 `sun4i-lradc` node
+/// (`Name="5070800.lradc"`, `Phys=sun4i_lradc/input0`), set by platform `d81c1eec`. The stock-OS
+/// name was `sunxi-keyboard`. This test reads the live platform descriptor, so it follows that file.
+const A133_VOL_SOURCE: &str = "5070800.lradc";
+
 /// sha256 of `platform/devices/a133/capabilities.toml` at platform `54ba5301` — the descriptor
 /// staged on the tsp-f3fm.215 bench image, where the broker refused the pre-fix decoder.
 const STAGED_A133_SHA256: &str = "98305bae7fe0529980c0275af76a4110d870783a03486e24b2596ea44200184e";
@@ -179,7 +184,7 @@ fn negative_control_removing_any_required_input_is_refused() {
 }
 
 /// The requirement set is PAD-sourced only: `class = "system"` rows (VOL±, which carry
-/// `source = "sunxi-keyboard"`, a different node) never enter it. The broker filters on `class`,
+/// `source = "5070800.lradc"`, a different node) never enter it. The broker filters on `class`,
 /// so also pin that every row naming a foreign `source` is a system row.
 #[test]
 fn broker_requires_only_pad_sourced_inputs() {
@@ -201,9 +206,25 @@ fn broker_requires_only_pad_sourced_inputs() {
         .filter(|i| i.id.starts_with("vol_"))
         .collect();
     assert_eq!(vol.len(), 2, "descriptor carries vol_up/vol_down");
-    assert!(vol
-        .iter()
-        .all(|i| i.is_system() && i.source.as_deref() == Some("sunxi-keyboard")));
+    let pad_node = d
+        .identity
+        .r#match
+        .as_ref()
+        .map(|m| m.evdev_name.as_str())
+        .expect("a133 descriptor names its primary gamepad node");
+    assert_ne!(
+        A133_VOL_SOURCE, pad_node,
+        "VOL± are not on the gamepad node"
+    );
+    for i in &vol {
+        assert!(i.is_system(), "{} must be class=system", i.id);
+        assert_eq!(
+            i.source.as_deref(),
+            Some(A133_VOL_SOURCE),
+            "{} must name the Linux 7 LRADC node",
+            i.id
+        );
+    }
     let r = remap(&d);
     for code in [KEY_VOLUMEUP, KEY_VOLUMEDOWN] {
         assert!(

@@ -65,7 +65,7 @@ pub struct ControlSpec {
     /// The evdev NODE this control lives on, by name — the descriptor's `input.source` field
     /// (tsp-bwrg.16). `None` = the PRIMARY gamepad node (the run's default source). A device with
     /// more than one input node — the a133 has THREE (the `TRIMUI Player1` gamepad, the
-    /// `sunxi-keyboard` LRADC where VOL± live, the `audiocodec` Audio Jack) — names the non-default
+    /// `5070800.lradc` LRADC where VOL± live, the `audiocodec` Audio Jack) — names the non-default
     /// node here so the engine reads that control from the right place. The engine routes to it via
     /// [`crate::source::EventSource::set_active_source`] before pumping each control; a single-node
     /// source ignores the hint (default no-op), so single-source runs are unchanged.
@@ -189,7 +189,8 @@ pub fn default_gamepad_plan() -> Vec<ControlSpec> {
 /// MENU (`BTN_MODE`, SDL `guide`) and no `l3`/`r3` clicks (no `BTN_THUMBL/THUMBR`). It is **NOT** the
 /// whole device: the a133 exposes **three** input nodes, and this plan reads only the first —
 ///   • event2 `TRIMUI Player1` — this gamepad node (the 17 below);
-///   • event0 `sunxi-keyboard` — the LRADC node carrying the SYSTEM keys **VOL+ / VOL-**
+///   • the LRADC node (`5070800.lradc` on Linux 7; stock-OS event0 `sunxi-keyboard`) — carrying
+///     the SYSTEM keys **VOL+ / VOL-**
 ///     (`KEY_VOLUMEUP`/`KEY_VOLUMEDOWN`), which this single-node plan structurally cannot see
 ///     (they are absent from the gamepad node's KEY bitmap — tsp-ozbp.2 / tsp-bwrg.16);
 ///   • event1 `audiocodec sunxi Audio Jack` — the wired-headset inline remote (also 114/115 +
@@ -355,7 +356,7 @@ mod tests {
 
     /// FRAME PIN (tsp-bwrg.16, AC#4). The a133 plan reads exactly ONE node — the primary gamepad
     /// node — so every control it carries is on it (`source == None`), and NO system/volume control
-    /// has leaked in (those live on the sunxi-keyboard / audiocodec nodes). This is the guard the
+    /// has leaked in (those live on the 5070800.lradc / audiocodec nodes). This is the guard the
     /// old "the device has EXACTLY these controls and NOTHING ELSE" comment lacked: it FAILS if a
     /// future edit re-broadens this gamepad-NODE plan into a device-wide claim — either by smuggling
     /// a system key into it or by pinning a control to a non-primary `source` without going through
@@ -384,7 +385,7 @@ mod tests {
             assert!(
                 !plan.iter().any(|c| c.id == sys),
                 "system control '{sys}' must NOT appear in the a133 gamepad-node plan — it lives on \
-                 a DIFFERENT evdev node (sunxi-keyboard / audiocodec), and claiming it here would \
+                 a DIFFERENT evdev node (5070800.lradc / audiocodec), and claiming it here would \
                  repeat the node-scoped-observation-as-device-fact defect this bead fixed"
             );
         }

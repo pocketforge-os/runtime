@@ -835,14 +835,14 @@ kind = "button"
 ev_type = "EV_KEY"
 code = "KEY_VOLUMEUP"
 class = "system"
-source = "sunxi-keyboard"
+source = "5070800.lradc"
 [[inputs]]
 id = "vol_down"
 kind = "button"
 ev_type = "EV_KEY"
 code = "KEY_VOLUMEDOWN"
 class = "system"
-source = "sunxi-keyboard"
+source = "5070800.lradc"
 "#,
         )
         .unwrap();

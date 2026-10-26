@@ -87,8 +87,10 @@ pub struct Input {
     pub class: Option<String>,
     /// The evdev NODE this control lives on, by name (tsp-bwrg.16). Absent ⇒ the PRIMARY gamepad
     /// node (`identity.match.evdev_name`). Named explicitly when the control is on a different node
-    /// — the a133 has three (the gamepad node, the `sunxi-keyboard` LRADC where VOL± live, the
+    /// — the a133 has three (the gamepad node, the `5070800.lradc` LRADC where VOL± live, the
     /// `audiocodec` Audio Jack) — so multi-source collection reads each control from the right node.
+    /// The name is descriptor data: the stock OS called the LRADC node `sunxi-keyboard`, Linux 7
+    /// calls it `5070800.lradc` (platform `d81c1eec`). Runtime code must not hard-code either.
     #[serde(default)]
     pub source: Option<String>,
     #[serde(default)]
