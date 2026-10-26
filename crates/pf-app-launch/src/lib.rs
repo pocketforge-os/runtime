@@ -55,6 +55,9 @@ fn execution_command(
         // DISPLAY is never ambient: every child starts with it removed and only the
         // manifest-derived projection below can add the validated value back.
         .env_remove("DISPLAY")
+        // The base unit supplies the broker socket for compatibility, but the signed
+        // resource inventory decides whether this launch uses the broker or raw input.
+        .env_remove("PF_BROKER_SOCK")
         .envs(environment.iter().cloned());
     command
 }
@@ -175,6 +178,26 @@ pub fn launch_with<E: Exec, P: PolicyEnforcer>(
 
 fn load_environment(policy: &PolicyDecision) -> Result<Vec<(String, String)>, PolicyError> {
     let mut environment = Vec::new();
+    if policy
+        .endpoints
+        .contains(&policy::MediatedEndpoint::InputBroker)
+    {
+        let socket = Path::new(policy::INPUT_BROKER_SOCKET);
+        if !policy
+            .unit
+            .bind_read_write
+            .iter()
+            .any(|path| path == socket)
+        {
+            return Err(PolicyError(
+                "input broker endpoint has no canonical socket projection".to_owned(),
+            ));
+        }
+        environment.push((
+            "PF_BROKER_SOCK".to_owned(),
+            policy::INPUT_BROKER_SOCKET.to_owned(),
+        ));
+    }
     for projection in &policy.environment {
         if projection.name == "DISPLAY" {
             let socket = policy
@@ -585,6 +608,79 @@ mod tests {
         let plain = derive_policy(&resolved_fixture(&root, &[]), &inputs).unwrap();
         assert!(load_environment(&plain).unwrap().is_empty());
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn input_broker_environment_tracks_compiled_route_and_scrubs_ambient_value() {
+        let root = PathBuf::from("/fixture");
+        let app = resolved_fixture(&root, &["input"]);
+        let paths = |resources| PolicyInputs {
+            platform_runtime: root.join("runtime"),
+            xdg_config: root.join("config"),
+            xdg_state: root.join("state"),
+            xdg_cache: root.join("cache"),
+            resource_paths: Vec::new(),
+            resources,
+        };
+
+        let raw = derive_policy(
+            &app,
+            &paths(std::collections::BTreeMap::from([(
+                "input-devices".to_owned(),
+                vec![PathBuf::from("/dev/input/event0")],
+            )])),
+        )
+        .unwrap();
+        let raw_environment = load_environment(&raw).unwrap();
+        assert!(raw_environment
+            .iter()
+            .all(|(name, _)| name != "PF_BROKER_SOCK"));
+        let raw_command = execution_command(Path::new("/usr/bin/env"), &root, &raw_environment);
+        assert_eq!(
+            raw_command
+                .get_envs()
+                .find(|(name, _)| *name == "PF_BROKER_SOCK"),
+            Some((std::ffi::OsStr::new("PF_BROKER_SOCK"), None)),
+            "a raw-input route must remove the unit's ambient broker selector"
+        );
+
+        let broker = derive_policy(
+            &app,
+            &paths(std::collections::BTreeMap::from([(
+                "broker-sockets".to_owned(),
+                vec![PathBuf::from(policy::INPUT_BROKER_SOCKET)],
+            )])),
+        )
+        .unwrap();
+        let broker_environment = load_environment(&broker).unwrap();
+        assert!(broker_environment.iter().any(|(name, value)| {
+            name == "PF_BROKER_SOCK" && value == policy::INPUT_BROKER_SOCKET
+        }));
+        let broker_command =
+            execution_command(Path::new("/usr/bin/env"), &root, &broker_environment);
+        assert_eq!(
+            broker_command
+                .get_envs()
+                .find(|(name, _)| *name == "PF_BROKER_SOCK"),
+            Some((
+                std::ffi::OsStr::new("PF_BROKER_SOCK"),
+                Some(std::ffi::OsStr::new(policy::INPUT_BROKER_SOCKET))
+            )),
+            "a broker route must restore the policy-derived broker selector"
+        );
+
+        let mismatched = derive_policy(
+            &app,
+            &paths(std::collections::BTreeMap::from([(
+                "broker-sockets".to_owned(),
+                vec![PathBuf::from("/run/pocketforge/not-input-broker.sock")],
+            )])),
+        )
+        .unwrap();
+        assert_eq!(
+            load_environment(&mismatched).unwrap_err().to_string(),
+            "input broker endpoint has no canonical socket projection"
+        );
     }
 
     #[test]

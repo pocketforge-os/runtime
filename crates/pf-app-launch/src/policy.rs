@@ -15,6 +15,7 @@ const X11_BIND: (&str, &str) = ("/run/pocketforge/x11/.X11-unix/X0", "/tmp/.X11-
 pub const X11_SOCKET: &str = X11_BIND.0;
 pub const X11_SOCKET_DESTINATION: &str = X11_BIND.1;
 pub const X11_ENVIRONMENT: &str = "/run/pocketforge/x11/policy/environment";
+pub const INPUT_BROKER_SOCKET: &str = "/run/pocketforge/input-broker.sock";
 
 #[derive(Clone, Copy)]
 enum DisplayResourceGrant {
