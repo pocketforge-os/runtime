@@ -329,6 +329,58 @@ fn device_regression_input_selects_broker_or_raw_route() {
 }
 
 #[test]
+fn optional_broker_only_capabilities_refuse_without_broker_route() {
+    let root = PathBuf::from("/fixture");
+    let broker_only = [
+        "accelerometer",
+        "gnss",
+        "gyroscope",
+        "imu",
+        "leds",
+        "location",
+        "magnetometer",
+    ];
+    let mut cases = broker_only
+        .iter()
+        .map(|capability| vec![format!("{capability}?")])
+        .collect::<Vec<_>>();
+    cases.push(
+        broker_only
+            .iter()
+            .map(|capability| format!("{capability}?"))
+            .collect(),
+    );
+
+    for capabilities in cases {
+        let capability_refs = capabilities.iter().map(String::as_str).collect::<Vec<_>>();
+        let app = resolved(&root, &capability_refs, false, true);
+
+        let present = derive_policy(&app, &inputs(&root)).unwrap();
+        assert!(present.endpoints.contains(&MediatedEndpoint::InputBroker));
+        assert!(present
+            .unit
+            .bind_read_write
+            .contains(&PathBuf::from("/run/pocketforge/input-broker.sock")));
+
+        let mut absent = inputs(&root);
+        absent.resources.remove("broker-sockets");
+        assert_eq!(
+            derive_policy(&app, &absent).unwrap_err().to_string(),
+            "optional broker-only capability requires broker-sockets to prevent direct backend fallback"
+        );
+    }
+
+    let mut absent = inputs(&root);
+    absent.resources.remove("broker-sockets");
+    assert_eq!(
+        derive_policy(&resolved(&root, &["accelerometer"], false, true), &absent,)
+            .unwrap_err()
+            .to_string(),
+        "required resource broker-sockets is missing"
+    );
+}
+
+#[test]
 fn input_actuators_share_routes_and_escalate_only_raw_devices() {
     let root = PathBuf::from("/fixture");
     let app = resolved(&root, &["input", "rumble", "vibration"], false, true);

@@ -547,9 +547,13 @@ pub fn derive_policy(
             .iter()
             .all(|name| capability_optional.get(*name) == Some(&true));
         let broker_paths = resource("broker-sockets", optional)?;
-        if !broker_paths.is_empty() {
-            uses_input_broker = true;
+        if broker_paths.is_empty() {
+            return Err(PolicyError(
+                "optional broker-only capability requires broker-sockets to prevent direct backend fallback"
+                    .to_owned(),
+            ));
         }
+        uses_input_broker = true;
         socket_paths.extend(broker_paths);
     }
     if class == AppClass::Full {
