@@ -352,10 +352,7 @@ fn optional_broker_only_capabilities_refuse_without_broker_route() {
     );
 
     for capabilities in cases {
-        let capability_refs = capabilities
-            .iter()
-            .map(String::as_str)
-            .collect::<Vec<_>>();
+        let capability_refs = capabilities.iter().map(String::as_str).collect::<Vec<_>>();
         let app = resolved(&root, &capability_refs, false, true);
 
         let present = derive_policy(&app, &inputs(&root)).unwrap();
@@ -376,12 +373,9 @@ fn optional_broker_only_capabilities_refuse_without_broker_route() {
     let mut absent = inputs(&root);
     absent.resources.remove("broker-sockets");
     assert_eq!(
-        derive_policy(
-            &resolved(&root, &["accelerometer"], false, true),
-            &absent,
-        )
-        .unwrap_err()
-        .to_string(),
+        derive_policy(&resolved(&root, &["accelerometer"], false, true), &absent,)
+            .unwrap_err()
+            .to_string(),
         "required resource broker-sockets is missing"
     );
 }
