@@ -726,6 +726,65 @@ mod tests {
     }
 
     #[test]
+    fn broker_only_capabilities_restore_canonical_selector_and_refuse_mismatch() {
+        const BROKER_ONLY_CAPABILITIES: [&str; 7] = [
+            "accelerometer",
+            "gnss",
+            "gyroscope",
+            "imu",
+            "leds",
+            "location",
+            "magnetometer",
+        ];
+
+        let root = PathBuf::from("/fixture");
+        let paths = |socket: &str| PolicyInputs {
+            platform_runtime: root.join("runtime"),
+            xdg_config: root.join("config"),
+            xdg_state: root.join("state"),
+            xdg_cache: root.join("cache"),
+            resource_paths: Vec::new(),
+            resources: std::collections::BTreeMap::from([(
+                "broker-sockets".to_owned(),
+                vec![PathBuf::from(socket)],
+            )]),
+        };
+
+        for mask in 1..(1 << BROKER_ONLY_CAPABILITIES.len()) {
+            let capabilities = BROKER_ONLY_CAPABILITIES
+                .iter()
+                .enumerate()
+                .filter_map(|(index, capability)| {
+                    ((mask & (1 << index)) != 0).then_some(*capability)
+                })
+                .collect::<Vec<_>>();
+            let app = resolved_fixture(&root, &capabilities);
+
+            let canonical = derive_policy(&app, &paths(policy::INPUT_BROKER_SOCKET)).unwrap();
+            assert!(
+                canonical
+                    .endpoints
+                    .contains(&policy::MediatedEndpoint::InputBroker),
+                "broker-only route must identify its endpoint for {capabilities:?}"
+            );
+            assert!(load_environment(&canonical)
+                .unwrap()
+                .iter()
+                .any(|(name, value)| {
+                    name == "PF_BROKER_SOCK" && value == policy::INPUT_BROKER_SOCKET
+                }));
+
+            let mismatched =
+                derive_policy(&app, &paths("/run/pocketforge/not-input-broker.sock")).unwrap();
+            assert_eq!(
+                load_environment(&mismatched).unwrap_err().to_string(),
+                "input broker endpoint has no canonical socket projection",
+                "a noncanonical broker-only route must fail closed for {capabilities:?}"
+            );
+        }
+    }
+
+    #[test]
     fn x11_policy_uses_real_producer_paths_and_refuses_b15_session_alias() {
         assert_eq!(policy::X11_SOCKET, "/run/pocketforge/x11/.X11-unix/X0");
         assert_eq!(
