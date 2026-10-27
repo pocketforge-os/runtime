@@ -13,12 +13,15 @@ use std::io::Read;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant};
 
 const P3_STATE: &str = r#"{"phase":{"Restoring":{"session_id":"session-1","item_id":"org.pocketforge.poolsuite","receipt":{"Crash":{"summary":"systemd result: exit-code"}},"rung":"PresentationAcknowledged"}},"history":[{"session_id":"session-1","item_id":"org.pocketforge.poolsuite","receipt":null,"started_at":null,"ended_at":{"at":{"secs_since_epoch":1790000000,"nanos_since_epoch":0},"precision":"Approximate"}}],"pending":[{"sequence":1,"event":"ObservedStarting"},{"sequence":2,"event":"ObservedRunning"}],"next_sequence":3,"next_session":2,"safe_return_queue":0,"safe_return_binding_revision":0,"acknowledged":{}}"#;
 
 /// Deadline (10 s) armed on the first tick (<= 1 s after start) plus scheduling slack.
 const EXPIRY_BOUND: Duration = Duration::from_secs(15);
+/// Exceeds the daemon's combined 16 lifecycle plus 16 orientation connection permits.
+const UNTRUSTED_FLOOD_CLIENTS: usize = 64;
 
 struct Daemon {
     child: Child,
@@ -55,6 +58,7 @@ fn start_daemon() -> (Daemon, PathBuf, PathBuf) {
         .args(["--command-preset", "desktop-sim"])
         .args(["--orientation-mode", "static"])
         .args(["--shell-user", "root"])
+        .args(["--compositor-user", "root"])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -75,19 +79,32 @@ fn phase(state: &Path) -> serde_json::Value {
 
 #[test]
 fn untrusted_clients_are_closed_and_never_stall_the_presentation_deadline() {
-    let (daemon, socket, state) = start_daemon();
+    let (mut daemon, socket, state) = start_daemon();
     let started = Instant::now();
-    let mut silent = UnixStream::connect(&socket).unwrap();
-    silent
-        .set_read_timeout(Some(Duration::from_secs(3)))
-        .unwrap();
-    let mut second = UnixStream::connect(&socket).unwrap();
-    second
-        .set_read_timeout(Some(Duration::from_secs(3)))
-        .unwrap();
-    let mut byte = [0];
-    assert_eq!(silent.read(&mut byte).unwrap(), 0);
-    assert_eq!(second.read(&mut byte).unwrap(), 0);
+    let barrier = Arc::new(Barrier::new(UNTRUSTED_FLOOD_CLIENTS + 1));
+    let clients = (0..UNTRUSTED_FLOOD_CLIENTS)
+        .map(|_| {
+            let barrier = Arc::clone(&barrier);
+            let socket = socket.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                let mut stream = UnixStream::connect(socket).unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(3)))
+                    .unwrap();
+                let mut byte = [0];
+                assert_eq!(stream.read(&mut byte).unwrap(), 0);
+            })
+        })
+        .collect::<Vec<_>>();
+    barrier.wait();
+    for client in clients {
+        client.join().unwrap();
+    }
+    assert!(
+        daemon.child.try_wait().unwrap().is_none(),
+        "untrusted connection flood stopped the daemon"
+    );
 
     let mut reached = None;
     while started.elapsed() < EXPIRY_BOUND {
@@ -113,5 +130,5 @@ fn untrusted_clients_are_closed_and_never_stall_the_presentation_deadline() {
         .unwrap()
         .starts_with("presentation_not_acknowledged:"));
 
-    drop((silent, second, daemon));
+    drop(daemon);
 }

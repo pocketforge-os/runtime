@@ -2903,8 +2903,10 @@ fn raw_rpc(socket: &Path, request: &RpcRequest) -> RpcResponse {
 }
 
 const TEST_GAMER_UID: u32 = 1000;
+const TEST_COMPOSITOR_UID: u32 = 991;
 const TEST_SHELL_UNIT: &str = "pf-shell-selected.service";
 const TEST_BROKER_UNIT: &str = "pf-input-broker.service";
+const TEST_COMPOSITOR_UNIT: &str = "pocketforge-gamescope.service";
 
 fn shell_policy_for(uid: u32, unit: &str) -> ShellPolicy {
     let unit = unit.to_owned();
@@ -2928,6 +2930,27 @@ fn shell_policy_for(uid: u32, unit: &str) -> ShellPolicy {
 
 fn trusted_shell_policy() -> ShellPolicy {
     shell_policy_for(TEST_GAMER_UID, TEST_SHELL_UNIT)
+}
+
+fn compositor_policy_for_peer(uid: u32, unit: &str) -> ShellPolicy {
+    let unit = unit.to_owned();
+    ShellPolicy::custom_with_compositor(
+        TEST_GAMER_UID,
+        TEST_SHELL_UNIT.into(),
+        TEST_BROKER_UNIT.into(),
+        Some((TEST_COMPOSITOR_UID, TEST_COMPOSITOR_UNIT.into())),
+        move |_| {
+            Ok(pf_peer_identity::PeerServiceIdentity {
+                cred: pf_peer_identity::PeerCred {
+                    pid: 4242,
+                    uid,
+                    gid: uid,
+                },
+                unit: unit.clone(),
+            })
+        },
+    )
+    .unwrap()
 }
 
 fn assert_shell_socket_peer_refused(name: &str, uid: u32, unit: &str) {
@@ -3230,19 +3253,19 @@ fn overlapping_shell_and_broker_identity_never_gets_shell_authority() {
 
 #[test]
 fn compositor_identity_never_overlaps_a_more_privileged_identity() {
-    for (shell_uid, shell_unit, broker_unit, compositor_unit, expected) in [
+    for (shell_uid, shell_unit, broker_unit, compositor_identity, expected) in [
         (
             TEST_GAMER_UID,
             TEST_SHELL_UNIT,
             TEST_BROKER_UNIT,
-            TEST_SHELL_UNIT,
+            (TEST_GAMER_UID, TEST_SHELL_UNIT),
             "shell",
         ),
         (
-            0,
+            TEST_GAMER_UID,
             TEST_SHELL_UNIT,
             TEST_BROKER_UNIT,
-            TEST_BROKER_UNIT,
+            (0, TEST_BROKER_UNIT),
             "broker",
         ),
     ] {
@@ -3250,7 +3273,7 @@ fn compositor_identity_never_overlaps_a_more_privileged_identity() {
             shell_uid,
             shell_unit.into(),
             broker_unit.into(),
-            Some(compositor_unit.into()),
+            Some((compositor_identity.0, compositor_identity.1.into())),
             |_| unreachable!("overlapping policy must fail before identity resolution"),
         );
         let error = policy.err().expect("compositor overlap was accepted");
@@ -3262,10 +3285,31 @@ fn compositor_identity_never_overlaps_a_more_privileged_identity() {
         TEST_GAMER_UID,
         TEST_SHELL_UNIT.into(),
         TEST_BROKER_UNIT.into(),
-        Some("gamescope-session.service".into()),
+        Some((TEST_COMPOSITOR_UID, TEST_COMPOSITOR_UNIT.into())),
         |_| unreachable!("construction does not resolve a peer"),
     )
     .is_ok());
+}
+
+#[test]
+fn compositor_identity_requires_its_dedicated_uid_and_unit() {
+    let (stream, _peer) = std::os::unix::net::UnixStream::pair().unwrap();
+    assert_eq!(
+        compositor_policy_for_peer(TEST_COMPOSITOR_UID, TEST_COMPOSITOR_UNIT)
+            .authenticate_peer(&stream)
+            .unwrap(),
+        ShellPeerRole::Compositor
+    );
+
+    for (uid, unit) in [
+        (TEST_GAMER_UID, TEST_COMPOSITOR_UNIT),
+        (TEST_COMPOSITOR_UID, "wrong-gamescope.service"),
+    ] {
+        let error = compositor_policy_for_peer(uid, unit)
+            .authenticate_peer(&stream)
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+    }
 }
 
 #[test]

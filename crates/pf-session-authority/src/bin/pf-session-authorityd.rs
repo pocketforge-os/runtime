@@ -14,7 +14,7 @@ use pf_session_authority::{
 use std::env;
 use std::fs;
 use std::io;
-use std::os::unix::fs::FileTypeExt;
+use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
@@ -35,6 +35,7 @@ struct Args {
     shell_user: String,
     shell_unit: String,
     broker_unit: String,
+    compositor_user: String,
     compositor_unit: String,
     home_client_unit: Option<String>,
     home_client_presentation: Option<PathBuf>,
@@ -76,10 +77,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         None => None,
     };
     let shell_uid = resolve_uid(&args.shell_user)?;
+    let compositor_uid = resolve_uid(&args.compositor_user)?;
     let shell_policy = ShellPolicy::kernel_with_compositor(
         shell_uid,
         args.shell_unit.clone(),
         args.broker_unit.clone(),
+        compositor_uid,
         args.compositor_unit.clone(),
     )?;
     let (hang_notifier, hang_requests) = EscalationNotifier::bounded(8);
@@ -199,7 +202,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     // The socket is the daemon readiness boundary. The first complete snapshot gates it; panel
     // metadata cannot block that snapshot because the source supplies a typed degraded fallback.
-    let listener = UnixListener::bind(&args.socket)?;
+    let listener = bind_shell_socket(&args.socket)?;
     let _socket_guard = SocketGuard(args.socket.clone());
     // Connection threads own all socket I/O (bounded by DEFAULT_CONNECTION_LIMITS) and forward
     // only complete requests, so the single-threaded authority blocks only in the loop's channel
@@ -276,6 +279,17 @@ fn prepare_socket(path: &Path) -> io::Result<()> {
     }
 }
 
+fn bind_shell_socket(path: &Path) -> io::Result<UnixListener> {
+    let listener = UnixListener::bind(path)?;
+    // The shell, broker and compositor deliberately live in distinct service groups. Reusing the
+    // compositor-input group would also grant the shell access to an unrelated privileged input
+    // endpoint, so this socket is broadly reachable while authorization stays narrow:
+    // authenticate_peer checks SO_PEERCRED and the kernel-attested systemd unit before reading a
+    // frame. The acceptor also bounds concurrent pre-authentication work.
+    fs::set_permissions(path, fs::Permissions::from_mode(0o777))?;
+    Ok(listener)
+}
+
 struct SocketGuard(PathBuf);
 impl Drop for SocketGuard {
     fn drop(&mut self) {
@@ -301,7 +315,9 @@ Options:
   --shell-user NAME                Shell socket user (default gamer)
   --shell-unit UNIT                Full-access shell unit (default pf-shell-selected.service)
   --broker-unit UNIT               Root SafeReturn-only unit (default pf-input-broker.service)
-  --compositor-unit UNIT           Read-only orientation consumer (default gamescope-session.service)
+  --compositor-user NAME           Read-only orientation user (default pf-gamescope)
+  --compositor-unit UNIT           Read-only orientation unit
+                                   (default pocketforge-gamescope.service)
   --home-client-unit UNIT          Gamescope session home client (optional; paired with signal)
   --home-client-presentation PATH  Compositor-owned focused-home signal (paired with unit)
   --descriptor PATH               Device capabilities descriptor (default $PF_DESCRIPTOR,
@@ -323,7 +339,8 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
     let mut shell_user = "gamer".to_owned();
     let mut shell_unit = "pf-shell-selected.service".to_owned();
     let mut broker_unit = "pf-input-broker.service".to_owned();
-    let mut compositor_unit = "gamescope-session.service".to_owned();
+    let mut compositor_user = pf_input_ipc::sockets::COMPOSITOR_USER.to_owned();
+    let mut compositor_unit = pf_input_ipc::sockets::COMPOSITOR_UNIT.to_owned();
     let mut home_client_unit = None;
     let mut home_client_presentation: Option<PathBuf> = None;
     let defaults = LinuxOrientationPaths::default();
@@ -352,6 +369,7 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
             "--shell-user" => shell_user = value,
             "--shell-unit" => shell_unit = value,
             "--broker-unit" => broker_unit = value,
+            "--compositor-user" => compositor_user = value,
             "--compositor-unit" => compositor_unit = value,
             "--home-client-unit" => home_client_unit = Some(value),
             "--home-client-presentation" => home_client_presentation = Some(value.into()),
@@ -436,6 +454,7 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
         shell_user,
         shell_unit,
         broker_unit,
+        compositor_user,
         compositor_unit,
         home_client_unit,
         home_client_presentation,
@@ -454,6 +473,28 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn device_unit_admits_the_pinned_compositor_identity() {
+        let unit = include_str!("../../../../systemd/pf-session-authorityd.service");
+        let exec_start = unit
+            .lines()
+            .find(|line| line.starts_with("ExecStart="))
+            .expect("authority unit must define ExecStart");
+
+        assert!(
+            exec_start.contains("--compositor-user pf-gamescope"),
+            "device unit did not pin the dedicated compositor user: {exec_start}"
+        );
+        assert!(
+            exec_start.contains("--compositor-unit pocketforge-gamescope.service"),
+            "device unit did not pin the installed compositor unit: {exec_start}"
+        );
+        assert!(unit.lines().any(|line| line == "UMask=0007"));
+
+        assert!(!exec_start.contains("gamescope-session.service"));
+        assert!(!unit.lines().any(|line| line == "UMask=0000"));
+    }
 
     #[test]
     fn desktop_sim_preset_parses_and_explicit_commands_override_it() {
@@ -481,6 +522,8 @@ mod tests {
         assert_eq!(args.shell_user, "gamer");
         assert_eq!(args.shell_unit, "pf-shell-selected.service");
         assert_eq!(args.broker_unit, "pf-input-broker.service");
+        assert_eq!(args.compositor_user, pf_input_ipc::sockets::COMPOSITOR_USER);
+        assert_eq!(args.compositor_unit, pf_input_ipc::sockets::COMPOSITOR_UNIT);
         assert!(args.orientation_live);
     }
 
