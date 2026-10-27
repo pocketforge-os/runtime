@@ -281,9 +281,11 @@ fn prepare_socket(path: &Path) -> io::Result<()> {
 
 fn bind_shell_socket(path: &Path) -> io::Result<UnixListener> {
     let listener = UnixListener::bind(path)?;
-    // The shell, broker and compositor deliberately live in distinct service groups. Access to
-    // this socket is therefore broad, while authorization stays narrow: authenticate_peer checks
-    // SO_PEERCRED and the kernel-attested systemd unit before reading a frame.
+    // The shell, broker and compositor deliberately live in distinct service groups. Reusing the
+    // compositor-input group would also grant the shell access to an unrelated privileged input
+    // endpoint, so this socket is broadly reachable while authorization stays narrow:
+    // authenticate_peer checks SO_PEERCRED and the kernel-attested systemd unit before reading a
+    // frame. The acceptor also bounds concurrent pre-authentication work.
     fs::set_permissions(path, fs::Permissions::from_mode(0o777))?;
     Ok(listener)
 }
