@@ -5,6 +5,7 @@ use pf_prefsd::{serve_until_with_timeout_and_resolver, PreferenceWriter};
 use pf_session_authority::PersistedState;
 use std::fs;
 use std::io::Read;
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -55,6 +56,8 @@ impl Daemon {
                 "static",
                 "--shell-user",
                 "root",
+                "--compositor-user",
+                "root",
             ])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -68,6 +71,11 @@ impl Daemon {
         let deadline = Instant::now() + STARTUP_TIMEOUT;
         while Instant::now() < deadline {
             if socket.exists() {
+                assert_eq!(
+                    fs::metadata(socket).unwrap().permissions().mode() & 0o777,
+                    0o777,
+                    "peer-authenticated shell socket must be reachable across service groups"
+                );
                 return;
             }
             if let Some(status) = self.0.try_wait().unwrap() {
@@ -101,6 +109,8 @@ impl Daemon {
                 "--orientation-mode",
                 "live",
                 "--shell-user",
+                "root",
+                "--compositor-user",
                 "root",
                 "--descriptor",
                 descriptor.to_str().unwrap(),

@@ -55,6 +55,7 @@ fn start_daemon() -> (Daemon, PathBuf, PathBuf) {
         .args(["--command-preset", "desktop-sim"])
         .args(["--orientation-mode", "static"])
         .args(["--shell-user", "root"])
+        .args(["--compositor-user", "root"])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()

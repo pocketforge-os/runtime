@@ -1507,6 +1507,7 @@ pub struct ShellPolicy {
     shell_uid: u32,
     shell_unit: String,
     broker_unit: String,
+    compositor_uid: Option<u32>,
     compositor_unit: Option<String>,
     resolve_peer: Arc<ShellPeerResolver>,
 }
@@ -1535,13 +1536,14 @@ impl ShellPolicy {
         shell_uid: u32,
         shell_unit: String,
         broker_unit: String,
+        compositor_uid: u32,
         compositor_unit: String,
     ) -> io::Result<Self> {
         Self::custom_with_compositor(
             shell_uid,
             shell_unit,
             broker_unit,
-            Some(compositor_unit),
+            Some((compositor_uid, compositor_unit)),
             pf_peer_identity::peer_service_identity,
         )
     }
@@ -1562,7 +1564,7 @@ impl ShellPolicy {
         shell_uid: u32,
         shell_unit: String,
         broker_unit: String,
-        compositor_unit: Option<String>,
+        compositor_identity: Option<(u32, String)>,
         resolve_peer: impl Fn(&UnixStream) -> io::Result<pf_peer_identity::PeerServiceIdentity>
             + Send
             + Sync
@@ -1574,13 +1576,16 @@ impl ShellPolicy {
                 format!("shell uid=0 unit={shell_unit} overlaps the root broker identity"),
             ));
         }
+        let (compositor_uid, compositor_unit) = compositor_identity
+            .map(|(uid, unit)| (Some(uid), Some(unit)))
+            .unwrap_or((None, None));
         if compositor_unit.as_deref() == Some(shell_unit.as_str()) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!("compositor unit={shell_unit} overlaps the full-authority shell identity"),
             ));
         }
-        if shell_uid == 0 && compositor_unit.as_deref() == Some(broker_unit.as_str()) {
+        if compositor_uid == Some(0) && compositor_unit.as_deref() == Some(broker_unit.as_str()) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!("compositor unit={broker_unit} overlaps the root broker identity"),
@@ -1590,6 +1595,7 @@ impl ShellPolicy {
             shell_uid,
             shell_unit,
             broker_unit,
+            compositor_uid,
             compositor_unit,
             resolve_peer: Arc::new(resolve_peer),
         })
@@ -1603,7 +1609,7 @@ impl ShellPolicy {
         if identity.cred.uid == 0 && identity.unit == self.broker_unit {
             return Ok(ShellPeerRole::Broker);
         }
-        if identity.cred.uid == self.shell_uid
+        if Some(identity.cred.uid) == self.compositor_uid
             && self.compositor_unit.as_deref() == Some(identity.unit.as_str())
         {
             return Ok(ShellPeerRole::Compositor);
@@ -1611,13 +1617,15 @@ impl ShellPolicy {
         Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             format!(
-                "refused peer pid={} uid={} unit={} (expected uid={} unit={} or uid=0 unit={})",
+                "refused peer pid={} uid={} unit={} (expected uid={} unit={}, uid=0 unit={}, or uid={:?} unit={:?})",
                 identity.cred.pid,
                 identity.cred.uid,
                 identity.unit,
                 self.shell_uid,
                 self.shell_unit,
-                self.broker_unit
+                self.broker_unit,
+                self.compositor_uid,
+                self.compositor_unit,
             ),
         ))
     }
