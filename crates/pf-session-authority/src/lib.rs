@@ -78,8 +78,6 @@ pub mod orientation_source;
 pub const DEFAULT_PRESENTATION_TIMEOUT: Duration = Duration::from_secs(10);
 const GAMESCOPE_SESSION_TARGET: &str = "pocketforge-gamescope-session.target";
 const GAMESCOPE_RESIDENT_UNIT: &str = "pocketforge-gamescope-resident.service";
-const PREAUTH_RATE_WINDOW: Duration = Duration::from_secs(1);
-const MAX_PREAUTH_ATTEMPTS_PER_WINDOW: usize = 32;
 
 /// Version of the private SDK-front wire ([`FrontEnvelope`]).
 pub const FRONT_WIRE_VERSION: u32 = 1;
@@ -1812,9 +1810,8 @@ fn serve_front_connection(
 /// Framing never runs on the authority loop: a connection thread reads and decodes one request
 /// under `io_timeout`, forwards only the complete request, waits at most `response_timeout` for
 /// the reply and writes it under `io_timeout`. A silent, partial or non-reading client therefore
-/// costs one bounded connection thread, never an authority tick. Before a worker is created, a
-/// global rate limit also bounds peer-identity resolution for callers that can reach the socket
-/// but are not authorized. An accept error is forwarded and ends the acceptor.
+/// costs one bounded connection thread, never an authority tick. An accept error is forwarded and
+/// ends the acceptor.
 pub fn spawn_rpc_acceptor(
     listener: UnixListener,
     requests: mpsc::Sender<io::Result<PendingRpc>>,
@@ -1823,7 +1820,6 @@ pub fn spawn_rpc_acceptor(
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let active = Arc::new(AtomicUsize::new(0));
-        let mut preauth_rate = PreauthRateLimiter::new(Instant::now());
         for connection in listener.incoming() {
             let stream = match connection {
                 Ok(stream) => stream,
@@ -1832,16 +1828,6 @@ pub fn spawn_rpc_acceptor(
                     return;
                 }
             };
-            if !preauth_rate.admit(Instant::now()) {
-                if preauth_rate.take_refusal_report() {
-                    eprintln!(
-                        "pf-session-authorityd: connection_refused reason=preauth_rate_limited limit={} window_ms={}",
-                        MAX_PREAUTH_ATTEMPTS_PER_WINDOW,
-                        PREAUTH_RATE_WINDOW.as_millis()
-                    );
-                }
-                continue;
-            }
             if active.fetch_add(1, Ordering::AcqRel) >= limits.max_connections {
                 active.fetch_sub(1, Ordering::AcqRel);
                 eprintln!(
@@ -1875,7 +1861,6 @@ pub fn spawn_rpc_acceptor_with_orientation(
         let lifecycle_active = Arc::new(AtomicUsize::new(0));
         let connections_active = Arc::new(AtomicUsize::new(0));
         let total_bound = limits.max_connections.saturating_add(watch.max_waiters());
-        let mut preauth_rate = PreauthRateLimiter::new(Instant::now());
         for connection in listener.incoming() {
             let stream = match connection {
                 Ok(stream) => stream,
@@ -1884,16 +1869,6 @@ pub fn spawn_rpc_acceptor_with_orientation(
                     return;
                 }
             };
-            if !preauth_rate.admit(Instant::now()) {
-                if preauth_rate.take_refusal_report() {
-                    eprintln!(
-                        "pf-session-authorityd: connection_refused reason=preauth_rate_limited limit={} window_ms={}",
-                        MAX_PREAUTH_ATTEMPTS_PER_WINDOW,
-                        PREAUTH_RATE_WINDOW.as_millis()
-                    );
-                }
-                continue;
-            }
             if connections_active.fetch_add(1, Ordering::AcqRel) >= total_bound {
                 connections_active.fetch_sub(1, Ordering::AcqRel);
                 continue;
@@ -1920,44 +1895,6 @@ pub fn spawn_rpc_acceptor_with_orientation(
             });
         }
     })
-}
-
-struct PreauthRateLimiter {
-    window_started: Instant,
-    admitted: usize,
-    refusal_reported: bool,
-}
-
-impl PreauthRateLimiter {
-    fn new(now: Instant) -> Self {
-        Self {
-            window_started: now,
-            admitted: 0,
-            refusal_reported: false,
-        }
-    }
-
-    fn admit(&mut self, now: Instant) -> bool {
-        if now.duration_since(self.window_started) >= PREAUTH_RATE_WINDOW {
-            self.window_started = now;
-            self.admitted = 0;
-            self.refusal_reported = false;
-        }
-        if self.admitted >= MAX_PREAUTH_ATTEMPTS_PER_WINDOW {
-            return false;
-        }
-        self.admitted += 1;
-        true
-    }
-
-    fn take_refusal_report(&mut self) -> bool {
-        if self.refusal_reported {
-            false
-        } else {
-            self.refusal_reported = true;
-            true
-        }
-    }
 }
 
 fn serve_orientation_aware_connection(
