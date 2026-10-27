@@ -3469,6 +3469,24 @@ fn acceptor_closes_connections_beyond_its_bound() {
     fs::remove_dir_all(dir).unwrap();
 }
 
+#[test]
+fn preauth_rate_limiter_bounds_identity_work_and_refills() {
+    let started = Instant::now();
+    let mut limiter = PreauthRateLimiter::new(started);
+
+    for _ in 0..MAX_PREAUTH_ATTEMPTS_PER_WINDOW {
+        assert!(limiter.admit(started), "the documented burst must pass");
+    }
+    assert!(
+        !limiter.admit(started),
+        "an excess peer must be dropped before identity resolution"
+    );
+    assert!(
+        limiter.admit(started + PREAUTH_RATE_WINDOW),
+        "a new window must admit legitimate clients again"
+    );
+}
+
 // ---- tsp-ihne1.10: close-progress events (contract v2) for the system menu ----
 //
 // The menu never decides anything during a close; it renders the authority's progress. These
