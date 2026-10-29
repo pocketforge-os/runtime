@@ -557,7 +557,6 @@ dependencies = [
 name = "pf-input-ipc"
 version = "0.0.1"
 dependencies = [
- "pf-input-broker",
  "serde",
  "serde_json",
 ]

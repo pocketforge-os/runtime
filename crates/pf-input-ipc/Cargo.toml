@@ -11,8 +11,3 @@ authors.workspace = true
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
-
-[dev-dependencies]
-# Byte-level compatibility with the system-menu provider frames the broker already speaks
-# (crates/pf-input-broker/src/safe_return.rs, merged as runtime#108). Test-only.
-pf-input-broker = { path = "../pf-input-broker", version = "0.0.1" }
