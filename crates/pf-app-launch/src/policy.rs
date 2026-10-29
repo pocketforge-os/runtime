@@ -735,7 +735,9 @@ pub fn render_systemd_dropin(policy: &PolicyDecision) -> String {
         }
     ));
     for path in &policy.unit.inaccessible_paths {
-        lines.push(format!("InaccessiblePaths={}", path.display()));
+        // These are deny-only paths: their absence must not make namespace
+        // setup fail, while an existing path must still be hidden from apps.
+        lines.push(format!("InaccessiblePaths=-{}", path.display()));
     }
     for path in &policy.unit.bind_read_only {
         lines.push(format!("BindReadOnlyPaths={}", path.display()));
