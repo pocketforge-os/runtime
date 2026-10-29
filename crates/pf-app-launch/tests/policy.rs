@@ -191,6 +191,18 @@ fn x11_projection_is_exact_manifest_scoped_and_fail_closed() {
 }
 
 #[test]
+fn absent_inaccessible_paths_do_not_prevent_namespace_setup() {
+    let root = PathBuf::from("/fixture");
+    let policy = derive_policy(&resolved(&root, &[], false, true), &inputs(&root)).unwrap();
+    let rendered = render_systemd_dropin(&policy);
+
+    // A leading '-' tells systemd to ignore only an absent path. When the
+    // system bus socket exists it is still made inaccessible to the app.
+    assert!(rendered.contains("InaccessiblePaths=-/run/dbus/system_bus_socket\n"));
+    assert!(!rendered.contains("InaccessiblePaths=/run/dbus/system_bus_socket\n"));
+}
+
+#[test]
 fn browser_profile_has_scopes_and_no_fs_or_net_rules() {
     let root = PathBuf::from("/fixture");
     let browser = derive_policy(
