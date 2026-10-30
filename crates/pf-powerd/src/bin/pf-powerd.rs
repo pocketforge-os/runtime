@@ -5,7 +5,7 @@ use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 const MAX_CLIENTS: usize = 4;
 
@@ -35,6 +35,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let listener = UnixListener::bind(&socket)?;
     fs::set_permissions(&socket, fs::Permissions::from_mode(0o660))?;
     let allowed_uid = gamer_uid()?;
+    let incarnation = fs::read_to_string("/proc/sys/kernel/random/uuid")?
+        .trim()
+        .to_owned();
+    let menu = Arc::new(Mutex::new(pf_powerd::key::Menu::new(incarnation)));
+    let _key_reader = pf_powerd::key::spawn(Arc::clone(&menu))?;
     let active = Arc::new(AtomicUsize::new(0));
     for stream in listener.incoming() {
         match stream {
@@ -50,9 +55,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     eprintln!("pf-powerd: refused peer: client limit reached");
                     continue;
                 };
+                let menu = Arc::clone(&menu);
                 if let Err(error) = std::thread::Builder::new().spawn(move || {
                     let _slot = slot;
-                    if let Err(error) = connection.serve(&SystemctlExecutor) {
+                    if let Err(error) = connection.serve_with_menu(&SystemctlExecutor, &menu) {
                         eprintln!("pf-powerd: refused request: {error}");
                     }
                 }) {
