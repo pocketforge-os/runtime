@@ -1,3 +1,5 @@
+pub mod key;
+
 use pf_peer_identity::PeerServiceIdentity;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -21,12 +23,20 @@ pub enum PowerAction {
 #[serde(tag = "method", rename_all = "snake_case")]
 pub enum Request {
     Capabilities,
+    MenuPoll,
+    MenuAck { request_id: String },
     Request { action: PowerAction },
 }
 
 #[derive(Debug, PartialEq, Serialize)]
 #[serde(tag = "result", rename_all = "snake_case")]
 pub enum Response {
+    Menu {
+        request_id: Option<String>,
+    },
+    MenuAck {
+        acknowledged: bool,
+    },
     Capabilities {
         actions: [PowerAction; 3],
     },
@@ -122,6 +132,18 @@ fn authorize_identified(
 }
 
 pub fn handle(body: &[u8], executor: &dyn CommandExecutor) -> Response {
+    handle_with_menu(
+        body,
+        executor,
+        &std::sync::Mutex::new(key::Menu::new(String::new())),
+    )
+}
+
+pub fn handle_with_menu(
+    body: &[u8],
+    executor: &dyn CommandExecutor,
+    menu: &std::sync::Mutex<key::Menu>,
+) -> Response {
     let request: Request = match serde_json::from_slice(body) {
         Ok(request) => request,
         Err(_) => {
@@ -131,6 +153,15 @@ pub fn handle(body: &[u8], executor: &dyn CommandExecutor) -> Response {
         }
     };
     match request {
+        Request::MenuPoll => Response::Menu {
+            request_id: menu.lock().expect("power menu mutex poisoned").pending(),
+        },
+        Request::MenuAck { request_id } => Response::MenuAck {
+            acknowledged: menu
+                .lock()
+                .expect("power menu mutex poisoned")
+                .acknowledge(&request_id),
+        },
         Request::Capabilities => Response::Capabilities {
             actions: [
                 PowerAction::PowerOff,
@@ -164,11 +195,22 @@ pub fn serve_connection(
 }
 
 impl AuthorizedConnection {
-    pub fn serve(mut self, executor: &dyn CommandExecutor) -> io::Result<()> {
+    pub fn serve(self, executor: &dyn CommandExecutor) -> io::Result<()> {
+        self.serve_with_menu(
+            executor,
+            &std::sync::Mutex::new(key::Menu::new(String::new())),
+        )
+    }
+
+    pub fn serve_with_menu(
+        mut self,
+        executor: &dyn CommandExecutor,
+        menu: &std::sync::Mutex<key::Menu>,
+    ) -> io::Result<()> {
         self.0.set_read_timeout(Some(CONNECTION_TIMEOUT))?;
         self.0.set_write_timeout(Some(CONNECTION_TIMEOUT))?;
         let body = pf_wire::read_frame(&mut self.0).map_err(map_wire)?;
-        let response = handle(&body, executor);
+        let response = handle_with_menu(&body, executor, menu);
         let body = serde_json::to_vec(&response).map_err(io::Error::other)?;
         pf_wire::write_frame(&mut self.0, &body).map_err(map_wire)
     }
@@ -264,12 +306,67 @@ mod tests {
     }
 
     #[test]
+    fn physical_key_poll_is_supported_without_a_power_command() {
+        let executor = FakeExecutor::default();
+        let response =
+            serde_json::to_value(handle(br#"{"method":"menu_poll"}"#, &executor)).unwrap();
+        assert_eq!(
+            response,
+            serde_json::json!({"result":"menu", "request_id":null})
+        );
+        assert!(executor.0.lock().unwrap().is_empty());
+    }
+
+    #[test]
     fn wrong_peer_is_refused_before_any_frame_is_read() {
         let (server, _client) = UnixStream::pair().unwrap();
         let error = authorize_identified(server, identity(1000, "pf-app@evil.service"), 1000)
             .err()
             .unwrap();
         assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        for peer in [
+            identity(0, SHELL_UNIT),
+            identity(1001, SHELL_UNIT),
+            Err(io::Error::other("no identity")),
+        ] {
+            let (server, _client) = UnixStream::pair().unwrap();
+            assert!(authorize_identified(server, peer, 1000).is_err());
+        }
+    }
+
+    #[test]
+    fn menu_socket_poll_crash_retry_and_ack_never_execute_power() {
+        let menu = Mutex::new(key::Menu::new("daemon-1".into()));
+        menu.lock().unwrap().request();
+        let executor = FakeExecutor::default();
+        let exchange = |body: &[u8]| {
+            let (server, mut client) = UnixStream::pair().unwrap();
+            let authorized =
+                authorize_identified(server, identity(1000, SHELL_UNIT), 1000).unwrap();
+            std::thread::scope(|scope| {
+                let worker = scope.spawn(|| authorized.serve_with_menu(&executor, &menu).unwrap());
+                pf_wire::write_frame(&mut client, body).unwrap();
+                let reply = pf_wire::read_frame(&mut client).unwrap();
+                worker.join().unwrap();
+                serde_json::from_slice::<serde_json::Value>(&reply).unwrap()
+            })
+        };
+        let first = exchange(br#"{"method":"menu_poll"}"#);
+        assert_eq!(
+            first,
+            serde_json::json!({"result":"menu","request_id":"daemon-1:1"})
+        );
+        assert_eq!(exchange(br#"{"method":"menu_poll"}"#), first);
+        assert_eq!(
+            exchange(br#"{"method":"menu_ack","request_id":"stale:1"}"#)["acknowledged"],
+            false
+        );
+        assert_eq!(
+            exchange(br#"{"method":"menu_ack","request_id":"daemon-1:1"}"#)["acknowledged"],
+            true
+        );
+        assert!(exchange(br#"{"method":"menu_poll"}"#)["request_id"].is_null());
+        assert!(executor.0.lock().unwrap().is_empty());
     }
 
     #[test]
