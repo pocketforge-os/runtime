@@ -398,7 +398,8 @@ pub fn derive_policy(
             }
         }
         let socket = PathBuf::from(X11_BIND.0);
-        landlock_only_socket_paths.insert(socket.clone());
+        landlock_only_socket_paths.insert(PathBuf::from(X11_SOCKET_DESTINATION));
+        read_only_paths.insert(PathBuf::from(X11_ENVIRONMENT));
         bind_read_write_mappings.push(BindMapping {
             source: socket,
             destination: PathBuf::from(X11_BIND.1),

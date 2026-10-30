@@ -267,6 +267,68 @@ pub struct Runtime {
     pub abi: String,
     #[serde(default, rename = "platform-version")]
     pub platform_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root: Option<RuntimeRoot>,
+}
+
+/// Image-owned sealed-root metadata. Artifact integrity remains the image renderer's
+/// responsibility; every consumer parses the complete descriptor with this contract.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct RuntimeRoot {
+    pub schema: u32,
+    pub format: String,
+    #[serde(default = "default_root_distribution")]
+    pub distribution: String,
+    pub digest: String,
+    pub platform_runtime: String,
+    pub platform_runtime_abi: String,
+    pub platform_runtime_version: String,
+    #[serde(default)]
+    pub library_paths: Vec<String>,
+}
+
+fn default_root_distribution() -> String {
+    "debian-12".to_owned()
+}
+
+fn validate_runtime_root(root: &RuntimeRoot) -> Result<(), ManifestError> {
+    let digest = |value: &str| {
+        value.strip_prefix("sha256:").is_some_and(|hex| {
+            hex.len() == 64
+                && hex
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        })
+    };
+    let platform = &root.platform_runtime;
+    let canonical_platform = !platform.is_empty()
+        && platform.split(['.', '/', '-']).all(|part| {
+            !part.is_empty()
+                && part
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+        });
+    if root.schema != 1
+        || root.format != "squashfs"
+        || !matches!(root.distribution.as_str(), "debian-12" | "debian-13")
+        || !digest(&root.digest)
+        || !digest(&root.platform_runtime_version)
+        || !canonical_platform
+        || root.platform_runtime_abi.is_empty()
+    {
+        return invalid_manifest("invalid runtime.root metadata");
+    }
+    let mut paths = BTreeSet::new();
+    for path in &root.library_paths {
+        if path.is_empty()
+            || path.split('/').any(|part| matches!(part, "" | "." | ".."))
+            || !paths.insert(path)
+        {
+            return invalid_manifest("invalid or duplicate runtime.root library path");
+        }
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -385,6 +447,10 @@ fn validate_manifest(manifest: &Manifest) -> Result<(), ManifestError> {
         .is_some_and(|version| !decimal_version(version))
     {
         return invalid_manifest("invalid runtime.platform-version");
+    }
+
+    if let Some(root) = &manifest.runtime.root {
+        validate_runtime_root(root)?;
     }
 
     let mut capabilities = BTreeSet::new();

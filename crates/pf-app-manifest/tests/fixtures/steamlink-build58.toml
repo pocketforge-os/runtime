@@ -1,0 +1,34 @@
+schema_version = 2
+
+[app]
+id = "org.pocketforge.steamlink"
+name = "Steam Link"
+version = "1.3.32.316"
+category = "stream"
+use = ["audio", "input", "x11", "egress:tcp/443@*"]
+
+[runtime]
+family = "pocketforge/a133-powervr"
+abi = "1"
+platform-version = "20"
+
+# The image builder replaces both sentinel digests with artifacts produced and
+# verified in the same build before this descriptor can reach a rootfs.
+[runtime.root]
+schema = 1
+format = "squashfs"
+distribution = "debian-13"
+digest = "sha256:7a5061d95e397d9cd9d621684efec500917c4ceb7d8cc4e25f9c326dfc1ab34a"
+platform-runtime = "pocketforge/bookworm-aarch64"
+platform-runtime-abi = "1"
+platform-runtime-version = "sha256:9360d57cba68650c8f125261745686f67a52c2365a274870ebdd2c2e62766b02"
+library-paths = []
+
+[launch]
+exec = "bin/pf-launch"
+needs_network = true
+takes_display = true
+audio = true
+
+[display]
+orientations = ["landscape"]

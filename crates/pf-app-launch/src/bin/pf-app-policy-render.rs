@@ -28,19 +28,7 @@ fn run() -> Result<(), String> {
 
     let manifest_source =
         fs::read_to_string(manifest_path).map_err(|error| format!("read manifest: {error}"))?;
-    // Image manifests may already carry the image-owned runtime-root table. It is not an app
-    // capability and is deliberately removed before the strict shared app manifest parser runs.
-    let mut manifest_value: toml::Value =
-        toml::from_str(&manifest_source).map_err(|error| format!("parse manifest: {error}"))?;
-    if let Some(runtime) = manifest_value
-        .get_mut("runtime")
-        .and_then(toml::Value::as_table_mut)
-    {
-        runtime.remove("root");
-    }
-    let policy_manifest =
-        toml::to_string(&manifest_value).map_err(|error| format!("normalize manifest: {error}"))?;
-    let manifest = parse_manifest(&policy_manifest).map_err(|error| error.to_string())?;
+    let manifest = parse_manifest(&manifest_source).map_err(|error| error.to_string())?;
     if app_dir.file_name().and_then(|name| name.to_str()) != Some(&manifest.app.id) {
         return Err("--app-dir basename must equal app.id".to_owned());
     }
