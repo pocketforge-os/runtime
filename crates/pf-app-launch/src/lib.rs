@@ -204,29 +204,29 @@ fn load_environment(policy: &PolicyDecision) -> Result<Vec<(String, String)>, Po
                 .unit
                 .bind_read_write_mappings
                 .iter()
-                .find(|mapping| mapping.destination == Path::new(policy::X11_SOCKET_DESTINATION))
+                .find(|mapping| mapping.source == Path::new(policy::X11_SOCKET))
                 .ok_or_else(|| PolicyError("x11 DISPLAY has no socket projection".to_owned()))?;
             let socket_file = open_without_symlinks(
-                &socket.source,
+                &socket.destination,
                 libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
                 "inspect x11 socket",
             )?;
             let metadata = socket_file.metadata().map_err(|error| {
                 PolicyError(format!(
                     "inspect x11 socket {}: {error}",
-                    socket.source.display()
+                    socket.destination.display()
                 ))
             })?;
             if metadata.file_type().is_symlink() {
                 return Err(PolicyError(format!(
                     "x11 socket {} is an alias",
-                    socket.source.display()
+                    socket.destination.display()
                 )));
             }
             if !metadata.file_type().is_socket() {
                 return Err(PolicyError(format!(
                     "x11 socket {} is not a filesystem socket",
-                    socket.source.display()
+                    socket.destination.display()
                 )));
             }
         }
@@ -550,7 +550,7 @@ mod tests {
             ]),
         };
         let mut policy = derive_policy(&app, &inputs).unwrap();
-        policy.unit.bind_read_write_mappings[0].source = socket.clone();
+        policy.unit.bind_read_write_mappings[0].destination = socket.clone();
         policy.environment[0].source = environment.clone();
         assert_eq!(
             load_environment(&policy).unwrap(),
@@ -559,12 +559,12 @@ mod tests {
 
         let socket_alias = dir.join("X0-alias");
         symlink(&socket, &socket_alias).unwrap();
-        policy.unit.bind_read_write_mappings[0].source = socket_alias;
+        policy.unit.bind_read_write_mappings[0].destination = socket_alias;
         assert!(load_environment(&policy)
             .unwrap_err()
             .to_string()
             .contains("alias"));
-        policy.unit.bind_read_write_mappings[0].source = socket.clone();
+        policy.unit.bind_read_write_mappings[0].destination = socket.clone();
 
         let environment_alias = dir.join("environment-alias");
         symlink(&environment, &environment_alias).unwrap();
@@ -577,12 +577,12 @@ mod tests {
 
         let parent_alias = dir.join("x11-parent-alias");
         symlink(&dir, &parent_alias).unwrap();
-        policy.unit.bind_read_write_mappings[0].source = parent_alias.join("X0");
+        policy.unit.bind_read_write_mappings[0].destination = parent_alias.join("X0");
         assert!(load_environment(&policy)
             .unwrap_err()
             .to_string()
             .contains("alias"));
-        policy.unit.bind_read_write_mappings[0].source = socket.clone();
+        policy.unit.bind_read_write_mappings[0].destination = socket.clone();
         policy.environment[0].source = parent_alias.join("environment");
         assert!(load_environment(&policy)
             .unwrap_err()
@@ -640,7 +640,7 @@ mod tests {
         let abstract_name = dir.join("@X0");
         fs::write(&abstract_name, b"not a socket").unwrap();
         fs::write(&environment, b"DISPLAY=:0\n").unwrap();
-        policy.unit.bind_read_write_mappings[0].source = abstract_name;
+        policy.unit.bind_read_write_mappings[0].destination = abstract_name;
         assert!(load_environment(&policy)
             .unwrap_err()
             .to_string()
@@ -840,14 +840,14 @@ mod tests {
         // This is the exact Build 15 shape: the public session path has a symlink
         // parent and its X11 leaves are aliases. Strict descriptor traversal must
         // continue to reject it.
-        policy.unit.bind_read_write_mappings[0].source = session.join("capabilities/x11/X0");
+        policy.unit.bind_read_write_mappings[0].destination = session.join("capabilities/x11/X0");
         policy.environment[0].source = session.join("capabilities/x11/environment");
         assert!(load_environment(&policy)
             .unwrap_err()
             .to_string()
             .contains("alias"));
 
-        policy.unit.bind_read_write_mappings[0].source = socket;
+        policy.unit.bind_read_write_mappings[0].destination = socket;
         policy.environment[0].source = environment;
         assert_eq!(
             load_environment(&policy).unwrap(),
@@ -858,7 +858,7 @@ mod tests {
         fs::create_dir_all(&foreign).unwrap();
         let parent_alias = producer.join("foreign-parent");
         symlink(&foreign, &parent_alias).unwrap();
-        policy.unit.bind_read_write_mappings[0].source = parent_alias.join("X0");
+        policy.unit.bind_read_write_mappings[0].destination = parent_alias.join("X0");
         assert!(load_environment(&policy)
             .unwrap_err()
             .to_string()

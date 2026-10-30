@@ -114,7 +114,7 @@ fn inputs(root: &Path) -> PolicyInputs {
 #[test]
 fn x11_projection_is_exact_manifest_scoped_and_fail_closed() {
     let root = PathBuf::from("/fixture");
-    let socket = Path::new("/run/pocketforge/x11/.X11-unix/X0");
+    let socket = Path::new(X11_SOCKET_DESTINATION);
     let mapping = "BindPaths=/run/pocketforge/x11/.X11-unix/X0:/tmp/.X11-unix/X0";
 
     let x11 = derive_policy(&resolved(&root, &["x11"], false, true), &inputs(&root)).unwrap();
@@ -140,6 +140,12 @@ fn x11_projection_is_exact_manifest_scoped_and_fail_closed() {
         .iter()
         .any(|rule| { rule.path == socket && rule.access == FsAccess::UnixConnect }));
     assert!(!rendered.contains("@/tmp/.X11-unix/X0"));
+    assert!(rendered.contains("BindReadOnlyPaths=/run/pocketforge/x11/policy/environment\n"));
+    assert!(!x11
+        .landlock
+        .filesystem
+        .iter()
+        .any(|rule| rule.path == Path::new("/run/pocketforge/x11/.X11-unix/X0")));
 
     let plain = derive_policy(&resolved(&root, &[], false, true), &inputs(&root)).unwrap();
     let plain_rendered = render_systemd_dropin(&plain);
