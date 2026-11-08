@@ -1,0 +1,21 @@
+schema_version = 3
+
+[app]
+id = "com.pocketforge.fixture"
+name = "Fixture"
+
+[runtime]
+family = "pocketforge/a133-powervr"
+abi = "1"
+
+[fetch]
+enabled = true
+reason = "fixture source-vendor-pointer"
+source = "vendor-signed-pointer"
+
+[[fetch.files]]
+url = "https://example.invalid/assets.tar.gz"
+sha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+size = 1024
+format = "tar.gz"
+dest = "data"

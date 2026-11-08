@@ -894,14 +894,14 @@ fn schema_version_validates_and_old_manifests_keep_parsing() {
         [DisplayOrientation::Portrait]
     );
     // Negative control: a version outside the accepted set is refused by name.
-    for version in [0u32, 3, 99] {
+    for version in [0u32, 99] {
         let error = parse_manifest(&format!(
             "schema_version = {version}\n{}",
             manifest_with("")
         ))
         .unwrap_err();
         assert_eq!(error.kind, ManifestErrorKind::Invalid);
-        assert_eq!(error.message, "schema_version must be 1 or 2");
+        assert_eq!(error.message, "schema_version must be 1, 2 or 3");
     }
 }
 

@@ -19,3 +19,4 @@ toml.workspace = true
 # can never drift from the manifests devices actually ship (same policy as the descriptor tests
 # in pf-input-broker; cargo permits this dev-only cycle because pocketforge is the facade).
 pocketforge = { workspace = true }
+serde_json.workspace = true

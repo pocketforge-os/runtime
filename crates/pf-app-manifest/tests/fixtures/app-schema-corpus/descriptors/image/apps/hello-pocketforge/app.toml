@@ -1,0 +1,33 @@
+# Hello PocketForge — the PocketForge app descriptor (scaffolded by pf-app).
+#
+# ONE descriptor, THREE consumers: the on-device broker/supervisor at launch, the
+# packaging path at build/sign, and the SDK/author tooling at scaffold. Schema +
+# validator live in pocketforge-os/platform:
+#   pf app-validate app.toml        # -> abi/app.schema.json + core/appmanifest.py
+# Full contract: platform/docs/PLATFORM-ABI-CONTRACT.md.
+
+[app]
+id       = "com.pocketforge.hello"
+name     = "Hello PocketForge"
+category = "game"
+version  = "0.1.0"
+# Capability authority graph — the CEILING of what this app may ever acquire (the pf-broker
+# refuses anything outside it at runtime). `?` = OPTIONAL: graceful HardwareAbsent if the
+# device can't back it. This starter reads input (required) and optionally pulses vibration.
+use      = ["input", "vibration?"]
+
+[runtime]
+# The per-SoC-family Platform ABI pin (E8). A Platform accepts this app iff its family
+# matches AND it offers abi 1. platform-version pins the exact {kernel,gpu,sdl} SHA-set.
+family           = "pocketforge/a523-mali"
+abi              = "1"
+platform-version = "1"
+
+[launch]
+exec          = "./launch"     # the SDL3_DYNAMIC_API shim (see ./launch)
+takes_display = true
+
+# Sibling files that ride ALONGSIDE app.toml at PACKAGE time (produced by the packaging
+# path, NOT keys here): app.toml.sig (minisign), oci/ + oci.sig (cosign-by-digest),
+# sbom.spdx.json (syft), slice.conf (systemd resource limits). See oci/build-oci.sh +
+# platform/docs/PLATFORM-ABI-CONTRACT.md §6. Optional [health]/[fetch] tables: schema.

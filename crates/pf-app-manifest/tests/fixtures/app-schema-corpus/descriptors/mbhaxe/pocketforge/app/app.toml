@@ -1,0 +1,86 @@
+# MBHaxe (Marble Blast Ultra) - PocketForge app descriptor (tsp-0qwbh.5).
+#
+# One descriptor for the launcher catalog, the session authority and pf-app-launch
+# (runtime crates/pf-app-manifest). Validate it with the runtime resolver against a
+# staged app root and the device platform contract; pocketforge/app/DEV-INSTALL.md
+# has the commands. The app root that ships beside this file is assembled by
+# pocketforge/build/app-root.sh: marblegame, libhl.so.1, the hdlls, lib/ (bundled
+# Debian bookworm libraries, see bundle.lock), launch, alsoft.conf, licenses/.
+#
+# The game data is NOT part of the app root and is never redistributed by PocketForge:
+# the [fetch] table pins the upstream release asset that carries it.
+schema_version = 2
+
+[app]
+id = "org.pocketforge.mbhaxe"
+name = "Marble Blast Ultra"
+category = "game"
+# PocketForge package version; upstream_version is the MBHaxe release the build and the
+# fetched data come from (src/MarbleGame.hx currentVersion, release tag 1.3.2-mbu).
+version = "1.3.2-pf.1"
+upstream_version = "1.3.2-mbu"
+# Gamepad input through the input broker, ALSA audio through OpenAL Soft. No network:
+# the handheld build is offline (-D offline), so there is no egress authority and
+# launch.needs_network stays false (the policy compiler requires the two to match).
+use = ["input", "audio"]
+
+[runtime]
+family = "pocketforge/a133-powervr"
+abi = "1"
+platform-version = "20"
+
+[launch]
+# A POSIX sh wrapper: bundled lib/ on LD_LIBRARY_PATH, ALSOFT_CONF, SDL_VIDEODRIVER=wayland,
+# and a writable working directory under XDG_STATE_HOME (the game writes settings.json,
+# console.log and replays to its working directory; the app directory is read-only).
+exec = "launch"
+takes_display = true
+audio = true
+
+[display]
+orientations = ["landscape"]
+
+[requirements]
+# OpenGL ES 3.0 context (compile-linux-gles.hxml -D gles, hashlink WITH_SDL_GLES).
+gles = "3.0"
+# Gamepad-only play: face buttons plus an analog stick to roll the marble. The runtime
+# input vocabulary has no "gamepad" token; buttons + stick is its spelling of it.
+inputs = ["buttons", "stick"]
+# PLACEHOLDER - measure in the device window (tsp-0qwbh.6): peak RSS plus GPU memory on
+# the A133 with no zram credit. Laptop x86_64 RSS under Zink/lavapipe is recorded in
+# LOCK.md for orientation only. Kept within the device app budget so the placeholder
+# itself never refuses the launch.
+memory_mib = 400
+# Laptop staging (tsp-0qwbh.5): aarch64 app root 13.4 MiB + fetched data/ 70.8 MiB = 84.2 MiB;
+# state and cache after a run about 2 MiB. While [fetch] runs it also holds the 55.2 MiB archive.
+# 160 covers both with room for replays.
+storage_mib = 160
+
+[recommended]
+# The second stick turns the camera; the d-pad navigates menus.
+inputs = ["buttons", "dpad", "two_sticks"]
+
+[fetch]
+enabled = true
+reason = "Marble Blast Ultra game data (levels, textures, sounds) from the upstream MBHaxe release; PocketForge does not redistribute it."
+# "var": the fetched data lands in /var/lib/pocketforge/apps/org.pocketforge.mbhaxe/<dest>, outside
+# the read-only app directory. `launch` points the game at it (MBHAXE_DATA_DIR) when it exists and
+# puts the game's converter cache under XDG_CACHE_HOME, so the game never writes to the data. The
+# dev install (DEV-INSTALL.md) still stages data/ inside the app directory (pf-fetch.py --root),
+# which `launch` falls back to.
+destination = "var"
+
+# Upstream MBHaxe 1.3.2-mbu Linux release asset, pinned by exact URL, SHA256 and size
+# (the GitHub release asset digest matches). The archive holds one top-level directory,
+# MBHaxe-Ultra-Linux/, with the upstream x86_64 binaries next to data/. strip_components = 2
+# drops every member with two or fewer path components (the top-level directory and the
+# binaries beside data/) and maps MBHaxe-Ultra-Linux/data/<path> to data/<path>, so exactly
+# the contents of data/ are installed at dest, relative to the destination above. The game
+# requires that directory to be a real directory (not a symlink) called data.
+[[fetch.files]]
+url = "https://github.com/RandomityGuy/MBHaxe/releases/download/1.3.2-mbu/MBHaxe-Ultra-Linux.tar.gz"
+sha256 = "515487e0f9eac03dd660ddedc856bee989c7921464aa96e3cb4f5407267573f2"
+size = 57876762
+format = "tar.gz"
+strip_components = 2
+dest = "data"
