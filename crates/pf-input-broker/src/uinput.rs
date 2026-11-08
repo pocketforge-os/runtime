@@ -36,6 +36,8 @@ pub struct UinputSpec {
     pub rel: Vec<u16>,
     /// Absolute axes to advertise, with calibration.
     pub abs: Vec<(u16, AbsInfo)>,
+    /// Advertise `EV_FF` / `FF_RUMBLE` (App Pad only, and only when a vibrator exists).
+    pub ff_rumble: bool,
 }
 
 /// A live uinput virtual device. `Drop` destroys it.
@@ -134,12 +136,20 @@ impl Uinput {
             }
         }
 
+        if spec.ff_rumble {
+            dev.set_bit(ioc::UI_SET_EVBIT, ioc::EV_FF as libc::c_int)?;
+            dev.set_bit(ioc::UI_SET_FFBIT, ioc::FF_RUMBLE as libc::c_int)?;
+        }
+
         // Legacy setup: write a uinput_user_dev, then UI_DEV_CREATE.
         let mut uud: libc::uinput_user_dev = unsafe { std::mem::zeroed() };
         let name = spec.name.as_bytes();
         let n = name.len().min(libc::UINPUT_MAX_NAME_SIZE - 1);
         for (dst, &b) in uud.name.iter_mut().zip(&name[..n]) {
             *dst = b as libc::c_char;
+        }
+        if spec.ff_rumble {
+            uud.ff_effects_max = 16;
         }
         uud.id.bustype = spec.bus;
         uud.id.vendor = spec.vendor;
@@ -268,6 +278,7 @@ pub fn pointer_uinput_spec() -> UinputSpec {
         keys: vec![0x110, 0x111],          // BTN_LEFT, BTN_RIGHT
         rel: vec![0x00, 0x01, 0x0b, 0x0c], // X, Y, horizontal/vertical hi-res wheel
         abs: Vec::new(),
+        ff_rumble: false,
     }
 }
 
@@ -289,7 +300,15 @@ pub fn pad_uinput_spec(base: &UinputSpec, destination: PadDestination) -> Option
     spec.vendor = 0x5046;
     spec.product = product;
     spec.version = 1;
+    spec.ff_rumble = false;
     Some(spec)
+}
+
+/// The App Pad spec; advertises rumble only when `has_actuator`.
+pub fn app_pad_uinput_spec(base: &UinputSpec, has_actuator: bool) -> UinputSpec {
+    let mut spec = pad_uinput_spec(base, PadDestination::App).expect("app has a pad spec");
+    spec.ff_rumble = has_actuator;
+    spec
 }
 
 fn open_uinput() -> io::Result<RawFd> {

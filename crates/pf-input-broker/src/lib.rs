@@ -61,7 +61,8 @@ pub use safe_return::{
     serve_system_menu_provider, PostureFeed, SafeReturnIntake, SystemMenuGate, SystemMenuRouter,
 };
 pub use uinput::{
-    pad_uinput_spec, pointer_uinput_spec, AbsInfo, SessionUinputs, Uinput, UinputSpec,
+    app_pad_uinput_spec, pad_uinput_spec, pointer_uinput_spec, AbsInfo, SessionUinputs, Uinput,
+    UinputSpec,
 };
 
 /// How the broker vends the input device to a consumer (R-C).
