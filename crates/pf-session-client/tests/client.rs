@@ -1,6 +1,7 @@
 use pf_ports::*;
 use pf_session_authority::{serve_connection, Authority, FileStore, Observation, SessionSystem};
 use pf_session_authority::{AuthorityApi, AuthorityError};
+use pf_session_authority::{FetchSetupApi, SetupCancel, SetupLaunch, SetupStart};
 use pf_session_client::SessionClient;
 use pf_session_client::SocketTransport;
 use std::os::unix::fs::PermissionsExt;
@@ -360,6 +361,105 @@ fn socket_transport_reports_mid_stream_drop_on_next_call() {
         Err(SessionError::BackendUnavailable)
     );
 
+    thread.join().unwrap();
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// A session system whose setup unit is idle for the first request and running afterwards.
+#[derive(Default)]
+struct SetupSocketSystem {
+    started: u32,
+    cancelled: u32,
+}
+impl SessionSystem for SetupSocketSystem {
+    fn start_foreground(&mut self, _: &LaunchRequest, _: &str) -> Result<(), String> {
+        Ok(())
+    }
+    fn request_graceful_stop(&mut self, _: &str, _: &str) -> Result<(), String> {
+        Ok(())
+    }
+    fn enforce_termination(&mut self, _: &str, _: &str) -> Result<(), String> {
+        Ok(())
+    }
+    fn activate_selected_owner(&mut self) -> Result<(), String> {
+        Ok(())
+    }
+    fn start_setup(&mut self, item_id: &str) -> Result<SetupLaunch, String> {
+        assert_eq!(item_id, FETCH_ID);
+        self.started += 1;
+        Ok(if self.started == 1 {
+            SetupLaunch::Started
+        } else {
+            SetupLaunch::AlreadyRunning
+        })
+    }
+    fn cancel_setup(&mut self, item_id: &str) -> Result<(), String> {
+        assert_eq!(item_id, FETCH_ID);
+        self.cancelled += 1;
+        Ok(())
+    }
+}
+
+const FETCH_ID: &str = "org.example.fetcher";
+
+#[test]
+fn socket_transport_starts_and_cancels_fetch_setup() {
+    let dir = std::env::temp_dir().join(format!("pf-session-socket-setup-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let setup_resolver = resolver(&dir);
+    let app = dir.join("apps").join(FETCH_ID);
+    std::fs::create_dir_all(app.join("bin")).unwrap();
+    std::fs::write(
+        app.join("app.toml"),
+        "[app]\nid = \"org.example.fetcher\"\nuse = [\"input\"]\n\
+         [runtime]\nfamily = \"pocketforge/a133-powervr\"\nabi = \"1\"\nplatform-version = \"20\"\n\
+         [launch]\nexec = \"bin/app\"\n\
+         [fetch]\nenabled = true\nreason = \"game data\"\n",
+    )
+    .unwrap();
+    let executable = app.join("bin/app");
+    std::fs::write(&executable, b"#!/bin/sh\n").unwrap();
+    let mut permissions = std::fs::metadata(&executable).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(executable, permissions).unwrap();
+    let socket = dir.join("authority.sock");
+    let state = dir.join("authority.json");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let thread = std::thread::spawn(move || {
+        let mut authority = Authority::open_with_resolver(
+            FileStore::new(&state),
+            SetupSocketSystem::default(),
+            TestClock::new(),
+            4,
+            Duration::from_secs(1),
+            setup_resolver,
+        )
+        .unwrap();
+        for _ in 0..5 {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut writer = stream.try_clone().unwrap();
+            serve_connection(&mut authority, &mut stream, &mut writer).unwrap();
+        }
+    });
+    let mut client = SessionClient::new("launcher", SocketTransport::connect(&socket));
+    assert_eq!(client.start_setup(FETCH_ID).unwrap(), SetupStart::Started);
+    assert_eq!(
+        client.start_setup(FETCH_ID).unwrap(),
+        SetupStart::AlreadyRunning
+    );
+    assert_eq!(
+        client.start_setup(APP_ID).unwrap(),
+        SetupStart::NotFetchEnabled
+    );
+    assert_eq!(
+        client.start_setup("../escape").unwrap(),
+        SetupStart::ItemUnavailable
+    );
+    assert_eq!(
+        client.cancel_setup(FETCH_ID).unwrap(),
+        SetupCancel::Requested
+    );
     thread.join().unwrap();
     std::fs::remove_dir_all(dir).unwrap();
 }

@@ -4,8 +4,8 @@ use pf_ports::{
     Deadline, LaunchRequest, LaunchResult, SessionError, SessionEvent, SessionPoll, SessionPort,
 };
 use pf_session_authority::{
-    AuthorityApi, AuthorityError, HistoryEntry, RpcEvent, RpcRequest, RpcResponse,
-    SESSION_RPC_CONTRACT_V1,
+    AuthorityApi, AuthorityError, FetchSetupApi, HistoryEntry, RpcEvent, RpcRequest, RpcResponse,
+    SetupCancel, SetupStart, SESSION_RPC_CONTRACT_V1,
 };
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -160,6 +160,45 @@ impl AuthorityApi for SocketTransport {
     }
     fn history_entries(&self) -> Vec<HistoryEntry> {
         SocketTransport::history_entries(self).unwrap_or_default()
+    }
+}
+
+impl FetchSetupApi for SocketTransport {
+    fn start_setup(&mut self, item_id: &str) -> Result<SetupStart, AuthorityError> {
+        match self.call(&RpcRequest::StartSetup {
+            item_id: item_id.to_owned(),
+        })? {
+            RpcResponse::SetupStarted => Ok(SetupStart::Started),
+            RpcResponse::SetupRunning => Ok(SetupStart::AlreadyRunning),
+            RpcResponse::RejectedBusy => Ok(SetupStart::RejectedBusy),
+            RpcResponse::ItemUnavailable => Ok(SetupStart::ItemUnavailable),
+            RpcResponse::SetupNotEnabled => Ok(SetupStart::NotFetchEnabled),
+            _ => Err(AuthorityError::Backend(
+                "unexpected start_setup response".into(),
+            )),
+        }
+    }
+    fn cancel_setup(&mut self, item_id: &str) -> Result<SetupCancel, AuthorityError> {
+        match self.call(&RpcRequest::CancelSetup {
+            item_id: item_id.to_owned(),
+        })? {
+            RpcResponse::Ok => Ok(SetupCancel::Requested),
+            RpcResponse::ItemUnavailable => Ok(SetupCancel::ItemUnavailable),
+            RpcResponse::SetupNotEnabled => Ok(SetupCancel::NotFetchEnabled),
+            _ => Err(AuthorityError::Backend(
+                "unexpected cancel_setup response".into(),
+            )),
+        }
+    }
+}
+
+/// The launcher's setup seam: the same transport, so a fake transport can stand in for tests.
+impl<T: FetchSetupApi> FetchSetupApi for SessionClient<T> {
+    fn start_setup(&mut self, item_id: &str) -> Result<SetupStart, AuthorityError> {
+        self.transport.start_setup(item_id)
+    }
+    fn cancel_setup(&mut self, item_id: &str) -> Result<SetupCancel, AuthorityError> {
+        self.transport.cancel_setup(item_id)
     }
 }
 
