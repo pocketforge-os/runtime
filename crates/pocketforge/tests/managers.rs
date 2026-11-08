@@ -90,10 +90,18 @@ fn imu_pose_roundtrips_through_the_physical_model() {
 // --- vibration: the unified no-op shape + the E4 enforcement point ---------------------------
 
 #[test]
-fn a133_rumble_is_noop_absent() {
+fn a133_rumble_fires_gpio_vibrator() {
     let pf = Pf::in_process(common::descriptor("a133"));
     let v = pf.vibration();
-    assert!(!v.has_motor(), "a133 has no pwm-vibrator");
+    assert!(v.has_motor(), "a133 has a gpio-vibrator (platform#458)");
+    assert_eq!(v.pulse(40), RumbleStatus::Fired);
+}
+
+#[test]
+fn motorless_rumble_is_noop_absent() {
+    let pf = Pf::in_process(common::motorless_descriptor("a133"));
+    let v = pf.vibration();
+    assert!(!v.has_motor(), "fixture has no rumble actuator");
     assert_eq!(v.pulse(40), RumbleStatus::NoopAbsent);
 }
 

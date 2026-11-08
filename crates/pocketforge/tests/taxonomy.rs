@@ -31,13 +31,13 @@ fn a133_imu_is_hardware_absent_not_a_crash() {
 }
 
 #[test]
-fn a133_vibration_is_cosmetic_noop_absent() {
-    let pf = Pf::in_process(common::descriptor("a133"));
+fn motorless_vibration_is_cosmetic_noop_absent() {
+    let pf = Pf::in_process(common::motorless_descriptor("a133"));
     // Cosmetic tier: acquire NEVER errors, even with no motor.
     let vib = pf
         .acquire::<Vibration>()
         .expect("vibration acquire is infallible (cosmetic)");
-    assert!(!vib.has_motor, "a133 has no rumble motor");
+    assert!(!vib.has_motor, "fixture has no rumble motor");
     assert_eq!(vib.pulse(40), RumbleStatus::NoopAbsent);
 }
 

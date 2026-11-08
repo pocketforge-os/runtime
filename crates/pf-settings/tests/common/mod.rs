@@ -32,6 +32,20 @@ pub fn descriptor(id: &str) -> Descriptor {
     pocketforge::test_support::descriptor(id)
 }
 
+/// The named platform descriptor with every rumble actuator removed: a motorless device. No
+/// shipping descriptor lacks a motor since platform#458 (a133 gained a gpio-vibrator), so this
+/// fixture keeps the `NoopAbsent` path covered. Derived from real data, not hand-written.
+pub fn motorless_descriptor(id: &str) -> Descriptor {
+    let mut d = descriptor(id);
+    d.actuators
+        .retain(|a| !a.kind.to_ascii_lowercase().contains("rumble"));
+    assert!(
+        !d.cap_present("rumble"),
+        "fixture must have no rumble actuator"
+    );
+    d
+}
+
 /// A scratch `$PF_PREFS_DIR` unique to this process + tag, wiped fresh so no prior run's state
 /// bleeds in. Callers pair this with [`cleanup`] on the happy path — a failed test intentionally
 /// leaves the directory for post-mortem inspection.

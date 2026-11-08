@@ -4,7 +4,7 @@
  * Proves a plain C program can link the staticlib, open a session against a real
  * capabilities.toml, and observe the descriptor-honest contract:
  *   - a133 (base Pro): no IMU   -> pf_acquire("imu")      == PF_HARDWARE_ABSENT
- *                      no motor  -> pf_rumble_pulse(...)   == PF_RUMBLE_NOOP_ABSENT
+ *                      gpio motor-> pf_rumble_pulse(...)   == PF_RUMBLE_FIRED
  *                      no GNSS   -> pf_acquire("location") == PF_HARDWARE_ABSENT (DT-unbound,
  *                                   so the descriptor omits it; consent path is tested in Rust)
  *                      entropy ungated                    -> pf_acquire == PF_OK, fill ok
@@ -46,10 +46,10 @@ int main(int argc, char **argv) {
     printf("     pf_acquire(imu) = %d (%s)\n", imu_acq, pf_strerror(imu_acq));
     CHECK(imu_acq == PF_HARDWARE_ABSENT, "acquire(imu) == HARDWARE_ABSENT on a133");
 
-    /* rumble cosmetic no-op tier: acquire OK, pulse is a typed no-op (no motor on a133) */
+    /* rumble cosmetic no-op tier: acquire OK, pulse actuates (a133 has a gpio-vibrator) */
     CHECK(pf_acquire(pf, "vibration") == PF_OK, "acquire(vibration) == OK (cosmetic tier)");
     int r = pf_rumble_pulse(pf, 40);
-    CHECK(r == PF_RUMBLE_NOOP_ABSENT, "rumble pulse == NOOP_ABSENT on a133");
+    CHECK(r == PF_RUMBLE_FIRED, "rumble pulse == FIRED on a133");
 
     /* a133 has no GNSS (DT-unbound; descriptor omits it) -> hardware-absent, not consent */
     CHECK(pf_query(pf, "location") == PF_DENIED, "query(location) == DENIED (a133 no GNSS)");

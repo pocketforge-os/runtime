@@ -161,7 +161,7 @@ default(0).
 | value | status            | meaning                                              |
 |------:|-------------------|------------------------------------------------------|
 | 0     | `Fired`           | motor present AND haptics enabled → would actuate    |
-| 1     | `NoopAbsent`      | no rumble motor on this descriptor (a133)            |
+| 1     | `NoopAbsent`      | no rumble motor on this descriptor                  |
 | 2     | `NoopSuppressed`  | motor present but `hapticsEnabled` is off (E4)       |
 
 `NoopAbsent` and `NoopSuppressed` are **both `status=Ok`** — a cosmetic-tier call never

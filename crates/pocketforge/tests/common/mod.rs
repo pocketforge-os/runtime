@@ -15,6 +15,19 @@ pub fn descriptor(id: &str) -> Descriptor {
     pocketforge::test_support::descriptor(id)
 }
 
+/// The named platform descriptor with its rumble actuators removed: a motorless device. Since
+/// platform#458 no shipping descriptor lacks a motor, so this keeps `NoopAbsent` covered.
+pub fn motorless_descriptor(id: &str) -> Descriptor {
+    let mut d = descriptor(id);
+    d.actuators
+        .retain(|a| !a.kind.to_ascii_lowercase().contains("rumble"));
+    assert!(
+        !d.cap_present("rumble"),
+        "fixture must have no rumble actuator"
+    );
+    d
+}
+
 /// The SYNTHETIC descriptor rigs, re-exported from their single home in
 /// `pocketforge::test_support` so `pf-input-broker`'s unit tests use the same definitions rather
 /// than a second copy of them (`tsp-ozbp.16` — the whole point of this bead is one home per

@@ -3,9 +3,9 @@
 # Two matrix rows, ZERO test-code diff (`crates/pf-settings/tests/prefs_e2e.rs::run_unified_scenario`
 # is one function body; both rows pass an argument, no branch on the descriptor). Each row runs the
 # same `cargo test -p pf-settings --test prefs_e2e` filter, restricted to that row's descriptor by
-# the standard `#[test]`-name substring match — and every row also runs the `unified_zero_code_diff_
-# a133_absent` + `..._a523_suppressed` tests, since the a133/a523 substring hits both descriptors'
-# tests, honestly proving THE unification claim in each row.
+# the standard `#[test]`-name substring match — and every row also runs its `unified_zero_code_diff_
+# a133_suppressed` + `..._a133_motorless_absent` / `..._a523_suppressed` tests, since the a133/a523
+# substring hits those descriptors' tests (the a133 row also carries the motorless-absent fixture), honestly proving THE unification claim in each row.
 #
 # The two green rows ARE the unification proof: the same test code (byte-for-byte) exits 0 on both.
 # The honest diagnostic (`NoopAbsent` vs `NoopSuppressed`) is asserted inside each test — it is the
@@ -79,8 +79,8 @@ jobs:
             prefs-e2e-${{ runner.os }}-
 
       # The FILTER: cargo test does substring match on test names. `a133` runs every test whose
-      # name contains "a133" — including the unification test `unified_zero_code_diff_a133_absent`
-      # AND the a133 flip tests; symmetrically for a523. Each row's assertion set exercises its
+      # name contains "a133" — including the unification tests `unified_zero_code_diff_a133_suppressed`
+      # and `..._a133_motorless_absent` AND the a133 flip tests; symmetrically for a523. Each row's assertion set exercises its
       # descriptor's silent-no-op flavor + the shared observer contract. Since the two unification
       # tests share bodies via `run_unified_scenario`, GREEN on BOTH matrix rows is precisely the
       # "zero test-code diff between rows" proof the epic acceptance names.
