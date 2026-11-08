@@ -40,7 +40,7 @@ pub mod ioc;
 pub mod policy;
 pub mod remap;
 pub mod router;
-pub mod rumble;
+pub mod ff;
 pub mod safe_return;
 pub mod scm;
 pub mod session_ipc;

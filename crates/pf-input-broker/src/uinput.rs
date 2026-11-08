@@ -358,3 +358,62 @@ impl Drop for Uinput {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn base() -> UinputSpec {
+        UinputSpec {
+            name: "x".into(),
+            bus: 3,
+            vendor: 1,
+            product: 2,
+            version: 1,
+            keys: vec![0x130],
+            rel: vec![],
+            abs: vec![],
+            ff: vec![],
+            ff_effects_max: 0,
+        }
+    }
+
+    #[test]
+    fn app_pad_advertises_ff_rumble_only_with_actuator() {
+        let app = app_pad_uinput_spec(&base(), true);
+        assert_eq!(app.ff, [0x50]);
+        assert!(app.ff_effects_max > 0);
+        let none = app_pad_uinput_spec(&base(), false);
+        assert!(none.ff.is_empty());
+        assert_eq!(none.ff_effects_max, 0);
+        for d in [
+            PadDestination::App,
+            PadDestination::Keyboard,
+            PadDestination::Menu,
+            PadDestination::Shell,
+        ] {
+            let spec = pad_uinput_spec(&base(), d).unwrap();
+            assert!(spec.ff.is_empty(), "{d:?}");
+        }
+        assert!(pointer_uinput_spec().ff.is_empty());
+    }
+
+    #[test]
+    fn udev_rule_matches_app_pad_spec() {
+        let rule = include_str!("../systemd/70-pf-app-pad.rules");
+        let s = pad_uinput_spec(&base(), PadDestination::App).unwrap();
+        for needle in [
+            "SUBSYSTEM==\"input\"".to_string(),
+            "KERNEL==\"event*\"".to_string(),
+            format!("ATTRS{{name}}==\"{}\"", s.name),
+            format!("ATTRS{{id/bustype}}==\"{:04x}\"", s.bus),
+            format!("ATTRS{{id/vendor}}==\"{:04x}\"", s.vendor),
+            format!("ATTRS{{id/product}}==\"{:04x}\"", s.product),
+            "SYMLINK+=\"input/pf-app-pad\"".to_string(),
+            "GROUP=\"input\"".to_string(),
+            "MODE=\"0660\"".to_string(),
+        ] {
+            assert!(rule.contains(&needle), "missing {needle}");
+        }
+    }
+}
