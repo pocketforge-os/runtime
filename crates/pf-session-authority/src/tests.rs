@@ -6316,6 +6316,26 @@ fn a_repeat_start_while_the_unit_is_running_is_idempotent() {
 }
 
 #[test]
+fn a_start_while_a_cancel_is_queued_on_a_running_unit_answers_running_and_starts_nothing() {
+    // runtime#189 review N1: `activating` (a oneshot mid-run) with a stop job queued is a cancel
+    // that has not taken effect yet. A start here would replace the queued stop job and undo the
+    // user's cancel, so the documented answer stands: setup_running, no command. The launcher's
+    // watch ends when the cancelled run releases its lock, and a retry is then offered.
+    let (mut a, log, dir) = setup_authority(vec![fetch_unit_state("activating", "31")]);
+    assert!(matches!(
+        handle_rpc(&mut a, start_setup(FETCH_ID)).unwrap(),
+        RpcResponse::SetupRunning
+    ));
+    assert_eq!(a.system.executor.calls, [state_query()]);
+    assert!(log
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|line| line.contains("setup_running") && line.contains(FETCH_ID)));
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn start_setup_is_refused_while_a_foreground_session_is_active() {
     // pf-app-fetch@ has Conflicts=pf-app@%i: starting it under a session could stop that app.
     let (resolver, dir) = setup_resolver();

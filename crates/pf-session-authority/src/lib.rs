@@ -883,6 +883,8 @@ impl<E: CommandExecutor> CommandSystem<E> {
 
     /// True when `pf-app-fetch@<id>` is running or has a start job queued. A unit that is
     /// deactivating (a cancel in flight) is not running: a new start queues behind the stop.
+    /// A unit still activating with a stop job queued counts as running: starting it would
+    /// replace that stop job and undo the cancel.
     fn setup_unit_running(&mut self, item_id: &str) -> Result<bool, String> {
         let unit = format!("pf-app-fetch@{item_id}.service");
         let output = self.query(&[
