@@ -35,6 +35,7 @@
 
 pub mod broker;
 pub mod evdev;
+pub mod ff;
 pub mod io;
 pub mod ioc;
 pub mod policy;
@@ -60,7 +61,8 @@ pub use safe_return::{
     serve_system_menu_provider, PostureFeed, SafeReturnIntake, SystemMenuGate, SystemMenuRouter,
 };
 pub use uinput::{
-    pad_uinput_spec, pointer_uinput_spec, AbsInfo, SessionUinputs, Uinput, UinputSpec,
+    app_pad_uinput_spec, pad_uinput_spec, pointer_uinput_spec, AbsInfo, SessionUinputs, Uinput,
+    UinputSpec, APP_PAD_FF_EFFECTS_MAX,
 };
 
 /// How the broker vends the input device to a consumer (R-C).

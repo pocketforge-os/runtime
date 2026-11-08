@@ -695,6 +695,7 @@ impl SafeReturnIntake {
 pub struct SystemMenuGate {
     router: SystemMenuRouter,
     down: bool,
+    rumble: Option<crate::ff::RumbleControl>,
 }
 
 impl SystemMenuGate {
@@ -702,7 +703,14 @@ impl SystemMenuGate {
         SystemMenuGate {
             router,
             down: false,
+            rumble: None,
         }
+    }
+
+    /// Stop and erase App Pad rumble on every protected Menu press (safe-return entry).
+    pub fn with_rumble(mut self, rumble: crate::ff::RumbleControl) -> Self {
+        self.rumble = Some(rumble);
+        self
     }
 
     /// Offer one canonical `EV_KEY` transition. Returns `true` when it is the guide key, which
@@ -720,6 +728,9 @@ impl SystemMenuGate {
     /// up-to-down change is a press edge.
     pub fn set_down(&mut self, down: bool) {
         if down && !self.down {
+            if let Some(rumble) = &self.rumble {
+                rumble.safe_return();
+            }
             self.router.press();
         }
         self.down = down;

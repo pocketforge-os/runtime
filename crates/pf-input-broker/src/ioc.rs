@@ -16,6 +16,10 @@ pub const EV_KEY: u16 = 0x01;
 pub const EV_REL: u16 = 0x02;
 /// `EV_ABS` — absolute-axis event type.
 pub const EV_ABS: u16 = 0x03;
+/// `EV_FF` — force-feedback event type.
+pub const EV_FF: u16 = 0x15;
+/// `FF_RUMBLE` — rumble effect code.
+pub const FF_RUMBLE: u16 = 0x50;
 /// `SYN_REPORT` — commit the current event report.
 pub const SYN_REPORT: u16 = 0x00;
 /// `SYN_DROPPED` — the evdev client lost events and must resynchronize state.
@@ -101,6 +105,60 @@ pub const UI_SET_KEYBIT: c_ulong = ioc(IOC_WRITE, UI, 101, 4);
 pub const UI_SET_RELBIT: c_ulong = ioc(IOC_WRITE, UI, 102, 4);
 /// `UI_SET_ABSBIT` — advertise an absolute axis (arg: `int`).
 pub const UI_SET_ABSBIT: c_ulong = ioc(IOC_WRITE, UI, 103, 4);
+
+/// `UI_SET_FFBIT` — advertise a force-feedback effect (arg: `int`).
+pub const UI_SET_FFBIT: c_ulong = ioc(IOC_WRITE, UI, 107, 4);
+
+/// `UI_BEGIN_FF_UPLOAD` — fetch the effect the app is uploading (`_IOWR('U', 200, uinput_ff_upload)`).
+pub fn ui_begin_ff_upload() -> c_ulong {
+    ioc(
+        IOC_READ | IOC_WRITE,
+        UI,
+        200,
+        std::mem::size_of::<libc::uinput_ff_upload>() as u64,
+    )
+}
+/// `UI_END_FF_UPLOAD` — answer it (`_IOW('U', 201, uinput_ff_upload)`).
+pub fn ui_end_ff_upload() -> c_ulong {
+    ioc(
+        IOC_WRITE,
+        UI,
+        201,
+        std::mem::size_of::<libc::uinput_ff_upload>() as u64,
+    )
+}
+/// `UI_BEGIN_FF_ERASE` (`_IOWR('U', 202, uinput_ff_erase)`).
+pub fn ui_begin_ff_erase() -> c_ulong {
+    ioc(
+        IOC_READ | IOC_WRITE,
+        UI,
+        202,
+        std::mem::size_of::<libc::uinput_ff_erase>() as u64,
+    )
+}
+/// `UI_END_FF_ERASE` (`_IOW('U', 203, uinput_ff_erase)`).
+pub fn ui_end_ff_erase() -> c_ulong {
+    ioc(
+        IOC_WRITE,
+        UI,
+        203,
+        std::mem::size_of::<libc::uinput_ff_erase>() as u64,
+    )
+}
+
+/// `EVIOCSFF` — upload an effect to an evdev device (`_IOW('E', 0x80, ff_effect)`).
+pub fn eviocsff() -> c_ulong {
+    ioc(
+        IOC_WRITE,
+        EV,
+        0x80,
+        std::mem::size_of::<libc::ff_effect>() as u64,
+    )
+}
+/// `EVIOCRMFF` — erase an effect by id (`_IOW('E', 0x81, int)`).
+pub fn eviocrmff() -> c_ulong {
+    ioc(IOC_WRITE, EV, 0x81, 4)
+}
 
 /// `UI_GET_SYSNAME(len)` — read the created device's `inputN` sysname into a `len`-byte buffer.
 pub fn ui_get_sysname(len: usize) -> c_ulong {

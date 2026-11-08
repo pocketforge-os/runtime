@@ -233,6 +233,8 @@ fn run_production(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(router) = system_menu_router.as_ref() {
         broker = broker.with_system_menu(router.clone());
     }
+    let rumble = broker.rumble_control();
+    let rumble_pump = broker.spawn_rumble_pump(&STOP);
     // GetAppearance fallback when $PF_PREFSD_SOCK is unset: the store-less in-process default.
     let backend: Arc<dyn Backend> = Arc::new(InProcessBackend::new(Arc::new(descriptor)));
     let node = broker
@@ -325,9 +327,13 @@ fn run_production(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         }
         _ => None,
     };
-    let compositor_authority = compositor_listener
-        .as_ref()
-        .map(|_| Arc::new(CompositorAuthority::default()));
+    let compositor_authority = compositor_listener.as_ref().map(|_| {
+        let authority = CompositorAuthority::default();
+        Arc::new(match rumble.clone() {
+            Some(rumble) => authority.with_rumble(rumble),
+            None => authority,
+        })
+    });
     let keyboard_listener = match (keyboard_sock.as_deref(), keyboard_policy.as_ref()) {
         (Some(sock), Some(policy)) => Some(bind_endpoint(Path::new(sock), policy)?),
         _ => None,
@@ -367,6 +373,13 @@ fn run_production(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     });
     STOP.store(true, Ordering::Release);
     let _ = pump.join();
+    if let Some(handle) = rumble_pump {
+        let _ = handle.join();
+    }
+    // Broker shutdown: the vibrator must not outlive us.
+    if let Some(rumble) = rumble {
+        rumble.shutdown();
+    }
     result.map_err(Into::into)
 }
 

@@ -387,6 +387,8 @@ impl Remap {
             keys,
             rel: Vec::new(),
             abs,
+            ff: Vec::new(),
+            ff_effects_max: 0,
         };
         Ok(Remap {
             spec,

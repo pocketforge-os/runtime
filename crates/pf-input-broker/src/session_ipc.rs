@@ -60,6 +60,7 @@ pub struct CompositorAuthority {
     next_epoch: AtomicU64,
     next_request: AtomicU64,
     state: Mutex<CompositorState>,
+    rumble: Option<crate::ff::RumbleControl>,
 }
 
 impl Default for CompositorAuthority {
@@ -75,11 +76,30 @@ impl Default for CompositorAuthority {
                 pending_fds: HashMap::new(),
                 role_peers: BTreeMap::new(),
             }),
+            rumble: None,
         }
     }
 }
 
 impl CompositorAuthority {
+    /// Drive App Pad rumble from the compositor's focus: only a focused App may rumble.
+    pub fn with_rumble(mut self, rumble: crate::ff::RumbleControl) -> Self {
+        self.rumble = Some(rumble);
+        self
+    }
+
+    fn rumble_focus(&self, surface: &pf_input_ipc::compositor::FocusedSurface) {
+        let Some(rumble) = &self.rumble else { return };
+        if matches!(
+            surface,
+            pf_input_ipc::compositor::FocusedSurface::App { .. }
+        ) {
+            rumble.focus_gained();
+        } else {
+            rumble.focus_lost();
+        }
+    }
+
     fn register(&self, writer: UnixStream) -> u64 {
         let epoch = self.next_epoch.fetch_add(1, Ordering::Relaxed).max(1);
         let mut state = self.state.lock().expect("compositor state poisoned");
@@ -90,6 +110,9 @@ impl CompositorAuthority {
         state.current_epoch = Some(epoch);
         state.session = Some(CompositorSession::new(epoch));
         state.signals.register_compositor(epoch);
+        if let Some(rumble) = &self.rumble {
+            rumble.focus_lost();
+        }
         state.writer = Some(writer);
         epoch
     }
@@ -117,15 +140,19 @@ impl CompositorAuthority {
             CompositorToRouter::StateSnapshot { snapshot } => {
                 let epoch = snapshot.epoch;
                 let secure_entry = snapshot.focus.secure_entry;
+                let surface = snapshot.focus.surface.clone();
                 session.apply_snapshot(snapshot).map_err(state_error)?;
+                self.rumble_focus(&surface);
                 state.signals.snapshot(epoch, secure_entry);
             }
             CompositorToRouter::Focus {
                 epoch,
                 secure_entry,
+                surface,
                 ..
             } => {
                 session.accept_delta(epoch).map_err(state_error)?;
+                self.rumble_focus(&surface);
                 state.signals.focus(epoch, secure_entry);
             }
             CompositorToRouter::Overlay { epoch, .. } => {

@@ -166,6 +166,9 @@ pub struct Actuator {
     pub controller: Option<String>,
     #[serde(default)]
     pub sysfs: Option<String>,
+    /// Input-device name of the backing driver (rumble: `gpio-vibrator`).
+    #[serde(default)]
+    pub source: Option<String>,
 }
 
 /// Failure loading or parsing a descriptor.

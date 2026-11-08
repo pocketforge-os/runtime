@@ -33,6 +33,8 @@ fn every_pad_destination_has_a_distinct_private_virtual_device_identity() {
         keys: vec![0x130],
         rel: Vec::new(),
         abs: Vec::new(),
+        ff: Vec::new(),
+        ff_effects_max: 0,
     };
     let destinations = [
         PadDestination::App,
