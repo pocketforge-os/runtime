@@ -135,9 +135,9 @@ impl ValidatedSize {
         }
         let width_i32 = i32::try_from(width).map_err(|_| invalid())?;
         let height_i32 = i32::try_from(height).map_err(|_| invalid())?;
-        let stride = width.checked_mul(4).ok_or_else(&invalid)?;
+        let stride = width.checked_mul(4).ok_or_else(invalid)?;
         let stride_i32 = i32::try_from(stride).map_err(|_| invalid())?;
-        let pool_bytes = stride.checked_mul(height).ok_or_else(&invalid)?;
+        let pool_bytes = stride.checked_mul(height).ok_or_else(invalid)?;
         let pool_bytes_i32 = i32::try_from(pool_bytes).map_err(|_| invalid())?;
         Ok(Self {
             width,
