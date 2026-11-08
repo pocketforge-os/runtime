@@ -129,6 +129,8 @@ pub enum FsAccess {
     DeviceReadOnly,
     DeviceReadWrite,
     UnixConnect,
+    /// `LANDLOCK_ACCESS_FS_READ_DIR` only: enumerate a directory, open nothing in it.
+    ListDirectory,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -348,6 +350,9 @@ pub fn derive_policy(
     let mut bind_read_write_mappings = Vec::new();
     let mut environment = Vec::new();
     let mut devices: BTreeMap<PathBuf, String> = BTreeMap::new();
+    // Raw input identity sources the app sees under a different /dev/input/eventN name.
+    let mut device_destinations: BTreeMap<PathBuf, PathBuf> = BTreeMap::new();
+    let mut landlock_only_listings: BTreeSet<PathBuf> = BTreeSet::new();
     let mut groups = BTreeSet::new();
     let mut uses_input_broker = false;
     let resource = |name: &str, optional: bool| -> Result<Vec<PathBuf>, PolicyError> {
@@ -510,6 +515,30 @@ pub fn derive_policy(
                 InputRouteGrant::RawDevice => {
                     groups.insert("input".to_owned());
                     add_devices(&mut devices, route.class, raw_mode, false)?;
+                    let mut sources = resource(route.class, false)?;
+                    sources.sort();
+                    sources.dedup();
+                    let mut taken = sources
+                        .iter()
+                        .filter(|path| is_event_node(path))
+                        .cloned()
+                        .collect::<BTreeSet<_>>();
+                    let mut next = 0u32;
+                    for source in sources.iter().filter(|path| !is_event_node(path)) {
+                        let destination = loop {
+                            let candidate = PathBuf::from(format!("/dev/input/event{next}"));
+                            next += 1;
+                            if taken.insert(candidate.clone()) {
+                                break candidate;
+                            }
+                        };
+                        device_destinations.insert(source.clone(), destination.clone());
+                        bind_read_write_mappings.push(BindMapping {
+                            source: source.clone(),
+                            destination,
+                        });
+                    }
+                    landlock_only_listings.insert(PathBuf::from(INPUT_DEVICE_DIRECTORY));
                 }
             }
         }
@@ -575,16 +604,28 @@ pub fn derive_policy(
                     access: FsAccess::UnixConnect,
                 }),
         );
-        filesystem.extend(devices.iter().map(|(path, mode)| FsRule {
-            path: path.clone(),
-            access: if mode == "rw" {
-                FsAccess::DeviceReadWrite
-            } else {
-                FsAccess::DeviceReadOnly
-            },
+        filesystem.extend(landlock_only_listings.iter().cloned().map(|path| FsRule {
+            path,
+            access: FsAccess::ListDirectory,
+        }));
+        filesystem.extend(devices.iter().map(|(path, mode)| {
+            FsRule {
+                path: device_destinations
+                    .get(path)
+                    .cloned()
+                    .unwrap_or_else(|| path.clone()),
+                access: if mode == "rw" {
+                    FsAccess::DeviceReadWrite
+                } else {
+                    FsAccess::DeviceReadOnly
+                },
+            }
         }));
     }
     for (path, mode) in &devices {
+        if device_destinations.contains_key(path) {
+            continue; // bound through its source:destination mapping
+        }
         if mode == "rw" {
             socket_paths.insert(path.clone());
         } else {
@@ -700,6 +741,18 @@ pub fn derive_policy(
             device_allow,
         },
     })
+}
+
+const INPUT_DEVICE_DIRECTORY: &str = "/dev/input";
+
+/// `^/dev/input/event[0-9]+$`
+fn is_event_node(path: &Path) -> bool {
+    path.parent() == Some(Path::new(INPUT_DEVICE_DIRECTORY))
+        && path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.strip_prefix("event"))
+            .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
 }
 
 fn confined_absolute(path: &Path) -> bool {

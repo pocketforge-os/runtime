@@ -848,8 +848,10 @@ fn rumble_upgrades_only_pad_and_never_grants_vibrator() {
     let root = PathBuf::from("/fixture");
     let with_vibrator = |capabilities: &[&str]| {
         let mut i = identity_inputs(&root, &[BY_ID_PAD]);
-        i.resources
-            .insert("vibrator-devices".into(), vec![PathBuf::from("/dev/vibrator0")]);
+        i.resources.insert(
+            "vibrator-devices".into(),
+            vec![PathBuf::from("/dev/vibrator0")],
+        );
         i.resources
             .insert("vibrator".into(), vec![PathBuf::from("/dev/input/event9")]);
         derive_policy(&resolved(&root, capabilities, false, true), &i).unwrap()
@@ -866,12 +868,11 @@ fn rumble_upgrades_only_pad_and_never_grants_vibrator() {
         assert_eq!(policy.unit.device_allow[0].path, Path::new(BY_ID_PAD));
         assert_eq!(policy.unit.device_allow[0].mode, "rw");
         assert!(!render_systemd_dropin(&policy).contains("vibrator"));
-        assert!(!policy
-            .landlock
-            .filesystem
-            .iter()
-            .any(|r| r.path.to_string_lossy().contains("vibrator")
-                || r.path == Path::new("/dev/input/event9")));
+        assert!(!policy.landlock.filesystem.iter().any(|r| r
+            .path
+            .to_string_lossy()
+            .contains("vibrator")
+            || r.path == Path::new("/dev/input/event9")));
         assert!(policy.landlock.filesystem.iter().any(|r| {
             r.path == Path::new("/dev/input/event0") && r.access == FsAccess::DeviceReadWrite
         }));
@@ -892,8 +893,14 @@ fn raw_input_lists_dev_input_landlock_only() {
         .collect::<Vec<_>>();
     assert_eq!(listings, vec![PathBuf::from("/dev/input")]);
     // Landlock only: no systemd bind/device property mentions the directory itself.
-    assert!(!raw.unit.bind_read_only.contains(&PathBuf::from("/dev/input")));
-    assert!(!raw.unit.bind_read_write.contains(&PathBuf::from("/dev/input")));
+    assert!(!raw
+        .unit
+        .bind_read_only
+        .contains(&PathBuf::from("/dev/input")));
+    assert!(!raw
+        .unit
+        .bind_read_write
+        .contains(&PathBuf::from("/dev/input")));
     assert!(!render_systemd_dropin(&raw)
         .lines()
         .any(|l| l.ends_with("/dev/input") || l.contains("/dev/input ")));

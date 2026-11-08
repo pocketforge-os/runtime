@@ -87,6 +87,22 @@ mod tests {
         // The same manifest access on a directory must keep both traversal rights.
         assert_eq!(normalize_fs_access(requested, true), requested);
     }
+
+    #[test]
+    fn list_directory_is_read_dir_only() {
+        assert_eq!(fs_access(FsAccess::ListDirectory), FS_READ_DIR);
+        assert_eq!(fs_access(FsAccess::ListDirectory) & FS_READ_FILE, 0);
+        assert_eq!(fs_access(FsAccess::ListDirectory) & FS_ACCESS_FILE, 0);
+        // On a non-directory the right is dropped entirely rather than rejected by the kernel.
+        assert_eq!(
+            normalize_fs_access(fs_access(FsAccess::ListDirectory), false),
+            0
+        );
+        assert_eq!(
+            normalize_fs_access(fs_access(FsAccess::ListDirectory), true),
+            FS_READ_DIR
+        );
+    }
 }
 
 #[repr(C)]
@@ -449,21 +465,6 @@ const fn fs_access(access: FsAccess) -> u64 {
         FsAccess::DeviceReadOnly => FS_READ_FILE | FS_IOCTL_DEV,
         FsAccess::DeviceReadWrite => FS_READ_FILE | FS_WRITE_FILE | FS_IOCTL_DEV,
         FsAccess::UnixConnect => FS_RESOLVE_UNIX,
-    }
-
-    #[test]
-    fn list_directory_is_read_dir_only() {
-        assert_eq!(fs_access(FsAccess::ListDirectory), FS_READ_DIR);
-        assert_eq!(fs_access(FsAccess::ListDirectory) & FS_READ_FILE, 0);
-        assert_eq!(fs_access(FsAccess::ListDirectory) & FS_ACCESS_FILE, 0);
-        // On a non-directory the right is dropped entirely rather than rejected by the kernel.
-        assert_eq!(
-            normalize_fs_access(fs_access(FsAccess::ListDirectory), false),
-            0
-        );
-        assert_eq!(
-            normalize_fs_access(fs_access(FsAccess::ListDirectory), true),
-            FS_READ_DIR
-        );
+        FsAccess::ListDirectory => FS_READ_DIR,
     }
 }
