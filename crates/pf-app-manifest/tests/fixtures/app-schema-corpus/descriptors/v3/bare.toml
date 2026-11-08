@@ -1,0 +1,9 @@
+schema_version = 3
+
+[app]
+id = "com.pocketforge.v3bare"
+name = "Fixture"
+
+[runtime]
+family = "pocketforge/a133-powervr"
+abi = "1"

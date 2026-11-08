@@ -1,0 +1,89 @@
+{
+  "description": "Cross-repo app-descriptor drift corpus shared byte-identically by runtime (crates/pf-app-manifest/tests/fixtures/app-schema-corpus) and platform (regression/abi/fixtures/app-schema-corpus). Contains the current image descriptors, MBHaxe's app.toml, and one positive plus one negative v3 case per rule. No file is edited per repo.",
+  "digest_algorithm": "sha256 over, for each file under descriptors/ sorted by POSIX relative path: the relative path bytes, one NUL byte, then the file bytes. expected.json is not part of the digest.",
+  "corpus_sha256": "33e928892867a15fffa90f71d5d3b236709242e4111f2f397681be7d9fc7833f",
+  "cases": [
+    {
+      "path": "image/apps/hello-pocketforge/app.toml",
+      "expect": "accept",
+      "origin": "pocketforge-os/image@main"
+    },
+    {
+      "path": "image/apps/steamlink/app.toml",
+      "expect": "accept",
+      "origin": "pocketforge-os/image@main"
+    },
+    {
+      "path": "mbhaxe/pocketforge/app/app.toml",
+      "expect": "accept",
+      "origin": "pocketforge-os/MBHaxe@pocketforge"
+    },
+    {
+      "path": "v3/bare.toml",
+      "expect": "accept",
+      "rule": "schema_version-3"
+    },
+    {
+      "path": "v3/size-ok.toml",
+      "expect": "accept",
+      "rule": "size"
+    },
+    {
+      "path": "v3/size-missing.toml",
+      "expect": "refuse",
+      "rule": "size",
+      "reason": "missing-size",
+      "schema_path": "fetch.files.0"
+    },
+    {
+      "path": "v3/include-ok.toml",
+      "expect": "accept",
+      "rule": "include"
+    },
+    {
+      "path": "v3/include-invalid.toml",
+      "expect": "refuse",
+      "rule": "include",
+      "reason": "invalid-include",
+      "schema_path": "fetch.files.0.include"
+    },
+    {
+      "path": "v3/dest-ok.toml",
+      "expect": "accept",
+      "rule": "dest"
+    },
+    {
+      "path": "v3/dest-invalid.toml",
+      "expect": "refuse",
+      "rule": "dest",
+      "reason": "invalid-dest",
+      "schema_path": "fetch.files.0.dest"
+    },
+    {
+      "path": "v3/source-pinned-ok.toml",
+      "expect": "accept",
+      "rule": "source"
+    },
+    {
+      "path": "v3/source-vendor-pointer.toml",
+      "expect": "refuse",
+      "rule": "source",
+      "reason": "reserved-source",
+      "schema_path": "fetch.source"
+    },
+    {
+      "path": "v2/include-refused.toml",
+      "expect": "refuse",
+      "rule": "v3-only-include",
+      "reason": "v3-only-include",
+      "schema_path": "fetch"
+    },
+    {
+      "path": "v2/source-refused.toml",
+      "expect": "refuse",
+      "rule": "v3-only-source",
+      "reason": "v3-only-source",
+      "schema_path": "fetch"
+    }
+  ]
+}
