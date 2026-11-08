@@ -11,6 +11,9 @@
 # C spike build outputs
 spikes/**/build/
 *.o
+# ...but vendored crates ship prebuilt objects their checksum manifests cover (ring's
+# pregenerated/*.o for Windows targets; cargo verifies every file on every build).
+!vendor/**/*.o
 # C ABI smoke-test build output
 ctest/build/
 # editor / OS noise
