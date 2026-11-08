@@ -703,7 +703,7 @@ fn rendered_unit_and_runtime_policy_share_one_decision() {
         .iter()
         .any(|authority| authority.host == "example.com" && authority.port == 443));
     assert!(rendered.contains("SupplementaryGroups=audio input"));
-    assert!(rendered.contains("RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6"));
+    assert!(rendered.contains("RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK"));
     assert!(rendered.contains("# egress tcp example.com 443"));
     assert!(!rendered.contains("AF_BLUETOOTH"));
 
