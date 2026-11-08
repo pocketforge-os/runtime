@@ -1,7 +1,7 @@
 {
-  "description": "Cross-repo app-descriptor drift corpus shared byte-identically by runtime (crates/pf-app-manifest/tests/fixtures/app-schema-corpus) and platform (regression/abi/fixtures/app-schema-corpus). Contains the current image descriptors, MBHaxe's app.toml, and one positive plus one negative v3 case per rule. No file is edited per repo.",
+  "description": "Cross-repo app-descriptor drift corpus shared byte-identically by runtime (crates/pf-app-manifest/tests/fixtures/app-schema-corpus) and platform (regression/abi/fixtures/app-schema-corpus). Contains the current image descriptors, MBHaxe's app.toml, one positive plus one negative v3 case per rule, and the v1/default [display] acceptance case. No file is edited per repo.",
   "digest_algorithm": "sha256 over, for each file under descriptors/ sorted by POSIX relative path: the relative path bytes, one NUL byte, then the file bytes. expected.json is not part of the digest.",
-  "corpus_sha256": "f7f9ed3291392338e84fa363ad10639165c81b283f1dbbbb238dc63f20aeca82",
+  "corpus_sha256": "62360848d6a23aeea2692e24d150800100f0a8a1d2a3eb8b7d987b66cfbd6551",
   "cases": [
     {
       "path": "image/apps/hello-pocketforge/app.toml",
@@ -98,6 +98,11 @@
       "rule": "v3-only-include",
       "reason": "v3-only-include",
       "schema_path": "fetch"
+    },
+    {
+      "path": "v1/display-ok.toml",
+      "expect": "accept",
+      "rule": "display-v1"
     },
     {
       "path": "v1/include-refused.toml",

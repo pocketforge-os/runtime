@@ -1,0 +1,10 @@
+[app]
+id = "com.pocketforge.fixture.display"
+name = "Fixture Display"
+
+[display]
+orientations = ["landscape", "portrait"]
+
+[runtime]
+family = "pocketforge/a133-powervr"
+abi = "1"
