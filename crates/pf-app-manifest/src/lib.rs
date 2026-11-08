@@ -607,6 +607,18 @@ fn validate_fetch_dest(dest: &str) -> Result<(), ManifestError> {
     Ok(())
 }
 
+/// Canonical JSON of an enabled `[fetch]` block for the receipt key (infra-107.4 §4.6
+/// item 3). Red-first stub (tsp-ziac.4.3.5); the implementation follows.
+pub fn fetch_receipt_canonical_json(_fetch: &Fetch) -> Option<String> {
+    None
+}
+
+/// The ONE shared receipt key: lowercase hex SHA256 of [`fetch_receipt_canonical_json`].
+/// Red-first stub (tsp-ziac.4.3.5); the implementation follows.
+pub fn fetch_receipt_key(_fetch: &Fetch) -> Option<String> {
+    None
+}
+
 /// Validate the `[display]` table: a NON-EMPTY list of the typed
 /// [`DisplayOrientation`] vocabulary with no duplicates (an unknown TOML
 /// spelling is refused earlier, by serde, as an unknown variant).
