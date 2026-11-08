@@ -1,0 +1,30 @@
+[package]
+name = "pf-app-fetch"
+description = "Unprivileged pinned [fetch] stager for PocketForge applications (pf-app-fetch@.service)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+libc.workspace = true
+pf-app-launch.workspace = true
+pf-app-manifest.workspace = true
+# HTTP/1.1 + TLS, no async runtime. Redirects are followed by hand (max_redirects 0) so every
+# hop is checked for https and scope BEFORE it connects; no decompression features, so the
+# size+SHA256 pin covers the raw bytes. The ring provider is the only crypto backend.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+sha2.workspace = true
+tar = { version = "0.4", default-features = false }
+ureq = { version = "3.5", default-features = false, features = ["rustls-no-provider"] }
+
+[dev-dependencies]
+pf-app-manifest.workspace = true
+serde_json.workspace = true
+
+[[bin]]
+name = "pf-app-fetch"
+path = "src/main.rs"
