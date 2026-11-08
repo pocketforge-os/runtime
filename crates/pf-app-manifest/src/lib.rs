@@ -401,7 +401,9 @@ pub struct FetchFile {
     pub executable: Option<BTreeMap<String, String>>,
     /// Only extract archive members matching one of these relative prefixes
     /// (schema_version 3). A trailing `/` names a directory subtree; a bare
-    /// entry names one file.
+    /// entry names one file. Prefixes match archive member names BEFORE
+    /// `strip_components` is applied (W0 contract, mission-control#709 §4.6
+    /// item 5).
     #[serde(default)]
     pub include: Option<Vec<String>>,
 }
