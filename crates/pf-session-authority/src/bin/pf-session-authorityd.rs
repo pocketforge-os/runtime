@@ -280,14 +280,29 @@ fn prepare_socket(path: &Path) -> io::Result<()> {
 }
 
 fn bind_shell_socket(path: &Path) -> io::Result<UnixListener> {
-    let listener = UnixListener::bind(path)?;
-    // The shell, broker and compositor deliberately live in distinct service groups. Reusing the
-    // compositor-input group would also grant the shell access to an unrelated privileged input
-    // endpoint, so this socket is broadly reachable while authorization stays narrow:
-    // authenticate_peer checks SO_PEERCRED and the kernel-attested systemd unit before reading a
-    // frame. The acceptor also bounds concurrent pre-authentication work.
-    fs::set_permissions(path, fs::Permissions::from_mode(0o777))?;
-    Ok(listener)
+    // bind(2) creates the socket inode with umask-derived permissions, so binding straight to
+    // `path` would publish the readiness path at a narrow mode until the chmod below lands, and a
+    // client (or readiness probe) that connects in that window is refused. Bind to a private
+    // sibling name, set the final mode, then rename(2) it into place: the path never exists
+    // except fully reachable, and a bound listener stays valid across the rename.
+    let mut staging = path.as_os_str().to_owned();
+    staging.push(format!(".bind-{}", std::process::id()));
+    let staging = PathBuf::from(staging);
+    let _ = fs::remove_file(&staging);
+    let published = UnixListener::bind(&staging).and_then(|listener| {
+        // The shell, broker and compositor deliberately live in distinct service groups. Reusing
+        // the compositor-input group would also grant the shell access to an unrelated privileged
+        // input endpoint, so this socket is broadly reachable while authorization stays narrow:
+        // authenticate_peer checks SO_PEERCRED and the kernel-attested systemd unit before reading
+        // a frame. The acceptor also bounds concurrent pre-authentication work.
+        fs::set_permissions(&staging, fs::Permissions::from_mode(0o777))?;
+        fs::rename(&staging, path)?;
+        Ok(listener)
+    });
+    if published.is_err() {
+        let _ = fs::remove_file(&staging);
+    }
+    published
 }
 
 struct SocketGuard(PathBuf);

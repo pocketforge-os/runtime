@@ -4,17 +4,20 @@ use pf_prefs::PrefsStore;
 use pf_prefsd::{serve_until_with_timeout_and_resolver, PreferenceWriter};
 use pf_session_authority::PersistedState;
 use std::fs;
-use std::io::Read;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{self, Receiver};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 static SCRATCH_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
+/// Outer safety bound only: the tests wait on daemon log events, never on this elapsed time. It
+/// keeps a genuinely wedged daemon from hanging CI and is deliberately far above any loaded run.
+const EVENT_BOUND: Duration = Duration::from_secs(60);
 
 struct Scratch(PathBuf);
 
@@ -128,6 +131,40 @@ impl Daemon {
     }
 }
 
+/// Forwards the live daemon's stderr lines so tests can wait on the event they assert instead of
+/// sleeping for a fixed window. The channel closes when the daemon exits.
+fn forward_stderr(daemon: &mut Daemon) -> Receiver<String> {
+    use std::io::BufRead;
+    let stderr = daemon.0.stderr.take().unwrap();
+    let (lines, events) = mpsc::channel();
+    std::thread::spawn(move || {
+        for line in std::io::BufReader::new(stderr)
+            .lines()
+            .map_while(Result::ok)
+        {
+            if lines.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    events
+}
+
+/// Blocks until a stderr line containing `needle` arrives; returns every line seen so far.
+fn wait_for_event(events: &Receiver<String>, seen: &mut Vec<String>, needle: &str, label: &str) {
+    let deadline = Instant::now() + EVENT_BOUND;
+    loop {
+        if seen.iter().any(|line| line.contains(needle)) {
+            return;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match events.recv_timeout(remaining) {
+            Ok(line) => seen.push(line),
+            Err(error) => panic!("{label}: no `{needle}` event ({error}); stderr: {seen:#?}"),
+        }
+    }
+}
+
 impl Drop for Daemon {
     fn drop(&mut self) {
         if self.0.try_wait().unwrap().is_none() {
@@ -149,6 +186,35 @@ fn daemon_publishes_fresh_idle_state_before_socket_readiness() {
 
     assert_eq!(published.phase.name(), "idle");
     assert!(published.history.is_empty());
+}
+
+#[test]
+fn daemon_socket_is_never_visible_with_a_narrow_mode() {
+    // Spin on the path with no sleep so a bind-then-chmod window is observed, not stepped over.
+    for round in 0..40 {
+        let scratch = Scratch::new("socket-mode");
+        let socket = scratch.path().join("authority.sock");
+        let mut daemon = Daemon::spawn(scratch.path());
+        let deadline = Instant::now() + STARTUP_TIMEOUT;
+        loop {
+            match fs::metadata(&socket) {
+                Ok(metadata) => {
+                    assert_eq!(
+                        metadata.permissions().mode() & 0o777,
+                        0o777,
+                        "round {round}: socket was visible before it was reachable"
+                    );
+                    break;
+                }
+                Err(_) => {
+                    assert!(Instant::now() < deadline, "round {round}: no socket");
+                    if let Some(status) = daemon.0.try_wait().unwrap() {
+                        panic!("daemon exited before readiness: {status}");
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[test]
@@ -225,42 +291,32 @@ fn live_daemon_binds_for_absent_unreadable_and_late_panel_orientation() {
         let mut daemon = Daemon::spawn_live(scratch.path(), &descriptor, &prefs_socket, &fixture);
         daemon.wait_for_socket(&socket);
 
+        let events = forward_stderr(&mut daemon);
+        let mut seen = Vec::new();
+        let expected_reason = if unreadable { "unreadable" } else { "missing" };
+        // The fallback is logged by the first snapshot, before the socket is published.
+        wait_for_event(
+            &events,
+            &mut seen,
+            &format!("panel_orientation_fallback reason={expected_reason} fallback=descriptor"),
+            label,
+        );
         if label == "late" {
             let connector = fixture.join("drm/card0-DSI-1");
             fs::create_dir_all(&connector).unwrap();
             fs::write(connector.join("status"), "connected\n").unwrap();
             fs::write(connector.join("panel_orientation"), "left side up\n").unwrap();
-        }
-
-        std::thread::sleep(if label == "late" {
-            Duration::from_millis(1_500)
-        } else {
-            Duration::from_millis(150)
-        });
-        assert!(daemon.0.try_wait().unwrap().is_none(), "{label}");
-        daemon.0.kill().unwrap();
-        daemon.0.wait().unwrap();
-        let mut stderr = String::new();
-        daemon
-            .0
-            .stderr
-            .take()
-            .unwrap()
-            .read_to_string(&mut stderr)
-            .unwrap();
-        let expected_reason = if unreadable { "unreadable" } else { "missing" };
-        assert!(
-            stderr.contains(&format!(
-                "panel_orientation_fallback reason={expected_reason} fallback=descriptor"
-            )),
-            "{label}: {stderr}"
-        );
-        if label == "late" {
-            assert!(
-                stderr.contains("panel_orientation_recovered source=drm_connector"),
-                "{stderr}"
+            // Recovery happens on the daemon's next tick; wait for that event, not a duration.
+            wait_for_event(
+                &events,
+                &mut seen,
+                "panel_orientation_recovered source=drm_connector",
+                label,
             );
         }
+        assert!(daemon.0.try_wait().unwrap().is_none(), "{label}: {seen:#?}");
+        daemon.0.kill().unwrap();
+        daemon.0.wait().unwrap();
 
         drop(daemon);
         stop.store(true, Ordering::Release);
