@@ -304,12 +304,27 @@ fn lock(fetch_dir: &Path) -> Result<File> {
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(fetch_dir.join("lock"))
         .map_err(|e| io_failure(Code::StateInvalid, "open lock", &e))?;
-    // SAFETY: flock(2) on a descriptor we own.
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-        return Err(state_invalid("another pf-app-fetch run holds the lock"));
+    // The launcher probes this lock with a microsecond `try_lock_exclusive` (its watch polls at
+    // 2 Hz); a run that lands inside that window must not lose to the probe. Retry briefly
+    // (LOCK_TRIES attempts, LOCK_RETRY_DELAY apart, ~250 ms in all), then fail as before: a
+    // genuine concurrent run holds the lock for its whole run. A loser still writes nothing
+    // (W3 section 4.6): this function only returns the error.
+    for attempt in 0..LOCK_TRIES {
+        // SAFETY: flock(2) on a descriptor we own.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            return Ok(file);
+        }
+        if attempt + 1 < LOCK_TRIES {
+            std::thread::sleep(LOCK_RETRY_DELAY);
+        }
     }
-    Ok(file)
+    Err(state_invalid("another pf-app-fetch run holds the lock"))
 }
+
+/// Attempts to take the run lock before reporting another run holds it.
+const LOCK_TRIES: u32 = 6;
+/// Delay between lock attempts: 5 waits x 50 ms = 250 ms worst case.
+const LOCK_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
 
 fn sweep(fetch_dir: &Path) -> Result<()> {
     let entries = fs::read_dir(fetch_dir)
