@@ -84,9 +84,10 @@ fn broker_reports_a133_missing_hardware_like_in_process() {
         Some(pocketforge::CapError::HardwareAbsent),
         "broker: acquire(imu) hardware-absent over the wire"
     );
+    // a133 carries a gpio-vibrator since platform#458: the pulse actuates.
     assert_eq!(
         pf.backend().rumble_pulse(40),
-        pocketforge::RumbleStatus::NoopAbsent
+        pocketforge::RumbleStatus::Fired
     );
     let _ = std::fs::remove_file(&sock);
 }

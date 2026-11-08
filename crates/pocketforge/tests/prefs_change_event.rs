@@ -184,8 +184,8 @@ fn reduce_motion_is_a_readable_observable_flag_with_no_v0_machinery() {
 }
 
 /// THE UNIFICATION TEST (`tsp-xubv.2` acceptance): suppression ≡ absence under IDENTICAL calling
-/// code. One helper drives any backend the same way; an a523 with haptics disabled and an a133
-/// with no motor both produce the SAME app-visible silent no-op, distinguished ONLY by the frozen
+/// code. One helper drives any backend the same way; an a523 with haptics disabled and a
+/// motorless device both produce the SAME app-visible silent no-op, distinguished ONLY by the frozen
 /// diagnostic discriminant (`NoopSuppressed` vs `NoopAbsent`). `.4` builds its sim matrix on this.
 #[test]
 fn suppression_and_absence_are_one_silent_no_op_under_identical_code() {
@@ -200,9 +200,11 @@ fn suppression_and_absence_are_one_silent_no_op_under_identical_code() {
     a523.set_preference_bool("hapticsEnabled", false);
     let pf_a523 = Pf::over_in_process(a523);
 
-    // a133-shaped: rumble ABSENT (no motor); haptics preference is irrelevant.
+    // motorless: rumble ABSENT (no motor); haptics preference is irrelevant. (The real a133 has a
+    // gpio-vibrator since platform#458, so it is derived from a133 with the actuator removed.)
     let s_a133 = Arc::new(PrefsStore::at(scratch("unif-a133")));
-    let a133 = InProcessBackend::shared_with_store(Arc::new(common::descriptor("a133")), s_a133);
+    let a133 =
+        InProcessBackend::shared_with_store(Arc::new(common::motorless_descriptor("a133")), s_a133);
     let pf_a133 = Pf::over_in_process(a133);
 
     let r_suppressed = drive(&pf_a523);
