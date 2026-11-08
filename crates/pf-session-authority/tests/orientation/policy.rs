@@ -217,33 +217,74 @@ fn app_selection_letterboxes_cross_aspect_and_documents_180_degree_fill() {
 #[test]
 fn bounded_orientation_waiters_do_not_delay_lifecycle_work() {
     const N: usize = 8;
+    // Outer hang guard only: every wait below is released by observed causal state (a waiter
+    // thread announcing itself, an occupied permit, a published serial), never by an elapsed
+    // time budget. This bound exists so a product regression fails instead of hanging the
+    // harness, and sits far above any loaded-run scheduler delay.
+    const HANG_GUARD: Duration = Duration::from_secs(30);
+    // Release valve only: in a passing run each parked waiter is released by `publish`.
+    const WAITER_RELEASE: Duration = Duration::from_secs(10);
     let watch = Arc::new(OrientationWatch::new(
         pf_session_authority::orientation::OrientationState::default(),
         N,
     ));
     let serial = watch.snapshot().serial;
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
     let mut waiters = Vec::new();
     for _ in 0..N {
         let watch = Arc::clone(&watch);
+        let started_tx = started_tx.clone();
         waiters.push(thread::spawn(move || {
-            watch
-                .wait_after(serial, Duration::from_millis(200))
-                .unwrap()
+            // Announce before taking the permit so the main thread can distinguish "thread
+            // not scheduled yet" from "permit not taken yet" without guessing with timeouts.
+            started_tx.send(()).unwrap();
+            watch.wait_after(serial, WAITER_RELEASE).unwrap()
         }));
     }
-    let deadline = Instant::now() + Duration::from_millis(100);
-    while watch.active_waiters() != N && Instant::now() < deadline {
+    drop(started_tx);
+
+    // Park all N waiters and observe the watcher's own admission state: `active_waiters()`
+    // counts permits that are actually occupied, so this is the saturation condition itself,
+    // not a proxy measured with elapsed time.
+    for _ in 0..N {
+        started_rx
+            .recv_timeout(HANG_GUARD)
+            .expect("a waiter thread never started");
+    }
+    let parked_by = Instant::now() + HANG_GUARD;
+    while watch.active_waiters() != N {
+        assert!(
+            Instant::now() < parked_by,
+            "only {} of {N} orientation permits were taken",
+            watch.active_waiters()
+        );
         thread::yield_now();
     }
-    assert_eq!(watch.active_waiters(), N);
+    assert!(!waiters.iter().any(|waiter| waiter.is_finished()));
+
+    // The occupied bound is only admission control: one more long-poll is refused outright.
     assert!(watch.wait_after(serial, Duration::from_millis(1)).is_err());
 
-    // This models the authority's existing lifecycle lane: it does not share the watcher's
-    // permits or condvar, so a Broker safe_return-sized action stays well inside its deadline.
-    let started = Instant::now();
-    let lifecycle = thread::spawn(|| 42).join().unwrap();
-    assert_eq!(lifecycle, 42);
-    assert!(started.elapsed() < Duration::from_millis(50));
+    // Model a lifecycle-lane call on the authority loop: it reads state through the shared
+    // mutex but never joins the watcher's permit pool or condvar. The causal property is that
+    // it completes while all N waiters are parked: no waiter was woken, timed out, or released
+    // its permit to make room for it. A lane that queued behind a waiter could not return
+    // before `publish`, so `active_waiters() == N` plus every waiter still unfinished after the
+    // call is the assertion; `HANG_GUARD` only bounds how long we wait for completion.
+    let (lifecycle_tx, lifecycle_rx) = std::sync::mpsc::channel();
+    let lifecycle_watch = Arc::clone(&watch);
+    let lifecycle = thread::spawn(move || {
+        lifecycle_tx
+            .send((lifecycle_watch.snapshot().serial, 42))
+            .unwrap();
+    });
+    let result = lifecycle_rx
+        .recv_timeout(HANG_GUARD)
+        .expect("lifecycle work did not finish while orientation waiters were parked");
+    lifecycle.join().unwrap();
+    assert_eq!(result, (serial, 42));
+    assert_eq!(watch.active_waiters(), N);
+    assert!(!waiters.iter().any(|waiter| waiter.is_finished()));
 
     watch.publish({
         let mut state = watch.snapshot();
