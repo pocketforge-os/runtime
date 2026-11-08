@@ -42,6 +42,9 @@ struct FakeSystem {
     fail_open_url: bool,
     fail_restore: bool,
     delivered: bool,
+    /// Every `setup_running` query the authority made, and the answer to give (`Err` = failed).
+    setup_queries: Vec<String>,
+    setup_query_fails: bool,
 }
 
 #[derive(Default)]
@@ -807,6 +810,14 @@ impl FakeSystem {
     }
 }
 impl SessionSystem for FakeSystem {
+    fn setup_running(&mut self, item_id: &str) -> Result<bool, String> {
+        self.setup_queries.push(item_id.to_owned());
+        if self.setup_query_fails {
+            Err("systemctl unavailable".into())
+        } else {
+            Ok(false)
+        }
+    }
     fn start_foreground(&mut self, _: &LaunchRequest, _: &str) -> Result<(), String> {
         self.calls.push("start".into());
         if self.fail_start {
@@ -6685,5 +6696,123 @@ fn cancel_setup_is_allowed_for_an_installed_item_whose_fetch_was_disabled_but_is
         RpcResponse::SetupNotEnabled
     ));
     assert!(a.system.executor.calls.is_empty());
+    fs::remove_dir_all(dir).unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// runtime#191 review r1: coverage for the open_url guard, and the Launch predicate (N3).
+// ---------------------------------------------------------------------------
+
+/// `setup_resolver` with `FETCH_ID` also declaring `open_url`, so it can be caller and handler.
+fn fetch_url_resolver() -> (Resolver, PathBuf) {
+    let (resolver, dir) = setup_resolver();
+    let manifest = dir.join("apps").join(FETCH_ID).join("app.toml");
+    let text = fs::read_to_string(&manifest)
+        .unwrap()
+        .replace("use = [\"input\"]", "use = [\"input\", \"open_url\"]");
+    fs::write(&manifest, text).unwrap();
+    let platform = dir.join("platform.toml");
+    let text = fs::read_to_string(&platform)
+        .unwrap()
+        .replace("[\"input\"]", "[\"input\", \"open_url\"]");
+    fs::write(&platform, text).unwrap();
+    (resolver, dir)
+}
+
+fn fetch_url_authority(
+    system: FakeSystem,
+) -> (Authority<MemoryStore, FakeSystem, TestClock>, PathBuf) {
+    let (resolver, dir) = fetch_url_resolver();
+    let a = Authority::open_with_resolver(
+        MemoryStore::default(),
+        system,
+        TestClock::new(),
+        3,
+        Duration::from_millis(10),
+        resolver,
+    )
+    .unwrap()
+    .with_url_handler(FixedUrlHandler(FETCH_ID.into()));
+    (a, dir)
+}
+
+#[test]
+fn an_app_open_url_to_itself_in_front_is_delivered_with_no_setup_query() {
+    // The handler already in front is a delivery, not a launch: Conflicts= cannot apply, so the
+    // guard must not spend a systemctl query (or refuse on a failing one).
+    let (mut a, dir) = fetch_url_authority(FakeSystem {
+        setup_query_fails: true,
+        ..FakeSystem::available()
+    });
+    a.system.setup_query_fails = false;
+    assert!(matches!(
+        a.launch(LaunchRequest {
+            item_id: FETCH_ID.into()
+        }),
+        Ok(LaunchResult::Accepted { .. })
+    ));
+    a.system.setup_queries.clear();
+    a.system.setup_query_fails = true; // any query now would also fail the delivery
+    let response = dispatch_rpc_from(
+        &mut a,
+        front(FETCH_ID),
+        open_url_request(Some(FETCH_ID), URL, 0),
+    );
+    assert!(matches!(response, RpcResponse::Delivered), "{response:?}");
+    assert!(
+        a.system.setup_queries.is_empty(),
+        "{:?}",
+        a.system.setup_queries
+    );
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn an_open_url_hand_off_to_a_fetch_item_whose_state_query_fails_changes_nothing() {
+    let (mut a, dir) = fetch_url_authority(FakeSystem {
+        setup_query_fails: true,
+        ..FakeSystem::available()
+    });
+    let persisted = a.store.snapshot().cloned();
+    let response = dispatch_rpc_from(&mut a, RpcOrigin::Shell, open_url_request(None, URL, 0));
+    assert!(
+        matches!(response, RpcResponse::Error { .. }),
+        "{response:?}"
+    );
+    assert_eq!(a.system.setup_queries, [FETCH_ID]);
+    assert!(a.system.handoffs.is_empty());
+    assert!(matches!(a.state.phase, Phase::Idle));
+    assert!(a.state.return_slot.is_none());
+    assert_eq!(a.store.snapshot().cloned(), persisted);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn launch_is_refused_for_a_disabled_fetch_block_whose_unit_is_still_running() {
+    // N3: Launch must use the predicate cancel uses (the item *declares* `[fetch]`), or a launch
+    // could cancel, through Conflicts=, a run the user can still cancel but not protect.
+    let (resolver, dir) = setup_resolver();
+    let manifest = dir.join("apps").join(APP_ID).join("app.toml");
+    let mut text = fs::read_to_string(&manifest).unwrap();
+    text.push_str("[fetch]\nenabled = false\n");
+    fs::write(&manifest, text).unwrap();
+    let mut a = Authority::open_with_resolver(
+        MemoryStore::default(),
+        CommandSystem::with_executor(CommandTemplates::default(), FakeExecutor::default()),
+        TestClock::new(),
+        3,
+        Duration::from_millis(10),
+        resolver,
+    )
+    .unwrap();
+    a.system.executor.outputs = vec![fetch_unit_state("activating", "")].into();
+    assert_eq!(
+        a.launch(LaunchRequest {
+            item_id: APP_ID.into()
+        }),
+        Ok(LaunchResult::RejectedSetupRunning)
+    );
+    assert_eq!(a.system.executor.calls.len(), 1);
+    assert!(matches!(a.state.phase, Phase::Idle));
     fs::remove_dir_all(dir).unwrap();
 }
