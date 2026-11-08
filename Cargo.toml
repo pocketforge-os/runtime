@@ -29,6 +29,7 @@ members = [
     "crates/pf-framehost-wayland",
     "crates/pf-app-manifest",
     "crates/pf-app-launch",
+    "crates/pf-app-fetch",
     "crates/pf-session-authority",
     "crates/pf-session-client",
     "crates/pf-session-contract",
@@ -71,6 +72,7 @@ pf-ui-test-contracts = { path = "crates/pf-ui-test-contracts", version = "0.0.1"
 pf-theme = { path = "crates/pf-theme", version = "0.0.1" }
 pf-framehost-wayland = { path = "crates/pf-framehost-wayland", version = "0.0.1" }
 pf-app-manifest = { path = "crates/pf-app-manifest", version = "0.0.1" }
+pf-app-launch = { path = "crates/pf-app-launch", version = "0.0.1" }
 pf-session-authority = { path = "crates/pf-session-authority", version = "0.0.1" }
 pf-session-contract = { path = "crates/pf-session-contract", version = "0.0.1" }
 pf-problem-report = { path = "crates/pf-problem-report", version = "0.0.1" }

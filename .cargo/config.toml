@@ -13,6 +13,16 @@
 [target.aarch64-unknown-linux-musl]
 linker = "rust-lld"
 
+# ring (rustls' crypto provider, pf-app-fetch only) compiles C and assembly through cc-rs,
+# which would otherwise look for a nonexistent `aarch64-linux-musl-gcc`. The objects are
+# freestanding (no libc headers), so the distro GNU cross-gcc is enough; rust-lld still links
+# the static musl binary. ci-rust ships `aarch64-linux-gnu-gcc`. The image's runtime stage
+# has only the Arm toolchain and overrides these with `aarch64-none-linux-gnu-*` in its
+# environment (a real environment variable wins over [env] without `force`).
+[env]
+CC_aarch64_unknown_linux_musl = "aarch64-linux-gnu-gcc"
+AR_aarch64_unknown_linux_musl = "aarch64-linux-gnu-ar"
+
 [target.aarch64-unknown-linux-gnu]
 linker = "aarch64-none-linux-gnu-gcc"
 ar = "aarch64-none-linux-gnu-ar"
