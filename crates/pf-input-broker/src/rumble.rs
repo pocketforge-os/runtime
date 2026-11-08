@@ -67,7 +67,7 @@ impl<S: FfSink> Forwarder<S> {
                 self.uploaded.insert(id);
                 self.sink.upload(id, strong, weak, length_ms)
             }
-            FfRequest::Play { id, count } if count == 0 => {
+            FfRequest::Play { id, count: 0 } => {
                 self.playing.remove(&id);
                 self.sink.stop(id)
             }
