@@ -304,12 +304,27 @@ fn lock(fetch_dir: &Path) -> Result<File> {
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(fetch_dir.join("lock"))
         .map_err(|e| io_failure(Code::StateInvalid, "open lock", &e))?;
-    // SAFETY: flock(2) on a descriptor we own.
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-        return Err(state_invalid("another pf-app-fetch run holds the lock"));
+    // The launcher probes this lock with a microsecond `try_lock_exclusive` (its watch polls at
+    // 2 Hz); a run that lands inside that window must not lose to the probe. Retry briefly
+    // (LOCK_TRIES attempts, LOCK_RETRY_DELAY apart, ~250 ms in all), then fail as before: a
+    // genuine concurrent run holds the lock for its whole run. A loser still writes nothing
+    // (W3 section 4.6): this function only returns the error.
+    for attempt in 0..LOCK_TRIES {
+        // SAFETY: flock(2) on a descriptor we own.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            return Ok(file);
+        }
+        if attempt + 1 < LOCK_TRIES {
+            std::thread::sleep(LOCK_RETRY_DELAY);
+        }
     }
-    Ok(file)
+    Err(state_invalid("another pf-app-fetch run holds the lock"))
 }
+
+/// Attempts to take the run lock before reporting another run holds it.
+const LOCK_TRIES: u32 = 6;
+/// Delay between lock attempts: 5 waits x 50 ms = 250 ms worst case.
+const LOCK_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
 
 fn sweep(fetch_dir: &Path) -> Result<()> {
     let entries = fs::read_dir(fetch_dir)
@@ -648,4 +663,60 @@ pub fn execute(prep: Prepared, cancel: &AtomicBool, report: &Mutex<Report>) -> R
     let _ = fs::remove_dir_all(&staging);
     let _ = fsync_dir(&fetch_dir);
     Ok(())
+}
+
+#[cfg(test)]
+mod lock_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("pf-fetch-lock-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn hold(dir: &Path) -> File {
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(dir.join("lock"))
+            .unwrap();
+        // SAFETY: flock(2) on a descriptor we own.
+        assert_eq!(
+            unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        file
+    }
+
+    #[test]
+    fn a_brief_foreign_hold_does_not_lose_the_run_its_lock() {
+        // The launcher's `fetch_lock_held` probe takes the lock for microseconds; a run reaching
+        // lock() inside that window must wait it out (tsp-ziac.4.3.10 N1), not fail state_invalid.
+        let dir = scratch("brief");
+        let probe = hold(&dir);
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(60));
+            drop(probe);
+        });
+        let got = lock(&dir);
+        releaser.join().unwrap();
+        assert!(got.is_ok(), "{:?}", got.err().map(|e| e.detail));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_long_hold_still_loses_with_state_invalid_after_a_bounded_wait() {
+        let dir = scratch("long");
+        let _holder = hold(&dir);
+        let started = Instant::now();
+        let error = lock(&dir).expect_err("a real concurrent run keeps the lock");
+        assert_eq!(error.code, Code::StateInvalid);
+        assert!(error.detail.contains("holds the lock"), "{}", error.detail);
+        assert!(started.elapsed() < Duration::from_secs(2));
+        fs::remove_dir_all(dir).unwrap();
+    }
 }

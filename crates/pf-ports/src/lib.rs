@@ -194,9 +194,14 @@ pub struct LaunchRequest {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum LaunchResult {
-    Accepted { session_id: String },
+    Accepted {
+        session_id: String,
+    },
     RejectedBusy,
     ItemUnavailable,
+    /// The item's `[fetch]` setup unit (`pf-app-fetch@<id>`) is activating, active or has a
+    /// start job queued; launching would make systemd stop it (`Conflicts=`). Nothing started.
+    RejectedSetupRunning,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

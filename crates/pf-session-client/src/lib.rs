@@ -118,6 +118,7 @@ impl AuthorityApi for SocketTransport {
             RpcResponse::Accepted { session_id } => Ok(LaunchResult::Accepted { session_id }),
             RpcResponse::RejectedBusy => Ok(LaunchResult::RejectedBusy),
             RpcResponse::ItemUnavailable => Ok(LaunchResult::ItemUnavailable),
+            RpcResponse::RejectedSetupRunning => Ok(LaunchResult::RejectedSetupRunning),
             _ => Err(AuthorityError::Backend("unexpected launch response".into())),
         }
     }

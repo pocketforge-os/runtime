@@ -38,7 +38,14 @@ Flags: `AUTH_SESSION = 1` (reserved, refused everywhere in v1), `CAPTIVE_PORTAL 
 from the shell socket; an app can never open a portal-mode session). Unknown bits are refused.
 
 Results (`result` field): `launched{session_id}`, `delivered`, `no_handler`, `invalid_url`,
-`denied`, `busy`, `rate_limited`, `restored`, `caller_gone`, plus the existing `error{message}`.
+`denied`, `busy`, `rate_limited`, `rejected_setup_running`, `restored`, `caller_gone`, plus the
+existing `error{message}`.
+`rejected_setup_running` is returned when the handler that would be launched declares a `[fetch]`
+block and its `pf-app-fetch@<id>` setup unit is activating, active or has a start job queued
+(starting the handler would stop the fetch through `Conflicts=`). Nothing is started and no
+return slot is taken. It is transient: clients should treat it as retryable, like `busy`, but it
+is a separate result and is not folded into `busy`. If the unit's state cannot be read the
+authority fails closed with `error{message}` instead.
 `no_handler` is what drives an app's QR fallback. Every refusal is logged with its reason; the
 reason is never sent to the caller beyond the typed result.
 
