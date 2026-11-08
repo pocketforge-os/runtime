@@ -654,7 +654,8 @@ pub fn derive_policy(
     if networked {
         address_families.extend(["AF_INET".to_owned(), "AF_INET6".to_owned()]);
     }
-    if class == AppClass::NestedUserns {
+    // glibc getifaddrs/if_nametoindex (LAN discovery) use AF_NETLINK, so networked apps need it.
+    if networked || class == AppClass::NestedUserns {
         address_families.push("AF_NETLINK".to_owned());
     }
 
