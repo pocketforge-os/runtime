@@ -563,6 +563,11 @@ pub struct CommandTemplates {
     pub request_graceful_stop: Vec<String>,
     pub enforce_termination: Vec<String>,
     pub activate_selected_owner: Vec<String>,
+    /// Starts an item's `[fetch]` setup unit without waiting on it. Empty means the preset has
+    /// no setup unit and `start_setup` answers an error.
+    pub start_setup: Vec<String>,
+    /// Asks an item's setup unit to stop (the unit reports `cancelled`). Empty as above.
+    pub cancel_setup: Vec<String>,
     systemd_reconciliation: bool,
 }
 
@@ -616,6 +621,10 @@ impl Default for CommandTemplates {
             request_graceful_stop: words("systemctl stop --no-block pf-app@{item_id}.service"),
             enforce_termination: words("systemctl kill --kill-who=all pf-app@{item_id}.service"),
             activate_selected_owner: words("systemctl start pf-shell-selected.service"),
+            // --no-block: the authority queues the job and never waits on the download
+            // (infra-107.4 section 4.6); the launcher reads liveness from `.pf-fetch/lock`.
+            start_setup: words("systemctl start --no-block pf-app-fetch@{item_id}.service"),
+            cancel_setup: words("systemctl stop --no-block pf-app-fetch@{item_id}.service"),
             systemd_reconciliation: true,
         }
     }
@@ -632,6 +641,8 @@ impl CommandTemplates {
             request_graceful_stop: words(graceful),
             enforce_termination: words(terminate),
             activate_selected_owner: words(activate),
+            start_setup: Vec::new(),
+            cancel_setup: Vec::new(),
             systemd_reconciliation: false,
         }
     }
@@ -660,6 +671,8 @@ impl CommandTemplates {
                 "pf-session-authorityd".into(),
                 state_dir,
             ],
+            start_setup: Vec::new(),
+            cancel_setup: Vec::new(),
             systemd_reconciliation: false,
         }
     }
@@ -926,6 +939,27 @@ pub trait SessionSystem {
     fn restore_caller(&mut self, _slot: &ReturnSlot) -> Result<(), String> {
         Err(FOREGROUND_HANDOFF_UNAVAILABLE.to_owned())
     }
+    /// Queue the item's `[fetch]` setup unit unless it is already running, and never wait on
+    /// it. The item id has already passed the resolver. The default has no setup unit.
+    fn start_setup(&mut self, _item_id: &str) -> Result<SetupLaunch, String> {
+        Err(SETUP_UNAVAILABLE.to_owned())
+    }
+    /// Ask the item's setup unit to stop; stopping an inactive unit is not an error.
+    fn cancel_setup(&mut self, _item_id: &str) -> Result<(), String> {
+        Err(SETUP_UNAVAILABLE.to_owned())
+    }
+}
+
+/// The session system's error when it has no `[fetch]` setup unit (desktop-sim and test presets).
+pub const SETUP_UNAVAILABLE: &str = "fetch setup unit is not configured";
+
+/// How the service manager took a setup request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SetupLaunch {
+    /// One start job was queued.
+    Started,
+    /// The unit was already running or had a start job queued; nothing was started.
+    AlreadyRunning,
 }
 
 /// Resolves the default handler (a pf-app item id) for a URL scheme. The user's choice lives in
@@ -1102,6 +1136,14 @@ impl<E: CommandExecutor> SessionSystem for CommandSystem<E> {
         command_ok(self.executor.execute("systemctl", &args)?)
     }
 
+    fn start_setup(&mut self, _item_id: &str) -> Result<SetupLaunch, String> {
+        Err("start_setup not implemented".to_owned())
+    }
+
+    fn cancel_setup(&mut self, _item_id: &str) -> Result<(), String> {
+        Err("cancel_setup not implemented".to_owned())
+    }
+
     fn lifecycle(&mut self, item_id: &str) -> Result<Option<SystemLifecycle>, String> {
         if !self.templates.systemd_reconciliation {
             return Ok(None);
@@ -1188,6 +1230,39 @@ pub trait AuthorityApi {
     }
 }
 
+/// The answer to a `start_setup` request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SetupStart {
+    /// `pf-app-fetch@<id>` was queued; the launcher watches `.pf-fetch/` for the outcome.
+    Started,
+    /// The unit was already running; no second run was started.
+    AlreadyRunning,
+    /// A foreground session is active (the unit conflicts with `pf-app@<id>`).
+    RejectedBusy,
+    /// The item id is invalid or the item is not installed.
+    ItemUnavailable,
+    /// The item has no enabled `[fetch]` block.
+    NotFetchEnabled,
+}
+
+/// The answer to a `cancel_setup` request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SetupCancel {
+    /// A stop was queued (a no-op when no run is active); the unit reports `cancelled`.
+    Requested,
+    /// The item id is invalid or the item is not installed.
+    ItemUnavailable,
+    /// The item has no enabled `[fetch]` block.
+    NotFetchEnabled,
+}
+
+/// Run or cancel an item's `[fetch]` setup unit (infra-107.4 section 4.6, tsp-ziac.4.3.8).
+/// Separate from [`AuthorityApi`] so existing session transports are unaffected.
+pub trait FetchSetupApi {
+    fn start_setup(&mut self, item_id: &str) -> Result<SetupStart, AuthorityError>;
+    fn cancel_setup(&mut self, item_id: &str) -> Result<SetupCancel, AuthorityError>;
+}
+
 /// Versioned session-authority RPC payload carried inside `pf-wire` frames.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "method", rename_all = "snake_case")]
@@ -1239,6 +1314,14 @@ pub enum RpcRequest {
         app_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         url: Option<String>,
+    },
+    /// Shell only: queue `pf-app-fetch@<item_id>` for an installed, fetch-enabled item.
+    StartSetup {
+        item_id: String,
+    },
+    /// Shell only: ask a running `pf-app-fetch@<item_id>` to stop.
+    CancelSetup {
+        item_id: String,
     },
 }
 
@@ -1340,6 +1423,12 @@ pub enum RpcResponse {
     Restored,
     /// `ReturnToCaller`: the caller is no longer running (a normal outcome).
     CallerGone,
+    /// `StartSetup`: the setup unit was queued.
+    SetupStarted,
+    /// `StartSetup`: the setup unit was already running; nothing was started.
+    SetupRunning,
+    /// `StartSetup`/`CancelSetup`: the item has no enabled `[fetch]` block.
+    SetupNotEnabled,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -2111,6 +2200,9 @@ fn handle_rpc_from<S: StateStore, B: SessionSystem, C: Clock>(
                 unreachable!("restricted requests are filtered above")
             }
         },
+        RpcRequest::StartSetup { .. } | RpcRequest::CancelSetup { .. } => RpcResponse::Error {
+            message: "setup not implemented".into(),
+        },
         RpcRequest::Launch { item_id } => match authority.launch(LaunchRequest { item_id })? {
             LaunchResult::Accepted { session_id } => RpcResponse::Accepted { session_id },
             LaunchResult::RejectedBusy => RpcResponse::RejectedBusy,
@@ -2186,6 +2278,8 @@ fn rpc_method(request: &RpcRequest) -> &'static str {
         RpcRequest::Orientation { .. } => "orientation",
         RpcRequest::OpenUrl { .. } => "open_url",
         RpcRequest::ReturnToCaller { .. } => "return_to_caller",
+        RpcRequest::StartSetup { .. } => "start_setup",
+        RpcRequest::CancelSetup { .. } => "cancel_setup",
     }
 }
 
@@ -4505,6 +4599,19 @@ impl<S: StateStore, B: SessionSystem, C: Clock> AuthorityApi for Authority<S, B,
     }
     fn history_entries(&self) -> Vec<HistoryEntry> {
         self.state.history.iter().cloned().collect()
+    }
+}
+
+impl<S: StateStore, B: SessionSystem, C: Clock> FetchSetupApi for Authority<S, B, C> {
+    fn start_setup(&mut self, _item_id: &str) -> Result<SetupStart, AuthorityError> {
+        Err(AuthorityError::Backend(
+            "start_setup not implemented".into(),
+        ))
+    }
+    fn cancel_setup(&mut self, _item_id: &str) -> Result<SetupCancel, AuthorityError> {
+        Err(AuthorityError::Backend(
+            "cancel_setup not implemented".into(),
+        ))
     }
 }
 

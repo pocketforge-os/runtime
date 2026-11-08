@@ -6029,3 +6029,446 @@ fn front_socket_refuses_a_non_front_peer_and_re_derives_the_caller_from_the_hand
     assert_eq!(a.system.handoffs.len(), 1);
     fs::remove_dir_all(dir).unwrap();
 }
+
+// ---------------------------------------------------------------------------
+// Fetched-asset setup (tsp-ziac.4.3.8, infra-107.4 section 4.6): start_setup / cancel_setup
+// queue pf-app-fetch@<id> for an installed, fetch-enabled item and never wait on it.
+// ---------------------------------------------------------------------------
+
+const FETCH_ID: &str = "org.example.fetcher";
+const FETCH_UNIT: &str = "pf-app-fetch@org.example.fetcher.service";
+
+/// A resolver root with one fetch-enabled app (`FETCH_ID`) and one plain app (`APP_ID`).
+fn setup_resolver() -> (Resolver, PathBuf) {
+    let dir = scratch("setup");
+    let root = dir.join("apps");
+    for (id, fetch) in [
+        (
+            FETCH_ID,
+            "[fetch]\nenabled = true\nreason = \"game data\"\n",
+        ),
+        (APP_ID, ""),
+    ] {
+        let app = root.join(id);
+        fs::create_dir_all(app.join("bin")).unwrap();
+        fs::write(
+            app.join("app.toml"),
+            format!(
+                "[app]\nid = \"{id}\"\nuse = [\"input\"]\n\
+                 [runtime]\nfamily = \"pocketforge/a133-powervr\"\nabi = \"1\"\nplatform-version = \"20\"\n\
+                 [launch]\nexec = \"bin/app\"\n{fetch}"
+            ),
+        )
+        .unwrap();
+        let executable = app.join("bin/app");
+        fs::write(&executable, b"#!/bin/sh\n").unwrap();
+        let mut permissions = fs::metadata(&executable).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(executable, permissions).unwrap();
+    }
+    let platform = dir.join("platform.toml");
+    fs::write(
+        &platform,
+        "schema_version = 1\n\
+         runtime_family = \"pocketforge/a133-powervr\"\n\
+         runtime_abi = \"1\"\n\
+         platform_version = \"20\"\n\
+         supported_capabilities = [\"input\"]\n",
+    )
+    .unwrap();
+    (Resolver::new(root, platform), dir)
+}
+
+type SetupAuthority = Authority<MemoryStore, CommandSystem<FakeExecutor>, TestClock>;
+
+/// The device templates over a fake systemctl that answers `outputs` to queries.
+fn setup_authority(outputs: Vec<CommandOutput>) -> (SetupAuthority, Log, PathBuf) {
+    let (resolver, dir) = setup_resolver();
+    let log = Log::default();
+    let sink = log.clone();
+    let mut authority = Authority::open_with_resolver(
+        MemoryStore::default(),
+        CommandSystem::with_executor(CommandTemplates::default(), FakeExecutor::default()),
+        TestClock::new(),
+        3,
+        Duration::from_millis(10),
+        resolver,
+    )
+    .unwrap()
+    .with_log_sink(move |line| sink.lock().unwrap().push(line.to_owned()));
+    assert!(
+        authority.system.executor.calls.is_empty(),
+        "opening an idle authority runs no command"
+    );
+    authority.system.executor.outputs = outputs.into();
+    (authority, log, dir)
+}
+
+fn fetch_unit_state(active_state: &str, job: &str) -> CommandOutput {
+    CommandOutput {
+        code: 0,
+        stdout: format!("ActiveState={active_state}\nJob={job}\n"),
+    }
+}
+
+fn state_query() -> (String, Vec<String>) {
+    (
+        "systemctl".into(),
+        words(&format!(
+            "show --property ActiveState --property Job {FETCH_UNIT}"
+        )),
+    )
+}
+
+fn systemctl(command: &str) -> (String, Vec<String>) {
+    ("systemctl".into(), words(command))
+}
+
+fn start_setup(id: &str) -> RpcRequest {
+    RpcRequest::StartSetup { item_id: id.into() }
+}
+
+fn cancel_setup(id: &str) -> RpcRequest {
+    RpcRequest::CancelSetup { item_id: id.into() }
+}
+
+#[test]
+fn default_setup_templates_queue_and_stop_the_fetch_unit_without_blocking() {
+    let templates = CommandTemplates::default();
+    assert_eq!(
+        templates.start_setup,
+        words("systemctl start --no-block pf-app-fetch@{item_id}.service")
+    );
+    assert_eq!(
+        templates.cancel_setup,
+        words("systemctl stop --no-block pf-app-fetch@{item_id}.service")
+    );
+}
+
+#[test]
+fn start_setup_for_a_fetch_enabled_item_runs_exactly_one_no_block_start() {
+    let (mut a, log, dir) = setup_authority(vec![fetch_unit_state("inactive", "")]);
+    assert!(matches!(
+        handle_rpc(&mut a, start_setup(FETCH_ID)).unwrap(),
+        RpcResponse::SetupStarted
+    ));
+    assert_eq!(
+        a.system.executor.calls,
+        [
+            state_query(),
+            systemctl(&format!("start --no-block {FETCH_UNIT}")),
+        ]
+    );
+    // No session: the foreground state machine is untouched and nothing was persisted.
+    assert!(matches!(a.state.phase, Phase::Idle));
+    assert!(a.store.snapshot().is_none());
+    assert!(log
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|line| line.contains("setup_started") && line.contains(FETCH_ID)));
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn a_failed_or_crashed_previous_run_does_not_block_a_retry() {
+    for state in ["failed", "deactivating"] {
+        let (mut a, _, dir) = setup_authority(vec![fetch_unit_state(state, "")]);
+        assert!(
+            matches!(
+                handle_rpc(&mut a, start_setup(FETCH_ID)).unwrap(),
+                RpcResponse::SetupStarted
+            ),
+            "{state}"
+        );
+        assert_eq!(a.system.executor.calls.len(), 2, "{state}");
+        fs::remove_dir_all(dir).unwrap();
+    }
+    // A stop job in flight (a cancel just before the retry) still lets the start queue behind it.
+    let (mut a, _, dir) = setup_authority(vec![fetch_unit_state("deactivating", "7")]);
+    assert!(matches!(
+        handle_rpc(&mut a, start_setup(FETCH_ID)).unwrap(),
+        RpcResponse::SetupStarted
+    ));
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn start_setup_refuses_invalid_and_unknown_items_without_running_a_command() {
+    for id in [
+        "",
+        "../org.example.fetcher",
+        "org.example.fetcher.service; reboot",
+        "org.example.fetcher x",
+        "org.example.missing",
+    ] {
+        let (mut a, log, dir) = setup_authority(Vec::new());
+        assert!(
+            matches!(
+                handle_rpc(&mut a, start_setup(id)).unwrap(),
+                RpcResponse::ItemUnavailable
+            ),
+            "{id:?}"
+        );
+        assert!(
+            matches!(
+                handle_rpc(&mut a, cancel_setup(id)).unwrap(),
+                RpcResponse::ItemUnavailable
+            ),
+            "{id:?}"
+        );
+        assert!(a.system.executor.calls.is_empty(), "{id:?}");
+        let log = log.lock().unwrap();
+        assert_eq!(log.len(), 2, "{log:?}");
+        assert!(
+            log.iter().all(|line| line.contains("setup_refused")),
+            "{log:?}"
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[test]
+fn setup_for_an_item_without_an_enabled_fetch_block_is_refused() {
+    let (mut a, log, dir) = setup_authority(Vec::new());
+    assert!(matches!(
+        handle_rpc(&mut a, start_setup(APP_ID)).unwrap(),
+        RpcResponse::SetupNotEnabled
+    ));
+    assert!(matches!(
+        handle_rpc(&mut a, cancel_setup(APP_ID)).unwrap(),
+        RpcResponse::SetupNotEnabled
+    ));
+    assert!(a.system.executor.calls.is_empty());
+    let log = log.lock().unwrap();
+    assert!(
+        log.iter().all(|line| line
+            .contains("setup_refused reason=fetch_not_enabled item_id=\"org.example.game\"")),
+        "{log:?}"
+    );
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn disabled_fetch_block_is_refused_like_a_missing_one() {
+    let (resolver, dir) = setup_resolver();
+    let manifest = dir.join("apps").join(APP_ID).join("app.toml");
+    let mut text = fs::read_to_string(&manifest).unwrap();
+    text.push_str("[fetch]\nenabled = false\n");
+    fs::write(&manifest, text).unwrap();
+    let mut a = Authority::open_with_resolver(
+        MemoryStore::default(),
+        CommandSystem::with_executor(CommandTemplates::default(), FakeExecutor::default()),
+        TestClock::new(),
+        3,
+        Duration::from_millis(10),
+        resolver,
+    )
+    .unwrap();
+    assert!(matches!(
+        handle_rpc(&mut a, start_setup(APP_ID)).unwrap(),
+        RpcResponse::SetupNotEnabled
+    ));
+    assert!(a.system.executor.calls.is_empty());
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn a_repeat_start_while_the_unit_is_running_is_idempotent() {
+    // First request queues the run; the repeat sees it activating (a oneshot's running state)
+    // and starts nothing, so exactly one start was ever issued.
+    let (mut a, _, dir) = setup_authority(vec![
+        fetch_unit_state("inactive", ""),
+        fetch_unit_state("activating", "12"),
+    ]);
+    assert!(matches!(
+        handle_rpc(&mut a, start_setup(FETCH_ID)).unwrap(),
+        RpcResponse::SetupStarted
+    ));
+    assert!(matches!(
+        handle_rpc(&mut a, start_setup(FETCH_ID)).unwrap(),
+        RpcResponse::SetupRunning
+    ));
+    assert_eq!(
+        a.system.executor.calls,
+        [
+            state_query(),
+            systemctl(&format!("start --no-block {FETCH_UNIT}")),
+            state_query(),
+        ]
+    );
+    fs::remove_dir_all(dir).unwrap();
+
+    // A start job that is queued but not yet running counts as running too.
+    for (state, job) in [("inactive", "12"), ("active", ""), ("reloading", "")] {
+        let (mut a, _, dir) = setup_authority(vec![fetch_unit_state(state, job)]);
+        assert!(
+            matches!(
+                handle_rpc(&mut a, start_setup(FETCH_ID)).unwrap(),
+                RpcResponse::SetupRunning
+            ),
+            "{state} {job}"
+        );
+        assert_eq!(a.system.executor.calls, [state_query()], "{state} {job}");
+        fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[test]
+fn start_setup_is_refused_while_a_foreground_session_is_active() {
+    // pf-app-fetch@ has Conflicts=pf-app@%i: starting it under a session could stop that app.
+    let (resolver, dir) = setup_resolver();
+    let mut a = Authority::open_with_resolver(
+        MemoryStore::default(),
+        FakeSystem::available(),
+        TestClock::new(),
+        3,
+        Duration::from_millis(10),
+        resolver,
+    )
+    .unwrap();
+    assert!(matches!(
+        a.launch(LaunchRequest {
+            item_id: FETCH_ID.into()
+        })
+        .unwrap(),
+        LaunchResult::Accepted { .. }
+    ));
+    assert!(matches!(
+        handle_rpc(&mut a, start_setup(FETCH_ID)).unwrap(),
+        RpcResponse::RejectedBusy
+    ));
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn cancel_setup_queues_a_no_block_stop_of_the_fetch_unit() {
+    let (mut a, log, dir) = setup_authority(Vec::new());
+    assert!(matches!(
+        handle_rpc(&mut a, cancel_setup(FETCH_ID)).unwrap(),
+        RpcResponse::Ok
+    ));
+    assert_eq!(
+        a.system.executor.calls,
+        [systemctl(&format!("stop --no-block {FETCH_UNIT}"))]
+    );
+    assert!(matches!(a.state.phase, Phase::Idle));
+    assert!(log
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|line| line.contains("setup_cancel_requested") && line.contains(FETCH_ID)));
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn setup_command_failures_answer_an_error_and_leave_the_session_idle() {
+    // systemctl start exits 5 (unit not installed, e.g. an image without pf-app-fetch@).
+    let (mut a, _, dir) = setup_authority(vec![fetch_unit_state("inactive", "")]);
+    a.system.executor.codes = VecDeque::from([5]);
+    assert!(matches!(
+        handle_rpc_from(&mut a, RpcOrigin::Shell, start_setup(FETCH_ID)),
+        Err(AuthorityError::Backend(_))
+    ));
+    assert!(matches!(a.state.phase, Phase::Idle));
+    fs::remove_dir_all(dir).unwrap();
+
+    // The state query itself fails: nothing is started.
+    let (mut a, _, dir) = setup_authority(vec![CommandOutput {
+        code: 1,
+        stdout: String::new(),
+    }]);
+    assert!(handle_rpc(&mut a, start_setup(FETCH_ID)).is_err());
+    assert_eq!(a.system.executor.calls, [state_query()]);
+    fs::remove_dir_all(dir).unwrap();
+
+    // Malformed systemctl output is an error, not "not running".
+    let (mut a, _, dir) = setup_authority(vec![CommandOutput {
+        code: 0,
+        stdout: "Job=\n".into(),
+    }]);
+    assert!(handle_rpc(&mut a, start_setup(FETCH_ID)).is_err());
+    assert_eq!(a.system.executor.calls, [state_query()]);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn presets_without_a_setup_unit_answer_unavailable_and_run_nothing() {
+    let dir = scratch("setup-sim");
+    for templates in [
+        CommandTemplates::desktop_sim(&dir),
+        CommandTemplates::from_strings("a", "b", "c", "d"),
+    ] {
+        let mut system = CommandSystem::with_executor(templates, FakeExecutor::default());
+        assert_eq!(
+            system.start_setup(FETCH_ID),
+            Err(SETUP_UNAVAILABLE.to_owned())
+        );
+        assert_eq!(
+            system.cancel_setup(FETCH_ID),
+            Err(SETUP_UNAVAILABLE.to_owned())
+        );
+        assert!(system.into_executor().calls.is_empty());
+    }
+}
+
+#[test]
+fn setup_verbs_are_shell_only() {
+    for origin in [RpcOrigin::Broker, RpcOrigin::Compositor, front(FETCH_ID)] {
+        let (mut a, _, dir) = setup_authority(Vec::new());
+        for request in [start_setup(FETCH_ID), cancel_setup(FETCH_ID)] {
+            assert!(
+                matches!(
+                    handle_rpc_from(&mut a, origin.clone(), request).unwrap(),
+                    RpcResponse::Denied
+                ),
+                "{origin:?}"
+            );
+        }
+        assert!(a.system.executor.calls.is_empty(), "{origin:?}");
+        fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[test]
+fn setup_wire_encoding_is_additive_snake_case() {
+    assert_eq!(
+        serde_json::to_string(&start_setup(FETCH_ID)).unwrap(),
+        r#"{"method":"start_setup","item_id":"org.example.fetcher"}"#
+    );
+    assert_eq!(
+        serde_json::to_string(&cancel_setup(FETCH_ID)).unwrap(),
+        r#"{"method":"cancel_setup","item_id":"org.example.fetcher"}"#
+    );
+    for (response, wire) in [
+        (RpcResponse::SetupStarted, r#"{"result":"setup_started"}"#),
+        (RpcResponse::SetupRunning, r#"{"result":"setup_running"}"#),
+        (
+            RpcResponse::SetupNotEnabled,
+            r#"{"result":"setup_not_enabled"}"#,
+        ),
+    ] {
+        assert_eq!(serde_json::to_string(&response).unwrap(), wire);
+    }
+    // The existing launch encoding is unchanged.
+    assert_eq!(
+        serde_json::to_string(&RpcRequest::Launch {
+            item_id: FETCH_ID.into()
+        })
+        .unwrap(),
+        r#"{"method":"launch","item_id":"org.example.fetcher"}"#
+    );
+}
+
+#[test]
+fn authority_setup_api_matches_the_rpc_answers() {
+    let (mut a, _, dir) = setup_authority(vec![fetch_unit_state("inactive", "")]);
+    assert_eq!(a.start_setup(FETCH_ID).unwrap(), SetupStart::Started);
+    assert_eq!(a.start_setup(APP_ID).unwrap(), SetupStart::NotFetchEnabled);
+    assert_eq!(
+        a.start_setup("org.example.missing").unwrap(),
+        SetupStart::ItemUnavailable
+    );
+    assert_eq!(a.cancel_setup(FETCH_ID).unwrap(), SetupCancel::Requested);
+    fs::remove_dir_all(dir).unwrap();
+}
