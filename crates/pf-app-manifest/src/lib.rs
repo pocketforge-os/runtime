@@ -608,15 +608,120 @@ fn validate_fetch_dest(dest: &str) -> Result<(), ManifestError> {
 }
 
 /// Canonical JSON of an enabled `[fetch]` block for the receipt key (infra-107.4 §4.6
-/// item 3). Red-first stub (tsp-ziac.4.3.5); the implementation follows.
-pub fn fetch_receipt_canonical_json(_fetch: &Fetch) -> Option<String> {
-    None
+/// item 3, tsp-ziac.4.3.5). Compact JSON, keys sorted, UTF-8, decimal integers, built from
+/// the typed parsed values (never the raw TOML):
+///
+/// `{"destination":…,"files":[{"dest":…,"format":…,"include":…,"sha256":…,"size":…,
+/// "strip_components":…,"url":…},…],"source":…}`
+///
+/// - `source` absent encodes as `"pinned"`; `strip_components` absent as `0`; `include`
+///   absent as `null`. Any other absent optional (`destination`, `dest`, `format`, `size`)
+///   encodes as `null`.
+/// - Files stay in declared order.
+/// - Excluded: `reason` (a text change never forces a re-download), `enabled` (only an
+///   enabled block has a key), `executable` (refused by pf-app-fetch) and `schema_version`.
+///
+/// Strings are escaped exactly as `serde_json` does (`\"`, `\\`, `\b \f \n \r \t`, other
+/// controls as lowercase `\u00xx`, everything else raw UTF-8), so any sorted, compact
+/// serde_json rendering reproduces these bytes. `None` for a disabled block.
+pub fn fetch_receipt_canonical_json(fetch: &Fetch) -> Option<String> {
+    if !fetch.enabled {
+        return None;
+    }
+    let mut out = String::from("{\"destination\":");
+    json_opt_str(&mut out, fetch.destination.as_deref());
+    out.push_str(",\"files\":[");
+    for (index, file) in fetch
+        .files
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .enumerate()
+    {
+        if index > 0 {
+            out.push(',');
+        }
+        out.push_str("{\"dest\":");
+        json_opt_str(&mut out, file.dest.as_deref());
+        out.push_str(",\"format\":");
+        json_opt_str(&mut out, file.format.as_deref());
+        out.push_str(",\"include\":");
+        match &file.include {
+            None => out.push_str("null"),
+            Some(entries) => {
+                out.push('[');
+                for (i, entry) in entries.iter().enumerate() {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    json_str(&mut out, entry);
+                }
+                out.push(']');
+            }
+        }
+        out.push_str(",\"sha256\":");
+        json_str(&mut out, &file.sha256);
+        out.push_str(",\"size\":");
+        match file.size {
+            Some(size) => out.push_str(&size.to_string()),
+            None => out.push_str("null"),
+        }
+        out.push_str(",\"strip_components\":");
+        out.push_str(&file.strip_components.unwrap_or(0).to_string());
+        out.push_str(",\"url\":");
+        json_str(&mut out, &file.url);
+        out.push('}');
+    }
+    out.push_str("],\"source\":");
+    json_str(
+        &mut out,
+        match fetch.source.unwrap_or_default() {
+            FetchSource::Pinned => "pinned",
+            FetchSource::VendorSignedPointer => "vendor-signed-pointer",
+        },
+    );
+    out.push('}');
+    Some(out)
 }
 
-/// The ONE shared receipt key: lowercase hex SHA256 of [`fetch_receipt_canonical_json`].
-/// Red-first stub (tsp-ziac.4.3.5); the implementation follows.
-pub fn fetch_receipt_key(_fetch: &Fetch) -> Option<String> {
-    None
+/// The ONE shared receipt key (infra-107.4 §4.6 item 3): lowercase hex SHA256 of
+/// [`fetch_receipt_canonical_json`]. pf-app-fetch (W3) writes it into
+/// `.pf-fetch/receipt.json`; the launcher (W4) recomputes it to decide Ready versus
+/// `receipt_stale`. The committed vector is `tests/receipt_key.rs`. `None` for a disabled
+/// block.
+pub fn fetch_receipt_key(fetch: &Fetch) -> Option<String> {
+    let json = fetch_receipt_canonical_json(fetch)?;
+    Some(
+        Sha256::digest(json.as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect(),
+    )
+}
+
+fn json_opt_str(out: &mut String, value: Option<&str>) {
+    match value {
+        Some(value) => json_str(out, value),
+        None => out.push_str("null"),
+    }
+}
+
+fn json_str(out: &mut String, value: &str) {
+    out.push('"');
+    for ch in value.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\u{8}' => out.push_str("\\b"),
+            '\u{c}' => out.push_str("\\f"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            ch if (ch as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", ch as u32)),
+            ch => out.push(ch),
+        }
+    }
+    out.push('"');
 }
 
 /// Validate the `[display]` table: a NON-EMPTY list of the typed

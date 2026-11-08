@@ -433,9 +433,11 @@ fn off_scope_redirect_is_refused_before_connecting() {
     );
 }
 
+type Routes = Vec<(&'static str, &'static str, Reply)>;
+
 #[test]
 fn every_bad_redirect_shape_is_redirect_refused() {
-    let shapes: Vec<(&str, Vec<(&str, &str, Reply)>)> = vec![
+    let shapes: Vec<(&str, Routes)> = vec![
         (
             "http downgrade",
             vec![(
@@ -860,7 +862,7 @@ fn sigterm_mid_download_is_cancelled() {
         },
     );
     let fixture = Fixture::new(&descriptor(&[FileSpec::for_bytes(URL, &archive)], "r", ""));
-    let mut child = fixture
+    let child = fixture
         .command(&server)
         .stderr(std::process::Stdio::piped())
         .spawn()
@@ -892,4 +894,25 @@ fn version_reports_hooks_state() {
     assert!(out.status.success());
     // Test binaries are debug builds; the image ships release (test-hooks=off).
     assert!(text.contains("test-hooks=on"), "{text}");
+}
+
+#[test]
+fn landlock_confined_run_installs_when_the_kernel_has_net_rules() {
+    // The release binary always requires Landlock ABI >= 4. Hosts without it (some CI
+    // sandboxes) run this best-effort; the a133 kernel is ABI 10.
+    let server = Server::start();
+    let (fixture, _) = good(&server);
+    let mode = std::env::var("PF_APP_FETCH_CONFINE_TEST_MODE");
+    let run = fixture.run_with(&server, |c| {
+        // PF_APP_FETCH_CONFINE_TEST_MODE=required proves enforcement on a known host.
+        c.env(
+            "PF_APP_FETCH_TEST_CONFINE",
+            mode.as_deref().unwrap_or("best-effort"),
+        );
+    });
+    run.assert_ready();
+    assert_ready_with(&fixture, &good_payload("v1"));
+    if mode.as_deref() == Ok("required") {
+        assert!(run.stderr().contains("landlock=abi"), "{}", run.stderr());
+    }
 }

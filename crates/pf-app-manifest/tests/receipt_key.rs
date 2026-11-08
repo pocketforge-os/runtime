@@ -83,11 +83,13 @@ fn absent_source_and_strip_encode_as_their_defaults() {
     assert_ne!(fetch_receipt_key(&no_strip), fetch_receipt_key(&base));
 }
 
+type Edit = Box<dyn Fn(&mut Fetch)>;
+
 #[test]
 fn every_keyed_field_changes_the_key() {
     let base = mbhaxe_fetch();
     let base_key = fetch_receipt_key(&base).expect("key");
-    let edits: Vec<(&str, Box<dyn Fn(&mut Fetch)>)> = vec![
+    let edits: Vec<(&str, Edit)> = vec![
         (
             "url",
             Box::new(|f| f.files.as_mut().unwrap()[0].url.push('x')),
