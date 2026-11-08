@@ -872,9 +872,14 @@ fn sigterm_mid_download_is_cancelled() {
         std::thread::sleep(Duration::from_millis(20));
     }
     std::thread::sleep(Duration::from_millis(300));
+    let sent = std::time::Instant::now();
     // SAFETY: plain kill(2) on our own child.
     unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
     let output = child.wait_with_output().unwrap();
+    // Review r1 P2-1: prompt even though the read is stalled for 30 s, well inside the
+    // unit's TimeoutStopSec=10s.
+    let latency = sent.elapsed();
+    assert!(latency < Duration::from_secs(3), "cancel took {latency:?}");
     let run = Run {
         output,
         result: fixture.result(),
