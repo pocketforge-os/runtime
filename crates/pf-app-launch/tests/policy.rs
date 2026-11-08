@@ -770,3 +770,145 @@ fn resource_inventory_requires_its_platform_runtime() {
         vec![PathBuf::from("/dev/input/event0")]
     );
 }
+
+const BY_ID_PAD: &str = "/dev/input/by-id/usb-Valve_Software_Steam_Controller-event-joystick";
+
+fn identity_inputs(root: &Path, sources: &[&str]) -> PolicyInputs {
+    let mut inputs = inputs(root);
+    inputs.resources.remove("broker-sockets");
+    inputs.resources.insert(
+        "input-devices".into(),
+        sources.iter().map(PathBuf::from).collect(),
+    );
+    inputs
+}
+
+#[test]
+fn raw_input_identity_binds_to_event_destination() {
+    let root = PathBuf::from("/fixture");
+    let app = resolved(&root, &["input"], false, true);
+    let other = "/dev/input/by-path/platform-gpio-keys-event";
+    let policy = derive_policy(&app, &identity_inputs(&root, &[other, BY_ID_PAD])).unwrap();
+
+    let mappings = policy
+        .unit
+        .bind_read_write_mappings
+        .iter()
+        .filter(|m| m.source.starts_with("/dev/input"))
+        .map(|m| (m.source.clone(), m.destination.clone()))
+        .collect::<Vec<_>>();
+    // Deterministic: sorted source order maps to event0, event1, ...
+    assert_eq!(
+        mappings,
+        vec![
+            (PathBuf::from(BY_ID_PAD), PathBuf::from("/dev/input/event0")),
+            (PathBuf::from(other), PathBuf::from("/dev/input/event1")),
+        ]
+    );
+    // DeviceAllow is on the identity source; Landlock sees the destination.
+    assert!(policy
+        .unit
+        .device_allow
+        .iter()
+        .any(|g| g.path == Path::new(BY_ID_PAD) && g.mode == "r"));
+    assert!(policy.landlock.filesystem.iter().any(|r| {
+        r.path == Path::new("/dev/input/event0") && r.access == FsAccess::DeviceReadOnly
+    }));
+    assert!(!policy
+        .landlock
+        .filesystem
+        .iter()
+        .any(|r| r.path == Path::new(BY_ID_PAD)));
+    let dropin = render_systemd_dropin(&policy);
+    assert!(dropin.contains(&format!("BindPaths={BY_ID_PAD}:/dev/input/event0")));
+    assert!(dropin.contains(&format!("DeviceAllow={BY_ID_PAD} r")));
+
+    // A source that is already an event node keeps its own name; others avoid it.
+    let policy = derive_policy(
+        &app,
+        &identity_inputs(&root, &["/dev/input/event0", BY_ID_PAD]),
+    )
+    .unwrap();
+    assert!(policy.unit.bind_read_write_mappings.iter().any(|m| {
+        m.source == Path::new(BY_ID_PAD) && m.destination == Path::new("/dev/input/event1")
+    }));
+    assert!(!policy
+        .unit
+        .bind_read_write_mappings
+        .iter()
+        .any(|m| m.source == Path::new("/dev/input/event0")));
+    assert_eq!(
+        derive_policy(&app, &identity_inputs(&root, &[BY_ID_PAD])).unwrap(),
+        derive_policy(&app, &identity_inputs(&root, &[BY_ID_PAD])).unwrap()
+    );
+}
+
+#[test]
+fn rumble_upgrades_only_pad_and_never_grants_vibrator() {
+    let root = PathBuf::from("/fixture");
+    let with_vibrator = |capabilities: &[&str]| {
+        let mut i = identity_inputs(&root, &[BY_ID_PAD]);
+        i.resources
+            .insert("vibrator-devices".into(), vec![PathBuf::from("/dev/vibrator0")]);
+        i.resources
+            .insert("vibrator".into(), vec![PathBuf::from("/dev/input/event9")]);
+        derive_policy(&resolved(&root, capabilities, false, true), &i).unwrap()
+    };
+    let plain = with_vibrator(&["input"]);
+    assert!(plain
+        .unit
+        .device_allow
+        .iter()
+        .all(|g| g.mode == "r" && g.path == Path::new(BY_ID_PAD)));
+    for use_name in ["rumble", "vibration"] {
+        let policy = with_vibrator(&["input", use_name]);
+        assert_eq!(policy.unit.device_allow.len(), 1, "{use_name}");
+        assert_eq!(policy.unit.device_allow[0].path, Path::new(BY_ID_PAD));
+        assert_eq!(policy.unit.device_allow[0].mode, "rw");
+        assert!(!render_systemd_dropin(&policy).contains("vibrator"));
+        assert!(!policy
+            .landlock
+            .filesystem
+            .iter()
+            .any(|r| r.path.to_string_lossy().contains("vibrator")
+                || r.path == Path::new("/dev/input/event9")));
+        assert!(policy.landlock.filesystem.iter().any(|r| {
+            r.path == Path::new("/dev/input/event0") && r.access == FsAccess::DeviceReadWrite
+        }));
+    }
+}
+
+#[test]
+fn raw_input_lists_dev_input_landlock_only() {
+    let root = PathBuf::from("/fixture");
+    let app = resolved(&root, &["input"], false, true);
+    let raw = derive_policy(&app, &identity_inputs(&root, &[BY_ID_PAD])).unwrap();
+    let listings = raw
+        .landlock
+        .filesystem
+        .iter()
+        .filter(|r| r.access == FsAccess::ListDirectory)
+        .map(|r| r.path.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(listings, vec![PathBuf::from("/dev/input")]);
+    // Landlock only: no systemd bind/device property mentions the directory itself.
+    assert!(!raw.unit.bind_read_only.contains(&PathBuf::from("/dev/input")));
+    assert!(!raw.unit.bind_read_write.contains(&PathBuf::from("/dev/input")));
+    assert!(!render_systemd_dropin(&raw)
+        .lines()
+        .any(|l| l.ends_with("/dev/input") || l.contains("/dev/input ")));
+
+    // Broker-only and no-input apps get no directory listing.
+    let mut broker_only = inputs(&root);
+    broker_only.resources.remove("input-devices");
+    for policy in [
+        derive_policy(&app, &broker_only).unwrap(),
+        derive_policy(&resolved(&root, &[], false, true), &inputs(&root)).unwrap(),
+    ] {
+        assert!(!policy
+            .landlock
+            .filesystem
+            .iter()
+            .any(|r| r.access == FsAccess::ListDirectory));
+    }
+}
