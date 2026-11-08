@@ -6148,6 +6148,7 @@ fn default_setup_templates_queue_and_stop_the_fetch_unit_without_blocking() {
 #[test]
 fn start_setup_for_a_fetch_enabled_item_runs_exactly_one_no_block_start() {
     let (mut a, log, dir) = setup_authority(vec![fetch_unit_state("inactive", "")]);
+    let persisted = a.store.snapshot().cloned();
     assert!(matches!(
         handle_rpc(&mut a, start_setup(FETCH_ID)).unwrap(),
         RpcResponse::SetupStarted
@@ -6159,9 +6160,9 @@ fn start_setup_for_a_fetch_enabled_item_runs_exactly_one_no_block_start() {
             systemctl(&format!("start --no-block {FETCH_UNIT}")),
         ]
     );
-    // No session: the foreground state machine is untouched and nothing was persisted.
+    // No session: the foreground state machine and the persisted state are untouched.
     assert!(matches!(a.state.phase, Phase::Idle));
-    assert!(a.store.snapshot().is_none());
+    assert_eq!(a.store.snapshot().cloned(), persisted);
     assert!(log
         .lock()
         .unwrap()

@@ -881,6 +881,56 @@ impl<E: CommandExecutor> CommandSystem<E> {
         }
     }
 
+    /// True when `pf-app-fetch@<id>` is running or has a start job queued. A unit that is
+    /// deactivating (a cancel in flight) is not running: a new start queues behind the stop.
+    fn setup_unit_running(&mut self, item_id: &str) -> Result<bool, String> {
+        let unit = format!("pf-app-fetch@{item_id}.service");
+        let output = self.query(&[
+            "show",
+            "--property",
+            "ActiveState",
+            "--property",
+            "Job",
+            &unit,
+        ])?;
+        if output.code != 0 {
+            return Err(format!(
+                "systemctl show ActiveState/Job {unit} exited {}",
+                output.code
+            ));
+        }
+        let mut active_state = None;
+        let mut job = None;
+        for line in output.stdout.lines().filter(|line| !line.is_empty()) {
+            let (property, value) = line
+                .split_once('=')
+                .ok_or_else(|| format!("malformed systemctl property for {unit}: {line:?}"))?;
+            let slot = match property {
+                "ActiveState" => &mut active_state,
+                "Job" => &mut job,
+                _ => {
+                    return Err(format!(
+                        "unexpected systemctl property {property} for {unit}"
+                    ))
+                }
+            };
+            if slot.replace(value.to_owned()).is_some() {
+                return Err(format!(
+                    "duplicate systemctl property {property} for {unit}"
+                ));
+            }
+        }
+        let active_state =
+            active_state.ok_or_else(|| format!("systemctl omitted ActiveState for {unit}"))?;
+        let job = job.ok_or_else(|| format!("systemctl omitted Job for {unit}"))?;
+        Ok(match active_state.as_str() {
+            "activating" | "active" | "reloading" => true,
+            "deactivating" => false,
+            "inactive" | "failed" => !job.is_empty(),
+            state => return Err(format!("unknown ActiveState {state:?} for {unit}")),
+        })
+    }
+
     fn is_active(&mut self, unit: &str) -> Result<bool, String> {
         match self.query(&["is-active", "--quiet", unit])?.code {
             0 => Ok(true),
@@ -1136,12 +1186,26 @@ impl<E: CommandExecutor> SessionSystem for CommandSystem<E> {
         command_ok(self.executor.execute("systemctl", &args)?)
     }
 
-    fn start_setup(&mut self, _item_id: &str) -> Result<SetupLaunch, String> {
-        Err("start_setup not implemented".to_owned())
+    fn start_setup(&mut self, item_id: &str) -> Result<SetupLaunch, String> {
+        if self.templates.start_setup.is_empty() {
+            return Err(SETUP_UNAVAILABLE.to_owned());
+        }
+        // systemd would merge a second start into the running job and pf-app-fetch's flock
+        // refuses a second run; the read-only query makes the idempotence explicit and typed.
+        if self.templates.systemd_reconciliation && self.setup_unit_running(item_id)? {
+            return Ok(SetupLaunch::AlreadyRunning);
+        }
+        let template = self.templates.start_setup.clone();
+        command_ok(self.run(&template, item_id, "")?)?;
+        Ok(SetupLaunch::Started)
     }
 
-    fn cancel_setup(&mut self, _item_id: &str) -> Result<(), String> {
-        Err("cancel_setup not implemented".to_owned())
+    fn cancel_setup(&mut self, item_id: &str) -> Result<(), String> {
+        if self.templates.cancel_setup.is_empty() {
+            return Err(SETUP_UNAVAILABLE.to_owned());
+        }
+        let template = self.templates.cancel_setup.clone();
+        command_ok(self.run(&template, item_id, "")?)
     }
 
     fn lifecycle(&mut self, item_id: &str) -> Result<Option<SystemLifecycle>, String> {
@@ -2200,8 +2264,26 @@ fn handle_rpc_from<S: StateStore, B: SessionSystem, C: Clock>(
                 unreachable!("restricted requests are filtered above")
             }
         },
-        RpcRequest::StartSetup { .. } | RpcRequest::CancelSetup { .. } => RpcResponse::Error {
-            message: "setup not implemented".into(),
+        RpcRequest::StartSetup { item_id } | RpcRequest::CancelSetup { item_id }
+            if !matches!(origin, RpcOrigin::Shell) =>
+        {
+            authority.log(&format!(
+                "pf-session-authorityd: setup_refused reason=peer_scope item_id={}",
+                json_string(&item_id)
+            ));
+            RpcResponse::Denied
+        }
+        RpcRequest::StartSetup { item_id } => match authority.start_setup(&item_id)? {
+            SetupStart::Started => RpcResponse::SetupStarted,
+            SetupStart::AlreadyRunning => RpcResponse::SetupRunning,
+            SetupStart::RejectedBusy => RpcResponse::RejectedBusy,
+            SetupStart::ItemUnavailable => RpcResponse::ItemUnavailable,
+            SetupStart::NotFetchEnabled => RpcResponse::SetupNotEnabled,
+        },
+        RpcRequest::CancelSetup { item_id } => match authority.cancel_setup(&item_id)? {
+            SetupCancel::Requested => RpcResponse::Ok,
+            SetupCancel::ItemUnavailable => RpcResponse::ItemUnavailable,
+            SetupCancel::NotFetchEnabled => RpcResponse::SetupNotEnabled,
         },
         RpcRequest::Launch { item_id } => match authority.launch(LaunchRequest { item_id })? {
             LaunchResult::Accepted { session_id } => RpcResponse::Accepted { session_id },
@@ -4602,17 +4684,103 @@ impl<S: StateStore, B: SessionSystem, C: Clock> AuthorityApi for Authority<S, B,
     }
 }
 
+/// Why a setup request was refused before any command ran.
+enum SetupRefusal {
+    ItemUnavailable,
+    NotFetchEnabled,
+}
+
+impl<S: StateStore, B: SessionSystem, C: Clock> Authority<S, B, C> {
+    /// The launch gate (the resolver, which validates the id first) plus an enabled `[fetch]`
+    /// block. The id reaches a unit name only after it passes.
+    fn setup_refusal(&mut self, verb: &str, item_id: &str) -> Option<SetupRefusal> {
+        let (reason, refusal) = match self.resolver.resolve(item_id) {
+            Err(error) => (error.reason.as_str(), SetupRefusal::ItemUnavailable),
+            Ok(app)
+                if !app
+                    .manifest
+                    .fetch
+                    .as_ref()
+                    .is_some_and(|fetch| fetch.enabled) =>
+            {
+                ("fetch_not_enabled", SetupRefusal::NotFetchEnabled)
+            }
+            Ok(_) => return None,
+        };
+        let line = format!(
+            "{} verb={verb}",
+            setup_line("setup_refused", Some(reason), item_id)
+        );
+        self.log(&line);
+        Some(refusal)
+    }
+
+    fn setup_failed(&mut self, verb: &str, item_id: &str, error: String) -> AuthorityError {
+        let line = format!(
+            "{} verb={verb} detail={}",
+            setup_line("setup_failed", None, item_id),
+            json_string(&error)
+        );
+        self.log(&line);
+        AuthorityError::Backend(error)
+    }
+}
+
 impl<S: StateStore, B: SessionSystem, C: Clock> FetchSetupApi for Authority<S, B, C> {
-    fn start_setup(&mut self, _item_id: &str) -> Result<SetupStart, AuthorityError> {
-        Err(AuthorityError::Backend(
-            "start_setup not implemented".into(),
-        ))
+    fn start_setup(&mut self, item_id: &str) -> Result<SetupStart, AuthorityError> {
+        match self.setup_refusal("start_setup", item_id) {
+            Some(SetupRefusal::ItemUnavailable) => return Ok(SetupStart::ItemUnavailable),
+            Some(SetupRefusal::NotFetchEnabled) => return Ok(SetupStart::NotFetchEnabled),
+            None => {}
+        }
+        // pf-app-fetch@ has Conflicts=pf-app@%i, and the launcher offers setup only from its own
+        // idle foreground: never start one under a session.
+        if !matches!(self.state.phase, Phase::Idle) {
+            let line = format!(
+                "{} verb=start_setup phase={}",
+                setup_line("setup_refused", Some("busy"), item_id),
+                self.state.phase.name()
+            );
+            self.log(&line);
+            return Ok(SetupStart::RejectedBusy);
+        }
+        match self.system.start_setup(item_id) {
+            Ok(SetupLaunch::Started) => {
+                self.log(&setup_line("setup_started", None, item_id));
+                Ok(SetupStart::Started)
+            }
+            Ok(SetupLaunch::AlreadyRunning) => {
+                self.log(&setup_line("setup_running", None, item_id));
+                Ok(SetupStart::AlreadyRunning)
+            }
+            Err(error) => Err(self.setup_failed("start_setup", item_id, error)),
+        }
     }
-    fn cancel_setup(&mut self, _item_id: &str) -> Result<SetupCancel, AuthorityError> {
-        Err(AuthorityError::Backend(
-            "cancel_setup not implemented".into(),
-        ))
+
+    fn cancel_setup(&mut self, item_id: &str) -> Result<SetupCancel, AuthorityError> {
+        match self.setup_refusal("cancel_setup", item_id) {
+            Some(SetupRefusal::ItemUnavailable) => return Ok(SetupCancel::ItemUnavailable),
+            Some(SetupRefusal::NotFetchEnabled) => return Ok(SetupCancel::NotFetchEnabled),
+            None => {}
+        }
+        match self.system.cancel_setup(item_id) {
+            Ok(()) => {
+                self.log(&setup_line("setup_cancel_requested", None, item_id));
+                Ok(SetupCancel::Requested)
+            }
+            Err(error) => Err(self.setup_failed("cancel_setup", item_id, error)),
+        }
     }
+}
+
+fn setup_line(event: &str, reason: Option<&str>, item_id: &str) -> String {
+    let reason = reason
+        .map(|reason| format!(" reason={reason}"))
+        .unwrap_or_default();
+    format!(
+        "pf-session-authorityd: {event}{reason} item_id={}",
+        json_string(item_id)
+    )
 }
 
 fn json_string(value: &str) -> String {

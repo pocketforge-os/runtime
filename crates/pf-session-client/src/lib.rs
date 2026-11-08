@@ -164,15 +164,31 @@ impl AuthorityApi for SocketTransport {
 }
 
 impl FetchSetupApi for SocketTransport {
-    fn start_setup(&mut self, _item_id: &str) -> Result<SetupStart, AuthorityError> {
-        Err(AuthorityError::Backend(
-            "start_setup not implemented".into(),
-        ))
+    fn start_setup(&mut self, item_id: &str) -> Result<SetupStart, AuthorityError> {
+        match self.call(&RpcRequest::StartSetup {
+            item_id: item_id.to_owned(),
+        })? {
+            RpcResponse::SetupStarted => Ok(SetupStart::Started),
+            RpcResponse::SetupRunning => Ok(SetupStart::AlreadyRunning),
+            RpcResponse::RejectedBusy => Ok(SetupStart::RejectedBusy),
+            RpcResponse::ItemUnavailable => Ok(SetupStart::ItemUnavailable),
+            RpcResponse::SetupNotEnabled => Ok(SetupStart::NotFetchEnabled),
+            _ => Err(AuthorityError::Backend(
+                "unexpected start_setup response".into(),
+            )),
+        }
     }
-    fn cancel_setup(&mut self, _item_id: &str) -> Result<SetupCancel, AuthorityError> {
-        Err(AuthorityError::Backend(
-            "cancel_setup not implemented".into(),
-        ))
+    fn cancel_setup(&mut self, item_id: &str) -> Result<SetupCancel, AuthorityError> {
+        match self.call(&RpcRequest::CancelSetup {
+            item_id: item_id.to_owned(),
+        })? {
+            RpcResponse::Ok => Ok(SetupCancel::Requested),
+            RpcResponse::ItemUnavailable => Ok(SetupCancel::ItemUnavailable),
+            RpcResponse::SetupNotEnabled => Ok(SetupCancel::NotFetchEnabled),
+            _ => Err(AuthorityError::Backend(
+                "unexpected cancel_setup response".into(),
+            )),
+        }
     }
 }
 
