@@ -4756,22 +4756,20 @@ impl<S: StateStore, B: SessionSystem, C: Clock> Authority<S, B, C> {
     /// the item mid-fetch would make systemd stop the fetch. True (logged) when the item's fetch
     /// unit is activating, active or has a start job queued.
     ///
-    /// Only a fetch-enabled item pays the read-only `systemctl show`; every other item runs no
-    /// query. FAIL CLOSED: when the query fails or is unparseable on a fetch-enabled item the
-    /// launch is refused with a backend error (logged `setup_state_unknown`) and nothing starts,
-    /// because proceeding could silently cancel a running fetch; a retry is harmless.
+    /// Only an item that *declares* a `[fetch]` block (enabled or not, the predicate
+    /// `cancel_setup` uses) pays the read-only `systemctl show`: a run outlives a manifest update
+    /// that disables `[fetch]`, and a launch would cancel it through `Conflicts=`. An item with
+    /// no `[fetch]` block runs no query.
+    ///
+    /// FAIL CLOSED: when the query fails or is unparseable on such an item the launch is refused with a
+    /// backend error (logged `setup_state_unknown`) and nothing starts, because proceeding could silently cancel a running fetch; a retry is harmless.
     fn fetch_blocks_launch(
         &mut self,
         app: &ResolvedApp,
         item_id: &str,
         event: &str,
     ) -> Result<bool, AuthorityError> {
-        if !app
-            .manifest
-            .fetch
-            .as_ref()
-            .is_some_and(|fetch| fetch.enabled)
-        {
+        if app.manifest.fetch.is_none() {
             return Ok(false);
         }
         let (reason, outcome) = match self.system.setup_running(item_id) {
