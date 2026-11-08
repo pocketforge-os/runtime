@@ -17,6 +17,8 @@ impl Drop for ClientSlot {
     }
 }
 
+// try_update replaces this from Rust 1.95; keep fetch_update while rust-version = 1.85 (tsp-mc9m.41.995.144)
+#[allow(deprecated)]
 fn try_client_slot(active: &Arc<AtomicUsize>) -> Option<ClientSlot> {
     active
         .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {

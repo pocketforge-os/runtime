@@ -560,6 +560,8 @@ impl OrientationWatch {
         after_serial: u64,
         timeout: Duration,
     ) -> Result<OrientationState, WaitError> {
+        // try_update replaces this from Rust 1.95; keep fetch_update while rust-version = 1.85 (tsp-mc9m.41.995.144)
+        #[allow(deprecated)]
         self.active
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
                 (active < self.max_waiters).then_some(active + 1)
