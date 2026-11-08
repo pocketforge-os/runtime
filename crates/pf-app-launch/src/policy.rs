@@ -16,6 +16,7 @@ pub const X11_SOCKET: &str = X11_BIND.0;
 pub const X11_SOCKET_DESTINATION: &str = X11_BIND.1;
 pub const X11_ENVIRONMENT: &str = "/run/pocketforge/x11/policy/environment";
 pub const INPUT_BROKER_SOCKET: &str = "/run/pocketforge/input-broker.sock";
+const APP_DATA_ROOT: &str = "/var/lib/pocketforge/apps";
 
 #[derive(Clone, Copy)]
 enum DisplayResourceGrant {
@@ -206,6 +207,11 @@ pub struct UnitProperties {
     pub restrict_address_families: Vec<String>,
     pub private_network: bool,
     pub inaccessible_paths: Vec<PathBuf>,
+    /// Fetch destinations made read-only in the mount namespace. Each entry
+    /// renders as `ReadOnlyPaths=-<path>`; absent when the app declares no
+    /// `[fetch] destination = "var"`, keeping that policy byte-identical.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub read_only_paths: Vec<PathBuf>,
     pub bind_read_only: Vec<PathBuf>,
     pub bind_read_write: Vec<PathBuf>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -316,6 +322,23 @@ pub fn derive_policy(
         PolicyError("signed platform contract has no Landlock ABI minimum".to_owned())
     })?;
 
+    // Fetch payloads are installed by the same uid as the app, so the sandbox
+    // must take the destination away rather than rely on DAC. Resolve the
+    // declared per-file dest exactly as the fetcher does: one component under
+    // the app's state root. Only `destination = "var"` lands there; `home` and
+    // an absent destination keep today's behaviour.
+    let state_root = PathBuf::from(APP_DATA_ROOT).join(&app.id);
+    let mut fetch_enabled = false;
+    let mut fetch_destinations = BTreeSet::new();
+    if let Some(fetch) = app.manifest.fetch.as_ref().filter(|fetch| fetch.enabled) {
+        fetch_enabled = true;
+        if fetch.destination.as_deref() == Some("var") {
+            for file in fetch.files.as_deref().unwrap_or_default() {
+                fetch_destinations.insert(fetch_destination(&state_root, file.dest.as_deref())?);
+            }
+        }
+    }
+
     let mut filesystem = Vec::new();
     if class == AppClass::Full {
         filesystem.push(FsRule {
@@ -340,6 +363,14 @@ pub fn derive_policy(
             filesystem.push(FsRule {
                 path: path.clone(),
                 access: FsAccess::ReadExecute,
+            });
+        }
+        // Fetched payloads are data, never executables: read file and read dir
+        // only, with no write, execute, make-*, remove or truncate rights.
+        for path in &fetch_destinations {
+            filesystem.push(FsRule {
+                path: path.clone(),
+                access: FsAccess::ReadOnly,
             });
         }
     }
@@ -734,7 +765,16 @@ pub fn derive_policy(
             },
             restrict_address_families: address_families,
             private_network: !networked,
-            inaccessible_paths: vec![PathBuf::from("/run/dbus/system_bus_socket")],
+            inaccessible_paths: {
+                let mut paths = vec![PathBuf::from("/run/dbus/system_bus_socket")];
+                // The receipt and staging must be invisible even to a
+                // NestedUserns app, which has no Landlock filesystem rules.
+                if fetch_enabled {
+                    paths.push(state_root.join(".pf-fetch"));
+                }
+                paths
+            },
+            read_only_paths: fetch_destinations.into_iter().collect(),
             bind_read_only: read_only_paths.into_iter().collect(),
             bind_read_write: socket_paths.into_iter().collect(),
             bind_read_write_mappings,
@@ -753,6 +793,29 @@ fn is_event_node(path: &Path) -> bool {
             .and_then(|name| name.to_str())
             .and_then(|name| name.strip_prefix("event"))
             .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// Resolve a declared `[[fetch.files]] dest` under the app's state root.
+///
+/// The fetcher installs each archive at `<state root>/<dest>`, where `dest` is
+/// one relative path component. The manifest parser enforces that rule for
+/// schema v3; deriving it here again keeps a hand-built v1/v2 manifest from
+/// widening the sandbox. An absent dest is refused rather than defaulted: the
+/// fetcher itself requires one, so there is nothing to protect without it.
+fn fetch_destination(state_root: &Path, dest: Option<&str>) -> Result<PathBuf, PolicyError> {
+    let dest = dest.unwrap_or_default();
+    let valid = !dest.is_empty()
+        && dest != "."
+        && dest != ".."
+        && !dest.contains('/')
+        && !matches!(dest, "config" | "state" | "cache");
+    if !valid {
+        return Err(PolicyError(
+            "invalid fetch dest: must be one path component outside config, state and cache"
+                .to_owned(),
+        ));
+    }
+    Ok(state_root.join(dest))
 }
 
 fn confined_absolute(path: &Path) -> bool {
@@ -793,6 +856,11 @@ pub fn render_systemd_dropin(policy: &PolicyDecision) -> String {
         // These are deny-only paths: their absence must not make namespace
         // setup fail, while an existing path must still be hidden from apps.
         lines.push(format!("InaccessiblePaths=-{}", path.display()));
+    }
+    for path in &policy.unit.read_only_paths {
+        // The leading '-' keeps a not-yet-fetched destination from failing the
+        // unit; when it exists the payload is read-only even against chmod.
+        lines.push(format!("ReadOnlyPaths=-{}", path.display()));
     }
     for path in &policy.unit.bind_read_only {
         lines.push(format!("BindReadOnlyPaths={}", path.display()));
