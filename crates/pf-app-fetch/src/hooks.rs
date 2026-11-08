@@ -8,6 +8,7 @@
 //! - `PF_APP_FETCH_TEST_STOP_AT=<step>` + `PF_APP_FETCH_TEST_STOP_MARKER=<path>`: write the
 //!   marker and `raise(SIGSTOP)` at a protocol step, so the harness can SIGKILL there.
 //! - `PF_APP_FETCH_TEST_FREE_BYTES=<n>`: the statvfs free-space figure.
+//! - `PF_APP_FETCH_TEST_ENOSPC_AFTER=<n>`: ENOSPC from the payload writer after n bytes.
 //! - `PF_APP_FETCH_TEST_CONFINE=off|best-effort|required` (debug default `off`).
 
 use std::collections::BTreeMap;
@@ -54,6 +55,15 @@ pub fn redirect_table() -> Option<BTreeMap<String, Vec<String>>> {
         }
     }
     Some(out)
+}
+
+/// `PF_APP_FETCH_TEST_ENOSPC_AFTER=<n>`: the payload writer fails with ENOSPC once more
+/// than `n` extracted bytes would have been written (debug builds only).
+pub fn enospc_after(total: u64) -> std::io::Result<()> {
+    match var("ENOSPC_AFTER").and_then(|n| n.parse::<u64>().ok()) {
+        Some(limit) if total > limit => Err(std::io::Error::from_raw_os_error(libc::ENOSPC)),
+        _ => Ok(()),
+    }
 }
 
 pub fn free_bytes() -> Option<u64> {

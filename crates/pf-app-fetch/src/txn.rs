@@ -29,12 +29,14 @@ use std::os::fd::AsRawFd;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
 
 pub const RECEIPT_SCHEMA: u64 = 1;
 /// Free space kept for the rest of the system on top of every precheck.
 pub const FREE_FLOOR: u64 = 32 << 20;
 
 pub struct Config {
+    pub run_id: String,
     pub app_id: String,
     pub descriptor: PathBuf,
     pub state_dir: PathBuf,
@@ -49,6 +51,8 @@ pub struct Report {
     pub gets: usize,
     /// The Landlock ABI enforced on this run (None: not applied, test builds only).
     pub landlock: Option<u32>,
+    /// This run holds `.pf-fetch/lock`, so it owns result.json.
+    pub locked: bool,
 }
 
 fn state_invalid(detail: impl Into<String>) -> Failure {
@@ -426,27 +430,140 @@ fn receipt_json(plan: &Plan, staged: &[Staged]) -> Vec<u8> {
     text
 }
 
-/// One run. `report` is filled as far as the run got, for result.json.
-pub fn run(cfg: &Config, cancel: &AtomicBool, report: &mut Report) -> Result<()> {
+/// Set once a run is inside the commit (steps 6-7). The main thread takes this lock before
+/// acting on a cancel, so a cancel never races the rename or the receipt commit: it either
+/// wins before step 6 (staging removed, `cancelled`) or waits for the commit to finish.
+pub static COMMIT_GATE: Mutex<bool> = Mutex::new(false);
+
+/// Everything `execute` needs, produced on the main thread by `prepare` (so the Landlock
+/// domain covers the whole process before the worker thread exists).
+pub struct Prepared {
+    _lock: File,
+    pub fetch_dir: PathBuf,
+    state: PathBuf,
+    plan: Plan,
+    roots: Vec<ureq::tls::Certificate<'static>>,
+    scope: Scope,
+    overrides: BTreeMap<String, std::net::SocketAddr>,
+}
+
+/// The JSON written to `.pf-fetch/result.json` (atomically, 0644).
+pub fn result_value(
+    cfg: &Config,
+    report: &Report,
+    failure: Option<&Failure>,
+    running: bool,
+) -> Value {
+    let (outcome, reason, class, retryable, detail) = match (running, failure) {
+        (true, _) => (
+            "running",
+            Value::Null,
+            Value::Null,
+            Value::Null,
+            String::new(),
+        ),
+        (false, None) => (
+            "ready",
+            Value::Null,
+            Value::Null,
+            Value::Null,
+            String::new(),
+        ),
+        (false, Some(f)) => (
+            "failed",
+            json!(f.code.as_str()),
+            json!(f.code.class()),
+            json!(f.code.retryable()),
+            truncate(&f.detail, 200),
+        ),
+    };
+    json!({
+        "schema_version": 1,
+        "run_id": cfg.run_id,
+        "app_id": cfg.app_id,
+        "outcome": outcome,
+        "reason": reason,
+        "class": class,
+        "retryable": retryable,
+        "detail": detail,
+        "check": report.check,
+        "gets": report.gets,
+    })
+}
+
+pub fn truncate(detail: &str, max: usize) -> String {
+    let mut end = detail.len().min(max);
+    while !detail.is_char_boundary(end) {
+        end -= 1;
+    }
+    detail[..end].to_string()
+}
+
+pub fn write_result(fetch_dir: &Path, value: &Value) -> Result<()> {
+    let mut text = serde_json::to_vec(value).expect("result serializes");
+    text.push(b'\n');
+    write_atomic(fetch_dir, "result.json", &text)
+}
+
+/// Main thread: take the lock FIRST (a run that loses it writes nothing, so it can never
+/// clobber the live run's result.json), mark result.json `running` with this run's id, then
+/// load the descriptor and CA bundle and apply Landlock.
+pub fn prepare(cfg: &Config, report: &Mutex<Report>) -> Result<Prepared> {
+    let state = cfg.state_dir.clone();
+    let fetch_dir = prepare_fetch_dir(&state)?;
+    let lock = lock(&fetch_dir)?;
+    report.lock().unwrap_or_else(|e| e.into_inner()).locked = true;
+    {
+        let snapshot = report.lock().unwrap_or_else(|e| e.into_inner());
+        write_result(&fetch_dir, &result_value(cfg, &snapshot, None, true))?;
+    }
     let plan = descriptor::load(&cfg.descriptor, &cfg.app_id)?;
     let roots = http::load_roots(&cfg.ca_file)?;
-    let state = cfg.state_dir.as_path();
-    let fetch_dir = prepare_fetch_dir(state)?;
-    let _lock = lock(&fetch_dir)?;
-
     let table = hooks::redirect_table().unwrap_or_else(scope::platform_table);
     let first_hops: Vec<_> = plan.entries.iter().map(|e| e.url.clone()).collect();
     let scope = Scope::new(&first_hops, &table);
     let overrides = hooks::resolve_overrides();
     let mut ports = scope.ports();
     ports.extend(overrides.values().map(|addr| addr.port()));
-    report.landlock = confine::apply(cfg.confine, state, &ports).map_err(state_invalid)?;
+    let landlock = confine::apply(cfg.confine, &state, &ports).map_err(state_invalid)?;
+    report.lock().unwrap_or_else(|e| e.into_inner()).landlock = landlock;
+    Ok(Prepared {
+        _lock: lock,
+        fetch_dir,
+        state,
+        plan,
+        roots,
+        scope,
+        overrides,
+    })
+}
+
+/// After a cancel that won the commit gate: remove this run's staging and moved-aside
+/// trees (the same sweep a later run or the boot tmpfiles rule would do).
+pub fn cleanup_after_cancel(fetch_dir: &Path) {
+    let _ = sweep(fetch_dir);
+}
+
+/// Worker thread: steps 1-7.
+pub fn execute(prep: Prepared, cancel: &AtomicBool, report: &Mutex<Report>) -> Result<()> {
+    let Prepared {
+        _lock,
+        fetch_dir,
+        state,
+        plan,
+        roots,
+        scope,
+        overrides,
+    } = prep;
+    let state = state.as_path();
+    let set = |f: &dyn Fn(&mut Report)| f(&mut report.lock().unwrap_or_else(|e| e.into_inner()));
 
     // 1. Sweep.
     sweep(&fetch_dir)?;
     // 2. Check.
-    report.check = check(state, &fetch_dir, &plan);
-    if report.check == "valid" {
+    let verdict = check(state, &fetch_dir, &plan);
+    set(&|r| r.check = verdict);
+    if verdict == "valid" {
         return Ok(());
     }
     cancelled(cancel)?;
@@ -495,7 +612,8 @@ pub fn run(cfg: &Config, cancel: &AtomicBool, report: &mut Report) -> Result<()>
         .map_err(|e| io_failure(Code::StateInvalid, "create staging", &e))?;
     let mut client = http::Client::new(roots, scope, overrides);
     let staged = stage(&plan, &mut client, state, &staging, cancel);
-    report.gets = client.gets;
+    let gets = client.gets;
+    set(&|r| r.gets = gets);
     let staged = match staged.and_then(|s| cancelled(cancel).map(|_| s)) {
         Ok(staged) => staged,
         Err(failure) => {
@@ -504,6 +622,14 @@ pub fn run(cfg: &Config, cancel: &AtomicBool, report: &mut Report) -> Result<()>
         }
     };
     hooks::stop_at("after-stage");
+    // Enter the commit only if no cancel has arrived; hold the gate through step 7.
+    let mut gate = COMMIT_GATE.lock().unwrap_or_else(|e| e.into_inner());
+    if cancel.load(Ordering::SeqCst) {
+        drop(gate);
+        let _ = fs::remove_dir_all(&staging);
+        return Err(Failure::new(Code::Cancelled, "stop requested"));
+    }
+    *gate = true;
     // 6. Rename onto the absent <dest>s.
     for (index, entry) in plan.entries.iter().enumerate() {
         fs::rename(
@@ -518,6 +644,7 @@ pub fn run(cfg: &Config, cancel: &AtomicBool, report: &mut Report) -> Result<()>
     // 7. Commit.
     write_atomic(&fetch_dir, "receipt.json", &receipt_json(&plan, &staged))?;
     hooks::stop_at("after-commit");
+    drop(gate);
     let _ = fs::remove_dir_all(&staging);
     let _ = fsync_dir(&fetch_dir);
     Ok(())

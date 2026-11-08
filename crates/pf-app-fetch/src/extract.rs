@@ -144,6 +144,7 @@ pub fn extract(
     let mut members: u64 = 0;
     let mut expanded: u64 = 0;
     let mut written_dirs: BTreeSet<String> = BTreeSet::new();
+    let mut written_total: u64 = 0;
     let entries = tar
         .entries()
         .map_err(|e| invalid(format!("read archive: {e}")))?;
@@ -167,14 +168,12 @@ pub fn extract(
         if !selected(&parts, is_dir, include) {
             continue;
         }
+        // strip_components removes every component: skip the member whatever its type,
+        // as pf-fetch.py member_path() and GNU tar do (MBHaxe's release tarball has its
+        // libhl.so* symlinks at depth 2 under strip 2). The absolute and `..` refusals
+        // above still apply first.
         if parts.len() <= strip {
-            if is_dir {
-                continue;
-            }
-            // A selected non-directory that strip_components removes entirely.
-            if kind.is_file() {
-                continue;
-            }
+            continue;
         }
         let stripped: Vec<&str> = parts.iter().skip(strip).copied().collect();
         let rel = stripped.join("/");
@@ -237,9 +236,11 @@ pub fn extract(
                 break;
             }
             hasher.update(&buf[..n]);
-            out.write_all(&buf[..n])
+            crate::hooks::enospc_after(written_total + n as u64)
+                .and_then(|()| out.write_all(&buf[..n]))
                 .map_err(|e| io_failure(Code::StateInvalid, "write payload file", &e))?;
             copied += n as u64;
+            written_total += n as u64;
         }
         if copied != size {
             return Err(invalid(format!("member {name:?} is short")));

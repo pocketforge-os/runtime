@@ -15,10 +15,12 @@ mod scope;
 mod txn;
 
 use codes::Code;
-use serde_json::json;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
+use std::thread;
+use std::time::Duration;
 
 static CANCEL: AtomicBool = AtomicBool::new(false);
 
@@ -50,14 +52,6 @@ fn valid_app_id(id: &str) -> bool {
         && id
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'))
-}
-
-fn truncate(detail: &str, max: usize) -> String {
-    let mut end = detail.len().min(max);
-    while !detail.is_char_boundary(end) {
-        end -= 1;
-    }
-    detail[..end].to_string()
 }
 
 fn main() -> ExitCode {
@@ -108,85 +102,106 @@ fn main() -> ExitCode {
     } else {
         confine::Mode::Required
     };
-    let config = txn::Config {
-        app_id: app_id.clone(),
+    let config = Arc::new(txn::Config {
+        run_id: txn::random_hex(),
+        app_id,
         descriptor,
-        state_dir: state_dir.clone(),
+        state_dir,
         ca_file,
         confine,
-    };
-    let mut report = txn::Report {
+    });
+    let report = Arc::new(Mutex::new(txn::Report {
         check: "not_run",
-        gets: 0,
-        landlock: None,
+        ..txn::Report::default()
+    }));
+    let fetch_dir = config.state_dir.join(".pf-fetch");
+
+    let outcome = match txn::prepare(&config, &report) {
+        Err(failure) => Err(failure),
+        Ok(prepared) => {
+            // Steps 1-7 run on a worker (it inherits the Landlock domain). The main thread
+            // polls the stop flag, so SIGTERM is answered within ~100 ms even while a read
+            // is stalled inside ureq/rustls (which retry EINTR internally).
+            let (tx, rx) = mpsc::channel();
+            {
+                let report = report.clone();
+                thread::spawn(move || {
+                    let _ = tx.send(txn::execute(prepared, &CANCEL, &report));
+                });
+            }
+            loop {
+                match rx.recv_timeout(Duration::from_millis(100)) {
+                    Ok(outcome) => break outcome,
+                    Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        break Err(codes::Failure::new(Code::StateInvalid, "worker exited"))
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        if CANCEL.load(Ordering::SeqCst) {
+                            let gate = txn::COMMIT_GATE.lock().unwrap_or_else(|e| e.into_inner());
+                            if *gate {
+                                // The commit is under way or done: let it finish.
+                                drop(gate);
+                                break rx.recv().unwrap_or_else(|_| {
+                                    Err(codes::Failure::new(Code::StateInvalid, "worker exited"))
+                                });
+                            }
+                            // Holding the gate, the worker cannot enter the commit. Remove
+                            // staging, report, and exit; the process exit stops the worker.
+                            txn::cleanup_after_cancel(&fetch_dir);
+                            let failure = codes::Failure::new(Code::Cancelled, "stop requested");
+                            finish(&config, &report, &fetch_dir, Err(failure));
+                            std::process::exit(1);
+                        }
+                    }
+                }
+            }
+        }
     };
-    let outcome = txn::run(&config, &CANCEL, &mut report);
-    let run_id = txn::random_hex();
-    let (result, exit) = match &outcome {
+    finish(&config, &report, &fetch_dir, outcome)
+}
+
+/// Log the outcome and, only for a run that holds the lock, write result.json.
+fn finish(
+    config: &txn::Config,
+    report: &Mutex<txn::Report>,
+    fetch_dir: &std::path::Path,
+    outcome: codes::Result<()>,
+) -> ExitCode {
+    let report = report.lock().unwrap_or_else(|e| e.into_inner());
+    let landlock = report
+        .landlock
+        .map_or("off".to_string(), |abi| format!("abi{abi}"));
+    let app_id = &config.app_id;
+    let exit = match &outcome {
         Ok(()) => {
             eprintln!(
-                "pf-app-fetch: app={app_id} outcome=ready check={} gets={} landlock={}",
-                report.check,
-                report.gets,
-                report
-                    .landlock
-                    .map_or("off".to_string(), |abi| format!("abi{abi}"))
+                "pf-app-fetch: app={app_id} run={} outcome=ready check={} gets={} landlock={landlock}",
+                config.run_id, report.check, report.gets
             );
-            (
-                json!({
-                    "schema_version": 1,
-                    "run_id": run_id,
-                    "app_id": app_id,
-                    "outcome": "ready",
-                    "reason": null,
-                    "class": null,
-                    "retryable": null,
-                    "detail": "",
-                    "check": report.check,
-                    "gets": report.gets,
-                }),
-                ExitCode::SUCCESS,
-            )
+            ExitCode::SUCCESS
         }
         Err(failure) => {
             let code: Code = failure.code;
-            let detail = truncate(&failure.detail, 200);
             eprintln!(
-                "pf-app-fetch: app={app_id} outcome=failed reason={} class={} retryable={} check={} gets={} detail={detail}",
+                "pf-app-fetch: app={app_id} run={} outcome=failed reason={} class={} retryable={} check={} gets={} landlock={landlock} detail={}",
+                config.run_id,
                 code.as_str(),
                 code.class(),
                 code.retryable(),
                 report.check,
-                report.gets
+                report.gets,
+                txn::truncate(&failure.detail, 200)
             );
-            (
-                json!({
-                    "schema_version": 1,
-                    "run_id": run_id,
-                    "app_id": app_id,
-                    "outcome": "failed",
-                    "reason": code.as_str(),
-                    "class": code.class(),
-                    "retryable": code.retryable(),
-                    "detail": detail,
-                    "check": report.check,
-                    "gets": report.gets,
-                }),
-                ExitCode::from(1),
-            )
+            ExitCode::from(1)
         }
     };
-    let fetch_dir = state_dir.join(".pf-fetch");
-    if state_dir.is_dir() && !fetch_dir.exists() {
-        use std::os::unix::fs::DirBuilderExt;
-        let _ = std::fs::DirBuilder::new().mode(0o755).create(&fetch_dir);
-    }
-    if fetch_dir.is_dir() {
-        let mut text = serde_json::to_vec(&result).expect("result serializes");
-        text.push(b'\n');
-        if let Err(e) = txn::write_atomic(&fetch_dir, "result.json", &text) {
+    if report.locked {
+        let value = txn::result_value(config, &report, outcome.as_ref().err(), false);
+        if let Err(e) = txn::write_result(fetch_dir, &value) {
             eprintln!("pf-app-fetch: could not write result.json: {e}");
         }
+    } else {
+        eprintln!("pf-app-fetch: app={app_id} did not hold the lock; result.json left untouched");
     }
     exit
 }
