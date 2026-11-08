@@ -1495,6 +1495,8 @@ pub enum RpcResponse {
     SetupRunning,
     /// `StartSetup`/`CancelSetup`: the item has no enabled `[fetch]` block.
     SetupNotEnabled,
+    /// `Launch`/`OpenUrl`: the target's fetch setup unit is running; nothing was started.
+    RejectedSetupRunning,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -2291,6 +2293,7 @@ fn handle_rpc_from<S: StateStore, B: SessionSystem, C: Clock>(
             LaunchResult::Accepted { session_id } => RpcResponse::Accepted { session_id },
             LaunchResult::RejectedBusy => RpcResponse::RejectedBusy,
             LaunchResult::ItemUnavailable => RpcResponse::ItemUnavailable,
+            LaunchResult::RejectedSetupRunning => RpcResponse::RejectedSetupRunning,
         },
         RpcRequest::SafeReturn => {
             if matches!(

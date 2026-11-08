@@ -6493,3 +6493,197 @@ fn authority_setup_api_matches_the_rpc_answers() {
     assert_eq!(a.cancel_setup(FETCH_ID).unwrap(), SetupCancel::Requested);
     fs::remove_dir_all(dir).unwrap();
 }
+
+// ---------------------------------------------------------------------------
+// tsp-ziac.4.3.10: Launch / open_url refuse while pf-app-fetch@<id> is running
+// (pf-app-fetch@ has Conflicts=pf-app@%i, so a launch would make systemd stop the fetch).
+// ---------------------------------------------------------------------------
+
+fn launch_setup_item(a: &mut SetupAuthority, id: &str) -> Result<LaunchResult, AuthorityError> {
+    a.launch(LaunchRequest { item_id: id.into() })
+}
+
+#[test]
+fn launch_of_a_fetch_enabled_item_is_refused_while_its_fetch_unit_is_running() {
+    for (state, job) in [
+        ("activating", ""),
+        ("active", ""),
+        ("reloading", ""),
+        ("inactive", "12"),
+    ] {
+        let (mut a, log, dir) = setup_authority(vec![fetch_unit_state(state, job)]);
+        let persisted = a.store.snapshot().cloned();
+        assert_eq!(
+            launch_setup_item(&mut a, FETCH_ID),
+            Ok(LaunchResult::RejectedSetupRunning),
+            "{state} {job}"
+        );
+        // No command beyond the read-only query, no session, nothing persisted.
+        assert_eq!(a.system.executor.calls, [state_query()], "{state} {job}");
+        assert!(matches!(a.state.phase, Phase::Idle));
+        assert_eq!(a.store.snapshot().cloned(), persisted);
+        assert!(log
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|line| line.contains("launch_refused reason=setup_running")
+                && line.contains(FETCH_ID)));
+        fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[test]
+fn launch_of_a_fetch_enabled_item_proceeds_when_its_fetch_unit_is_not_running() {
+    for (state, job) in [("inactive", ""), ("failed", ""), ("deactivating", "")] {
+        let (mut a, _, dir) = setup_authority(vec![fetch_unit_state(state, job)]);
+        assert!(
+            matches!(
+                launch_setup_item(&mut a, FETCH_ID),
+                Ok(LaunchResult::Accepted { .. })
+            ),
+            "{state}"
+        );
+        assert_eq!(a.system.executor.calls[0], state_query(), "{state}");
+        fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[test]
+fn launch_of_a_non_fetch_item_runs_no_state_query() {
+    let (mut a, _, dir) = setup_authority(Vec::new());
+    assert!(matches!(
+        launch_setup_item(&mut a, APP_ID),
+        Ok(LaunchResult::Accepted { .. })
+    ));
+    assert!(
+        !a.system
+            .executor
+            .calls
+            .iter()
+            .any(|call| call.1.iter().any(|arg| arg == "show")),
+        "{:?}",
+        a.system.executor.calls
+    );
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn a_failed_state_query_fails_closed_for_a_fetch_enabled_item() {
+    // Documented rule: when the fetch unit's state cannot be read, Launch refuses (a backend
+    // error, nothing started) rather than risk Conflicts= cancelling a running fetch.
+    for output in [
+        CommandOutput {
+            code: 1,
+            stdout: String::new(),
+        },
+        CommandOutput {
+            code: 0,
+            stdout: "garbage\n".into(),
+        },
+    ] {
+        let (mut a, log, dir) = setup_authority(vec![output]);
+        assert!(matches!(
+            launch_setup_item(&mut a, FETCH_ID),
+            Err(AuthorityError::Backend(_))
+        ));
+        assert_eq!(a.system.executor.calls, [state_query()]);
+        assert!(matches!(a.state.phase, Phase::Idle));
+        assert!(log
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|line| line.contains("launch_refused reason=setup_state_unknown")));
+        fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[test]
+fn the_launch_rpc_answers_rejected_setup_running() {
+    let (mut a, _, dir) = setup_authority(vec![fetch_unit_state("activating", "")]);
+    let response = handle_rpc(
+        &mut a,
+        RpcRequest::Launch {
+            item_id: FETCH_ID.into(),
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        serde_json::to_string(&response).unwrap(),
+        r#"{"result":"rejected_setup_running"}"#
+    );
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn the_open_url_hand_off_into_a_running_fetch_item_is_refused_the_same_way() {
+    let (a, log, dir) = setup_authority(vec![fetch_unit_state("activating", "")]);
+    let mut a = a.with_url_handler(FixedUrlHandler(FETCH_ID.into()));
+    let response = dispatch_rpc_from(&mut a, RpcOrigin::Shell, open_url_request(None, URL, 0));
+    assert!(
+        matches!(response, RpcResponse::RejectedSetupRunning),
+        "{response:?}"
+    );
+    assert_eq!(a.system.executor.calls, [state_query()]);
+    assert!(matches!(a.state.phase, Phase::Idle));
+    assert!(a.state.return_slot.is_none());
+    assert!(log
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|line| line.contains("url_refused reason=setup_running")));
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn cancel_setup_is_allowed_for_an_installed_item_whose_fetch_was_disabled_but_is_running() {
+    // runtime#189 review N3.
+    let (resolver, dir) = setup_resolver();
+    let manifest = dir.join("apps").join(APP_ID).join("app.toml");
+    let mut text = fs::read_to_string(&manifest).unwrap();
+    text.push_str("[fetch]\nenabled = false\n");
+    fs::write(&manifest, text).unwrap();
+    let app_unit = "pf-app-fetch@org.example.game.service";
+    let query = (
+        "systemctl".to_owned(),
+        words(&format!(
+            "show --property ActiveState --property Job {app_unit}"
+        )),
+    );
+    let mut a = Authority::open_with_resolver(
+        MemoryStore::default(),
+        CommandSystem::with_executor(CommandTemplates::default(), FakeExecutor::default()),
+        TestClock::new(),
+        3,
+        Duration::from_millis(10),
+        resolver,
+    )
+    .unwrap();
+    a.system.executor.outputs = vec![fetch_unit_state("activating", "")].into();
+    assert!(matches!(
+        handle_rpc(&mut a, cancel_setup(APP_ID)).unwrap(),
+        RpcResponse::Ok
+    ));
+    assert_eq!(
+        a.system.executor.calls,
+        [
+            query.clone(),
+            systemctl(&format!("stop --no-block {app_unit}"))
+        ]
+    );
+    // Not running: still refused.
+    a.system.executor.calls.clear();
+    a.system.executor.outputs = vec![fetch_unit_state("inactive", "")].into();
+    assert!(matches!(
+        handle_rpc(&mut a, cancel_setup(APP_ID)).unwrap(),
+        RpcResponse::SetupNotEnabled
+    ));
+    assert_eq!(a.system.executor.calls, [query]);
+    // Start still requires fetch-enabled, running or not.
+    a.system.executor.calls.clear();
+    assert!(matches!(
+        handle_rpc(&mut a, start_setup(APP_ID)).unwrap(),
+        RpcResponse::SetupNotEnabled
+    ));
+    assert!(a.system.executor.calls.is_empty());
+    fs::remove_dir_all(dir).unwrap();
+}
