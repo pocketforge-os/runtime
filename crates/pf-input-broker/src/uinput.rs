@@ -36,8 +36,11 @@ pub struct UinputSpec {
     pub rel: Vec<u16>,
     /// Absolute axes to advertise, with calibration.
     pub abs: Vec<(u16, AbsInfo)>,
-    /// Advertise `EV_FF` / `FF_RUMBLE` (App Pad only, and only when a vibrator exists).
-    pub ff_rumble: bool,
+    /// Force-feedback effect codes to advertise (`FF_RUMBLE`); empty for every pad but the App
+    /// Pad, and for the App Pad when the descriptor declares no rumble actuator.
+    pub ff: Vec<u16>,
+    /// `uinput_user_dev.ff_effects_max` (0 when `ff` is empty).
+    pub ff_effects_max: u32,
 }
 
 /// A live uinput virtual device. `Drop` destroys it.
@@ -60,10 +63,13 @@ pub struct SessionUinputs {
 
 impl SessionUinputs {
     pub fn create(pad: &UinputSpec) -> io::Result<Self> {
+        Self::create_with_rumble(pad, false)
+    }
+
+    /// As [`create`](Self::create); the App Pad advertises `FF_RUMBLE` iff `has_actuator`.
+    pub fn create_with_rumble(pad: &UinputSpec, has_actuator: bool) -> io::Result<Self> {
         Ok(Self {
-            app: Uinput::create(
-                &pad_uinput_spec(pad, PadDestination::App).expect("app has a pad spec"),
-            )?,
+            app: Uinput::create(&app_pad_uinput_spec(pad, has_actuator))?,
             keyboard: Uinput::create(
                 &pad_uinput_spec(pad, PadDestination::Keyboard).expect("keyboard has a pad spec"),
             )?,
@@ -75,6 +81,11 @@ impl SessionUinputs {
             )?,
             pointer: Uinput::create(&pointer_uinput_spec())?,
         })
+    }
+
+    /// A dup of the App Pad uinput fd for the FF request pump thread (shares the open file).
+    pub fn app_ff_fd(&self) -> io::Result<OwnedFd> {
+        self.app.try_clone_fd()
     }
 
     pub fn node(&self, destination: PadDestination) -> Option<&str> {
@@ -136,9 +147,11 @@ impl Uinput {
             }
         }
 
-        if spec.ff_rumble {
+        if !spec.ff.is_empty() {
             dev.set_bit(ioc::UI_SET_EVBIT, ioc::EV_FF as libc::c_int)?;
-            dev.set_bit(ioc::UI_SET_FFBIT, ioc::FF_RUMBLE as libc::c_int)?;
+            for &effect in &spec.ff {
+                dev.set_bit(ioc::UI_SET_FFBIT, effect as libc::c_int)?;
+            }
         }
 
         // Legacy setup: write a uinput_user_dev, then UI_DEV_CREATE.
@@ -148,9 +161,7 @@ impl Uinput {
         for (dst, &b) in uud.name.iter_mut().zip(&name[..n]) {
             *dst = b as libc::c_char;
         }
-        if spec.ff_rumble {
-            uud.ff_effects_max = 16;
-        }
+        uud.ff_effects_max = spec.ff_effects_max;
         uud.id.bustype = spec.bus;
         uud.id.vendor = spec.vendor;
         uud.id.product = spec.product;
@@ -178,6 +189,11 @@ impl Uinput {
         let mut dev = dev;
         dev.node = dev.resolve_node();
         Ok(dev)
+    }
+
+    /// Duplicate the uinput fd (same open file description).
+    pub fn try_clone_fd(&self) -> io::Result<OwnedFd> {
+        self.fd.try_clone()
     }
 
     fn set_bit(&self, req: libc::c_ulong, bit: libc::c_int) -> io::Result<()> {
@@ -278,7 +294,8 @@ pub fn pointer_uinput_spec() -> UinputSpec {
         keys: vec![0x110, 0x111],          // BTN_LEFT, BTN_RIGHT
         rel: vec![0x00, 0x01, 0x0b, 0x0c], // X, Y, horizontal/vertical hi-res wheel
         abs: Vec::new(),
-        ff_rumble: false,
+        ff: Vec::new(),
+        ff_effects_max: 0,
     }
 }
 
@@ -300,14 +317,21 @@ pub fn pad_uinput_spec(base: &UinputSpec, destination: PadDestination) -> Option
     spec.vendor = 0x5046;
     spec.product = product;
     spec.version = 1;
-    spec.ff_rumble = false;
+    spec.ff = Vec::new();
+    spec.ff_effects_max = 0;
     Some(spec)
 }
+
+/// `ff_effects_max` the App Pad advertises (design D3 item 1).
+pub const APP_PAD_FF_EFFECTS_MAX: u32 = 16;
 
 /// The App Pad spec; advertises rumble only when `has_actuator`.
 pub fn app_pad_uinput_spec(base: &UinputSpec, has_actuator: bool) -> UinputSpec {
     let mut spec = pad_uinput_spec(base, PadDestination::App).expect("app has a pad spec");
-    spec.ff_rumble = has_actuator;
+    if has_actuator {
+        spec.ff = vec![ioc::FF_RUMBLE];
+        spec.ff_effects_max = APP_PAD_FF_EFFECTS_MAX;
+    }
     spec
 }
 

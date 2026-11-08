@@ -1,3 +1,3 @@
-# Stable node for the broker's App Pad virtual gamepad (see pad_uinput_spec(App) in uinput.rs:
-# name "PocketForge App Pad", BUS_VIRTUAL, vendor 0x5046, product 0x0100).
-SUBSYSTEM=="input", KERNEL=="event*", ATTRS{name}=="PocketForge App Pad", ATTRS{id/vendor}=="5046", ATTRS{id/product}=="0100", SYMLINK+="input/pf-app-pad"
+# Stable node for the broker's App Pad virtual gamepad, found by identity (pad_uinput_spec(App) in
+# uinput.rs: name, BUS_VIRTUAL, vendor 0x5046, product 0x0100). Never by event number.
+SUBSYSTEM=="input", KERNEL=="event*", ATTRS{name}=="PocketForge App Pad", ATTRS{id/bustype}=="0006", ATTRS{id/vendor}=="5046", ATTRS{id/product}=="0100", SYMLINK+="input/pf-app-pad", GROUP="input", MODE="0660"

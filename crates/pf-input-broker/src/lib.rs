@@ -35,12 +35,12 @@
 
 pub mod broker;
 pub mod evdev;
+pub mod ff;
 pub mod io;
 pub mod ioc;
 pub mod policy;
 pub mod remap;
 pub mod router;
-pub mod ff;
 pub mod safe_return;
 pub mod scm;
 pub mod session_ipc;
@@ -62,7 +62,7 @@ pub use safe_return::{
 };
 pub use uinput::{
     app_pad_uinput_spec, pad_uinput_spec, pointer_uinput_spec, AbsInfo, SessionUinputs, Uinput,
-    UinputSpec,
+    UinputSpec, APP_PAD_FF_EFFECTS_MAX,
 };
 
 /// How the broker vends the input device to a consumer (R-C).

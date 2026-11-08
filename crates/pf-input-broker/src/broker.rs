@@ -17,6 +17,7 @@ use pocketforge::server::handle_request;
 use pocketforge::Backend;
 
 use crate::evdev::Evdev;
+use crate::ff::{FfSink, RumbleControl, VibratorSink};
 use crate::io::{EventSink, EventSource, SourceState};
 use crate::ioc;
 use crate::policy::TokenBucket;
@@ -177,6 +178,8 @@ pub struct InputBroker {
     sink: SessionUinputs,
     start: std::time::Instant,
     pump: ReportPump,
+    rumble: Option<RumbleControl>,
+    rumble_pad: Option<OwnedFd>,
 }
 
 /// Configuration for the shared production/private event loop.
@@ -304,6 +307,21 @@ impl ExpectedIdentity {
     }
 }
 
+/// The App Pad advertises rumble only when the descriptor declares a rumble actuator AND its
+/// `source` vibrator node exists. The node is found by identity and opened only here.
+fn open_declared_vibrator(descriptor: &Descriptor) -> Option<Box<dyn FfSink + Send>> {
+    let name = crate::ff::vibrator_source(descriptor)?;
+    match VibratorSink::open_by_identity(&name) {
+        Ok(sink) => Some(Box::new(sink)),
+        Err(e) => {
+            eprintln!(
+                "pf-input-broker: rumble actuator {name} unavailable: {e}; App Pad has no FF"
+            );
+            None
+        }
+    }
+}
+
 impl InputBroker {
     /// Open `source_path`, grab it (the enforcing default), and stand up the descriptor-derived
     /// re-emit device.
@@ -337,6 +355,7 @@ impl InputBroker {
     ) -> io::Result<InputBroker> {
         let remap = Remap::from_descriptor(descriptor)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+        let vibrator = open_declared_vibrator(descriptor);
         let (source, sink) = acquire_then_create(
             || {
                 let mut source = Evdev::open(source_path)?;
@@ -347,20 +366,51 @@ impl InputBroker {
                 }
                 Ok(source)
             },
-            |_| SessionUinputs::create(remap.spec()),
+            |_| SessionUinputs::create_with_rumble(remap.spec(), vibrator.is_some()),
         )?;
+        let (rumble, rumble_pad) = match vibrator {
+            Some(vibrator) => (Some(RumbleControl::new(vibrator)), Some(sink.app_ff_fd()?)),
+            None => (None, None),
+        };
         Ok(InputBroker {
             source,
             sink,
             start: std::time::Instant::now(),
             pump: ReportPump::new(remap),
+            rumble,
+            rumble_pad,
         })
+    }
+
+    /// The rumble handle (focus / safe-return / shutdown stops), present only when the descriptor
+    /// declares a rumble actuator and its vibrator node was found.
+    pub fn rumble_control(&self) -> Option<RumbleControl> {
+        self.rumble.clone()
+    }
+
+    /// Start the FF request pump on its own thread: the app's blocking `EVIOCSFF` is answered
+    /// here, apart from the input pump.
+    pub fn spawn_rumble_pump(
+        &mut self,
+        stop: &'static AtomicBool,
+    ) -> Option<std::thread::JoinHandle<()>> {
+        let control = self.rumble.clone()?;
+        let fd = self.rumble_pad.take()?;
+        Some(crate::ff::spawn_pump(
+            crate::ff::UinputFf::new(fd),
+            control,
+            stop,
+        ))
     }
 
     /// Make this broker the protected System Menu intake: guide/`BTN_MODE` transitions are
     /// withheld from apps, and each press routes through the provider/fallback policy.
     pub fn with_system_menu(mut self, router: SystemMenuRouter) -> InputBroker {
-        self.pump.system_menu = Some(SystemMenuGate::new(router));
+        let mut gate = SystemMenuGate::new(router);
+        if let Some(rumble) = self.rumble.clone() {
+            gate = gate.with_rumble(rumble);
+        }
+        self.pump.system_menu = Some(gate);
         self
     }
 
