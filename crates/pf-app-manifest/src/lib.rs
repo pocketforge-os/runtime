@@ -361,8 +361,9 @@ pub struct Fetch {
     pub destination: Option<String>,
     /// Where the archive bytes come from (schema_version 3). Absent or
     /// `pinned` means the pinned URL and sha256 are the authority.
-    /// `vendor-signed-pointer` is reserved for the pending D3 storage design:
-    /// it parses, but validation refuses it until that design lands.
+    /// `vendor-signed-pointer` is reserved per owner decision D4 (on-device
+    /// latest-pointers only as vendor-signed pointers with a pinned key and a
+    /// floor): it parses, but validation refuses it until that is implemented.
     #[serde(default)]
     pub source: Option<FetchSource>,
     #[serde(default)]
@@ -378,7 +379,8 @@ pub enum FetchSource {
     /// The pinned URL and sha256 are the authority (the default).
     #[default]
     Pinned,
-    /// Reserved for the pending D3 storage design; parsed but refused.
+    /// Reserved per owner decision D4 (vendor-signed pointers with a pinned key
+    /// and a floor); parsed but refused.
     VendorSignedPointer,
 }
 
