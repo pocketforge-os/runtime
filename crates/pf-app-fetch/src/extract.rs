@@ -52,6 +52,14 @@ pub fn expanded_bound(archive: &Path, format: Format) -> Result<u64> {
             }
             let mut file = File::open(archive).map_err(|e| invalid(format!("open: {e}")))?;
             use std::io::{Seek, SeekFrom};
+            // Trust the trailer only for a gzip stream (magic 1f 8b, deflate). Anything else
+            // is archive_invalid here, never a misleading disk_full from garbage bytes.
+            let mut magic = [0u8; 3];
+            file.read_exact(&mut magic)
+                .map_err(|e| invalid(format!("read gzip header: {e}")))?;
+            if magic != [0x1f, 0x8b, 0x08] {
+                return Err(invalid("not a gzip (deflate) stream"));
+            }
             file.seek(SeekFrom::End(-4))
                 .map_err(|e| invalid(format!("seek: {e}")))?;
             let mut trailer = [0u8; 4];
@@ -261,4 +269,25 @@ pub fn extract(
     }
     fsync_dir(root)?;
     Ok(files.into_values().collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn expanded_bound_refuses_non_gzip_before_reading_a_trailer() {
+        let dir = std::env::temp_dir().join(format!("pf-app-fetch-bound-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("a");
+        // Garbage whose last four bytes would claim a ~1.9 GB expansion.
+        fs::write(&path, b"definitely not gzip").unwrap();
+        let err = expanded_bound(&path, Format::TarGz).unwrap_err();
+        assert_eq!(err.code, Code::ArchiveInvalid);
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        gz.write_all(&[0u8; 5000]).unwrap();
+        fs::write(&path, gz.finish().unwrap()).unwrap();
+        assert_eq!(expanded_bound(&path, Format::TarGz).unwrap(), 5000);
+        fs::remove_dir_all(&dir).unwrap();
+    }
 }
