@@ -10,8 +10,8 @@
 //! exercised across a real process boundary.
 //!
 //! The UNIFICATION is asserted with ZERO test-code diff: [`run_unified_scenario`] is one function
-//! body; the a133-absent row and the a523-suppressed row differ ONLY in an argument (the
-//! descriptor id + the diagnostic status expected on the honest-`RumbleStatus` layer). Both rows'
+//! body; the motorless-absent row and the a523-suppressed row differ ONLY in an argument (the
+//! descriptor + the diagnostic status expected on the honest-`RumbleStatus` layer). Both rows'
 //! app-visible semantic — the [`PayloadApp`] sees a silent no-op after the flip, never a `Fired`
 //! and never an error to handle — is asserted identically.
 //!
@@ -26,7 +26,7 @@ use std::time::Duration;
 
 use pf_prefs::{PrefValue, PrefsStore};
 use pocketforge::backends::InProcessBackend;
-use pocketforge::{OutputMix, Pf, RumbleStatus};
+use pocketforge::{Descriptor, OutputMix, Pf, RumbleStatus};
 
 use common::{run_pf_settings, scratch_prefs_dir, PayloadApp};
 
@@ -144,40 +144,40 @@ fn a523_external_cli_flip_fires_observer_via_reload_and_suppresses_pulse() {
 }
 
 // ---------------------------------------------------------------------------------------
-// The a133 half — motor ABSENT. The observer STILL fires on any preference write (the flag is
-// user-mutable state independent of hardware presence) but the primitive stays a silent no-op
-// with the DIAGNOSTIC honestly reporting `NoopAbsent`, not `NoopSuppressed`.
+// The a133 half — motor PRESENT (gpio-vibrator, platform#458). Default-on the pulse is `Fired`;
+// once the user disables haptics the observer fires and the primitive becomes a silent no-op
+// with the DIAGNOSTIC honestly reporting `NoopSuppressed`.
 // ---------------------------------------------------------------------------------------
 
 #[test]
-fn a133_control_plane_flip_fires_observer_and_pulse_is_noop_absent_throughout() {
+fn a133_control_plane_flip_fires_observer_and_pulse_goes_fired_to_suppressed() {
     let prefs_dir = scratch_prefs_dir("a133-ctrl");
     let store = Arc::new(PrefsStore::at(&prefs_dir));
     let backend = InProcessBackend::shared_with_store(Arc::new(common::descriptor("a133")), store);
     let pf = Pf::over_in_process(backend.clone());
     let app = PayloadApp::start(&pf, "hapticsEnabled").expect("observer available");
 
-    // No motor: the primitive is a silent no-op regardless of the preference.
-    assert_eq!(app.pulse(), RumbleStatus::NoopAbsent);
+    // Motor present and haptics default-on: the primitive actuates.
+    assert_eq!(app.pulse(), RumbleStatus::Fired);
 
-    // The observer still fires — the preference is user-mutable state, hardware-presence is a
-    // separate axis. This is what makes a shared payload-app snippet legal on both descriptors.
+    // The observer fires on the preference write — this is what makes a shared payload-app
+    // snippet legal on every descriptor.
     pf.settings().set_bool("hapticsEnabled", false);
     let evt = app
         .observed(OBSERVER_WAIT)
         .expect("PrefsDidChange delivered");
     assert_eq!(evt, PrefValue::Bool(false));
 
-    // The primitive: SAME app-visible semantic (silent no-op, not Fired). Diagnostic still Absent.
+    // The primitive: silent no-op, not Fired. Motor present, so the diagnostic is Suppressed.
     let after = app.pulse();
     assert_ne!(after, RumbleStatus::Fired);
-    assert_eq!(after, RumbleStatus::NoopAbsent);
+    assert_eq!(after, RumbleStatus::NoopSuppressed);
 
     common::cleanup(&prefs_dir);
 }
 
 #[test]
-fn a133_external_cli_flip_fires_observer_via_reload_and_pulse_is_noop_absent_throughout() {
+fn a133_external_cli_flip_fires_observer_via_reload_and_pulse_goes_fired_to_suppressed() {
     let prefs_dir = scratch_prefs_dir("a133-cli");
     let store = Arc::new(PrefsStore::at(&prefs_dir));
     let backend =
@@ -185,7 +185,7 @@ fn a133_external_cli_flip_fires_observer_via_reload_and_pulse_is_noop_absent_thr
     let pf = Pf::over_in_process(backend.clone());
     let app = PayloadApp::start(&pf, "hapticsEnabled").expect("observer available");
 
-    assert_eq!(app.pulse(), RumbleStatus::NoopAbsent);
+    assert_eq!(app.pulse(), RumbleStatus::Fired);
 
     let out = run_pf_settings(&prefs_dir, &["set", "hapticsEnabled", "false"]);
     assert!(out.status.success(), "pf-settings set failed");
@@ -204,26 +204,25 @@ fn a133_external_cli_flip_fires_observer_via_reload_and_pulse_is_noop_absent_thr
     assert_eq!(evt, PrefValue::Bool(false));
     let after = app.pulse();
     assert_ne!(after, RumbleStatus::Fired);
-    assert_eq!(after, RumbleStatus::NoopAbsent);
+    assert_eq!(after, RumbleStatus::NoopSuppressed);
 
     common::cleanup(&prefs_dir);
 }
 
 // ---------------------------------------------------------------------------------------
-// THE UNIFICATION — a133-absent ≡ a523-suppressed under ZERO app/test-code diff.
+// THE UNIFICATION — motorless-absent ≡ a523-suppressed under ZERO app/test-code diff.
 //
-// `run_unified_scenario` is ONE function body; the a133 and a523 rows differ only in a parameter
-// (descriptor id + the honest diagnostic expected). Two `#[test]`s call it — no branch on the
+// `run_unified_scenario` is ONE function body; the rows differ only in a parameter (the
+// descriptor + the honest diagnostic expected). The `#[test]`s call it — no branch on the
 // descriptor inside the payload code; the "different device" fact falls out of the descriptor
 // data. The CI matrix (`.github/workflows/prefs-e2e.yml`) runs the whole file twice; the two
 // green rows ARE the unification proof.
 // ---------------------------------------------------------------------------------------
 
-fn run_unified_scenario(descriptor_id: &str, expected_off_diagnostic: RumbleStatus) {
-    let prefs_dir = scratch_prefs_dir(&format!("unif-{descriptor_id}"));
+fn run_unified_scenario(tag: &str, descriptor: Descriptor, expected_off_diagnostic: RumbleStatus) {
+    let prefs_dir = scratch_prefs_dir(&format!("unif-{tag}"));
     let store = Arc::new(PrefsStore::at(&prefs_dir));
-    let backend =
-        InProcessBackend::shared_with_store(Arc::new(common::descriptor(descriptor_id)), store);
+    let backend = InProcessBackend::shared_with_store(Arc::new(descriptor), store);
     let pf = Pf::over_in_process(backend.clone());
     let app = PayloadApp::start(&pf, "hapticsEnabled").expect("observer available");
 
@@ -259,16 +258,36 @@ fn run_unified_scenario(descriptor_id: &str, expected_off_diagnostic: RumbleStat
     common::cleanup(&prefs_dir);
 }
 
-/// The a133 row of the unification matrix — motor ABSENT, `NoopAbsent`.
+/// The a133 row of the unification matrix — motor PRESENT (gpio-vibrator) + user disabled →
+/// `NoopSuppressed`.
 #[test]
-fn unified_zero_code_diff_a133_absent() {
-    run_unified_scenario("a133", RumbleStatus::NoopAbsent);
+fn unified_zero_code_diff_a133_suppressed() {
+    run_unified_scenario(
+        "a133",
+        common::descriptor("a133"),
+        RumbleStatus::NoopSuppressed,
+    );
+}
+
+/// The motorless row of the unification matrix — the a133 descriptor with its rumble actuator
+/// removed (no shipping device lacks a motor today, so this is a fixture) → `NoopAbsent`.
+#[test]
+fn unified_zero_code_diff_a133_motorless_absent() {
+    run_unified_scenario(
+        "motorless",
+        common::motorless_descriptor("a133"),
+        RumbleStatus::NoopAbsent,
+    );
 }
 
 /// The a523 row of the unification matrix — motor PRESENT + user disabled → `NoopSuppressed`.
 #[test]
 fn unified_zero_code_diff_a523_suppressed() {
-    run_unified_scenario("a523", RumbleStatus::NoopSuppressed);
+    run_unified_scenario(
+        "a523",
+        common::descriptor("a523"),
+        RumbleStatus::NoopSuppressed,
+    );
 }
 
 // ---------------------------------------------------------------------------------------

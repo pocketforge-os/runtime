@@ -5,7 +5,7 @@
 //!
 //! Capability **presence is derived from the descriptor with zero per-device code** — exactly
 //! the rule the E5 sim's `broker_stub.py` proved: a sensor/actuator row present ⇒ the
-//! capability exists; omitted ⇒ hardware-absent. So `a133` (no `[[sensors]]`, no rumble) and
+//! capability exists; omitted ⇒ hardware-absent. So `a133` (no `[[sensors]]`, gpio-vibrator) and
 //! `a523` (qmi8658 IMU + pwm-vibrator) differ **only by descriptor data**.
 //!
 //! Loading is permissive on unknown fields (the schema is owned by E1 and may grow); it does

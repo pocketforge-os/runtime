@@ -189,14 +189,15 @@ bead's close and linked on the epic `tsp-xubv`), with an explicit owner return.
 
 ## 6. The no-op unification, stated honestly
 
-Preference-**suppression** ("user disabled rumble") and missing-**hardware** ("this a133 has no motor")
+Preference-**suppression** ("user disabled rumble") and missing-**hardware** ("this device has no motor")
 collapse to the **same app-visible silent no-op**: the app's `pulse()` succeeds, the motor stays
 silent, there is no error to handle, and **no app code special-cases either**. The `RumbleStatus`
 enum's diagnostic distinction — `Fired=0`, `NoopAbsent=1`, `NoopSuppressed=2`, **discriminants FROZEN
 at wire v1** — is *deliberate honesty* for surfaces like `pf-hwprobe`, **not** a behavioral fork. Do
 not "fix" the enum. The unification is proven under IDENTICAL calling code by
 `tests/prefs_change_event.rs::suppression_and_absence_are_one_silent_no_op_under_identical_code`
-(a523-with-haptics-off ⇒ `NoopSuppressed`, a133-no-motor ⇒ `NoopAbsent`), and `.4`'s two CI matrix
+(a523-with-haptics-off ⇒ `NoopSuppressed`, a motorless descriptor ⇒ `NoopAbsent`; the a133 itself has a
+gpio-vibrator since platform#458), and `.4`'s two CI matrix
 rows build on it.
 
 ## 7. Additive-only on the frozen v1 wire/ABI
@@ -228,7 +229,7 @@ cannot acquire a write surface.
   `$XDG_STATE_HOME/pocketforge/prefs`, else `$HOME/.local/state/pocketforge/prefs`) — schema-validated,
   atomic temp+rename, tolerant load (missing ⇒ defaults; unknown keys preserved for forward-compat).
   It **follows** the AppOps store family conventions; it does **not** fork the capabilities descriptor
-  (presence is the E1 descriptor's job — `hapticsEnabled == false` and "a133 has no motor" are
+  (presence is the E1 descriptor's job — `hapticsEnabled == false` and "this device has no motor" are
   deliberately different facts that unify only at the primitive, §6).
 
 ---
