@@ -100,7 +100,7 @@ fn main() -> ExitCode {
     }
     install_stop_handler();
     let confine = if hooks::ENABLED {
-        match hooks::var("PF_APP_FETCH_TEST_CONFINE").as_deref() {
+        match hooks::var("CONFINE").as_deref() {
             Some("required") => confine::Mode::Required,
             Some("best-effort") => confine::Mode::BestEffort,
             _ => confine::Mode::Off,

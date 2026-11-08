@@ -291,7 +291,7 @@ impl Client {
 
 /// The trusted roots: the image CA bundle (PEM), or the debug-build test CA (DER).
 pub fn load_roots(ca_file: &std::path::Path) -> Result<Vec<Certificate<'static>>> {
-    if let Some(test_ca) = crate::hooks::var("PF_APP_FETCH_TEST_CA") {
+    if let Some(test_ca) = crate::hooks::var("CA") {
         let der = std::fs::read(&test_ca)
             .map_err(|e| Failure::new(Code::StateInvalid, format!("read test CA: {e}")))?;
         return Ok(vec![Certificate::from_der(&der).to_owned()]);
