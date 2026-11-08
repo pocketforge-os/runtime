@@ -2905,10 +2905,16 @@ fn short_socket_dir(name: &str) -> PathBuf {
 }
 
 fn raw_rpc(socket: &Path, request: &RpcRequest) -> RpcResponse {
+    raw_rpc_with_read_timeout(socket, request, Duration::from_secs(5))
+}
+
+fn raw_rpc_with_read_timeout(
+    socket: &Path,
+    request: &RpcRequest,
+    read_timeout: Duration,
+) -> RpcResponse {
     let mut stream = std::os::unix::net::UnixStream::connect(socket).unwrap();
-    stream
-        .set_read_timeout(Some(Duration::from_secs(5)))
-        .unwrap();
+    stream.set_read_timeout(Some(read_timeout)).unwrap();
     pf_wire::write_frame(&mut stream, &serde_json::to_vec(request).unwrap()).unwrap();
     serde_json::from_slice(&pf_wire::read_frame(&mut stream).unwrap()).unwrap()
 }
@@ -3384,6 +3390,15 @@ fn stalled_clients_never_block_the_service_loop_tick() {
 #[test]
 fn full_orientation_waiter_bound_does_not_delay_safe_return_lane() {
     const N: usize = 8;
+    // Outer hang guard only: every wait below is released by observed causal state (all N
+    // permits occupied, the lifecycle request appearing on the channel, a published serial),
+    // never by an elapsed-time budget. This bound exists so a product regression fails instead
+    // of hanging the harness, and sits far above any loaded-run scheduler delay.
+    const HANG_GUARD: Duration = Duration::from_secs(10);
+    // Release valve only: in a passing run `publish` releases the parked waiters. It must
+    // outlast the guarded setup and lifecycle round trip so a slow scheduler cannot make the
+    // waiters time out and free their permits while the test still expects them parked.
+    const WAITER_RELEASE: Duration = Duration::from_secs(30);
     let dir = short_socket_dir("orientation-lane");
     let socket = dir.join("a.sock");
     let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
@@ -3405,40 +3420,55 @@ fn full_orientation_waiter_bound_does_not_delay_safe_return_lane() {
     for _ in 0..N {
         let socket = socket.clone();
         waiters.push(std::thread::spawn(move || {
-            raw_rpc(
+            raw_rpc_with_read_timeout(
                 &socket,
                 &RpcRequest::Orientation {
                     version: 1,
                     after_serial: Some(serial),
-                    wait_ms: 1_000,
+                    wait_ms: WAITER_RELEASE.as_millis() as u64,
                 },
+                WAITER_RELEASE + HANG_GUARD,
             )
         }));
     }
-    let fill_deadline = Instant::now() + Duration::from_millis(200);
-    while watch.active_waiters() != N && Instant::now() < fill_deadline {
+    // Park all N waiters and observe the watcher's own admission state: `active_waiters()`
+    // counts permits that are actually occupied, so this is the saturation condition itself,
+    // not a proxy measured with elapsed time.
+    let parked_by = Instant::now() + HANG_GUARD;
+    while watch.active_waiters() != N {
+        assert!(
+            Instant::now() < parked_by,
+            "only {} of {N} orientation permits were taken",
+            watch.active_waiters()
+        );
         std::thread::yield_now();
     }
-    assert_eq!(watch.active_waiters(), N);
+    assert!(!waiters.iter().any(|waiter| waiter.is_finished()));
 
     let socket_for_lifecycle = socket.clone();
     let lifecycle = std::thread::spawn(move || {
-        let started = Instant::now();
-        let response = raw_rpc(&socket_for_lifecycle, &RpcRequest::SafeReturn);
-        (started.elapsed(), response)
+        raw_rpc_with_read_timeout(&socket_for_lifecycle, &RpcRequest::SafeReturn, HANG_GUARD)
     });
+    // The lifecycle lane never shares the orientation permit pool. The causal property is
+    // that a safe_return request reaches the authority's lifecycle channel while all N
+    // orientation waiters are still parked. If lifecycle work queued behind a waiter this
+    // receive could not succeed until a waiter was woken or timed out and released its
+    // permit, so observing the request together with `active_waiters() == N` is the assertion;
+    // `HANG_GUARD` only bounds how long we wait for it.
     let pending = incoming
-        .recv_timeout(Duration::from_millis(100))
-        .expect("safe_return must reach the lifecycle lane")
+        .recv_timeout(HANG_GUARD)
+        .expect("safe_return must reach the lifecycle lane while orientation waiters are parked")
         .unwrap();
     assert!(matches!(pending.request, RpcRequest::SafeReturn));
-    pending.respond(RpcResponse::Ok);
-    let (elapsed, response) = lifecycle.join().unwrap();
-    assert!(matches!(response, RpcResponse::Ok));
-    assert!(
-        elapsed < Duration::from_millis(100),
-        "safe_return took {elapsed:?}"
+    assert_eq!(
+        watch.active_waiters(),
+        N,
+        "safe_return reached the lifecycle lane only after an orientation waiter stopped waiting"
     );
+    assert!(!waiters.iter().any(|waiter| waiter.is_finished()));
+    pending.respond(RpcResponse::Ok);
+    let response = lifecycle.join().unwrap();
+    assert!(matches!(response, RpcResponse::Ok));
 
     let mut changed = watch.snapshot();
     changed.serial += 1;
