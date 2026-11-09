@@ -59,9 +59,31 @@ fn errno(e: &io::Error) -> i32 {
     -e.raw_os_error().unwrap_or(libc::EIO)
 }
 
+/// Destination for `rumble: ...` journal lines. Production writes to stderr; tests capture.
+pub trait RumbleLogSink: Send + Sync {
+    fn line(&self, line: &str);
+}
+
+/// Journal sink (stderr, picked up by systemd).
+pub struct StderrLog;
+
+impl RumbleLogSink for StderrLog {
+    fn line(&self, line: &str) {
+        eprintln!("{line}");
+    }
+}
+
+/// Number of plays logged individually before only state changes and counters are logged.
+pub const PLAY_LOG_FIRST: u64 = 20;
+/// After the first [`PLAY_LOG_FIRST`] plays, an unchanged-state counter line every this many.
+pub const PLAY_LOG_EVERY: u64 = 50;
+
 /// App-id to vibrator-id map plus the safety stops.
 pub struct Forwarder<S: FfSink> {
     sink: S,
+    log: Arc<dyn RumbleLogSink>,
+    plays: u64,
+    last_play: Option<&'static str>,
     focused: bool,
     /// Effects as the app uploaded them (kept so a play after focus returns re-creates them).
     shadow: BTreeMap<i16, FfEffect>,
@@ -72,8 +94,15 @@ pub struct Forwarder<S: FfSink> {
 impl<S: FfSink> Forwarder<S> {
     /// Starts unfocused: nothing reaches the vibrator until [`focus_gained`](Self::focus_gained).
     pub fn new(sink: S) -> Self {
+        Self::with_log(sink, Arc::new(StderrLog))
+    }
+
+    pub fn with_log(sink: S, log: Arc<dyn RumbleLogSink>) -> Self {
         Self {
             sink,
+            log,
+            plays: 0,
+            last_play: None,
             focused: false,
             shadow: BTreeMap::new(),
             mapped: BTreeMap::new(),
@@ -84,20 +113,53 @@ impl<S: FfSink> Forwarder<S> {
         self.focused = true;
     }
 
+    fn log_play(&mut self, app_id: i16, value: i32, result: &'static str) {
+        self.plays += 1;
+        let changed = self.last_play != Some(result);
+        self.last_play = Some(result);
+        if changed || self.plays <= PLAY_LOG_FIRST {
+            self.log.line(&format!(
+                "rumble: ff_play app_id={app_id} value={value} result={result} count={}",
+                self.plays
+            ));
+        } else if self.plays % PLAY_LOG_EVERY == 0 {
+            self.log.line(&format!(
+                "rumble: ff_play app_id={app_id} value={value} result={result} count={} bounded=1",
+                self.plays
+            ));
+        }
+    }
+
+    fn log_upload(&self, app_id: i16, result: &str, focused: bool) {
+        self.log.line(&format!(
+            "rumble: ff_upload app_id={app_id} result={result} focused={focused}"
+        ));
+    }
+
     /// Handle one upload; returns the uinput `retval` (0 or `-errno`).
     pub fn upload(&mut self, app_id: i16, effect: &FfEffect) -> i32 {
         if effect.kind != FF_RUMBLE {
+            self.log_upload(app_id, "err", self.focused);
             return -libc::EINVAL;
         }
         let mut effect = *effect;
         effect.length_ms = effect.length_ms.min(MAX_EFFECT_MS);
         self.shadow.insert(app_id, effect);
         if !self.focused {
+            self.log_upload(app_id, "ok", false);
             return 0;
         }
         match self.push(app_id) {
-            Ok(()) => 0,
-            Err(e) => errno(&e),
+            Ok(()) => {
+                self.log_upload(app_id, "ok", true);
+                0
+            }
+            Err(e) => {
+                let no_act = matches!(e.raw_os_error(), Some(libc::ENODEV) | Some(libc::ENOENT))
+                    || e.kind() == io::ErrorKind::NotFound;
+                self.log_upload(app_id, if no_act { "no_actuator" } else { "err" }, true);
+                errno(&e)
+            }
         }
     }
 
@@ -115,17 +177,24 @@ impl<S: FfSink> Forwarder<S> {
     /// `EV_FF app_id value`. Plays are dropped without focus; `value == 0` always stops.
     pub fn play(&mut self, app_id: i16, value: i32) -> io::Result<()> {
         if value == 0 {
+            self.log_play(app_id, 0, "stop");
             return match self.mapped.get(&app_id) {
                 Some(&vib) => self.sink.play(vib, 0),
                 None => Ok(()),
             };
         }
-        if !self.focused || !self.shadow.contains_key(&app_id) {
+        if !self.focused {
+            self.log_play(app_id, value, "dropped_unfocused");
+            return Ok(());
+        }
+        if !self.shadow.contains_key(&app_id) {
+            self.log_play(app_id, value, "dropped_no_effect");
             return Ok(());
         }
         if !self.mapped.contains_key(&app_id) {
             self.push(app_id)?;
         }
+        self.log_play(app_id, value, "forwarded");
         self.sink.play(self.mapped[&app_id], value)
     }
 
@@ -184,7 +253,40 @@ pub struct RumbleControl(Arc<Mutex<Forwarder<Box<dyn FfSink + Send>>>>);
 
 impl RumbleControl {
     pub fn new(sink: Box<dyn FfSink + Send>) -> Self {
-        Self(Arc::new(Mutex::new(Forwarder::new(sink))))
+        Self::with_log(sink, Arc::new(StderrLog))
+    }
+
+    pub fn with_log(sink: Box<dyn FfSink + Send>, log: Arc<dyn RumbleLogSink>) -> Self {
+        Self(Arc::new(Mutex::new(Forwarder::with_log(sink, log))))
+    }
+
+    /// Upload through the shared forwarder (the pump's path, exposed for integration tests).
+    #[doc(hidden)]
+    pub fn upload_for_test(&self, app_id: i16, effect: &FfEffect) -> i32 {
+        self.with(|f| f.upload(app_id, effect))
+    }
+
+    /// Play through the shared forwarder (see [`upload_for_test`](Self::upload_for_test)).
+    #[doc(hidden)]
+    pub fn play_for_test(&self, app_id: i16, value: i32) {
+        Self::report("play", self.with(|f| f.play(app_id, value)));
+    }
+
+    /// Emit one `rumble: ...` line through this control's sink.
+    pub fn log(&self, line: &str) {
+        let sink = self.with(|f| f.log.clone());
+        sink.line(line);
+    }
+
+    /// Log a compositor focus update (`surface` is a stable kind) and apply it.
+    pub fn focus_update(&self, surface: &str, gained: bool) {
+        let action = if gained { "gained" } else { "lost" };
+        self.log(&format!("rumble: focus surface={surface} action={action}"));
+        if gained {
+            self.focus_gained();
+        } else {
+            self.focus_lost();
+        }
     }
 
     fn with<R>(&self, f: impl FnOnce(&mut Forwarder<Box<dyn FfSink + Send>>) -> R) -> R {
@@ -867,5 +969,176 @@ mod tests {
             assert_eq!(ioc::ui_begin_ff_erase(), 0xc00c_55ca);
             assert_eq!(ioc::ui_end_ff_erase(), 0x400c_55cb);
         }
+    }
+}
+
+#[cfg(test)]
+mod rumble_log {
+    use super::*;
+
+    #[derive(Clone, Default)]
+    struct Capture(Arc<Mutex<Vec<String>>>);
+    impl RumbleLogSink for Capture {
+        fn line(&self, line: &str) {
+            self.0.lock().unwrap().push(line.to_string());
+        }
+    }
+    impl Capture {
+        fn lines(&self) -> Vec<String> {
+            self.0.lock().unwrap().clone()
+        }
+        fn with(&self, prefix: &str) -> Vec<String> {
+            self.lines()
+                .into_iter()
+                .filter(|l| l.starts_with(prefix))
+                .collect()
+        }
+    }
+
+    struct Sink {
+        fail_upload: Option<i32>,
+    }
+    impl FfSink for Sink {
+        fn upload(&mut self, vib: i16, _: &FfEffect) -> io::Result<i16> {
+            match self.fail_upload {
+                Some(e) => Err(io::Error::from_raw_os_error(e)),
+                None => Ok(if vib < 0 { 7 } else { vib }),
+            }
+        }
+        fn play(&mut self, _: i16, _: i32) -> io::Result<()> {
+            Ok(())
+        }
+        fn erase(&mut self, _: i16) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn eff() -> FfEffect {
+        FfEffect {
+            kind: FF_RUMBLE,
+            strong: 0x8000,
+            weak: 0,
+            length_ms: 100,
+        }
+    }
+
+    fn fwd(fail: Option<i32>) -> (Forwarder<Sink>, Capture) {
+        let cap = Capture::default();
+        (
+            Forwarder::with_log(Sink { fail_upload: fail }, Arc::new(cap.clone())),
+            cap,
+        )
+    }
+
+    #[test]
+    fn upload_ok_and_err_are_logged_with_app_id() {
+        let (mut f, cap) = fwd(None);
+        f.focus_gained();
+        assert_eq!(f.upload(3, &eff()), 0);
+        let bad = FfEffect {
+            kind: 0x52,
+            ..eff()
+        };
+        assert!(f.upload(4, &bad) < 0);
+        assert_eq!(
+            cap.with("rumble: ff_upload"),
+            vec![
+                "rumble: ff_upload app_id=3 result=ok focused=true",
+                "rumble: ff_upload app_id=4 result=err focused=true"
+            ]
+        );
+    }
+
+    #[test]
+    fn upload_without_actuator_is_distinguished() {
+        let (mut f, cap) = fwd(Some(libc::ENODEV));
+        f.focus_gained();
+        assert!(f.upload(1, &eff()) < 0);
+        assert_eq!(
+            cap.with("rumble: ff_upload"),
+            vec!["rumble: ff_upload app_id=1 result=no_actuator focused=true"]
+        );
+    }
+
+    #[test]
+    fn unfocused_play_logs_dropped_unfocused() {
+        let (mut f, cap) = fwd(None);
+        f.upload(1, &eff());
+        f.play(1, 1).unwrap();
+        let p = cap.with("rumble: ff_play");
+        assert_eq!(p.len(), 1);
+        assert!(
+            p[0].starts_with("rumble: ff_play app_id=1 value=1 result=dropped_unfocused"),
+            "{p:?}"
+        );
+    }
+
+    #[test]
+    fn focused_play_logs_forwarded_and_stop() {
+        let (mut f, cap) = fwd(None);
+        f.focus_gained();
+        f.upload(1, &eff());
+        f.play(1, 1).unwrap();
+        f.play(1, 0).unwrap();
+        let p = cap.with("rumble: ff_play");
+        assert!(p[0].contains("result=forwarded"), "{p:?}");
+        assert!(p[1].contains("value=0 result=stop"), "{p:?}");
+    }
+
+    #[test]
+    fn play_without_uploaded_effect_logs_dropped_no_effect() {
+        let (mut f, cap) = fwd(None);
+        f.focus_gained();
+        f.play(9, 1).unwrap();
+        assert!(
+            cap.with("rumble: ff_play")[0].contains("app_id=9 value=1 result=dropped_no_effect")
+        );
+    }
+
+    #[test]
+    fn play_logging_is_bounded_first_20_then_every_50() {
+        let (mut f, cap) = fwd(None);
+        f.focus_gained();
+        f.upload(1, &eff());
+        for _ in 0..200 {
+            f.play(1, 1).unwrap();
+        }
+        let p = cap.with("rumble: ff_play");
+        // plays 1..=20, then counters at 50, 100, 150, 200.
+        assert_eq!(p.len(), 20 + 4, "{p:?}");
+        assert!(p[20].contains("count=50"), "{}", p[20]);
+        assert!(p[23].contains("count=200"));
+    }
+
+    #[test]
+    fn play_state_change_is_always_logged_even_after_budget() {
+        let (mut f, cap) = fwd(None);
+        f.focus_gained();
+        f.upload(1, &eff());
+        for _ in 0..30 {
+            f.play(1, 1).unwrap();
+        }
+        let before = cap.with("rumble: ff_play").len();
+        f.focus_lost().unwrap();
+        f.play(1, 1).unwrap();
+        let p = cap.with("rumble: ff_play");
+        assert_eq!(p.len(), before + 1);
+        assert!(p.last().unwrap().contains("result=dropped_unfocused"));
+    }
+
+    #[test]
+    fn control_focus_update_logs_surface_and_action() {
+        let cap = Capture::default();
+        let c =
+            RumbleControl::with_log(Box::new(Sink { fail_upload: None }), Arc::new(cap.clone()));
+        c.focus_update("app", true);
+        c.focus_update("trusted", false);
+        assert_eq!(
+            cap.with("rumble: focus"),
+            vec![
+                "rumble: focus surface=app action=gained",
+                "rumble: focus surface=trusted action=lost"
+            ]
+        );
     }
 }
