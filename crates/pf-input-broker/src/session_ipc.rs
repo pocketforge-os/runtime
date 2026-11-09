@@ -227,6 +227,12 @@ impl CompositorAuthority {
             peer.invalidate();
         }
         state.signals.disconnect();
+        drop(state);
+        // The compositor that owned focus is gone: stop the motor and refuse plays until a new
+        // registration names an App again.
+        if let Some(rumble) = &self.rumble {
+            rumble.focus_update("compositor_gone", false);
+        }
     }
 
     /// Ask the active compositor to mint one role-bound Wayland connection. The returned
@@ -379,7 +385,13 @@ pub fn serve_compositor_peer(
                 return Err(error);
             }
         };
-        let message: CompositorToRouter = pf_input_ipc::decode(&body).map_err(ipc_error)?;
+        let message: CompositorToRouter = match pf_input_ipc::decode(&body) {
+            Ok(message) => message,
+            Err(error) => {
+                authority.disconnect(epoch);
+                return Err(ipc_error(error));
+            }
+        };
         // Trusted connection requests are added when the keyboard/menu listeners mint them. Until
         // then, an unsolicited result is rejected by CompositorSession as an unexpected id.
         let result = authority.apply(epoch, message, fd);

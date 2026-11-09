@@ -820,6 +820,75 @@ mod rumble_log {
             .any(|l| l.contains("result=dropped_unfocused")));
     }
 
+    enum Break {
+        Eof,
+        Malformed,
+        ApplyError,
+    }
+
+    fn assert_focus_lost_after(how: Break) {
+        let (cap, plays, rumble, mut client, _a) = registered(Some(FocusedSurface::App {
+            app_id: "steamlink".into(),
+        }));
+        drive_play(&rumble);
+        assert_eq!(plays.0.lock().unwrap().as_slice(), &[(5, 1)]);
+        match how {
+            Break::Eof => drop(client.try_clone().map(|_| ())),
+            Break::Malformed => pf_wire::write_frame(&mut client, b"\xff not json").unwrap(),
+            Break::ApplyError => {
+                send_with_fd(&mut client, &CompositorToRouter::Pong { epoch: 0, seq: 1 })
+            }
+        }
+        if matches!(how, Break::Eof) {
+            client.shutdown(std::net::Shutdown::Both).unwrap();
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let lost = |cap: &Capture| {
+            cap.0
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|l| l.starts_with("rumble: focus ") && l.ends_with("action=lost"))
+        };
+        while !lost(&cap) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let lines = cap.0.lock().unwrap().clone();
+        assert!(lost(&cap), "no focus lost line: {lines:?}");
+        assert_eq!(
+            plays.0.lock().unwrap().last(),
+            Some(&(5, 0)),
+            "motor not stopped"
+        );
+        let before = plays.0.lock().unwrap().len();
+        drive_play(&rumble);
+        assert_eq!(plays.0.lock().unwrap().len(), before, "play after lost");
+        let lines = cap.0.lock().unwrap().clone();
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|l| l.contains("result=forwarded"))
+                .count(),
+            1,
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn compositor_focus_lost_on_eof() {
+        assert_focus_lost_after(Break::Eof);
+    }
+
+    #[test]
+    fn compositor_focus_lost_on_malformed_frame() {
+        assert_focus_lost_after(Break::Malformed);
+    }
+
+    #[test]
+    fn compositor_focus_lost_on_apply_error() {
+        assert_focus_lost_after(Break::ApplyError);
+    }
+
     fn drive_play(rumble: &RumbleControl) {
         rumble.upload_for_test(1, &eff());
         rumble.play_for_test(1, 1);

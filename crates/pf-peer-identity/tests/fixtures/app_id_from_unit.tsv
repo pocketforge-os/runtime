@@ -1,0 +1,16 @@
+# Shared cgroup-leaf -> app_id table for pf_peer_identity::app_id_from_unit.
+# Columns: leaf<TAB>app_id; "-" means app_id_from_unit returns None. gamescope consumes the same file.
+pf-app@org.example.game.service	org.example.game
+pf-app@steamlink.service	steamlink
+pf-app@a_b-c.1.service	a_b-c.1
+pf-app@.service	-
+pf-app@org.example.game	-
+pf-app@bad id.service	-
+pf-app@a/b.service	-
+pf-app@a@b.service	-
+pf-osk.service	-
+pf-system-menu.service	-
+pf-app.service	-
+xpf-app@game.service	-
+pf-app@game.service.scope	-
+	-
