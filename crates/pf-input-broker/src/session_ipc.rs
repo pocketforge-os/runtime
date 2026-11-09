@@ -89,18 +89,20 @@ impl CompositorAuthority {
     }
 
     fn rumble_focus(&self, surface: &pf_input_ipc::compositor::FocusedSurface) {
-        let Some(rumble) = &self.rumble else { return };
-        if matches!(
-            surface,
-            pf_input_ipc::compositor::FocusedSurface::App { .. }
-        ) {
-            rumble.focus_gained();
-        } else {
-            rumble.focus_lost();
-        }
+        use pf_input_ipc::compositor::FocusedSurface as S;
+        let Some(rumble) = &self.rumble else {
+            eprintln!("rumble: focus surface=unknown action=ignored reason=no_rumble_control");
+            return;
+        };
+        let kind = match surface {
+            S::None => "none",
+            S::App { .. } => "app",
+            S::Trusted { .. } => "trusted",
+        };
+        rumble.focus_update(kind, matches!(surface, S::App { .. }));
     }
 
-    fn register(&self, writer: UnixStream) -> u64 {
+    fn register(&self, writer: UnixStream, peer: &str) -> u64 {
         let epoch = self.next_epoch.fetch_add(1, Ordering::Relaxed).max(1);
         let mut state = self.state.lock().expect("compositor state poisoned");
         for peer in std::mem::take(&mut state.role_peers).into_values() {
@@ -112,6 +114,11 @@ impl CompositorAuthority {
         state.signals.register_compositor(epoch);
         if let Some(rumble) = &self.rumble {
             rumble.focus_lost();
+        }
+        let line = format!("rumble: compositor_register peer={peer} epoch={epoch}");
+        match &self.rumble {
+            Some(rumble) => rumble.log(&line),
+            None => eprintln!("{line}"),
         }
         state.writer = Some(writer);
         epoch
@@ -319,6 +326,30 @@ impl CompositorAuthority {
     }
 }
 
+/// `uid<N>/pid<N>` from SO_PEERCRED, or `unknown`.
+fn peer_desc(stream: &UnixStream) -> String {
+    let mut cred = libc::ucred {
+        pid: 0,
+        uid: 0,
+        gid: 0,
+    };
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    let rc = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            (&mut cred as *mut libc::ucred).cast(),
+            &mut len,
+        )
+    };
+    if rc == 0 {
+        format!("uid{}/pid{}", cred.uid, cred.pid)
+    } else {
+        "unknown".into()
+    }
+}
+
 /// Serve one already-authenticated compositor. Registration is the mandatory first frame and
 /// each new connection receives a fresh epoch; the complete snapshot must precede every delta.
 pub fn serve_compositor_peer(
@@ -333,7 +364,7 @@ pub fn serve_compositor_peer(
     if first != CompositorToRouter::Register {
         return Err(invalid("compositor must register before state replay"));
     }
-    let epoch = authority.register(stream.try_clone()?);
+    let epoch = authority.register(stream.try_clone()?, &peer_desc(&stream));
     write_message(&mut stream, &RouterToCompositor::Registered { epoch })?;
 
     loop {

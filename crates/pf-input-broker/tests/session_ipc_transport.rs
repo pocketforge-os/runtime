@@ -695,3 +695,133 @@ fn endpoint_binding_sets_contract_mode_and_refuses_non_socket_collisions() {
     std::fs::remove_file(socket).unwrap();
     std::fs::remove_dir(root).unwrap();
 }
+
+mod rumble_log {
+    use super::*;
+    use pf_input_broker::ff::{FfEffect, FfSink, RumbleControl, RumbleLogSink};
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Default)]
+    struct Capture(Arc<Mutex<Vec<String>>>);
+    impl RumbleLogSink for Capture {
+        fn line(&self, line: &str) {
+            self.0.lock().unwrap().push(line.to_string());
+        }
+    }
+    #[derive(Clone, Default)]
+    struct Plays(Arc<Mutex<Vec<(i16, i32)>>>);
+    struct Sink(Plays);
+    impl FfSink for Sink {
+        fn upload(&mut self, vib: i16, _: &FfEffect) -> std::io::Result<i16> {
+            Ok(if vib < 0 { 5 } else { vib })
+        }
+        fn play(&mut self, vib: i16, value: i32) -> std::io::Result<()> {
+            (self.0).0.lock().unwrap().push((vib, value));
+            Ok(())
+        }
+        fn erase(&mut self, _: i16) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn registered(
+        surface: Option<FocusedSurface>,
+    ) -> (
+        Capture,
+        Plays,
+        RumbleControl,
+        UnixStream,
+        Arc<CompositorAuthority>,
+    ) {
+        let cap = Capture::default();
+        let plays = Plays::default();
+        let rumble = RumbleControl::with_log(Box::new(Sink(plays.clone())), Arc::new(cap.clone()));
+        let authority = Arc::new(CompositorAuthority::default().with_rumble(rumble.clone()));
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let serving = authority.clone();
+        std::thread::spawn(move || serve_compositor_peer(server, &serving));
+        send(&mut client, &CompositorToRouter::Register);
+        let (body, _) = read_frame_with_fd(&mut client).unwrap();
+        let RouterToCompositor::Registered { epoch } = pf_input_ipc::decode(&body).unwrap() else {
+            panic!("not registered");
+        };
+        if let Some(surface) = surface {
+            let mut snap = snapshot(epoch);
+            snap.focus.surface = surface;
+            send(
+                &mut client,
+                &CompositorToRouter::StateSnapshot { snapshot: snap },
+            );
+            wait_for_snapshot(&authority, epoch);
+        }
+        (cap, plays, rumble, client, authority)
+    }
+
+    fn eff() -> FfEffect {
+        FfEffect {
+            kind: 0x50,
+            strong: 0x8000,
+            weak: 0,
+            length_ms: 100,
+        }
+    }
+
+    #[test]
+    fn register_is_logged_with_peer_and_epoch() {
+        let (cap, _, _, _client, _a) = registered(None);
+        let lines = cap.0.lock().unwrap().clone();
+        assert!(
+            lines.iter().any(
+                |l| l.starts_with("rumble: compositor_register peer=") && l.contains(" epoch=")
+            ),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn app_focus_via_session_ipc_gains_focus_and_play_forwards() {
+        let (cap, plays, rumble, _client, _a) = registered(Some(FocusedSurface::App {
+            app_id: "steamlink".into(),
+        }));
+        // Reach the Forwarder only through the shared control: upload+play via dispatch is
+        // covered in ff.rs; here the observable is the forwarded play.
+        let lines = cap.0.lock().unwrap().clone();
+        assert!(
+            lines.contains(&"rumble: focus surface=app action=gained".to_string()),
+            "{lines:?}"
+        );
+        drive_play(&rumble);
+        assert_eq!(plays.0.lock().unwrap().as_slice(), &[(5, 1)]);
+        assert!(cap
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|l| l.contains("ff_play") && l.contains("result=forwarded")));
+    }
+
+    #[test]
+    fn non_app_focus_via_session_ipc_is_lost_and_play_is_dropped() {
+        let (cap, plays, rumble, _client, _a) = registered(Some(FocusedSurface::Trusted {
+            role: OverlayRole::Menu,
+        }));
+        let lines = cap.0.lock().unwrap().clone();
+        assert!(
+            lines.contains(&"rumble: focus surface=trusted action=lost".to_string()),
+            "{lines:?}"
+        );
+        drive_play(&rumble);
+        assert!(plays.0.lock().unwrap().is_empty());
+        assert!(cap
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|l| l.contains("result=dropped_unfocused")));
+    }
+
+    fn drive_play(rumble: &RumbleControl) {
+        rumble.upload_for_test(1, &eff());
+        rumble.play_for_test(1, 1);
+    }
+}
