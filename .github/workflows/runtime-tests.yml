@@ -28,6 +28,7 @@ on:
       - 'vendor/**'
       - 'scripts/check-vendor.sh'
       - 'scripts/check-wlshm-focus-proof.py'
+      - 'scripts/test-wlshm-focus-proof.sh'
       - 'scripts/refresh-vendor.sh'
       - 'scripts/test-check-vendor.sh'
       - 'scripts/test-uinput-domain.sh'

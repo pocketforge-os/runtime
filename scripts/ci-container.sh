@@ -16,7 +16,7 @@ bash scripts/test-uinput-domain.sh
 bash scripts/check-vendor.sh
 bash scripts/test-check-vendor.sh
 bash scripts/test-clean-ci-cross-artifacts.sh
-python3 scripts/check-wlshm-focus-proof.py crates/pf-framehost-wayland/src/bin/pf-wlshm-focus-proof.rs
+bash scripts/test-wlshm-focus-proof.sh
 cargo metadata --offline --locked --format-version 1 > /dev/null
 bash scripts/check-session-authority-deps.sh
 echo '::endgroup::'
