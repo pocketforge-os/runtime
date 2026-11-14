@@ -98,9 +98,13 @@ jobs:
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "$PF_SOURCE_SHA"
           source_date_epoch=$(git show -s --format=%ct "$PF_SOURCE_SHA")
-          podman run --rm --userns=keep-id \
-            -e PF_SOURCE_SHA -e PF_IMAGE -e SOURCE_DATE_EPOCH="$source_date_epoch" \
-            -v "$PWD:/work:Z" -w /work -- "$PF_IMAGE" \
+          podman pull --tls-verify=false \
+            10.0.32.86:5555/pocketforge/ci-rust@sha256:801f15f7e8fd20b449e3b0d0a7a56d632e28dae825b251a19a30e6f8b32bd8e9
+          podman run --rm --pull=never --userns=keep-id \
+            -v "$GITHUB_WORKSPACE:/work:Z" -w /work -- \
+            10.0.32.86:5555/pocketforge/ci-rust@sha256:801f15f7e8fd20b449e3b0d0a7a56d632e28dae825b251a19a30e6f8b32bd8e9 \
+            env PF_SOURCE_SHA="$PF_SOURCE_SHA" PF_IMAGE="$PF_IMAGE" \
+            SOURCE_DATE_EPOCH="$source_date_epoch" \
             bash scripts/build-wlshm-focus-proof-artifact.sh
       - name: Upload exact binary, hashes and provenance
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
