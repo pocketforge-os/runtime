@@ -16,6 +16,7 @@ bash scripts/test-uinput-domain.sh
 bash scripts/check-vendor.sh
 bash scripts/test-check-vendor.sh
 bash scripts/test-clean-ci-cross-artifacts.sh
+python3 scripts/check-wlshm-focus-proof.py crates/pf-framehost-wayland/src/bin/pf-wlshm-focus-proof.rs
 cargo metadata --offline --locked --format-version 1 > /dev/null
 bash scripts/check-session-authority-deps.sh
 echo '::endgroup::'
@@ -32,6 +33,7 @@ cargo build --offline --locked --target aarch64-unknown-linux-musl -p pf-input-c
 cargo build --offline --locked --target aarch64-unknown-linux-musl -p pf-collect-ui --bin pf-collect-ui
 cargo build --offline --locked --target aarch64-unknown-linux-musl -p pf-hang-sampler --bin pf-hang-sampler
 cargo build --offline --locked --target aarch64-unknown-linux-musl -p pf-framehost-wayland
+cargo build --offline --locked --release --target aarch64-unknown-linux-musl -p pf-framehost-wayland --bin pf-wlshm-focus-proof
 cargo build --offline --locked --target aarch64-unknown-linux-musl -p pf-input-broker --bin pf-input-broker
 echo '::endgroup::'
 echo '::group::GNU AArch64 staticlib C SDK and ELF ABI smoke'
