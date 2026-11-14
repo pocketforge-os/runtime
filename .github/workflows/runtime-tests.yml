@@ -100,7 +100,7 @@ jobs:
           source_date_epoch=$(git show -s --format=%ct "$PF_SOURCE_SHA")
           podman pull --tls-verify=false \
             10.0.32.86:5555/pocketforge/ci-rust@sha256:801f15f7e8fd20b449e3b0d0a7a56d632e28dae825b251a19a30e6f8b32bd8e9
-          podman run --rm --pull=never --userns=keep-id \
+          podman run --rm --pull=never --userns=keep-id --network=none \
             -v "$GITHUB_WORKSPACE:/work:Z" -w /work -- \
             10.0.32.86:5555/pocketforge/ci-rust@sha256:801f15f7e8fd20b449e3b0d0a7a56d632e28dae825b251a19a30e6f8b32bd8e9 \
             env PF_SOURCE_SHA="$PF_SOURCE_SHA" PF_IMAGE="$PF_IMAGE" \
