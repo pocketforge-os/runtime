@@ -50,6 +50,6 @@ binary_bytes=$(stat -c %s "$binary")
   echo 'elf_needed=none'
   echo 'forbidden_dependency_strings=absent(libvulkan,zink,libgl.so,libegl)'
 } >"$artifact_root/BUILD-RECEIPT.txt"
-sha256sum "$artifact_root/BUILD-RECEIPT.txt" "$binary" >"$artifact_root/SHA256SUMS"
-sha256sum -c "$artifact_root/SHA256SUMS"
+(cd "$artifact_root" && sha256sum BUILD-RECEIPT.txt pf-wlshm-focus-proof >SHA256SUMS)
+(cd "$artifact_root" && sha256sum -c SHA256SUMS)
 cat "$artifact_root/BUILD-RECEIPT.txt"
